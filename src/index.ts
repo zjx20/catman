@@ -21,8 +21,13 @@ import type { Channel } from "./channels/types.js";
 import type { AttachmentLimits } from "./core/attachments.js";
 import { Dashboard } from "./dashboard/server.js";
 import { cleanupOldSessionsAcross } from "./core/transcript.js";
+import { installLogStamps } from "./core/log-stamp.js";
 
 async function main(): Promise<void> {
+  // 第一件事:给所有 console 输出加时间戳。放在最前面,连启动期的日志也带上 ——
+  // 排查发送失败之类的问题时,"这两条隔了多久"是最基本的信息。
+  installLogStamps();
+
   const config = loadConfig();
 
   // 让 Agent SDK 把会话 JSONL 存到数据卷里(而非镜像内的 HOME)。
