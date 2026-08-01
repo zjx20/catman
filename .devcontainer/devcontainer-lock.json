@@ -1,0 +1,34 @@
+{
+  "features": {
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {
+      "version": "1.0.5",
+      "resolved": "ghcr.io/anthropics/devcontainer-features/claude-code@sha256:cfc2e7d3e9fd3b9b01f8d5cb158508a884c8c0ede2e23ed10f32dea5d4ffe69a",
+      "integrity": "sha256:cfc2e7d3e9fd3b9b01f8d5cb158508a884c8c0ede2e23ed10f32dea5d4ffe69a"
+    },
+    "ghcr.io/devcontainers/features/node:2": {
+      "version": "2.0.0",
+      "resolved": "ghcr.io/devcontainers/features/node@sha256:fedd4c11f7adfb64283b578dddc7da906728daa25fa293351c9d913231acf12f",
+      "integrity": "sha256:fedd4c11f7adfb64283b578dddc7da906728daa25fa293351c9d913231acf12f"
+    },
+    "ghcr.io/zjx20/devcontainer-features/claude-yolo:1.0.2": {
+      "version": "1.0.2",
+      "resolved": "ghcr.io/zjx20/devcontainer-features/claude-yolo@sha256:e8a39ceabdd2440d165b8228b53bab42c84aefc4dc67cf20f3bf2c811bf43e98",
+      "integrity": "sha256:e8a39ceabdd2440d165b8228b53bab42c84aefc4dc67cf20f3bf2c811bf43e98"
+    },
+    "ghcr.io/zjx20/devcontainer-features/codex-yolo:1": {
+      "version": "1.0.1",
+      "resolved": "ghcr.io/zjx20/devcontainer-features/codex-yolo@sha256:38c0103ed14b8f02e8751fda8adec357aece3e314521fd33ed957ef45ba0506b",
+      "integrity": "sha256:38c0103ed14b8f02e8751fda8adec357aece3e314521fd33ed957ef45ba0506b"
+    },
+    "ghcr.io/zjx20/devcontainer-features/google-antigravity:1": {
+      "version": "1.0.1",
+      "resolved": "ghcr.io/zjx20/devcontainer-features/google-antigravity@sha256:f3f6e1af37f51461262beeed69dd37da59c7570031d2e65069793bcbdd73fb95",
+      "integrity": "sha256:f3f6e1af37f51461262beeed69dd37da59c7570031d2e65069793bcbdd73fb95"
+    },
+    "ghcr.io/zjx20/devcontainer-features/localhost-proxy:1.0.1": {
+      "version": "1.0.1",
+      "resolved": "ghcr.io/zjx20/devcontainer-features/localhost-proxy@sha256:f79b4b8587cd27ac1fb6f062730ccaca0cc2e30da1b2b70aaafb564f9f95c652",
+      "integrity": "sha256:f79b4b8587cd27ac1fb6f062730ccaca0cc2e30da1b2b70aaafb564f9f95c652"
+    }
+  }
+}

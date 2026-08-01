@@ -1,0 +1,51 @@
+{
+  "name": "Go + Claude Code",
+  "image": "mcr.microsoft.com/devcontainers/go:1",
+  "features": {
+    "ghcr.io/devcontainers/features/node:2": {},
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {},
+    "ghcr.io/zjx20/devcontainer-features/claude-yolo:1.0.2": {},
+    "ghcr.io/zjx20/devcontainer-features/codex-yolo:1": {},
+    "ghcr.io/zjx20/devcontainer-features/google-antigravity:1": {},
+    "ghcr.io/zjx20/devcontainer-features/localhost-proxy:1.0.1": {
+      "mappings": "8001,17872"
+    }
+  },
+  "mounts": [
+    "source=${localEnv:HOME}/.claude,target=${localEnv:HOME}/.claude,type=bind", // use the same path in the host, for plugin marketplace
+    "source=${localEnv:HOME}/.codex/,target=/codex-home/,type=bind",
+    "source=${localEnv:HOME}/.gemini/,target=/gemini-home/,type=bind",
+    "source=${localEnv:HOME}/.ssh_for_agent/,target=/home/vscode/.ssh/,type=bind",
+    "source=go-mod-cache,target=/go/pkg/mod,type=volume",
+    "source=go-sumdb-cache,target=/go/pkg/sumdb,type=volume",
+    "source=go-build-cache,target=/go/build-cache,type=volume",
+    "source=npm-cache,target=/home/vscode/.npm,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "remote.portsAttributes": {
+          "8001": {
+            "onAutoForward": "ignore"
+          },
+          "17872": {
+            "onAutoForward": "ignore"
+          }
+        }
+      }
+    }
+  },
+  "containerEnv": {
+    "GOCACHE": "/go/build-cache",
+    "CLAUDE_CONFIG_DIR": "${localEnv:HOME}/.claude",
+    "CODEX_HOME": "/codex-home",
+    "CODEX_SQLITE_HOME": "/tmp/codex-sqlite"
+  },
+  "remoteEnv": {
+    "FRUGALAI_API_TOKEN": "${localEnv:FRUGALAI_API_TOKEN}"
+  },
+  "postStartCommand": {
+    "gemini-setup": "ln -snf /gemini-home \"$HOME/.gemini\"",
+    "go-setup": "sudo chmod 777 /go/pkg/sumdb || sudo chmod 777 /go/pkg/mod",
+  }
+}

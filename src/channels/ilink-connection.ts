@@ -1,0 +1,372 @@
+import { randomBytes } from "node:crypto";
+import type { Account } from "../core/accounts.js";
+import { makeUserKey } from "../core/identity.js";
+import {
+  ilinkPost,
+  baseInfo,
+  fetchCdnMedia,
+  LONG_POLL_PATH,
+  WECHAT_CHANNEL,
+  type CdnMedia,
+} from "./ilink-protocol.js";
+import {
+  describeReject,
+  toImageAttachment,
+  type Attachment,
+  type AttachmentLimits,
+} from "../core/attachments.js";
+
+/**
+ * 单个 iLink 账号的连接:一份 bot_token = 一条 getupdates 长轮询 + 一份回复上下文缓存。
+ * 多账号由 wechat-ilink.ts 管理若干个本类实例。
+ *
+ * 协议要点:
+ *   - 回复必须带上对应入站消息的 context_token,否则消息不投递(且 HTTP 200 静默失败)
+ *   - 协议不支持主动推送:send() 只在有缓存的 context_token 时可用;
+ *     超时提醒大概率失败(由网关降级)
+ *   - 未发现撤回消息的端点:不实现 recall,网关的"处理中"回执在微信里会保留
+ */
+
+/**
+ * item_list 里的消息条目类型(proto: MessageItemType)。
+ * 完整枚举还有 VOICE=3 / FILE=4 / VIDEO=5 / TOOL_CALL_*=11,12,这里只处理前两种。
+ */
+const ITEM_TEXT = 1;
+const ITEM_IMAGE = 2;
+
+interface MessageItem {
+  type: number;
+  /** 条目是否已就绪。图片要先传 CDN,未传完时可能为 false —— 待真机确认。 */
+  is_completed?: boolean;
+  create_time_ms?: number;
+  update_time_ms?: number;
+  msg_id?: string;
+  text_item?: { text: string };
+  image_item?: {
+    /** hex 编码的 AES key。给了就优先于 media.aes_key(它是 base64)。 */
+    aeskey?: string;
+    media?: CdnMedia;
+  };
+}
+
+/**
+ * proto: WeixinMessage。字段照官方 proto 列全 —— 后面几个当前只被 TRACE 读,
+ * 它们是排查「图文分离」聚合键的候选,留着比每次要用再去翻协议强。
+ */
+interface WeixinMessage {
+  seq?: number;
+  message_id?: number;
+  from_user_id?: string;
+  to_user_id?: string;
+  client_id?: string;
+  create_time_ms?: number;
+  update_time_ms?: number;
+  /** 消息级会话 id(不是我们自己的 SessionManager 那个)。 */
+  session_id?: string;
+  run_id?: string;
+  context_token?: string;
+  message_type?: number; // 1 = USER, 2 = BOT
+  message_state?: number; // 0 = NEW, 1 = GENERATING, 2 = FINISH
+  item_list?: MessageItem[];
+}
+
+interface GetUpdatesResp {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+  msgs?: WeixinMessage[];
+  get_updates_buf?: string;
+  longpolling_timeout_ms?: number;
+}
+
+/** 每用户缓存最近一次入站消息的回复上下文,供 send() 使用。 */
+interface ReplyContext {
+  toUserId: string;
+  contextToken: string;
+}
+
+/** 收到一条用户消息。userKey 已由连接拼好(含本账号的 accountId)。 */
+export type ConnectionMessageHandler = (
+  userKey: string,
+  text: string,
+  attachments: readonly Attachment[],
+) => void;
+
+/** 出错退避时长。 */
+const BACKOFF_MS = 3000;
+
+/**
+ * 入站消息的协议追踪。默认关闭 —— 打开后每条来信都会打一行结构摘要。
+ *
+ * 存在的理由:微信发「图 + 文字」时**不是一条消息**,文本先到、图片要等 CDN 上传完
+ * 才作为另一条消息到达(实测间隔 4~9 秒,图越大越久)。想只对"知道有图要来"的消息
+ * 做聚合等待、而不拖慢纯文本,就得先确认协议里到底有没有这样的信号
+ * (`session_id` / `run_id` / `is_completed` / `message_state` 都是候选)。
+ * 类型定义看不出答案,只能看真机数据。
+ *
+ * **只打结构与标量,绝不打 base64 与 aeskey** —— 前者刷屏,后者是媒体密钥。
+ */
+const TRACE = process.env.CATMAN_ILINK_TRACE === "1";
+
+/**
+ * 把一条入站消息压成一行结构摘要。纯函数,所以能直接单测「不泄漏密钥」这条约束 ——
+ * 它是唯一会把协议原始内容写进日志的地方,值得钉死。
+ *
+ * 挑的字段就是候选聚合键本身:同一次发送动作若共享 `session_id` / `run_id`,
+ * 或带图那条先以 `is_completed=false` / `message_state≠2` 到达,都能成为
+ * "值得等一等"的信号;全都对不上,则说明协议给不出提示,只能另想办法。
+ *
+ * **只输出键名与标量**:`aeskey` 是媒体密钥,`data` 是几 MB 的 base64,都只打键名。
+ */
+export function formatTrace(m: WeixinMessage): string {
+  const items = (m.item_list ?? []).map((i) => {
+    const fields = Object.keys(i).filter((k) => !k.endsWith("_item"));
+    const inner = i.image_item
+      ? `image_item{${Object.keys(i.image_item).join(",")}}` +
+        (i.image_item.media ? `.media{${Object.keys(i.image_item.media).join(",")}}` : "")
+      : i.text_item
+        ? `text(${i.text_item.text?.length ?? 0}字)`
+        : "";
+    return `type=${i.type} completed=${i.is_completed ?? "-"} [${fields.join(",")}] ${inner}`;
+  });
+  return (
+    `seq=${m.seq ?? "-"} msgId=${m.message_id ?? "-"} state=${m.message_state ?? "-"} ` +
+    `sess=${m.session_id ?? "-"} run=${m.run_id ?? "-"} client=${m.client_id ?? "-"} ` +
+    `ctime=${m.create_time_ms ?? "-"} utime=${m.update_time_ms ?? "-"} ` +
+    `items=${items.length ? items.join(" ; ") : "(空)"}`
+  );
+}
+
+export class ILinkConnection {
+  readonly accountId: string;
+
+  private readonly account: Account;
+  private readonly onMessage: ConnectionMessageHandler;
+  private readonly replyCtx = new Map<string, ReplyContext>();
+  private readonly clientId = `catman-${randomBytes(8).toString("hex")}`;
+  private readonly abort = new AbortController();
+
+  private updatesBuf = "";
+  private running = false;
+  /** 轮询循环的 promise,stop() 时等它退出。 */
+  private loop?: Promise<void>;
+  /** 会话过期(需重新扫码)后置位,供 dashboard 展示。 */
+  private expired = false;
+
+  /**
+   * limits 传的是**函数不是值**:管理员在 dashboard 上改了上限,下一张图就按新值走,
+   * 不必重启进程、也不必给连接加一条配置变更通知。
+   */
+  constructor(
+    account: Account,
+    onMessage: ConnectionMessageHandler,
+    private readonly limits: () => AttachmentLimits,
+  ) {
+    this.account = account;
+    this.accountId = account.accountId;
+    this.onMessage = onMessage;
+  }
+
+  get isExpired(): boolean {
+    return this.expired;
+  }
+
+  async start(): Promise<void> {
+    if (this.running) return;
+    this.running = true;
+    await this.post("ilink/bot/msg/notifystart", {}).catch(() => {});
+    this.loop = this.pollLoop();
+  }
+
+  async stop(): Promise<void> {
+    this.running = false;
+    this.abort.abort();
+    await this.post("ilink/bot/msg/notifystop", {}).catch(() => {});
+    await this.loop?.catch(() => {});
+  }
+
+  /**
+   * 发送文本。使用该用户最近入站消息缓存的 context_token。
+   * 无缓存(如主动提醒且用户从未发过消息)时抛错,由网关判定推送失败并降级。
+   */
+  async send(userKey: string, text: string): Promise<void> {
+    const ctx = this.replyCtx.get(userKey);
+    if (!ctx) {
+      throw new Error(`无 ${userKey} 的 context_token,iLink 无法主动推送`);
+    }
+    const msg: WeixinMessage = {
+      from_user_id: "",
+      to_user_id: ctx.toUserId,
+      client_id: `${this.clientId}-${randomBytes(4).toString("hex")}`,
+      message_type: 2, // BOT
+      message_state: 2, // FINISH
+      context_token: ctx.contextToken,
+      item_list: [{ type: 1, text_item: { text } }],
+    };
+    const resp = await this.post<{ ret?: number; errmsg?: string }>("ilink/bot/sendmessage", {
+      msg,
+      base_info: baseInfo(),
+    });
+    if (resp.ret !== undefined && resp.ret !== 0) {
+      throw new Error(`sendmessage 失败 ret=${resp.ret} ${resp.errmsg ?? ""}`);
+    }
+  }
+
+  // --- 内部 ---
+
+  private async pollLoop(): Promise<void> {
+    while (this.running) {
+      try {
+        const resp = await this.post<GetUpdatesResp>(LONG_POLL_PATH, {
+          get_updates_buf: this.updatesBuf,
+          base_info: baseInfo(),
+        });
+
+        if (resp.errcode === -14) {
+          console.error(
+            `[ilink:${this.accountId}] 会话过期(errcode=-14),需在 dashboard 上重新扫码`,
+          );
+          this.expired = true;
+          this.running = false;
+          break;
+        }
+        if (resp.ret !== undefined && resp.ret !== 0) {
+          await this.sleep(BACKOFF_MS); // 出错退避
+          continue;
+        }
+        if (resp.get_updates_buf) this.updatesBuf = resp.get_updates_buf;
+        // 逐条 await:dispatch 现在可能要下载图片。代价是下载期间暂停拉取,
+        // 好处是投递顺序严格等于收到顺序 —— 长轮询有 get_updates_buf 游标兜底,
+        // 暂停不会丢消息;而乱序会让「先发图、后发问题」的两条消息颠倒着进队列。
+        for (const m of resp.msgs ?? []) await this.dispatch(m);
+      } catch (err) {
+        if (!this.running) break; // stop() 触发的 abort,正常退出
+        console.warn(`[ilink:${this.accountId}] 轮询异常,${BACKOFF_MS}ms 后重试: ${String(err)}`);
+        await this.sleep(BACKOFF_MS);
+      }
+    }
+  }
+
+  private async dispatch(m: WeixinMessage): Promise<void> {
+    if (TRACE) console.info(`[ilink:${this.accountId}] TRACE ${formatTrace(m)}`);
+    // 跳过自身(BOT)消息
+    if (m.message_type === 2 || m.from_user_id?.endsWith("@im.bot")) return;
+    if (!m.from_user_id) return;
+
+    const text = (m.item_list ?? [])
+      .filter((i) => i.type === ITEM_TEXT && i.text_item?.text)
+      .map((i) => i.text_item!.text)
+      .join("")
+      .trim();
+
+    const userKey = makeUserKey(WECHAT_CHANNEL, this.accountId, m.from_user_id);
+
+    // 缓存回复上下文要在下载**之前**做:下载可能失败,而报错也得发得出去。
+    // 注意按 userKey 存:同一 from_user_id 在别的账号下是另一个人。
+    if (m.context_token) {
+      this.replyCtx.set(userKey, {
+        toUserId: m.from_user_id,
+        contextToken: m.context_token,
+      });
+    }
+
+    const attachments = await this.collectImages(userKey, m.item_list ?? []);
+
+    // 文字与图片同时为空才算无内容。只发一张图是完全正常的用法。
+    if (!text && !attachments.length) return;
+    this.onMessage(userKey, text, attachments);
+  }
+
+  /**
+   * 把消息里的图片 item 下载解密成附件。
+   *
+   * 单张图片失败不影响其余部分:该图跳过并单独告知用户,剩下的文字和其它图片
+   * 照常投递 —— 整条消息因为一张图挂掉而消失,对用户来说就是"发了没反应"。
+   */
+  private async collectImages(
+    userKey: string,
+    items: readonly MessageItem[],
+  ): Promise<Attachment[]> {
+    const imageItems = items.filter((i) => i.type === ITEM_IMAGE);
+    const images = imageItems.filter((i) => i.image_item?.media);
+    if (imageItems.length > images.length) {
+      // 协议里确实有图片,但我们没在预期的字段里找到下载信息 —— 多半是字段名与
+      // 真机对不上。**只打字段名不打值**(aeskey 是媒体密钥),这份 key 列表正是
+      // 校准所需要的;不打的话真机上的表现是"发了图没反应",日志里一点痕迹都没有。
+      const shapes = imageItems
+        .filter((i) => !i.image_item?.media)
+        .map((i) => `{${Object.keys(i.image_item ?? {}).join(",") || "空"}}`);
+      console.warn(
+        `[ilink:${this.accountId}] 收到 ${shapes.length} 个图片条目但取不到下载信息,` +
+          `image_item 的字段是 ${shapes.join(" ")} —— 期望里面有 media`,
+      );
+    }
+    if (!images.length) return [];
+
+    // 整条消息用同一份上限快照:中途被改的话,同一条消息里的图会按不同标准处理。
+    const limits = this.limits();
+    const out: Attachment[] = [];
+    let skipped = 0;
+    for (const item of images) {
+      if (out.length >= limits.maxImagesPerTurn) {
+        skipped += 1;
+        continue;
+      }
+      const img = item.image_item!;
+      try {
+        // image_item.aeskey 是 hex,media.aes_key 是 base64 —— 统一成 base64 再传下去。
+        const aesKeyBase64 = img.aeskey
+          ? Buffer.from(img.aeskey, "hex").toString("base64")
+          : undefined;
+        const bytes = await fetchCdnMedia(img.media!, {
+          ...(aesKeyBase64 ? { aesKeyBase64 } : {}),
+          signal: this.abort.signal,
+        });
+        const result = toImageAttachment(bytes, limits);
+        if (result.ok) {
+          out.push(result.attachment);
+        } else {
+          await this.trySend(userKey, describeReject(result.reject));
+        }
+      } catch (err) {
+        console.warn(`[ilink:${this.accountId}] 图片下载/解密失败: ${String(err)}`);
+        await this.trySend(userKey, "有张图片我没取下来,你再发一次试试。");
+      }
+    }
+    if (skipped) {
+      await this.trySend(
+        userKey,
+        `一次最多看 ${limits.maxImagesPerTurn} 张图,后面 ${skipped} 张我先跳过了。`,
+      );
+    }
+    return out;
+  }
+
+  /** 发一句提示,失败就算了 —— 它只是解释,不该反过来把这条消息整个搞挂。 */
+  private async trySend(userKey: string, text: string): Promise<void> {
+    await this.send(userKey, text).catch(() => {});
+  }
+
+  private post<T>(path: string, body: unknown): Promise<T> {
+    return ilinkPost<T>(path, body, {
+      baseUrl: this.account.baseUrl,
+      botToken: this.account.botToken,
+      signal: this.abort.signal,
+    });
+  }
+
+  /** 可被 stop() 中断的 sleep,避免关机时白等一个退避周期。 */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      this.abort.signal.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          resolve();
+        },
+        { once: true },
+      );
+    });
+  }
+}
