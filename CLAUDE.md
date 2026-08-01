@@ -107,11 +107,14 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
   README「安全说明」按这个口径写,改动别改回"容器即隔离边界"。
 - **镜像里的 `npm ci` 必须跑在目标架构下**:claude 二进制来自 Agent SDK 的
   optionalDependencies(`claude-agent-sdk-<os>-<arch>[-musl]`),npm 按**执行安装的那个容器**的
-  arch/libc 选包。所以多架构要靠 buildx + QEMU(或原生 builder)整层在目标平台跑,
-  **不能**改成 `FROM --platform=$BUILDPLATFORM` 交叉编译 —— TS 编译确实与架构无关,但同层的
+  arch/libc 选包。Dockerfile 是多阶段的,发货的是**运行时阶段**那次 `npm ci --omit=dev`,
+  所以多架构要靠 buildx + QEMU(或原生 builder)让它在目标平台跑,**不能**给运行时阶段加
+  `FROM --platform=$BUILDPLATFORM` 交叉编译 —— TS 编译确实与架构无关,但那层的
   `npm ci` 会装成构建机的架构,构建期毫无征兆,只在目标机起 agent 时炸。
   验证手段:容器内 `node -p process.arch` 与 `ls node_modules/@anthropic-ai/` 必须对得上。
   基底是 bookworm(glibc),换 alpine 会切到 musl 变体。步骤见 README「构建多架构镜像」。
+  另两条镜像体积不变量在 Dockerfile 注释里:npm 缓存清理、`chown -R /app` 都必须与
+  `npm ci` 同层,分层会把整个 node_modules 的体积在镜像里再算一遍。
 - **清理严格限定在本程序自己建的 workspace 目录**(`transcript.ts` 全部函数都要 `projectDir`
   参数;多用户版的 `*Across` 函数接受调用方给定的一组 scope)。**绝不遍历整个 projects/ 树** ——
   否则 CLAUDE_CONFIG_DIR 指向共享 ~/.claude 时会误删无关的 Claude Code 历史(有专门单测守护;

@@ -434,9 +434,11 @@ Agent SDK 把 claude 二进制拆成一组 **optionalDependencies**
 `process.arch` 与 libc 挑一个装下来。由此:
 
 - 构建**必须**让 `npm ci` 在目标平台下执行 —— buildx + QEMU 模拟,或一台原生 arm64 builder。
-- **不要**用 `FROM --platform=$BUILDPLATFORM` 那套交叉编译提速。TypeScript 编译本身确实与
-  架构无关,但同一层的 `npm ci` 会装成**构建机**的架构:镜像能构建成功、`tsc` 产物也正常,
-  只有真正去起 agent 时才炸。这个坑不会在构建期暴露,别顺手"优化"掉。
+  Dockerfile 是多阶段的,进最终镜像的是**运行时阶段**那次 `npm ci --omit=dev`,这条约束
+  至少约束它(build 阶段的 node_modules 不发货,理论上可交叉,目前两个阶段都跑目标平台)。
+- **不要**给运行时阶段加 `FROM --platform=$BUILDPLATFORM` 那套交叉编译提速。TypeScript
+  编译本身确实与架构无关,但那一层的 `npm ci` 会装成**构建机**的架构:镜像能构建成功、
+  `tsc` 产物也正常,只有真正去起 agent 时才炸。这个坑不会在构建期暴露,别顺手"优化"掉。
 - 基础镜像是 `node:22-bookworm-slim`(glibc),因此选中的是 glibc 变体。改用 alpine 基底
   会切到 musl 变体,需要重新验证。
 
