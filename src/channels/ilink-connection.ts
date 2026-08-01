@@ -6,6 +6,7 @@ import {
   baseInfo,
   fetchCdnMedia,
   LONG_POLL_PATH,
+  LONG_POLL_TIMEOUT_MS,
   WECHAT_CHANNEL,
   type CdnMedia,
 } from "./ilink-protocol.js";
@@ -83,6 +84,15 @@ interface GetUpdatesResp {
 interface ReplyContext {
   toUserId: string;
   contextToken: string;
+  /** 该 token 入缓存的时刻。用来算「拿它发信时它已经多老了」。 */
+  cachedAt: number;
+  /** 用这个 token 尝试发了几条。 */
+  attempts: number;
+  /**
+   * 其中成功几条。**必须与 attempts 分开记**:合成一个计数的话,失败不推进序号,
+   * 「第 4 次尝试但只成功过 1 条」这种"从第 2 条起就一直坏"的形态就看不出来了。
+   */
+  sent: number;
 }
 
 /** 收到一条用户消息。userKey 已由连接拼好(含本账号的 accountId)。 */
@@ -137,6 +147,29 @@ export function formatTrace(m: WeixinMessage): string {
   );
 }
 
+/**
+ * 一次 sendmessage 的诊断行。
+ *
+ * 存在的理由:sendmessage 失败时,光看 `ret`/`errmsg` 分不出到底是**限流**、
+ * **context_token 过期**、还是**同一个 token 只允许回一条**。三者要靠三个量区分:
+ *   - `#n`      针对这条来信这是第几次回复,以及前面成功了几条
+ *                (n=2 就失败 ⇒ 两条之间只隔几秒,限流解释不通)
+ *   - `ctx龄`   拿到 token 到用它发信之间过了多久(第一条就失败且龄很大 ⇒ 时效)
+ *   - `字`      本条长度,用于对上是回执/进度/正文的哪一段
+ *
+ * 与 `formatTrace` 同一条约束:**只出标量,不出正文** —— 日志里不该有会话内容。
+ * 做成纯函数就是为了把这条约束钉在单测里。
+ */
+export function formatSendDiag(
+  attempt: number,
+  okBefore: number,
+  ageMs: number,
+  chars: number,
+  outcome: string,
+): string {
+  return `send #${attempt}(前 ${okBefore} 条成功) ctx龄=${ageMs}ms ${chars}字 → ${outcome}`;
+}
+
 export class ILinkConnection {
   readonly accountId: string;
 
@@ -148,6 +181,8 @@ export class ILinkConnection {
 
   private updatesBuf = "";
   private running = false;
+  /** 服务端上次报的长轮询时长,只为「变了才打日志」而存。 */
+  private serverPollTimeoutMs?: number;
   /** 轮询循环的 promise,stop() 时等它退出。 */
   private loop?: Promise<void>;
   /** 会话过期(需重新扫码)后置位,供 dashboard 展示。 */
@@ -203,12 +238,39 @@ export class ILinkConnection {
       context_token: ctx.contextToken,
       item_list: [{ type: 1, text_item: { text } }],
     };
+    // 诊断量在**发之前**取:失败路径要抛错,取晚了就得在两个分支各算一遍。
+    // attempts 就地自增(而非等结果),这样并发进来的发送拿到的是不同的序号 ——
+    // 硬指令与在飞回合是会同时发消息的。
+    const attempt = (ctx.attempts += 1);
+    const okBefore = ctx.sent;
+    const ageMs = Date.now() - ctx.cachedAt;
+
     const resp = await this.post<{ ret?: number; errmsg?: string }>("ilink/bot/sendmessage", {
       msg,
       base_info: baseInfo(),
     });
     if (resp.ret !== undefined && resp.ret !== 0) {
+      // 失败**无条件**打:上层的 trySend 会把回执/进度的失败吞掉,只在这里
+      // 还能看到全貌。带上三个判别量,见 formatSendDiag 的说明。
+      console.warn(
+        `[ilink:${this.accountId}] ` +
+          formatSendDiag(
+            attempt,
+            okBefore,
+            ageMs,
+            text.length,
+            `失败 ret=${resp.ret} ${resp.errmsg ?? ""}`,
+          ),
+      );
       throw new Error(`sendmessage 失败 ret=${resp.ret} ${resp.errmsg ?? ""}`);
+    }
+    ctx.sent += 1;
+    // 成功的量大(回执 + 每条进度 + 每段正文),跟入站 TRACE 同一个开关。
+    // 但失败行自带 okBefore,所以不开 TRACE 也判得出"第几条开始坏的"。
+    if (TRACE) {
+      console.info(
+        `[ilink:${this.accountId}] ` + formatSendDiag(attempt, okBefore, ageMs, text.length, "ok"),
+      );
     }
   }
 
@@ -216,11 +278,29 @@ export class ILinkConnection {
 
   private async pollLoop(): Promise<void> {
     while (this.running) {
+      const startedAt = Date.now();
       try {
         const resp = await this.post<GetUpdatesResp>(LONG_POLL_PATH, {
           get_updates_buf: this.updatesBuf,
           base_info: baseInfo(),
         });
+
+        // 服务端报的长轮询时长。当前并不据此调整客户端超时(仍是常量),打出来是为了
+        // 判断 AbortError 到底是不是「服务端挂得比 LONG_POLL_TIMEOUT_MS 久」——
+        // 只在变化时打一行,稳定后不再刷屏。
+        if (
+          resp.longpolling_timeout_ms !== undefined &&
+          resp.longpolling_timeout_ms !== this.serverPollTimeoutMs
+        ) {
+          this.serverPollTimeoutMs = resp.longpolling_timeout_ms;
+          console.info(
+            `[ilink:${this.accountId}] 服务端长轮询时长 ${resp.longpolling_timeout_ms}ms` +
+              `(客户端超时 ${LONG_POLL_TIMEOUT_MS}ms)` +
+              (resp.longpolling_timeout_ms >= LONG_POLL_TIMEOUT_MS
+                ? " —— 客户端更短,每轮都会被自己 abort"
+                : ""),
+          );
+        }
 
         if (resp.errcode === -14) {
           console.error(
@@ -241,7 +321,13 @@ export class ILinkConnection {
         for (const m of resp.msgs ?? []) await this.dispatch(m);
       } catch (err) {
         if (!this.running) break; // stop() 触发的 abort,正常退出
-        console.warn(`[ilink:${this.accountId}] 轮询异常,${BACKOFF_MS}ms 后重试: ${String(err)}`);
+        // 带上已等时长:AbortError 贴着 LONG_POLL_TIMEOUT_MS 就是客户端超时太短
+        // (服务端还在挂),明显更短则是真的网络异常 —— 两者的修法完全不同。
+        const waited = Date.now() - startedAt;
+        console.warn(
+          `[ilink:${this.accountId}] 轮询异常(已等 ${waited}ms / 客户端上限 ` +
+            `${LONG_POLL_TIMEOUT_MS}ms),${BACKOFF_MS}ms 后重试: ${String(err)}`,
+        );
         await this.sleep(BACKOFF_MS);
       }
     }
@@ -263,10 +349,16 @@ export class ILinkConnection {
 
     // 缓存回复上下文要在下载**之前**做:下载可能失败,而报错也得发得出去。
     // 注意按 userKey 存:同一 from_user_id 在别的账号下是另一个人。
+    //
+    // 每条新来信都换一份上下文,发送计数也跟着归零 —— 计数的语义是「针对**这条来信**
+    // 回了几条」。所以读日志时留意:用户在回合进行中又发了一条,会看到序号退回 #1。
     if (m.context_token) {
       this.replyCtx.set(userKey, {
         toUserId: m.from_user_id,
         contextToken: m.context_token,
+        cachedAt: Date.now(),
+        attempts: 0,
+        sent: 0,
       });
     }
 

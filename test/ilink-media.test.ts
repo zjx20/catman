@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { ILinkConnection, formatTrace } from "../src/channels/ilink-connection.js";
+import { ILinkConnection, formatTrace, formatSendDiag } from "../src/channels/ilink-connection.js";
 import type { AttachmentLimits } from "../src/core/attachments.js";
 import type { Account } from "../src/core/accounts.js";
 import type { Attachment } from "../src/core/attachments.js";
@@ -335,4 +335,18 @@ test("协议追踪:候选聚合键全部出现,密钥与 base64 只出现键名"
   assert.ok(!line.includes("deadbeef"), `aeskey 的值泄漏了:${line}`);
   assert.ok(!line.includes("SECRETKEYVALUE"), `aes_key 的值泄漏了:${line}`);
   assert.ok(line.includes("text(2字)"), `文本应只报长度:${line}`);
+});
+
+test("发送诊断:三个判别量齐全,且不带回复正文", () => {
+  // sendmessage 失败时要靠这一行分清「限流 / context_token 过期 / 同 token 只能回一条」。
+  // 少一个量就分不出来,而多打正文就等于把会话内容写进了日志。
+  const secret = "这是回复正文,不该出现在日志里";
+  const line = formatSendDiag(3, 2, 45_000, secret.length, "失败 ret=-2 prepare failed");
+
+  assert.ok(line.includes("#3"), `缺第几次:${line}`);
+  assert.ok(line.includes("2"), `缺已成功条数:${line}`);
+  assert.ok(line.includes("45000ms"), `缺 context_token 龄:${line}`);
+  assert.ok(line.includes(`${secret.length}字`), `缺长度:${line}`);
+  assert.ok(line.includes("ret=-2"), `缺服务端错误:${line}`);
+  assert.ok(!line.includes(secret), `正文泄漏了:${line}`);
 });

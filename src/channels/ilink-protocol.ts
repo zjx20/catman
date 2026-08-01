@@ -50,7 +50,13 @@ export const WECHAT_CHANNEL = "wechat";
 
 /** 长轮询端点用更长的超时;其余用短超时。 */
 export const LONG_POLL_PATH = "ilink/bot/getupdates";
-const LONG_POLL_TIMEOUT_MS = 40_000;
+/**
+ * 客户端给长轮询的上限。服务端会在响应的 `longpolling_timeout_ms` 里报它自己挂多久,
+ * 这个值必须**大于**那个 —— 否则每一轮都会被客户端自己 abort,表现为日志里连串的
+ * `AbortError: This operation was aborted`,并且每轮白等一个超时加一次退避。
+ * 导出是为了让连接层把两个数一起打出来对照。
+ */
+export const LONG_POLL_TIMEOUT_MS = 40_000;
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 export function baseInfo(): { channel_version: string; bot_agent: string } {
