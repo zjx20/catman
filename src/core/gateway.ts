@@ -40,6 +40,13 @@ export interface GatewayOptions {
   reminderIntervalMs: number;
   /** 谁能使用本助手。默认全放行(仅适合 stdin 这类本地通道)。 */
   admission?: AdmissionPolicy;
+  /**
+   * 时钟。目前只喂给进度节流 —— 它是纯计算,可以用假时钟驱动。
+   *
+   * 聚合窗口**刻意不用**这个:它的时刻是拿来和真实 `setTimeout` 对账的
+   * (`deadline - now` 直接当延时用),换成假时钟会让两者跑在不同的时间轴上。
+   */
+  now?: () => number;
 }
 
 function truncate(s: string, max: number): string {
@@ -62,13 +69,116 @@ function summarizeToolInput(input: unknown): string {
   }
 }
 
-/** 把进度事件格式化成一条发给用户的短消息。 */
-export function formatProgress(ev: AgentProgressEvent): string {
-  if (ev.kind === "thinking") {
-    return `💭 ${truncate(ev.text.trim(), PROGRESS_MAX_CHARS)}`;
+/**
+ * 把进度事件格式化成一条发给用户的短消息。
+ * `skipped` 是本条之前被节流掉的事件数,标出来是为了让"卡在一件事上"与
+ * "一直在快速推进"看起来不一样 —— 否则用户只看到间隔变长,分不清是哪种。
+ */
+export function formatProgress(ev: AgentProgressEvent, skipped = 0): string {
+  const body =
+    ev.kind === "thinking"
+      ? `💭 ${truncate(ev.text.trim(), PROGRESS_MAX_CHARS)}`
+      : (() => {
+          const summary = truncate(summarizeToolInput(ev.input), PROGRESS_MAX_CHARS);
+          return summary ? `🔧 ${ev.name}: ${summary}` : `🔧 ${ev.name}`;
+        })();
+  return skipped ? `${body}(+${skipped} 步)` : body;
+}
+
+/**
+ * 进度推送的间隔阶梯:发出第 1 条前等 5 秒,之后依次 15、30、60 秒,用完停在 60 秒。
+ *
+ * 逐级拉长而不是固定频率,是因为用户对进度的需求随回合变长而下降:开头想知道
+ * "接住了没",几分钟后只想知道"还活着"。而每条进度在 iLink 上都是一次 HTTP 往返,
+ * 且要消耗同一个 `context_token` 的额度(见 ProgressThrottle 的说明)。
+ */
+export const PROGRESS_INTERVALS_MS = [5_000, 15_000, 30_000, 60_000];
+
+/**
+ * 一个 `context_token` 总共能发多少条。
+ *
+ * 真机实测:第 11 条起 `sendmessage` 返回 `ret=-2 prepare failed`,且**永不恢复** ——
+ * 不是限流(限流会放行),是这个 token 作废。详见 README「一个 context_token 的发送预算」。
+ * 这里取实测值本身、不偷偷留余量:余量在 RESERVED_SENDS 里显式列支,
+ * 免得两处各自"稍微保守一点",最后谁也说不清实际还剩多少。
+ */
+const SEND_BUDGET = 10;
+
+/**
+ * 预留给非进度用途的条数,进度不许碰:
+ *
+ *   1 条**正文** —— 回复超过 `maxReplyChars` 会分段,后面几段仍可能超预算失败,
+ *     但用户至少拿到开头,比彻底静默强得多。
+ *   1 条**会话空闲提醒** —— 它和正文共用同一个 `context_token`:提醒的前提就是
+ *     用户没再发消息,而 `replyCtx` 只在收到新消息时更新,所以那时用的还是这一份。
+ *     预留不保证它一定发得出去(iLink 本就不支持主动推送),但进度把额度吃光的话,
+ *     它**一定**发不出去。
+ */
+const RESERVED_SENDS = 2;
+
+/**
+ * 一个回合里最多推几条进度 = 预算 − 回执 1 条 − 预留 2 条。
+ *
+ * 光有间隔阶梯不够:阶梯只是把间隔拉长,总条数仍随回合时长无限增长 ——
+ * 稳定在 60 秒一条之后,一个十分钟的回合照样能发十几条,又撞回预算,
+ * 而那时被挤掉的正好是最不能丢的那几条。所以还要一个绝对上限。
+ */
+export const MAX_PROGRESS_PER_TURN = SEND_BUDGET - 1 - RESERVED_SENDS;
+
+/** 额度用尽时附在最后一条进度后面的交代。 */
+const PROGRESS_CAP_NOTICE = "(进度就报到这儿,接下来直接等答案)";
+
+/**
+ * 进度推送节流器。
+ *
+ * **为什么必须节流**:iLink 的一个 `context_token` 撑不住一个长回合里的几十条消息 ——
+ * 真机实测第 11 条起 `sendmessage` 返回 `ret=-2 prepare failed` 且**永不恢复**,
+ * 连最后的正式回复都发不出去,用户那边彻底静默。旧实现每个事件发一条,
+ * 一个 83 秒的回合发了 23 条,其中 21 条是进度。
+ *
+ * **节流而不是聚合**:同一间隔内攒下的事件只发**最新那条**,旧的直接丢。
+ * 进度是"现在在干什么"这个状态,不是需要完整送达的流水;到点补发一条几十秒前的
+ * 工具调用没有意义,还要额外占一次发送额度。丢掉多少条记在 `skipped` 里交代。
+ *
+ * **纯事件驱动,不用定时器**:没有新事件就不推进。这一点与旧实现一致 ——
+ * agent 卡在一次长工具调用里时两者都不会更新进度,所以没有退步;而不引入定时器
+ * 就不存在"回合结束后定时器才触发、进度插到正式回复后面"这类乱序风险。
+ */
+export class ProgressThrottle {
+  private nextAllowedAt: number;
+  /** 已经放行几条 —— 决定用阶梯里的哪一档。 */
+  private sent = 0;
+  /** 上次放行之后被丢掉几条。 */
+  private skipped = 0;
+
+  constructor(
+    startedAt: number,
+    private readonly intervals: readonly number[] = PROGRESS_INTERVALS_MS,
+    private readonly maxSends: number = MAX_PROGRESS_PER_TURN,
+  ) {
+    this.nextAllowedAt = startedAt + (intervals[0] ?? 0);
   }
-  const summary = truncate(summarizeToolInput(ev.input), PROGRESS_MAX_CHARS);
-  return summary ? `🔧 ${ev.name}: ${summary}` : `🔧 ${ev.name}`;
+
+  /**
+   * 交一个事件进来。到点则返回该发的文本,没到点返回 undefined(该事件被丢弃)。
+   * 时刻在**决定放行时**推进而不是发送完成后 —— 否则一次慢发送期间会漏过好几条。
+   */
+  offer(now: number, ev: AgentProgressEvent): string | undefined {
+    // 额度用尽就彻底不发了,连计数都不必再攒 —— 后面没有任何一条会被放出去。
+    if (this.sent >= this.maxSends) return undefined;
+    if (now < this.nextAllowedAt) {
+      this.skipped += 1;
+      return undefined;
+    }
+    const text = formatProgress(ev, this.skipped);
+    this.skipped = 0;
+    this.sent += 1;
+    // 第 n 条发完之后用第 n 档间隔;超出阶梯长度就一直用最后一档。
+    this.nextAllowedAt = now + (this.intervals[Math.min(this.sent, this.intervals.length - 1)] ?? 0);
+    // 最后一条要说清楚后面没了。否则用户看到的是进度突然断掉,与"卡死了"无从分辨 ——
+    // 长回合下这段静默可能长达好几分钟,正是最容易让人以为出事的时候。
+    return this.sent === this.maxSends ? `${text}\n${PROGRESS_CAP_NOTICE}` : text;
+  }
 }
 
 /** 把毫秒说成人话。用于 /状态。 */
@@ -218,6 +328,7 @@ export class Gateway {
   private readonly turns: TurnTokens;
   private readonly apiBase: string;
   private readonly admission: AdmissionPolicy;
+  private readonly now: () => number;
   private readonly reminderIntervalMs: number;
   private readonly semaphore: Semaphore;
 
@@ -237,6 +348,7 @@ export class Gateway {
     this.turns = opts.turns;
     this.apiBase = opts.apiBase;
     this.admission = opts.admission ?? allowAll;
+    this.now = opts.now ?? Date.now;
     this.reminderIntervalMs = opts.reminderIntervalMs;
     this.semaphore = new Semaphore(this.settings.effective().maxConcurrentTurns);
     this.settings.onChange(() => {
@@ -394,7 +506,7 @@ export class Gateway {
     const verdict = this.admission(userKey);
     if (!verdict.ok) {
       console.warn(`[gateway] 拒绝来信:${verdict.reason}`);
-      if (verdict.reply) await this.trySend(userKey, verdict.reply);
+      if (verdict.reply) await this.trySend(userKey, verdict.reply, "准入拒绝说明");
       return null;
     }
 
@@ -403,7 +515,7 @@ export class Gateway {
     if (this.users.needsGreeting(userKey)) {
       const allowlist = this.settings.effective().modelAllowlist;
       // 发送成功才标记 —— 失败留给下次重试,指引值得重试。
-      if (await this.trySend(userKey, greetingText(allowlist))) {
+      if (await this.trySend(userKey, greetingText(allowlist), "首次使用指引")) {
         this.users.markGreeted(userKey);
         justGreeted = true;
       }
@@ -420,12 +532,12 @@ export class Gateway {
       case "help":
         // 刚推过 greeting 的话内容一模一样,不重复刷屏。
         if (!pre.justGreeted) {
-          await this.trySend(userKey, helpText(this.settings.effective().modelAllowlist));
+          await this.trySend(userKey, helpText(this.settings.effective().modelAllowlist), "帮助");
         }
         return;
 
       case "status":
-        await this.trySend(userKey, this.statusText(userKey));
+        await this.trySend(userKey, this.statusText(userKey), "状态");
         return;
 
       case "newSession": {
@@ -439,6 +551,7 @@ export class Gateway {
           inFlight
             ? "好,当前这一轮跑完就从新对话开始。"
             : "好,下次从新对话开始,之前的上下文不带了。",
+          "新会话确认",
         );
         return;
       }
@@ -452,6 +565,7 @@ export class Gateway {
           await this.trySend(
             userKey,
             dropped ? "好,刚发的还没开始处理,已经丢掉了。" : "现在没有正在跑的任务。",
+            "取消确认",
           );
           return;
         }
@@ -504,11 +618,17 @@ export class Gateway {
     const ackId = prefs.ackEnabled ? await this.trySendAck(userKey) : undefined;
 
     // 进度消息串行链:保证按事件产生顺序逐条发送,最终回复排在链尾之后。
+    // 节流从**回合开始**起算,而不是从第一个事件 —— 用户等待的是前者。
+    const throttle = new ProgressThrottle(this.now());
     let progress: Promise<void> = Promise.resolve();
     const onProgress = prefs.progressEnabled
       ? (ev: AgentProgressEvent) => {
+          // 节流判定在事件到达时就做完,不放进串行链:链上排队的时长会把
+          // "这个事件是什么时候发生的"整个搞乱,节流间隔也就不准了。
+          const text = throttle.offer(this.now(), ev);
+          if (text === undefined) return;
           progress = progress.then(async () => {
-            await this.trySend(userKey, formatProgress(ev));
+            await this.trySend(userKey, text, "进度");
           });
         }
       : undefined;
@@ -538,6 +658,7 @@ export class Gateway {
         turn.ctx.abort.signal.aborted
           ? "已中断这一轮。"
           : `处理出错了:${(err as Error).message}`,
+        "错误说明",
       );
     } finally {
       // reset 一律在这里做:try 里无条件 record(),finally 必在其后执行,
@@ -579,7 +700,10 @@ export class Gateway {
     try {
       const id = await this.channel.send(userKey, ACK_TEXT);
       return typeof id === "string" ? id : undefined;
-    } catch {
+    } catch (err) {
+      // 同 trySend:静默降级,但不静默消失。回执是一个回合里**第一条**外发消息,
+      // 它成不成功是判断后续失败原因的起点。
+      console.warn(`[gateway] 给 ${userKey} 发回执失败:${String(err)}`);
       return undefined;
     }
   }
@@ -587,7 +711,7 @@ export class Gateway {
   /** 到点提醒:尝试主动推送;推送失败(如渠道不支持)则静默降级。 */
   private async flushReminders(): Promise<void> {
     for (const userKey of this.sessions.dueReminders()) {
-      const ok = await this.trySend(userKey, REMINDER_TEXT);
+      const ok = await this.trySend(userKey, REMINDER_TEXT, "超时提醒");
       if (!ok) {
         // 渠道无法主动推送:降级为下次用户发消息时由会话规则处理,无需额外动作。
         console.info(`[gateway] 用户 ${userKey} 超时提醒推送失败,降级为下次消息提示`);
@@ -601,11 +725,19 @@ export class Gateway {
     }
   }
 
-  private async trySend(userKey: string, text: string): Promise<boolean> {
+  /**
+   * 发一条不该影响回合结果的消息。
+   *
+   * 吞掉异常是刻意的(进度推送失败不该把整个回合搞挂),但**吞掉不等于不记** ——
+   * 排查发送问题时,看不见的失败比失败本身更难办:日志里只剩最后一步正文报错,
+   * 会让人以为前面都成功了。`what` 用来分辨是哪一类发送坏掉的。
+   */
+  private async trySend(userKey: string, text: string, what = "消息"): Promise<boolean> {
     try {
       await this.channel.send(userKey, text);
       return true;
-    } catch {
+    } catch (err) {
+      console.warn(`[gateway] 给 ${userKey} 发${what}失败:${String(err)}`);
       return false;
     }
   }

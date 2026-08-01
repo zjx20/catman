@@ -3,7 +3,14 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Gateway, REMINDER_TEXT, ACK_TEXT, formatProgress } from "../src/core/gateway.js";
+import {
+  Gateway,
+  REMINDER_TEXT,
+  ACK_TEXT,
+  formatProgress,
+  ProgressThrottle,
+  MAX_PROGRESS_PER_TURN,
+} from "../src/core/gateway.js";
 import { SessionManager, InMemoryStore } from "../src/core/session.js";
 import { UserRegistry } from "../src/core/users.js";
 import { GlobalSettings, type SettingsPatch } from "../src/core/settings.js";
@@ -87,6 +94,12 @@ class FakeAgent {
   nextSessionId?: string;
   /** run 时依序回放给 onProgress 的事件。 */
   progressEvents: AgentProgressEvent[] = [];
+  /**
+   * 回放每个事件**之前**调一次,用来推进假时钟。
+   * 进度是节流的,不推进时间的话一条都放不出来 —— 而"瞬间连发一串事件"
+   * 恰恰不是真实回合的样子(真机上每约 10 秒一组)。
+   */
+  beforeProgress?: () => void;
   /** 设为 true 时 run 抛错,模拟 Agent 失败。 */
   fail = false;
   /** 设置后 run 会等待此 promise,用于测并发控制与"卡住的回合"。 */
@@ -111,7 +124,10 @@ class FakeAgent {
     try {
       // abort 会打断正在跑的回合,而不是等它跑完 —— 如实模拟 SDK 的行为。
       if (this.gate) await Promise.race([this.gate, rejectOnAbort(opts.abortController)]);
-      for (const ev of this.progressEvents) opts.onProgress?.(ev);
+      for (const ev of this.progressEvents) {
+        this.beforeProgress?.();
+        opts.onProgress?.(ev);
+      }
       if (this.fail) throw new Error("agent boom");
       const sessionId = opts.resumeSessionId ?? this.nextSessionId ?? `sess-${++this.n}`;
       return { text: `echo:${prompt}`, sessionId, isError: false };
@@ -179,6 +195,7 @@ function build(now: () => number, opts: BuildOpts = {}) {
     turns,
     apiBase: "http://127.0.0.1:8787",
     reminderIntervalMs: 999_999, // 测试里手动触发,不依赖定时器
+    now,
     ...(opts.admission ? { admission: opts.admission } : {}),
   });
   // 只注册 handler,不启动真实定时器/渠道。走 dispatch 才能覆盖硬指令分流。
@@ -235,17 +252,40 @@ test("回执:ackEnabled=false 时不发回执", async () => {
   assert.deepEqual(afterGreeting(channel.sent), [{ userKey: U1, text: "echo:你好" }]);
 });
 
-test("进度:思考/工具事件按序转发,最终回复排在最后", async () => {
-  const t = 1_000_000;
+test("进度:按序转发,且最终回复永远排在进度之后", async () => {
+  // 守的是顺序:进度走一条串行链,正文在 `await progress` 之后才发。
+  // 乱序的话用户会先看到答案、再看到"正在读文件",莫名其妙。
+  let t = 1_000_000;
   const { channel, agent } = build(() => t);
   agent.progressEvents = [
     { kind: "thinking", text: "先看看内存" },
     { kind: "tool", name: "Bash", input: { command: "free -m" } },
   ];
+  // 每个事件之间推进一整档,保证两条都放行 —— 节流本身由 ProgressThrottle 的用例覆盖。
+  agent.beforeProgress = () => {
+    t += 60_000;
+  };
   await channel.receive(U1, "内存占用?");
   assert.deepEqual(
     afterGreeting(channel.sent).map((m) => m.text),
     [ACK_TEXT, "💭 先看看内存", "🔧 Bash: free -m", "echo:内存占用?"],
+  );
+});
+
+test("进度:短回合里连发的事件被节流掉,只留回执与正文", async () => {
+  // 真机上一个 83 秒的回合发了 21 条进度,把 context_token 用废,连正文都发不出去。
+  // 时间不推进 = 所有事件挤在同一瞬间,一条都不该放行。
+  const t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  agent.progressEvents = Array.from({ length: 20 }, (_, i) => ({
+    kind: "tool" as const,
+    name: `T${i}`,
+    input: {},
+  }));
+  await channel.receive(U1, "内存占用?");
+  assert.deepEqual(
+    afterGreeting(channel.sent).map((m) => m.text),
+    [ACK_TEXT, "echo:内存占用?"],
   );
 });
 
@@ -269,6 +309,77 @@ test("formatProgress:超长内容截断,工具入参挑代表性字段", () => {
     "🔧 Read: /etc/hosts",
   );
   assert.equal(formatProgress({ kind: "tool", name: "Foo", input: { n: 1 } }), '🔧 Foo: {"n":1}');
+});
+
+/** 造一个工具事件,名字带序号便于断言"发出去的是最新那条"。 */
+const toolEv = (n: number): AgentProgressEvent => ({ kind: "tool", name: `T${n}`, input: {} });
+
+test("进度节流:间隔按 5/15/30/60 逐级拉长,最后一档保持", () => {
+  // 一个长回合发几十条进度会把 iLink 的 context_token 用废(实测第 11 条起
+  // prepare failed 且永不恢复),所以这个阶梯是发送预算,不是观感偏好。
+  const t0 = 1_000_000;
+  const th = new ProgressThrottle(t0);
+  const at = (ms: number, n = 0) => th.offer(t0 + ms, toolEv(n));
+
+  assert.equal(at(4_999), undefined, "5 秒内不该发");
+  assert.ok(at(5_000), "到 5 秒放行第 1 条");
+  assert.equal(at(19_999), undefined, "第 2 条要等 15 秒");
+  assert.ok(at(20_000), "5+15 放行第 2 条");
+  assert.equal(at(49_999), undefined, "第 3 条要等 30 秒");
+  assert.ok(at(50_000), "20+30 放行第 3 条");
+  assert.equal(at(109_999), undefined, "第 4 条要等 60 秒");
+  assert.ok(at(110_000), "50+60 放行第 4 条");
+  assert.equal(at(169_999), undefined, "之后一直是 60 秒");
+  assert.ok(at(170_000), "阶梯用完后保持最后一档");
+});
+
+test("进度节流:同一间隔内只发最新那条,丢掉的条数如实交代", () => {
+  // 进度是"现在在干什么"这个状态,不是必须完整送达的流水 —— 但丢了多少得说,
+  // 否则"卡在一件事上"和"飞快跑了 20 步"在用户眼里一模一样。
+  const t0 = 1_000_000;
+  const th = new ProgressThrottle(t0);
+
+  assert.ok(th.offer(t0 + 5_000, toolEv(1)));
+  for (let i = 2; i <= 5; i += 1) {
+    assert.equal(th.offer(t0 + 5_000 + i, toolEv(i)), undefined);
+  }
+  const text = th.offer(t0 + 20_000, toolEv(6));
+  assert.ok(text, "到点应当放行");
+  assert.ok(text.includes("T6"), `发的应是最新那条,实际:${text}`);
+  assert.ok(!text.includes("T2"), `不该补发旧事件:${text}`);
+  assert.ok(text.includes("+4 步"), `应交代丢了 4 条:${text}`);
+
+  // 计数在放行后归零,不会把上一轮的账算到下一轮头上。
+  const next = th.offer(t0 + 50_000, toolEv(7));
+  assert.ok(next && !next.includes("步"), `不该重复计数:${next}`);
+});
+
+test("进度节流:总条数封顶,给正文与超时提醒留出额度", () => {
+  // 阶梯只拉长间隔,不限制总数 —— 一个十分钟的回合照样能发十几条,
+  // 撞满预算后被挤掉的正好是正文和超时提醒(两者共用同一个 context_token)。
+  const t0 = 1_000_000;
+  const th = new ProgressThrottle(t0);
+  const texts: string[] = [];
+  // 跨度 30 分钟,远超阶梯能自然产生的条数。
+  for (let ms = 0; ms <= 1_800_000; ms += 1_000) {
+    const out = th.offer(t0 + ms, toolEv(ms));
+    if (out) texts.push(out);
+  }
+  assert.equal(texts.length, MAX_PROGRESS_PER_TURN, "封顶后不该再放行");
+  // 最后一条要交代"后面没了" —— 否则长回合里那段几分钟的静默与卡死无从分辨。
+  assert.ok(texts.at(-1)!.includes("进度就报到这儿"), `缺少收尾交代:${texts.at(-1)}`);
+  assert.ok(!texts.at(-2)!.includes("进度就报到这儿"), "只有最后一条该带交代");
+});
+
+test("进度节流:一个 83 秒的回合只发 3 条进度", () => {
+  // 真机上那次失败的回合:每约 10 秒一组三条事件,旧实现共发了 21 条进度。
+  const t0 = 1_000_000;
+  const th = new ProgressThrottle(t0);
+  let sent = 0;
+  for (let ms = 0; ms <= 83_000; ms += 300) {
+    if (th.offer(t0 + ms, toolEv(ms))) sent += 1;
+  }
+  assert.equal(sent, 3, "5s / 20s / 50s 各一条,下一档要到 110s");
 });
 
 test("同一用户第二条消息在超时内 → resume", async () => {
