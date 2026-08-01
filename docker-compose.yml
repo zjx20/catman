@@ -3,6 +3,13 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      # 构建期(apt 拉 Debian 源与 docker.com、npm ci 拉 registry)的代理,与下面
+      # environment 里的运行时代理是两套设置,互不影响 —— 构建时连不上就设这里。
+      # HTTP_PROXY 等是 Docker 预定义 build arg,Dockerfile 里无需 ARG 声明即生效。
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: "${NO_PROXY:-}"
     image: catman:0.1.0
     container_name: catman
     restart: unless-stopped
@@ -18,6 +25,21 @@ services:
       # 日志时间戳的时区。容器不会自动继承宿主时区,不设就是 UTC ——
       # 拿日志和微信里的消息时间对账时会差好几个小时。在 .env 里设 TZ=Asia/Shanghai。
       TZ: ${TZ:-UTC}
+      # 运行时网络代理。留空 = 不使用(各程序对空值一律按未设处理,行为与不配时一致)。
+      # 容器**不继承**宿主或路由器的代理设置,要用就得像这样显式传进来。
+      # ⚠️ 地址不能写 127.0.0.1 —— 在容器里那是它自己的回环,不是宿主。填代理机的
+      # 内网 IP;代理就在 docker 宿主上时可用 host.docker.internal(见下面 extra_hosts)。
+      # 覆盖范围(哪些流量会走、哪些不会)见 README「网络代理」。
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      # 大小写两份都给:程序之间认哪种并不统一(curl 的 http_proxy 只认小写)。
+      http_proxy: ${HTTP_PROXY:-}
+      https_proxy: ${HTTPS_PROXY:-}
+      # 必须绕开代理的地址。自定义时是**整体替换**而非追加,下面三类要一并补回:
+      # 微信服务器(.qq.com)是境内地址,走代理只会更慢甚至不通;本机与内网若不排除,
+      # 助手访问 127.0.0.1 上的服务(含 catman 自己的 dashboard)会被送去代理然后失败。
+      NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.qq.com}"
+      no_proxy: "${NO_PROXY:-localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.qq.com}"
       # dashboard 访问令牌(整站生效)。留空则首次启动自动生成,写入 /data/dashboard-token
       # 并打印在日志里 —— 不存在"无鉴权"这个选项:能打开 dashboard 的人可以扫码接入,
       # 而接入者拥有宿主 root 级别的能力。
@@ -54,5 +76,9 @@ services:
     # Debian/Ubuntu 多为 root:docker,必须显式设置。
     group_add:
       - "${DOCKER_GID:-0}"
+    # 代理跑在 docker 宿主自己身上时,HTTP_PROXY 可写成 http://host.docker.internal:<端口>。
+    # Linux 上这个名字不是内建的,靠这行映射到宿主网关;不用代理时它只是个多余的 hosts 条目。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8787:8787" # dashboard(整站需 CATMAN_ADMIN_TOKEN;仍应只在内网暴露)
