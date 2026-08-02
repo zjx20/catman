@@ -2,6 +2,7 @@
  * 会话状态机 —— 核心规则:
  *  - 距上次活动 < 超时(默认 1h)→ 继续当前会话
  *  - 超时后:调用方标记了 continueRequested → 恢复旧会话;否则开新会话
+ *  - touch() 把会话当作刚刚活动过 —— 供「纯 /继续」保活,不必起任何回合
  *  - 超时到点推送一次提醒(reminded 标记防重复)
  *
  * 决策逻辑是纯函数(decide),便于用假时钟单测;持久化、时钟、每用户超时
@@ -53,7 +54,7 @@ export interface Decision {
 
 /** decide() 的输入。文本已在 commands.ts 里解析过,这里只收结论。 */
 export interface DecideInput {
-  /** 用户发的是 /继续:超时后也恢复旧会话而不是新开。 */
+  /** 这批消息里带着 /继续:超时后也恢复旧会话而不是新开。 */
   continueRequested: boolean;
 }
 
@@ -123,6 +124,20 @@ export class SessionManager {
   idleMsOf(userKey: string): number | undefined {
     const st = this.states.get(userKey);
     return st ? this.now() - st.lastActive : undefined;
+  }
+
+  /**
+   * 把会话当作刚刚活动过:刷新时间戳并重置提醒标记,sessionId 不动。
+   * 供「纯 /继续」保活会话 —— 不起回合,之后的消息在 decide() 里自然命中
+   * 「未超时 → resume」。没有可续的会话时返回 false,由调用方告知用户。
+   */
+  touch(userKey: string): boolean {
+    const st = this.states.get(userKey);
+    if (!st) return false;
+    st.lastActive = this.now();
+    st.reminded = false;
+    this.persist();
+    return true;
   }
 
   /** agent 处理完后记录本轮 sessionId,刷新活动时间并重置提醒标记。 */

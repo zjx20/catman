@@ -32,21 +32,11 @@ test("必须整串匹配,正常说话不会被吞掉", () => {
 });
 
 test("只有 /继续 走队列,其余都绕过队列就地执行", () => {
-  // immediate 是硬指令的存在理由(agent 卡死时队列里的消息轮不到),
-  // 而 /继续 要驱动 LLM,必须走正常回合。
+  // immediate 是硬指令的存在理由(agent 卡死时队列里的消息轮不到)。
+  // /继续 是唯一的例外:它要刷新会话时钟,必须排在在飞回合之后才不会白刷 ——
+  // 但它和其余指令一样由后台消化,不进 LLM(gateway.test 守着这半句)。
   for (const cmd of COMMAND_TABLE) {
     assert.equal(cmd.immediate, cmd.name !== "continue", `${cmd.canonical} 的 immediate 不对`);
-  }
-});
-
-test("/继续 交给 LLM 的是「继续」而不是字面量斜杠形式", () => {
-  const cmd = parseCommand("/继续")!;
-  assert.equal(cmd.promptText, "继续");
-});
-
-test("immediate 指令不设 promptText(它们根本不进 LLM)", () => {
-  for (const cmd of COMMAND_TABLE) {
-    if (cmd.immediate) assert.equal(cmd.promptText, undefined, cmd.canonical);
   }
 });
 

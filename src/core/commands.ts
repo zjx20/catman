@@ -29,11 +29,6 @@ export interface CommandDef {
   readonly desc: string;
   /** true 表示绕过串行队列就地执行(见文件头)。 */
   readonly immediate: boolean;
-  /**
-   * 非 immediate 指令入队时改喂给 LLM 的文本。
-   * 把字面量「/继续」喂进去可能被模型当成它自己的 slash command。
-   */
-  readonly promptText?: string;
 }
 
 export const COMMAND_TABLE: readonly CommandDef[] = [
@@ -69,9 +64,12 @@ export const COMMAND_TABLE: readonly CommandDef[] = [
     name: "continue",
     canonical: "/继续",
     aliases: ["/continue", "/繼續"],
-    desc: "安静太久后接着刚才的话题聊;没超时的话就是催我继续干活",
+    desc: "续上刚才的对话,之后直接发消息就是接着聊(不花额度)",
+    // 唯一非 immediate 的指令,但同样不进 LLM(由网关在队列里直接消化)。
+    // 走队列的理由:它要刷新会话时钟,排在在飞回合的 record() 之后才保证
+    // 续上的是最新那个会话;也只有进聚合窗口,「/继续 + 问题」连发才能合成
+    // 同一个回合。它不救命,不需要绕队列。
     immediate: false,
-    promptText: "继续",
   },
 ];
 

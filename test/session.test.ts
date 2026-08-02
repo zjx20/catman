@@ -80,6 +80,49 @@ test('超时后先开新会话,之后的"继续"属于新会话(不再恢复旧�
   assert.equal(d.resumeSessionId, "sess-B");
 });
 
+test("touch:超时后保活,下一条普通消息仍恢复旧会话", () => {
+  const { sm, c } = mgr();
+  sm.record("stdin:local:u1", "sess-A");
+  c.advance(TIMEOUT + 1);
+  assert.equal(sm.decide("stdin:local:u1", GO).isNew, true, "超时后普通消息本该开新会话");
+
+  assert.equal(sm.touch("stdin:local:u1"), true);
+  const d = sm.decide("stdin:local:u1", GO);
+  assert.equal(d.isNew, false, "touch 之后普通消息也能续上,不再依赖 CONT 标记");
+  assert.equal(d.resumeSessionId, "sess-A");
+});
+
+test("touch:没有任何记录时返回 false,不凭空造状态", () => {
+  const { sm } = mgr();
+  assert.equal(sm.touch("stdin:local:u1"), false);
+  assert.deepEqual(sm.snapshot(), {});
+});
+
+test("touch 重置提醒标记:续上后的新一轮空闲会再次提醒", () => {
+  const { sm, c } = mgr();
+  sm.record("stdin:local:u1", "sess-A");
+  c.advance(TIMEOUT);
+  assert.deepEqual(sm.dueReminders(), ["stdin:local:u1"]);
+
+  sm.touch("stdin:local:u1");
+  assert.deepEqual(sm.dueReminders(), [], "刚 touch 过,不该立刻再提醒");
+  c.advance(TIMEOUT);
+  assert.deepEqual(sm.dueReminders(), ["stdin:local:u1"], "新一轮空闲到点应当再次提醒");
+});
+
+test("touch 持久化:重启后保活效果仍在", () => {
+  const store = new InMemoryStore();
+  const c = clock();
+  const first = new SessionManager({ store, timeoutMs: TIMEOUT, now: c.now });
+  first.record("stdin:local:u1", "sess-A");
+  c.advance(TIMEOUT + 1);
+  first.touch("stdin:local:u1");
+
+  const second = new SessionManager({ store, timeoutMs: TIMEOUT, now: c.now });
+  c.advance(TIMEOUT - 1);
+  assert.equal(second.decide("stdin:local:u1", GO).resumeSessionId, "sess-A");
+});
+
 test("dueReminders 在到点时返回用户且只提醒一次", () => {
   const { sm, c } = mgr();
   sm.record("stdin:local:u1", "sess-A");

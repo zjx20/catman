@@ -656,16 +656,64 @@ test("/新会话:没有在飞回合时直接清掉状态", async () => {
   assert.deepEqual(sessions.snapshot(), {});
 });
 
-test("/继续 走队列,喂给 LLM 的是「继续」而不是「/继续」", async () => {
+test("/继续 由后台消化:不触发回合,续上的会话留给下一条消息", async () => {
   let t = 1_000_000;
   const { channel, agent } = build(() => t);
   await channel.receive(U1, "第一条");
-  t += TIMEOUT + 1; // 超时,普通消息会开新会话
+  t += TIMEOUT + 1; // 超时:此刻普通消息本该开新会话
+  channel.sent.length = 0;
 
   await channel.receive(U1, "/继续");
-  const last = agent.calls[agent.calls.length - 1]!;
-  assert.equal(last.prompt, "继续", "字面量斜杠可能被模型当成它自己的指令");
-  assert.equal(last.resume, "sess-1", "超时后的 /继续 应当续上旧会话");
+  assert.equal(agent.calls.length, 1, "/继续 不该触发 agent 回合");
+  assert.deepEqual(
+    channel.sent.map((m) => m.text),
+    ["好,接上刚才的对话了,直接发消息继续聊。"],
+  );
+
+  await channel.receive(U1, "那件事后来怎么样了");
+  assert.equal(agent.calls.length, 2);
+  assert.equal(agent.calls[1]!.resume, "sess-1", "/继续 之后的消息应当续上旧会话");
+});
+
+test("/继续:没有可继续的会话时如实说明,同样不触发回合", async () => {
+  const t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  await channel.receive(U1, "/帮助"); // 消化掉 greeting;/帮助 不产生会话
+  channel.sent.length = 0;
+
+  await channel.receive(U1, "/继续");
+  assert.equal(agent.calls.length, 0);
+  assert.deepEqual(
+    channel.sent.map((m) => m.text),
+    ["现在没有可继续的对话,直接发消息就会开新的。"],
+  );
+});
+
+test("/继续 排在在飞回合之后:touch 的是它刚 record 的会话,不抢跑", async () => {
+  const t = 1_000_000;
+  const { channel, agent, sessions } = build(() => t);
+  let open!: () => void;
+  agent.gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const stuck = channel.receive(U1, "长任务");
+  await new Promise((r) => setImmediate(r));
+
+  const cont = channel.receive(U1, "/继续"); // 走队列,应当排在在飞回合后面
+  await new Promise((r) => setImmediate(r));
+  assert.equal(agent.calls.length, 1, "/继续 不该并发起新回合");
+  assert.ok(
+    !channel.sent.some((m) => m.text.includes("没有可继续的对话")),
+    "回合还在飞时 /继续 不该抢跑 —— 抢跑会误报「没有可继续的对话」",
+  );
+
+  open();
+  await Promise.all([stuck, cont]);
+  assert.equal(sessions.snapshot()[U1]!.sessionId, "sess-1");
+  assert.ok(
+    channel.sent.some((m) => m.text === "好,接上刚才的对话了,直接发消息继续聊。"),
+    "排在回合之后执行,record 过的会话应当续得上",
+  );
 });
 
 // --- 每用户配置 ---
@@ -960,6 +1008,19 @@ test("聚合:/取消 把还没入队的那批也丢掉", async () => {
     replies.some((t) => t.includes("还没开始处理")),
     `应当告诉用户丢掉了,实际:${JSON.stringify(replies)}`,
   );
+});
+
+test("聚合:/继续 与问题连发时合成一个回合 —— 只带 resume 标记,不混进文本", async () => {
+  let t = 1_000_000;
+  const { channel, agent } = build(() => t, { settings: { messageAggregationMs: AGG } });
+  await channel.receive(U1, "第一条");
+  t += TIMEOUT + 1; // 超时:没有 /继续 的话,下一批本该开新会话
+
+  await Promise.all([channel.receive(U1, "/继续"), channel.receive(U1, "接着改那个脚本")]);
+  assert.equal(agent.calls.length, 2, "两条应当合成一个回合");
+  const last = agent.calls[1]!;
+  assert.equal(last.prompt, "接着改那个脚本", "指令本身不该混进给 LLM 的文本");
+  assert.equal(last.resume, "sess-1", "批里带着 /继续:超时后也应当续上旧会话");
 });
 
 test("聚合:合并后仍然重新收一次图片上限", async () => {

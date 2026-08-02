@@ -38,6 +38,7 @@ Channel(收消息,产出 userKey + text + 可选图片附件) → Gateway.dispat
          → admission(userKey)      不过就地返回,不建目录/不写状态/不花额度
          → users.ensureWorkspace()  该用户的 cwd
          → 首次则推送使用指引(发送成功才标记)
+       → 纯 /继续 → sessions.touch() 就地答复,不起回合、不进 LLM
        → prefs.effective()        本回合的模型/回执/进度/分段长度
        → sessions.decide()        是否 resume
        → turns.mint()             回合令牌 + abort/reset 上下文
@@ -50,7 +51,9 @@ Dashboard 与清理的扫描范围 = listWorkspaceDirs(/data/workspace) 算出�
 ```
 
 硬指令(`/帮助` `/状态` `/新会话` `/取消`)在 `onMessage` 就地分流,**不进队列** ——
-见下面的不变量。`/继续` 是唯一走队列的指令。
+见下面的不变量。`/继续` 是唯一走队列的指令,但**同样不进 LLM**:单独的 `/继续` 在
+handle 里由 `sessions.touch()` 后台消化(见上图 prelude 之后那步),只有与别的消息
+攒成一批时才作为 resume 标记随批进回合。
 
 **身份**:`userKey = <channel>:<accountId>:<userId>`(`core/identity.ts`)。
 accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 from_user_id。
@@ -148,8 +151,10 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
   改白名单时**不要**去检查有没有人在用某个模型,那正是这条原则要消灭的东西。
 - **回落但不改盘**(`prefs.ts`):失效的用户覆盖只在读取时回退,不重写 `prefs.json` ——
   白名单加回来时用户当初的选择要能自动恢复。静默改盘会把意图永久抹掉。
-- **会话规则**(`session.ts`):距上次 <1h(可每用户覆盖)→ resume;超时后只有 `/继续` 才 resume,
-  否则开新会话;`reminded` 标记防重复提醒;`record()` 重置该标记。
+- **会话规则**(`session.ts`):距上次 <1h(可每用户覆盖)→ resume;超时后只有 `/继续` 才续上,
+  否则开新会话;`reminded` 标记防重复提醒,`record()` 与 `touch()` 都重置它。
+  单独的 `/继续` 走 `touch()`(刷新时钟,不起回合),之后的消息自然命中「未超时 → resume」;
+  与别的消息同批时才作为 `continueRequested` 标记进 `decide()`。
   **指令词汇不住在这里** —— `decide()` 收布尔标记,`commands.ts` 才认识 `/继续` 长什么样。
 - **immediate 硬指令绕过每用户串行队列**(`gateway.ts` 的 `dispatch`)。这是它们存在的**全部理由**:
   agent 卡死时队列里的消息永远轮不到,包括本该救命的那条。代价是它们与在飞回合并发,

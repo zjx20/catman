@@ -391,7 +391,9 @@ export class Gateway {
     // 让救命的 /取消 先等 1.5 秒等于取消了这个理由。
     if (cmd?.immediate) return this.runCommand(userKey, cmd);
 
-    const promptText = cmd?.promptText ?? text;
+    // 到这里 cmd 只可能是 /继续:它贡献的是「续上会话」这个标记,不是给 LLM 的文本。
+    // 单独的 /继续 由 handle 后台消化;与别的消息攒成一批时,标记随批生效。
+    const promptText = cmd ? "" : text;
     const continueRequested = cmd?.name === "continue";
     const windowMs = this.settings.effective().messageAggregationMs;
     if (windowMs <= 0) {
@@ -611,6 +613,21 @@ export class Gateway {
   ): Promise<void> {
     const pre = await this.prelude(userKey);
     if (!pre) return;
+
+    // 纯 /继续(这批里没攒进任何要处理的内容):后台直接消化,不进 LLM。
+    // 它的全部使命是刷新会话时钟 —— 之后的消息在 decide() 里自然命中
+    // 「未超时 → resume」。排在队列尾天然保证刷新发生在在飞回合 record()
+    // 之后,续上的必定是最新那个会话。
+    if (continueRequested && !text && !attachments.length) {
+      await this.trySend(
+        userKey,
+        this.sessions.touch(userKey)
+          ? "好,接上刚才的对话了,直接发消息继续聊。"
+          : "现在没有可继续的对话,直接发消息就会开新的。",
+        "继续确认",
+      );
+      return;
+    }
 
     const prefs = this.prefs.effective(userKey);
     const decision = this.sessions.decide(userKey, { continueRequested });
