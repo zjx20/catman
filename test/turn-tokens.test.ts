@@ -63,6 +63,23 @@ test("currentFor 找到在飞回合,供硬指令打标记/中断", () => {
   assert.equal(t.currentFor(A), undefined);
 });
 
+test("progress 快照:初始为零,时钟可注入", () => {
+  // /状态 与心跳日志都读这份快照 —— 它是回合卡住时唯一还答得出话的东西。
+  let now = 5_000;
+  const t = new TurnTokens(() => now);
+  const turn = t.mint(A);
+  assert.deepEqual(turn.ctx.progress, { startedAt: 5000, steps: 0, lastAt: 5000 });
+  assert.equal(turn.ctx.progress.running, undefined, "刚铸出来还没拿到并发名额");
+
+  now = 9_000;
+  turn.ctx.progress.running = now;
+  turn.ctx.progress.steps = 1;
+  turn.ctx.progress.lastAt = now;
+  turn.ctx.progress.last = "🔧 Bash: npm test";
+  // currentFor 拿到的是同一个对象,硬指令才看得见在飞回合的最新进展。
+  assert.equal(t.currentFor(A)?.progress.last, "🔧 Bash: npm test");
+});
+
 test("resetSession 与 abort 初始都是干净的", () => {
   const t = new TurnTokens();
   const turn = t.mint(A);

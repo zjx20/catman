@@ -81,6 +81,7 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 | `src/core/turn-tokens.ts` | 回合级一次性令牌 + 在飞回合上下文(reset 标记 / abort) |
 | `src/core/skills.ts` | 启动时生成两个 SKILL.md(接口说明按需加载,不占系统提示词) |
 | `src/core/agent.ts` | Agent SDK 封装;**必须**带 claude_code preset 三件套(见下) |
+| `src/core/agent-trace.ts` | LLM 侧可观测性:SDK 消息 → 一行日志(纯函数,分 always/trace 两级)+ 心跳文案 |
 | `src/core/session.ts` | 会话状态机(纯函数 decide + 注入时钟/store/每用户超时;current + history,/切换会话 靠它) |
 | `src/core/gateway.ts` | 串联各层;入口分流硬指令;每用户串行队列;并发信号量;greeting |
 | `src/channels/composite.ts` | 多渠道复合 + 复合准入,按 userKey 前缀路由 |
@@ -294,11 +295,36 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
   丢掉的条数记在 `(+N 步)` 里。纯事件驱动、**不用定时器**:与旧实现一样"卡在长工具调用里
   就不更新",没有退步;而引入定时器就会有"回合结束后才触发、进度插到正文后面"的乱序。
   改任何一个数之前先把那笔账重算一遍。
+- **LLM 侧的可观测性分两级,分界线是"事后才想起要查"**(`agent-trace.ts`):
+  回合起止、`init`、API 重试、限流、上下文压缩、`stderr`、心跳一律记录(`always`),
+  **不受开关约束** —— 需要它们时通常是事后翻日志,那时再开开关重启已经晚了;
+  逐条 SDK 消息的摘要才归 `CATMAN_AGENT_TRACE=1`(`trace`)。加新的消息类型时先问
+  「它是不是某种『为什么没反应』的答案」,是就进 always,否则进 trace。
+  与 `formatTrace` 同一条约束:**只出标量与截断摘要,不出正文** —— 思考/文本只出字数、
+  工具结果只出长度与成败、图片只出 base64 字符数。`describeSdkMessage` 是纯函数,
+  这条约束钉在单测里。唯一例外是工具入参摘要:"在跑什么命令"正是要找的东西,
+  而且它与推给用户的进度共用 `summarizeToolInput`,两处必须说同一句话。
+- **心跳用定时器不违反「进度不用定时器」那条不变量**(`agent.ts` 的 `HEARTBEAT_MS`):
+  那条约束的理由是定时器会让进度**消息**插到正文之后、在用户那边乱序,而心跳只进日志,
+  没有相对正文的位置可言。心跳的"上次动静"以**任何一条** SDK 消息为准(不只是
+  onProgress 透出的思考/工具),否则工具结果回填期间会把正常推进的回合误报成卡住。
+- **`onProgress` 回调无条件挂上,`progressEnabled` 只决定推不推给用户**(`gateway.handle`):
+  它同时在维护 `turn.ctx.progress` 快照,而 `/状态` 与心跳都读那份快照。绑在一起的话,
+  一个纯粹的省流开关会顺手把可观测性也关掉。
+- **`/状态` 第一行是在飞回合的状态**(`gateway.inFlightText`):排队 / 处理中 / 正在中断 /
+  空闲四种分开说 —— 处置完全不同(排队时 `/取消` 自己这条没用,空闲说明消息压根没被受理)。
+  它是用户侧唯一不受回合阻塞影响的观测点:`/状态` 走 immediate 分流、不进串行队列,
+  所以回合卡死时照样答得出。读快照是幂等只读,符合 immediate 硬指令的约束。
+  `progress.running` 与 `startedAt` 必须分开:前者是拿到并发名额的时刻,两者之差就是排队时长。
+- **`result.is_error` 必须落到日志**(`agent.logResult`):曾经它被读出来却没有任何消费者 ——
+  SDK 报错(鉴权失败、超限、达到轮数上限)时错误文本被当成正文发给用户,日志里一个字都没有。
 - **日志一律带时间戳**(`log-stamp.ts` 在 `index.ts` 最前面包裹 console):排查发送问题时
   "这两条隔了多久"是最基本的信息。包 console 而不是换 logger,是因为几十处调用点加上
   SDK 自己打的,漏一处那行就成了时间轴上的断点。容器**不继承宿主时区**,compose 透传 `TZ`。
   排查 iLink 用 `CATMAN_ILINK_TRACE=1`,每条发送打「第几次 / 成功过几条 / token 多老」;
   **失败行无条件打印**,因为回执与进度的失败在 `gateway.trySend` 那层是被吞掉的。
+  排查 LLM 侧用 `CATMAN_AGENT_TRACE=1`(逐条 SDK 消息),但回合起止/重试/限流/心跳
+  本就无条件打 —— 见上面那条分级原则。
 - **iLink App 标识无需申请**:`appid="bot"` 是官方包固定值,client version 是版本号编码;
   唯一个人凭据是扫码得的 `bot_token`。仅这些需真机校准:QR 端点、SKRouteTag、channel_version、限流。
 - **两个 CLAUDE.md**:本文件是开发指南;运行时 agent 加载的是 `/data/workspace/CLAUDE.md`

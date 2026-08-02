@@ -208,6 +208,18 @@ function build(now: () => number, opts: BuildOpts = {}) {
   return { channel, agent, sessions, users, prefs, settings, turns, gw, root };
 }
 
+/**
+ * 等到条件成立(靠让出事件循环推进,不用真实计时器)。
+ * 等不到就抛错而不是一直等 —— 挂死的测试比失败的测试难查得多。
+ */
+async function waitUntil(cond: () => boolean, label: string): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    if (cond()) return;
+    await new Promise((r) => setImmediate(r));
+  }
+  throw new Error(`等不到:${label}`);
+}
+
 /** 首次消息会先推一份使用指引;多数用例只关心之后的内容。 */
 function afterGreeting(sent: Array<{ userKey: string; text: string }>) {
   return sent.filter((m) => !m.text.startsWith("你好,我是 catman。"));
@@ -293,16 +305,97 @@ test("进度:短回合里连发的事件被节流掉,只留回执与正文", asy
   );
 });
 
-test("进度:progressEnabled=false 时不传 onProgress 给 Agent", async () => {
+test("进度:progressEnabled=false 只停推送,回合快照照常更新", async () => {
+  // 关进度是个省流开关,不该顺手把可观测性也关掉 —— /状态 与心跳日志都靠这份
+  // 快照回答"现在在干什么",两者绑在一起的话关了进度就彻底成了黑盒。
   const t = 1_000_000;
-  const { channel, agent } = build(() => t, { settings: { progressEnabled: false } });
-  agent.progressEvents = [{ kind: "thinking", text: "不该出现" }];
+  const { channel, agent, turns } = build(() => t, { settings: { progressEnabled: false } });
+  agent.progressEvents = [{ kind: "tool", name: "Bash", input: { command: "npm test" } }];
+  let snapshot: { steps: number; last?: string } | undefined;
+  agent.beforeProgress = () => {
+    // 事件回放期间回合还在飞,此刻正是 /状态 能看到的东西。
+    const ctx = turns.currentFor(U1);
+    if (ctx) snapshot = { steps: ctx.progress.steps, last: ctx.progress.last };
+  };
   await channel.receive(U1, "你好");
-  assert.equal(agent.calls[0]!.hasProgress, false);
+
+  assert.equal(agent.calls[0]!.hasProgress, true, "回调无条件挂上");
   assert.deepEqual(
     afterGreeting(channel.sent).map((m) => m.text),
     [ACK_TEXT, "echo:你好"],
+    "但一条进度都不推给用户",
   );
+  // beforeProgress 在事件送达之前跑,所以这里看到的是"上一条"的累计值;
+  // 回合结束后 revoke 会清掉 ctx,故快照要在回合内取。
+  assert.equal(snapshot?.steps, 0);
+});
+
+test("回合快照:步数与最后一步随事件推进,回合结束后清空", async () => {
+  const t = 1_000_000;
+  const { channel, agent, turns } = build(() => t);
+  agent.progressEvents = [
+    { kind: "tool", name: "Read", input: { file_path: "/etc/hosts" } },
+    { kind: "tool", name: "Bash", input: { command: "npm test" } },
+  ];
+  const seen: Array<{ steps: number; last?: string }> = [];
+  agent.beforeProgress = () => {
+    const ctx = turns.currentFor(U1);
+    if (ctx) seen.push({ steps: ctx.progress.steps, last: ctx.progress.last });
+  };
+  await channel.receive(U1, "跑个测试");
+
+  // 两次采样分别发生在第 1、第 2 个事件送达之前。
+  assert.deepEqual(seen[0], { steps: 0, last: undefined });
+  assert.deepEqual(seen[1], { steps: 1, last: "🔧 Read: /etc/hosts" });
+  assert.equal(turns.currentFor(U1), undefined, "回合结束后不再有在飞回合");
+});
+
+test("/状态 报告在飞回合:卡住时也答得出「在干什么」", async () => {
+  const t = 1_000_000;
+  const { channel, agent, turns } = build(() => t);
+  let release!: () => void;
+  agent.gate = new Promise<void>((r) => (release = r));
+
+  const inFlight = channel.receive(U1, "跑个长任务");
+  await waitUntil(() => agent.inFlight === 1, "回合进到 agent 里挂住");
+  const ctx = turns.currentFor(U1)!;
+  ctx.progress.steps = 3;
+  ctx.progress.last = "🔧 Bash: npm test";
+  ctx.progress.lastAt = t - 30_000;
+
+  await channel.receive(U1, "/状态");
+  const status = afterGreeting(channel.sent).find((m) => m.text.startsWith("📋"))!;
+  assert.match(status.text, /当前:处理中/);
+  assert.match(status.text, /第 3 步/);
+  assert.match(status.text, /🔧 Bash: npm test/);
+
+  release();
+  await inFlight;
+  // 回合结束后再问一次:必须明确说空闲,而不是沿用上一轮的说法。
+  await channel.receive(U1, "/状态");
+  const idle = afterGreeting(channel.sent).filter((m) => m.text.startsWith("📋")).at(-1)!;
+  assert.match(idle.text, /当前:空闲/);
+});
+
+test("/状态 区分排队与真在跑:并发满时说排队", async () => {
+  const t = 1_000_000;
+  const { channel, agent, turns } = build(() => t, { settings: { maxConcurrentTurns: 1 } });
+  let release!: () => void;
+  agent.gate = new Promise<void>((r) => (release = r));
+
+  const first = channel.receive(U2, "占住名额");
+  await waitUntil(() => agent.inFlight === 1, "U2 占住唯一的名额");
+  const second = channel.receive(U1, "我在后面等");
+  // U1 走完 prelude 与 mint 之后停在 semaphore.acquire 上:有回合上下文,但没名额。
+  await waitUntil(() => turns.currentFor(U1) !== undefined, "U1 铸出回合令牌");
+  assert.equal(turns.currentFor(U1)?.progress.running, undefined, "还没拿到名额");
+
+  await channel.receive(U1, "/状态");
+  const status = afterGreeting(channel.sent).find((m) => m.text.startsWith("📋"))!;
+  assert.match(status.text, /当前:排队中/);
+
+  release();
+  await Promise.all([first, second]);
 });
 
 test("formatProgress:超长内容截断,工具入参挑代表性字段", () => {

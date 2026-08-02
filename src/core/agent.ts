@@ -1,6 +1,15 @@
-import { query, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Config } from "../config.js";
 import type { Attachment } from "./attachments.js";
+import {
+  AGENT_TRACE,
+  HEARTBEAT_MS,
+  describeProgress,
+  describeSdkMessage,
+  formatHeartbeat,
+  shortMs,
+  shortNum,
+} from "./agent-trace.js";
 
 /**
  * Agent SDK 封装。目标:尽量还原 Claude Code 的行为("脾气"),
@@ -46,6 +55,11 @@ export interface AgentRunOptions {
   abortController?: AbortController;
   /** 中间过程回调(思考/工具调用)。回调应快速返回,耗时操作自行异步化。 */
   onProgress?: (ev: AgentProgressEvent) => void;
+  /**
+   * 日志里标识这是谁的回合(网关传 userKey)。多用户并发时,不带这个的话
+   * 几个回合的日志会交织成一团分不开。
+   */
+  logLabel?: string;
   /**
    * 随本回合带上的图片。会作为 image content block **内联**进这一轮的用户消息,
    * 模型第一次推理就能看到 —— 而不是先落盘再让它自己去 Read(那要多一次
@@ -99,6 +113,15 @@ export class Agent {
    */
   async run(prompt: string, opts: AgentRunOptions = {}): Promise<AgentReply> {
     const attachments = opts.attachments ?? [];
+    const tag = `[agent${opts.logLabel ? ` ${opts.logLabel}` : ""}]`;
+    const startedAt = Date.now();
+    const model = opts.model ?? this.config.model;
+    console.info(
+      `${tag} 回合开始 model=${model ?? "(交给 SDK)"} ` +
+        `${opts.resumeSessionId ? `resume=${opts.resumeSessionId.slice(0, 8)}` : "新会话"} ` +
+        `${prompt.length}字 图${attachments.length}`,
+    );
+
     const q = query({
       // 无附件时保持传 string —— SDK 内部会包成单个 text block,行为与从前完全一致。
       prompt: attachments.length
@@ -113,11 +136,18 @@ export class Agent {
         thinking: { type: "adaptive", display: "summarized" },
         cwd: opts.cwd ?? this.config.workspaceDir,
         // 两个都空就整个不传 model —— 兜底链的末端,交给 SDK 决定。
-        ...(opts.model ?? this.config.model ? { model: opts.model ?? this.config.model } : {}),
+        ...(model ? { model } : {}),
         ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
         ...(opts.env ? { env: opts.env } : {}),
         ...(opts.skills ? { skills: opts.skills } : {}),
         ...(opts.abortController ? { abortController: opts.abortController } : {}),
+        // CLI 子进程的 stderr 是启动失败/鉴权报错的唯一去处,不接就彻底看不见。
+        // 无条件转发(不受 TRACE 开关约束):正常回合它一个字都不输出,
+        // 一旦有内容就正是要找的东西。
+        stderr: (data: string) => {
+          const line = data.trim();
+          if (line) console.warn(`${tag} stderr: ${line.slice(0, 2000)}`);
+        },
       },
     });
 
@@ -125,28 +155,101 @@ export class Agent {
     let text = "";
     let isError = false;
 
-    for await (const message of q) {
-      // 每条消息都带 session_id;新会话时从这里捕获。
-      if ("session_id" in message && message.session_id) {
-        sessionId = message.session_id;
-      }
-      if (message.type === "assistant" && opts.onProgress) {
-        for (const block of message.message.content) {
-          // display 未生效或被覆盖时 thinking 可能为空串,跳过以免发出空的 💭 消息。
-          if (block.type === "thinking" && block.thinking.trim()) {
-            opts.onProgress({ kind: "thinking", text: block.thinking });
-          } else if (block.type === "tool_use") {
-            opts.onProgress({ kind: "tool", name: block.name, input: block.input });
+    // 心跳所需的状态。**覆盖所有 SDK 消息**而不只是 onProgress 透出的那两类:
+    // 工具结果回填、API 重试同样是"还在动"的证据,漏掉它们会把正常推进的回合
+    // 误报成卡住。计时器起在 query() 之后、紧挨着 finally 所在的 try ——
+    // 中间任何一步抛错都不会留下一个空转着打日志的定时器。
+    let steps = 0;
+    let lastAt = startedAt;
+    let lastStep: string | undefined;
+    const heartbeat =
+      HEARTBEAT_MS > 0
+        ? setInterval(() => {
+            const now = Date.now();
+            console.info(
+              `${tag} ${formatHeartbeat(now - startedAt, now - lastAt, steps, lastStep)}`,
+            );
+          }, HEARTBEAT_MS)
+        : undefined;
+    // 心跳不该拖着进程不退出 —— 它是观测,不是工作。
+    heartbeat?.unref?.();
+
+    try {
+      for await (const message of q) {
+        // 每条消息都带 session_id;新会话时从这里捕获。
+        if ("session_id" in message && message.session_id) {
+          sessionId = message.session_id;
+        }
+
+        const line = describeSdkMessage(message);
+        if (line && (line.level === "always" || AGENT_TRACE)) {
+          console.info(`${tag} ${line.text}`);
+        }
+        // 心跳的"上次动静"以任何一条 SDK 消息为准,与要不要打日志无关。
+        lastAt = Date.now();
+
+        if (message.type === "assistant") {
+          for (const block of message.message.content) {
+            // display 未生效或被覆盖时 thinking 可能为空串,跳过以免发出空的 💭 消息。
+            const ev: AgentProgressEvent | undefined =
+              block.type === "thinking" && block.thinking.trim()
+                ? { kind: "thinking", text: block.thinking }
+                : block.type === "tool_use"
+                  ? { kind: "tool", name: block.name, input: block.input }
+                  : undefined;
+            if (!ev) continue;
+            steps += 1;
+            lastStep = describeProgress(ev);
+            opts.onProgress?.(ev);
           }
         }
+
+        if (message.type === "result") {
+          isError = message.is_error;
+          text = message.subtype === "success" ? message.result : message.errors.join("\n");
+          this.logResult(tag, message, Date.now() - startedAt, steps);
+        }
       }
-      if (message.type === "result") {
-        isError = message.is_error;
-        text = message.subtype === "success" ? message.result : message.errors.join("\n");
-      }
+    } catch (err) {
+      // 回合以异常告终(abort / SDK 内部错误)也要留一行:上层网关只会打
+      // 一句"处理失败",而这里能说清它跑了多久、走到第几步就断了。
+      console.error(
+        `${tag} 回合中断 ${shortMs(Date.now() - startedAt)} 第 ${steps} 步:${String(err)}`,
+      );
+      throw err;
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
     }
 
     if (!text) text = "(助手没有返回内容)";
     return { text, sessionId, isError };
+  }
+
+  /**
+   * 回合结束的那一行。**无条件打** —— 一个回合只有一条,而它回答的问题
+   * (成功没有、花了多久、几轮、多少 token)正是事后翻日志最先要看的。
+   */
+  private logResult(
+    tag: string,
+    msg: Extract<SDKMessage, { type: "result" }>,
+    wallMs: number,
+    steps: number,
+  ): void {
+    const u = msg.usage;
+    const usage = u
+      ? ` in=${shortNum(u.input_tokens)} out=${shortNum(u.output_tokens)}` +
+        ` 缓存读=${shortNum(u.cache_read_input_tokens ?? 0)}`
+      : "";
+    const body =
+      `${shortMs(wallMs)}(API ${shortMs(msg.duration_api_ms)}) 第${steps}步 ` +
+      `${msg.num_turns}轮 $${msg.total_cost_usd.toFixed(4)}${usage}`;
+    if (msg.subtype === "success" && !msg.is_error) {
+      console.info(`${tag} 回合完成 ${body}`);
+      return;
+    }
+    // is_error 以前被读出来却从没人看 —— SDK 报错(鉴权失败、超限、达到轮数上限)
+    // 时,错误文本被当成正文发给用户,日志里一个字都没有。
+    const detail = msg.subtype === "success" ? "" : ` errors=${msg.errors.map((e) => e).join(" | ")}`;
+    console.error(`${tag} 回合失败 subtype=${msg.subtype} ${body}${detail}`);
   }
 }

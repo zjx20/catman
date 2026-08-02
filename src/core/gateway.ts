@@ -7,6 +7,7 @@ import type { GlobalSettings } from "./settings.js";
 import type { TurnTokens } from "./turn-tokens.js";
 import { allowAll, type AdmissionPolicy } from "./admission.js";
 import type { Attachment } from "./attachments.js";
+import { describeProgress, summarizeToolInput } from "./agent-trace.js";
 import { canonicalOf, commandHelpLines, parseCommand, type CommandDef } from "./commands.js";
 import { SETTING_SCHEMA, USER_SETTING_KEYS } from "./settings.js";
 import { ADMIN_SKILLS, USER_SKILLS } from "./skills.js";
@@ -80,22 +81,6 @@ function truncate(s: string, max: number): string {
 function sessionHint(text: string, hasAttachments: boolean): string {
   const firstLine = text.trim().split("\n", 1)[0] ?? "";
   return truncate(firstLine, 24) || (hasAttachments ? "[图片]" : "");
-}
-
-/** 从工具入参里挑一个最能说明"在干什么"的字段做摘要。 */
-function summarizeToolInput(input: unknown): string {
-  if (input && typeof input === "object") {
-    const o = input as Record<string, unknown>;
-    for (const key of ["description", "command", "file_path", "pattern", "prompt", "query", "url"]) {
-      const v = o[key];
-      if (typeof v === "string" && v.trim()) return v.trim();
-    }
-  }
-  try {
-    return JSON.stringify(input) ?? "";
-  } catch {
-    return "";
-  }
 }
 
 /**
@@ -631,6 +616,32 @@ export class Gateway {
     }
   }
 
+  /**
+   * 「现在有没有在处理」的那一行。
+   *
+   * 这是用户侧唯一能回答"是卡住了还是根本没收到"的观测点:`/状态` 走 immediate
+   * 分流、不进串行队列,所以回合卡死时它照样答得出。四种状态分开说,因为处置
+   * 完全不同:排队(等的是别人的回合,/取消 自己这条没用)、跑着(等模型或工具)、
+   * 正在中断、空闲(消息压根没被受理,该重发)。
+   */
+  private inFlightText(userKey: string): string {
+    const ctx = this.turns.currentFor(userKey);
+    if (!ctx) return "当前:空闲,没有正在处理的消息";
+
+    const p = ctx.progress;
+    const now = this.now();
+    const waited = humanDuration(now - p.startedAt);
+    if (p.running === undefined) {
+      return `当前:排队中,已等 ${waited}(并发上限满了,前面还有别的回合)`;
+    }
+    if (ctx.abort.signal.aborted) return `当前:正在中断这一轮(已 ${waited})`;
+    if (!p.steps) return `当前:处理中,已 ${waited},还在等模型的第一个动作`;
+    return (
+      `当前:处理中,已 ${waited} · 第 ${p.steps} 步` +
+      `(${humanDuration(now - p.lastAt)}前)${p.last ? ` · ${p.last}` : ""}`
+    );
+  }
+
   /** /状态 的正文。纯后台生成,不花订阅额度 —— 配置错乱时唯一可靠的信息源。 */
   private statusText(userKey: string): string {
     const p = this.prefs.effective(userKey);
@@ -642,6 +653,7 @@ export class Gateway {
 
     const lines = [
       "📋 当前状态",
+      this.inFlightText(userKey),
       `模型:${p.model ?? "由 SDK 决定"}${own("model")}`,
       current === undefined || idle === undefined
         ? "会话:还没有进行中的对话,下一条消息开新的"
@@ -797,26 +809,34 @@ export class Gateway {
     // 回执在排队之前发:并发受限时用户可能要等一会儿,先让他知道消息收到了。
     const ackId = prefs.ackEnabled ? await this.trySendAck(userKey) : undefined;
 
+    const isAdmin = this.settings.isAdmin(userKey);
+    const hint = sessionHint(text, attachments.length > 0);
+    const turn = this.turns.mint(userKey);
+
     // 进度消息串行链:保证按事件产生顺序逐条发送,最终回复排在链尾之后。
     // 节流从**回合开始**起算,而不是从第一个事件 —— 用户等待的是前者。
     const throttle = new ProgressThrottle(this.now());
     let progress: Promise<void> = Promise.resolve();
-    const onProgress = prefs.progressEnabled
-      ? (ev: AgentProgressEvent) => {
-          // 节流判定在事件到达时就做完,不放进串行链:链上排队的时长会把
-          // "这个事件是什么时候发生的"整个搞乱,节流间隔也就不准了。
-          const text = throttle.offer(this.now(), ev);
-          if (text === undefined) return;
-          progress = progress.then(async () => {
-            await this.trySend(userKey, text, "进度");
-          });
-        }
-      : undefined;
+    // **回调无条件挂上**,progressEnabled 只决定要不要推给用户。
+    // 关掉进度推送的用户同样需要 /状态 答得出"现在在干什么" —— 把观测和
+    // 推送绑在一起的话,一个纯粹的省流开关会顺手把可观测性也关掉。
+    const onProgress = (ev: AgentProgressEvent) => {
+      const snap = turn.ctx.progress;
+      snap.steps += 1;
+      snap.lastAt = this.now();
+      snap.last = describeProgress(ev);
+      if (!prefs.progressEnabled) return;
+      // 节流判定在事件到达时就做完,不放进串行链:链上排队的时长会把
+      // "这个事件是什么时候发生的"整个搞乱,节流间隔也就不准了。
+      const text = throttle.offer(this.now(), ev);
+      if (text === undefined) return;
+      progress = progress.then(async () => {
+        await this.trySend(userKey, text, "进度");
+      });
+    };
 
-    const isAdmin = this.settings.isAdmin(userKey);
-    const hint = sessionHint(text, attachments.length > 0);
-    const turn = this.turns.mint(userKey);
     const release = await this.semaphore.acquire();
+    turn.ctx.progress.running = this.now();
     try {
       const reply = await this.agent.run(text, {
         cwd: pre.cwd,
@@ -825,7 +845,8 @@ export class Gateway {
         env: this.childEnv(isAdmin, turn.token),
         skills: [...(isAdmin ? ADMIN_SKILLS : USER_SKILLS)],
         abortController: turn.ctx.abort,
-        ...(onProgress ? { onProgress } : {}),
+        onProgress,
+        logLabel: userKey,
         ...(attachments.length ? { attachments } : {}),
       });
       this.sessions.record(userKey, reply.sessionId, hint);

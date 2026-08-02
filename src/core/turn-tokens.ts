@@ -15,6 +15,34 @@ import { randomBytes } from "node:crypto";
  * 固定不变的长期 admin token 准备的。
  */
 
+/**
+ * 在飞回合的实时快照。
+ *
+ * 存在的理由:用户看不见日志,而"到底有没有在处理"是他最先想知道的事。
+ * `/状态` 是 immediate 硬指令、绕过串行队列,所以哪怕回合彻底卡住,
+ * 这份快照仍然问得到 —— 它是用户侧唯一不受回合阻塞影响的观测点。
+ *
+ * 只读快照,更新它是幂等的写标量,与在飞回合并发无碍。
+ */
+export interface TurnProgress {
+  /** 回合被受理的时刻(此刻起用户就在等了,哪怕还没轮到)。 */
+  readonly startedAt: number;
+  /**
+   * 拿到并发名额、真正开始跑的时刻;未设置 = 还在排队。
+   *
+   * 与 `startedAt` 分开是因为两者的处置不同:排队等的是别人的回合,
+   * `/取消` 自己这条没用;跑起来之后不动才是真卡住。并发上限默认不高,
+   * 多人同时说话时排队是常态,而用户完全看不见队列。
+   */
+  running?: number;
+  /** 已发生多少个可见步骤(思考 / 工具调用)。 */
+  steps: number;
+  /** 最后一个步骤的时刻;没有步骤时等于 startedAt。 */
+  lastAt: number;
+  /** 最后一步的人话描述,如「🔧 Bash: npm test」。 */
+  last?: string;
+}
+
 export interface TurnContext {
   readonly userKey: string;
   /**
@@ -25,6 +53,8 @@ export interface TurnContext {
   resetSession: boolean;
   /** /取消 用它中断本回合。 */
   readonly abort: AbortController;
+  /** 本回合的实时进度,供 /状态 回答"现在在干什么"。 */
+  readonly progress: TurnProgress;
 }
 
 export interface MintedTurn {
@@ -37,9 +67,18 @@ export class TurnTokens {
   private readonly byToken = new Map<string, TurnContext>();
   private readonly byUser = new Map<string, TurnContext>();
 
+  /** 时钟可注入,供单测用假时钟驱动 `progress` 的时刻。 */
+  constructor(private readonly now: () => number = Date.now) {}
+
   mint(userKey: string): MintedTurn {
     const token = randomBytes(32).toString("hex");
-    const ctx: TurnContext = { userKey, resetSession: false, abort: new AbortController() };
+    const startedAt = this.now();
+    const ctx: TurnContext = {
+      userKey,
+      resetSession: false,
+      abort: new AbortController(),
+      progress: { startedAt, steps: 0, lastAt: startedAt },
+    };
     this.byToken.set(token, ctx);
     this.byUser.set(userKey, ctx);
     let revoked = false;

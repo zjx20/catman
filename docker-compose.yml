@@ -20,6 +20,13 @@ services:
       # 排查用:打开后每条入站 iLink 消息打一行结构摘要(只有键名与标量,不含
       # base64 与媒体密钥)。用于确认「图 + 文字」这两条消息有没有可用的聚合键。
       CATMAN_ILINK_TRACE: ${CATMAN_ILINK_TRACE:-0}
+      # 排查用:打开后 agent 回合内每条 SDK 消息打一行摘要(思考/工具/结果的
+      # 结构与长度,不含正文与图片)。回合起止、API 重试、限流、上下文压缩
+      # **不受此开关约束**,一律记录 —— 那几条正是"为什么没反应"的答案。
+      CATMAN_AGENT_TRACE: ${CATMAN_AGENT_TRACE:-0}
+      # 回合进行中的心跳间隔(ms),0 = 关。长工具调用期间 SDK 完全静默,
+      # 心跳是分辨"还在跑"与"卡死了"的唯一依据。只进日志,不发给用户。
+      CATMAN_AGENT_HEARTBEAT_MS: ${CATMAN_AGENT_HEARTBEAT_MS:-30000}
       CATMAN_DATA_DIR: /data
       CLAUDE_CONFIG_DIR: /data/claude
       # 日志时间戳的时区。容器不会自动继承宿主时区,不设就是 UTC ——
