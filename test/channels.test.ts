@@ -10,7 +10,7 @@ import { BUILTIN_ADMIN_USER_KEY, makeUserKey } from "../src/core/identity.js";
 import { StdinChannel } from "../src/channels/stdin.js";
 import { WechatILinkChannel } from "../src/channels/wechat-ilink.js";
 import { WECHAT_CHANNEL } from "../src/channels/ilink-protocol.js";
-import type { AccountStore } from "../src/core/accounts.js";
+import { AccountStore } from "../src/core/accounts.js";
 import type { Channel, MessageHandler } from "../src/channels/types.js";
 
 class Fake implements Channel {
@@ -340,6 +340,65 @@ test("每个渠道产出的 userKey 都能被 CompositeChannel 路由回自己",
     );
   }
 });
+
+// --- 重新扫码:凭据换了,连接必须跟着换 ---
+
+/**
+ * 重新扫码只换凭据、**不换 accountId**,所以连接集合前后完全相同。reconcile 若只按
+ * "这个 accountId 有没有连接"判断,就会把作废的 bot_token 一直用下去 —— 表现是
+ * 扫了码依然收不到消息,而日志里什么异常都没有。
+ */
+test("凭据被替换后重建连接;凭据没变则不动它", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "catman-wechat-"));
+  chatDirs.push(dir);
+  const store = new AccountStore(join(dir, "accounts.json"));
+  store.add({
+    accountId: "a1",
+    channel: "wechat",
+    botToken: "old",
+    baseUrl: "https://x",
+    botId: "b1",
+    displayName: "老王的微信",
+    createdAt: 0,
+  });
+
+  // 长轮询挂起到被 stop() 中断为止;其余端点(notifystart/notifystop)一律成功。
+  t.mock.method(globalThis, "fetch", async (input: unknown, init: RequestInit) => {
+    if (String(input).includes("getupdates")) {
+      return new Promise((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    }
+    return new Response(JSON.stringify({ ret: 0 }), {
+      headers: { "content-type": "application/json" },
+    });
+  });
+
+  const ch = new WechatILinkChannel(store, () => ({
+    maxImageBytes: 1_000_000,
+    maxImagesPerTurn: 4,
+  }));
+  await ch.start();
+  const before = ch["connections"].get("a1");
+  assert.ok(before, "启动后该有一条连接");
+
+  // 与凭据无关的变更不该惊动连接。
+  store.rename("a1", "换个名字");
+  await settle();
+  assert.equal(ch["connections"].get("a1"), before, "改名不该重建连接");
+
+  store.replaceCredentials("a1", { botToken: "fresh", baseUrl: "https://x", botId: "b1" });
+  await settle();
+  assert.notEqual(ch["connections"].get("a1"), before, "换了 token 必须重建");
+  assert.deepEqual(ch.activeAccountIds(), ["a1"], "重建不是新增,账号仍只有一条连接");
+
+  await ch.stop();
+});
+
+/** 等 onConnectionSetChanged 触发的那次 reconcile 跑完(它是 void 出去的)。 */
+async function settle(): Promise<void> {
+  for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+}
 
 test("路由不到时的报错要指出差在哪", () => {
   const limits = () => ({ maxImageBytes: 1_000_000, maxImagesPerTurn: 4 });

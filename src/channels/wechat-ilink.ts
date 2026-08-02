@@ -28,7 +28,7 @@ export class WechatILinkChannel implements Channel {
     private readonly limits: () => AttachmentLimits,
   ) {
     this.accounts.onConnectionSetChanged(() => {
-      // 账号增删后立刻对齐连接集合。start() 之前的变更留给 start() 统一处理。
+      // 账号增删或凭据替换后立刻对齐连接。start() 之前的变更留给 start() 统一处理。
       if (this.started) void this.reconcile();
     });
   }
@@ -71,8 +71,12 @@ export class WechatILinkChannel implements Channel {
   }
 
   /**
-   * 让连接集合与 AccountStore 对齐:新账号起连接,已删除的账号停连接。
-   * 幂等,可反复调用。
+   * 让连接集合与 AccountStore 对齐:新账号起连接,已删除的账号停连接,
+   * **凭据被换过的账号重建连接**。幂等,可反复调用。
+   *
+   * 凭据失效(errcode=-14)后连接会自行停摆并留在表里,这里不重启它 ——
+   * token 没换的话重连只会再吃一次 -14,徒然刷屏。它要等重新扫码把凭据换掉,
+   * 那时下面的 usesCredentialsOf 会认出不同并重建。
    */
   private async reconcile(): Promise<void> {
     const wanted = new Map(
@@ -84,9 +88,11 @@ export class WechatILinkChannel implements Channel {
 
     const stopping: Array<Promise<void>> = [];
     for (const [id, conn] of this.connections) {
-      if (!wanted.has(id)) {
+      const account = wanted.get(id);
+      if (!account || !conn.usesCredentialsOf(account)) {
         this.connections.delete(id);
         stopping.push(conn.stop().catch(() => {}));
+        if (account) console.info(`[ilink] 账号 ${id} 凭据已更新,重建连接`);
       }
     }
 
@@ -102,6 +108,10 @@ export class WechatILinkChannel implements Channel {
           });
         },
         this.limits,
+        {
+          canonicalUserId: (raw) => this.accounts.canonicalUserId(id, raw),
+          onExpired: () => this.accounts.markExpired(id),
+        },
       );
       this.connections.set(id, conn);
       try {

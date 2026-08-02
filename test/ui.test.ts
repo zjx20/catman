@@ -328,7 +328,27 @@ const acct = (over = {}) => ({
 test("扫码前可以填备注名 —— 二维码之间没区别,扫完再认最容易配错", () => {
   const html = renderPage("accounts", { accounts: [], token: "tok" });
   assert.match(html, /id="newname"/);
-  assert.match(html, /displayName: name/);
+  assert.match(html, /displayName: document\.getElementById\('newname'\)\.value/);
+});
+
+test("每行都有「重新扫码」,发的是带 rebindAccountId 的登录请求(而非新建账号)", () => {
+  const html = renderPage("accounts", { accounts: [acct()], token: "tok" });
+  assert.match(html, /data-rescan="a1"/);
+  assert.match(html, /rebindAccountId: rescan/);
+});
+
+test("凭据失效要在账号页显性提示 —— 否则表现只是「不回消息」", () => {
+  const html = renderPage("accounts", { accounts: [acct({ expiredAt: 1_700_000_000_000 })], token: "tok" });
+  assert.match(html, /凭据已失效/);
+  assert.match(html, /请重新扫码/);
+});
+
+test("等待认领的账号要说明在等什么", () => {
+  const html = renderPage("accounts", {
+    accounts: [acct({ boundUserId: "u@im.wechat", pendingRebind: true })],
+    token: "tok",
+  });
+  assert.match(html, /等这个账号的主人发一条消息来认领/);
 });
 
 test("已有账号每行都能改备注名", () => {

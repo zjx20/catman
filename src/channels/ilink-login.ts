@@ -45,12 +45,27 @@ export interface LoginSession {
   expiresAt: number;
 }
 
-export type LoginStatus = "pending" | "confirmed" | "expired";
+export type LoginStatus = "pending" | "confirmed" | "expired" | "failed";
 
 export interface LoginPollResult {
   status: LoginStatus;
-  /** confirmed 时返回新建的账号 id。 */
+  /** confirmed 时返回账号 id(重新扫码时就是原来那个)。 */
   accountId?: string;
+  /** confirmed 且本次是重新扫码(凭据替换而非新建账号)。 */
+  rebound?: boolean;
+  /** failed 时给人看的原因。 */
+  message?: string;
+}
+
+/** 扫码目的:新建账号,或替换某个已有账号的凭据。 */
+export interface LoginTarget {
+  /** 备注名。仅新建账号时使用(重新扫码保留原账号的名字)。 */
+  displayName?: string;
+  /**
+   * 给出则本次是**重新扫码**:凭据写回这个账号,accountId 与绑定关系不变,
+   * 那位用户的会话/工作目录/个人配置因此得以延续。
+   */
+  rebindAccountId?: string;
 }
 
 interface QrcodeResp {
@@ -75,6 +90,10 @@ interface PendingLogin extends LoginSession {
    * 扫完再回头认"刚才那个是谁"最容易配错人。
    */
   displayName?: string;
+  /** 重新扫码的目标账号。理由同上:扫码之前就得定死这码是给谁用的。 */
+  rebindAccountId?: string;
+  /** 确认后置位,与 accountId 一起构成幂等返回。 */
+  rebound?: boolean;
 }
 
 export class ILinkLogin {
@@ -85,8 +104,14 @@ export class ILinkLogin {
     private readonly now: () => number = Date.now,
   ) {}
 
-  /** 申请一个二维码,返回可展示的登录会话。displayName 是可选备注名,留空用默认。 */
-  async start(displayName = ""): Promise<LoginSession> {
+  /**
+   * 申请一个二维码,返回可展示的登录会话。
+   *
+   * `target` 在**扫码之前**就要定死:备注名是为了扫完能认出是谁,
+   * 重新扫码的目标账号则决定了这次扫码是新建还是续命 —— 两者都没法事后补。
+   */
+  async start(target: LoginTarget = {}): Promise<LoginSession> {
+    const displayName = target.displayName ?? "";
     this.prune();
     const resp = await ilinkGet<QrcodeResp>("ilink/bot/get_bot_qrcode?bot_type=3");
     if (!resp.qrcode) {
@@ -103,6 +128,7 @@ export class ILinkLogin {
       qrcode: resp.qrcode,
       expiresAt: this.now() + LOGIN_TTL_MS,
       ...(displayName.trim() ? { displayName } : {}),
+      ...(target.rebindAccountId ? { rebindAccountId: target.rebindAccountId } : {}),
       ...(content ? { qrcodeContent: content, qrcodeImage: renderQrcode(content) } : {}),
     };
     this.sessions.set(session.loginId, session);
@@ -110,14 +136,20 @@ export class ILinkLogin {
   }
 
   /**
-   * 查询扫码状态。确认后就地创建账号并写入 AccountStore ——
-   * AccountStore 的变更回调会让渠道立刻拉起这条连接,无需重启进程。
+   * 查询扫码状态。确认后就地创建账号(或替换目标账号的凭据)并写入 AccountStore ——
+   * AccountStore 的变更回调会让渠道立刻拉起/重建这条连接,无需重启进程。
    */
   async poll(loginId: string): Promise<LoginPollResult> {
     const session = this.sessions.get(loginId);
     if (!session) return { status: "expired" };
     // 已确认过:幂等返回,不重复建账号。
-    if (session.accountId) return { status: "confirmed", accountId: session.accountId };
+    if (session.accountId) {
+      return {
+        status: "confirmed",
+        accountId: session.accountId,
+        ...(session.rebound ? { rebound: true } : {}),
+      };
+    }
     if (this.now() >= session.expiresAt) {
       this.sessions.delete(loginId);
       return { status: "expired" };
@@ -141,13 +173,37 @@ export class ILinkLogin {
       return { status: "pending" };
     }
 
+    const baseUrl = st.baseurl ?? ILINK.host;
+    const botId = st.bot_id ?? "";
+
+    if (session.rebindAccountId) {
+      const ok = this.accounts.replaceCredentials(session.rebindAccountId, {
+        botToken: st.bot_token,
+        baseUrl,
+        botId,
+      });
+      if (!ok) {
+        // 扫码期间目标账号被删掉了。**不能退化成新建账号** —— 那会静默造出一个
+        // 空白用户,而发起者要的恰恰是接上原来那位。
+        this.sessions.delete(loginId);
+        return {
+          status: "failed",
+          message: `账号 ${session.rebindAccountId} 已不存在,本次扫码未生效。`,
+        };
+      }
+      session.accountId = session.rebindAccountId;
+      session.rebound = true;
+      console.info(`[ilink-login] 账号 ${session.accountId} 已用新扫码的凭据替换`);
+      return { status: "confirmed", accountId: session.accountId, rebound: true };
+    }
+
     const accountId = newAccountId();
     const account: Account = {
       accountId,
       channel: "wechat",
       botToken: st.bot_token,
-      baseUrl: st.baseurl ?? ILINK.host,
-      botId: st.bot_id ?? "",
+      baseUrl,
+      botId,
       displayName: normalizeAccountName(session.displayName ?? "", accountId),
       createdAt: this.now(),
     };

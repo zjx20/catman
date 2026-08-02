@@ -32,9 +32,10 @@ import { handleAdminApi, isAdminApiPath, type AdminApiDeps } from "./api-admin.j
  *   GET/PATCH /api/settings                 全局配置
  *   GET    /api/users                       用户列表(含各自的 prefs)
  *   PATCH  /api/users/<userKey>             代改某人的 prefs / 展示名 / 管理员权限
- *   POST   /api/accounts/login/start        申请二维码(可带备注名)
+ *   POST   /api/accounts/login/start        申请二维码(可带备注名;带 rebindAccountId
+ *                                           则是重新扫码 —— 凭据换掉、账号与绑定不变)
  *   PATCH  /api/accounts/<id>               改账号备注名
- *   POST   /api/accounts/login/<loginId>    查询扫码状态;确认后建账号并拉起连接
+ *   POST   /api/accounts/login/<loginId>    查询扫码状态;确认后建账号/替换凭据并拉起连接
  *   POST   /api/accounts/<id>/unbind        解除 TOFU 绑定
  *   DELETE /api/accounts/<id>               移除账号(不删会话数据)
  * 回合令牌(**X-Catman-Session**,与 admin token 不互通):
@@ -314,10 +315,19 @@ export class Dashboard {
     }
 
     if (path === "/api/accounts/login/start" && req.method === "POST") {
-      // 备注名在扫码**之前**填:二维码之间没有任何区别,扫完再回头认是谁最容易配错。
+      // 目标在扫码**之前**定:二维码之间没有任何区别,扫完再回头认是谁最容易配错。
       const body = await readJsonBody(req);
       const name = isObject(body) && typeof body["displayName"] === "string" ? body["displayName"] : "";
-      const session = await this.opts.login.start(name);
+      const rebind =
+        isObject(body) && typeof body["rebindAccountId"] === "string" ? body["rebindAccountId"] : "";
+      // 先验一次账号存在:扫完才发现目标没了,那三分钟就白等了。
+      // 真正的判定仍在 poll() 里(账号可能在扫码期间被删),这里只是提前失败。
+      if (rebind && !this.opts.accounts.get(rebind)) {
+        return jsonError(res, 404, "账号不存在");
+      }
+      const session = await this.opts.login.start(
+        rebind ? { rebindAccountId: rebind } : { displayName: name },
+      );
       return json(res, session);
     }
 

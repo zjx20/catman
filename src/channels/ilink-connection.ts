@@ -102,6 +102,18 @@ export type ConnectionMessageHandler = (
   attachments: readonly Attachment[],
 ) => void;
 
+/** 连接向上回报的事件。都由 wechat-ilink.ts 接到 AccountStore 上。 */
+export interface ConnectionHooks {
+  /**
+   * 把来信的原始 from_user_id 归一成规范身份,再据此拼 userKey。
+   * 默认恒等;真正的实现是 `AccountStore.canonicalUserId`(重新扫码后换了标识时
+   * 让它接回原来那个 userKey)。
+   */
+  canonicalUserId?: (rawUserId: string) => string;
+  /** 凭据失效(errcode=-14)。落盘后账号页会提示"需要重新扫码"。 */
+  onExpired?: () => void;
+}
+
 /** 出错退避时长。 */
 const BACKOFF_MS = 3000;
 
@@ -196,6 +208,7 @@ export class ILinkConnection {
     account: Account,
     onMessage: ConnectionMessageHandler,
     private readonly limits: () => AttachmentLimits,
+    private readonly hooks: ConnectionHooks = {},
   ) {
     this.account = account;
     this.accountId = account.accountId;
@@ -204,6 +217,16 @@ export class ILinkConnection {
 
   get isExpired(): boolean {
     return this.expired;
+  }
+
+  /**
+   * 本连接握着的凭据是否仍是该账号当前的凭据。
+   *
+   * 重新扫码只换凭据、不换 accountId,连接集合因此看不出变化 —— 少了这道比较,
+   * reconcile 会认为"这个账号已经有连接了"而把作废的 token 一直用下去。
+   */
+  usesCredentialsOf(account: Account): boolean {
+    return account.botToken === this.account.botToken && account.baseUrl === this.account.baseUrl;
   }
 
   async start(): Promise<void> {
@@ -304,10 +327,11 @@ export class ILinkConnection {
 
         if (resp.errcode === -14) {
           console.error(
-            `[ilink:${this.accountId}] 会话过期(errcode=-14),需在 dashboard 上重新扫码`,
+            `[ilink:${this.accountId}] 会话过期(errcode=-14),需在 dashboard 的账号页点「重新扫码」`,
           );
           this.expired = true;
           this.running = false;
+          this.hooks.onExpired?.();
           break;
         }
         if (resp.ret !== undefined && resp.ret !== 0) {
@@ -345,10 +369,15 @@ export class ILinkConnection {
       .join("")
       .trim();
 
-    const userKey = makeUserKey(WECHAT_CHANNEL, this.accountId, m.from_user_id);
+    // 归一化后再拼 userKey:重新扫码换了 bot 之后,同一个人的 from_user_id 可能变,
+    // 归一让他仍落在原来那个 userKey 上,会话与工作目录不断线(见 canonicalUserId)。
+    const userId = this.hooks.canonicalUserId?.(m.from_user_id) ?? m.from_user_id;
+    const userKey = makeUserKey(WECHAT_CHANNEL, this.accountId, userId);
 
     // 缓存回复上下文要在下载**之前**做:下载可能失败,而报错也得发得出去。
     // 注意按 userKey 存:同一 from_user_id 在别的账号下是另一个人。
+    // `toUserId` 存的是**原始** from_user_id 而非归一后的:归一只服务于我们自己的
+    // 身份体系,发回去必须用协议认得的那个标识。
     //
     // 每条新来信都换一份上下文,发送计数也跟着归零 —— 计数的语义是「针对**这条来信**
     // 回了几条」。所以读日志时留意:用户在回合进行中又发了一条,会看到序号退回 #1。

@@ -143,6 +143,23 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
   新增渠道时在 `index.ts` 的 `createChannel` 里连同准入策略一起返回 —— 两者是同一个决定,
   分开配容易出现新渠道忘了配准入、结果全放行。
 - **账号绑定是 TOFU 且不可被来信改写**:`bind()` 在已绑定时返回 false,换人必须显式 `unbind()`。
+- **重新扫码 = 换凭据,不是换账号**(`accounts.replaceCredentials`):accountId 必须原样保留,
+  因为它是 userKey 的第二段 —— 换了就等于换了个人,会话、工作目录、prefs 全部接不上,
+  而这恰恰是这个功能存在的理由。同理 `poll()` 在目标账号已被删时返回 `failed` 而**不退化成
+  新建账号**:静默造出一个空白用户比报错糟得多。
+  两处配套机制:
+  **① 连接必须按凭据比对重建**(`wechat-ilink.reconcile` 的 `usesCredentialsOf`)——
+  accountId 没变,只看"这个账号有没有连接"会把作废的 token 一直用下去,表现是扫了码依然
+  收不到消息且日志无异常。凭据失效(errcode=-14)的连接则**故意不重启**,重连只会再吃一次
+  -14;它等的就是重新扫码。
+  **② userId 归一化**(`accounts.canonicalUserId`,经 `ConnectionHooks` 注入连接):
+  换一份 bot 凭据后同一个人的 from_user_id 会不会变由 iLink 决定,我们控制不了。
+  `replaceCredentials` 给已绑定的账号置 `pendingRebind`,下一条来信若换了标识就登记进
+  `userIdAliases`,于是 userKey 照旧。**认领与命中必须在同一条来信内完成**(先消费标记再查表),
+  否则第一条消息会开出一个空白用户。标识没变时别名表是空的,整条路径等同于不存在。
+  归一只作用于 userKey;`replyCtx.toUserId` 必须存**原始** from_user_id,否则回信投不到人。
+  安全前提与 TOFU 同一条(bot 属于扫码那个微信号自己),所以拿别人的微信重新扫码 =
+  把这位用户的会话与工作目录转手,账号页上写明了。`unbind()` 连同别名一起清空 —— 它的语义是换人。
 - **dashboard 写操作只认 `X-Catman-Token` 请求头,不认 Cookie**:Cookie 会被浏览器自动携带,
   只认 Cookie 的写接口能被外部页面诱导触发(CSRF)。读则两者皆可(请求头是更强的凭据,也放行)。
 - **共享人设靠 `@../CLAUDE.md` 显式 import**,不依赖「向上递归查找父目录 CLAUDE.md」的隐式行为。

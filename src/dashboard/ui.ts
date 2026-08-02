@@ -457,13 +457,22 @@ function renderAccounts({ accounts, token }: AccountsPageData): string {
                 .join("、")}</div>`
             : "";
           const id = escapeHtml(a.accountId);
+          // 凭据失效是"该点重新扫码了"的唯一明确信号 —— 不显示的话表现只是"不回消息"。
+          const expired = a.expiredAt
+            ? `<span class="tag bad">凭据已失效(${fmtTime(a.expiredAt)}),请重新扫码</span>`
+            : "";
+          const pending = a.pendingRebind
+            ? `<div class="meta">已换新凭据,等这个账号的主人发一条消息来认领。</div>`
+            : "";
           return `<div class="row">
-            <b>${escapeHtml(a.displayName)}</b> ${bound}
+            <b>${escapeHtml(a.displayName)}</b> ${bound} ${expired}
             <div class="meta">${id} · ${escapeHtml(a.channel)} · 创建于 ${fmtTime(a.createdAt)}</div>
+            ${pending}
             ${rejections}
             <p class="userops">
               <input data-name="${id}" value="${escapeHtml(a.displayName)}" placeholder="备注名(留空恢复默认)">
               <button class="btn" data-rename="${id}">改备注名</button>
+              <button class="btn" data-rescan="${id}">重新扫码</button>
               <button class="btn warn" data-unbind="${id}">解除绑定</button>
               <button class="btn danger" data-remove="${id}">移除账号</button>
             </p>
@@ -475,6 +484,10 @@ function renderAccounts({ accounts, token }: AccountsPageData): string {
   const body = `<h3>账号</h3>
     <p class="meta">每个账号服务一位用户:绑定后收到的第一条消息,其发送者成为该账号的主人,
     其他人的来信一律拒绝。移除账号只停止收发,<b>不会删除已有会话记录</b>(交由保留期清理)。</p>
+    <p class="meta"><b>「重新扫码」用于凭据失效或换手机</b>:换掉这个账号的凭据,
+    账号本身与它服务的用户不变 —— 会话上下文、工作目录、个人配置全都接着用。
+    请让<b>同一个人</b>来扫;换别人扫,等于把这位用户的会话与工作目录交给对方。
+    要接入新的人请用下面的「添加账号」。</p>
     ${rows}
     <h4 class="group">添加账号</h4>
     <p class="userops">
@@ -496,23 +509,28 @@ const post = (url, method, body) => fetch(url, {
 });
 const box = document.getElementById('login');
 
-document.getElementById('start').onclick = async (e) => {
-  e.target.disabled = true;
+// 新建与重新扫码走同一段流程,只是 payload 与提示语不同 —— 分成两套的话,
+// 二维码渲染、降级展示、轮询三处都得各维护一份。
+async function beginLogin(payload, hint, btn) {
+  if (btn) btn.disabled = true;
   box.innerHTML = '正在申请二维码…';
+  box.scrollIntoView({ block: 'nearest' });
   try {
-    const name = document.getElementById('newname').value;
-    const res = await post('/api/accounts/login/start', 'POST', { displayName: name });
+    const res = await post('/api/accounts/login/start', 'POST', payload);
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || '申请失败');
-    render(data);
+    render(data, hint);
     poll(data.loginId);
   } catch (err) {
     box.innerHTML = '出错了:' + String(err && err.message || err);
-    e.target.disabled = false;
+    if (btn) btn.disabled = false;
   }
-};
+}
 
-function render(d) {
+document.getElementById('start').onclick = (e) =>
+  beginLogin({ displayName: document.getElementById('newname').value }, '', e.target);
+
+function render(d, hint) {
   // 降级时要展示 qrcodeContent(二维码承载的授权 URL),而不是 qrcode key —— 后者
   // 只是查询扫码状态用的凭据,把它转成二维码扫了也没用。
   const img = d.qrcodeImage
@@ -521,7 +539,8 @@ function render(d) {
       ? '<p class="meta">二维码生成失败。可手动把下面的链接转成二维码扫描:</p><p><code>'
         + escapeText(d.qrcodeContent) + '</code></p>'
       : '<p class="meta">接口未返回二维码内容,无法生成。请查看服务端日志里的原始响应。</p>';
-  box.innerHTML = img + '<p class="meta" id="st">请用微信扫码并确认授权…</p>';
+  const head = hint ? '<p class="meta"><b>' + escapeText(hint) + '</b></p>' : '';
+  box.innerHTML = head + img + '<p class="meta" id="st">请用微信扫码并确认授权…</p>';
 }
 
 function escapeText(s) {
@@ -545,8 +564,18 @@ async function poll(loginId) {
       continue;
     }
     if (data.status === 'confirmed') {
-      if (st) st.textContent = '登录成功,连接已建立,正在刷新…';
+      if (st) {
+        st.textContent = data.rebound
+          ? '凭据已更新,连接正在重建。让他发一条消息就能接上原来的会话。'
+          : '登录成功,连接已建立,正在刷新…';
+      }
       location.reload();
+      return;
+    }
+    if (data.status === 'failed') {
+      // 例如重新扫码期间目标账号被删了。此时刻意**不**退化成新建账号 ——
+      // 那会静默造出一个空白用户,而发起者要的恰恰是接上原来那位。
+      if (st) st.textContent = data.message || '登录失败。';
       return;
     }
     if (data.status === 'expired') {
@@ -561,7 +590,13 @@ document.addEventListener('click', async (e) => {
   const unbind = at('data-unbind');
   const remove = at('data-remove');
   const rename = at('data-rename');
-  if (unbind) {
+  const rescan = at('data-rescan');
+  if (rescan) {
+    // 扫码的人决定了这个账号之后归谁 —— 换个人扫就是把原用户的会话与工作目录转手。
+    if (!confirm('重新扫码会换掉这个账号的凭据,账号与它服务的用户不变(会话、工作目录、'
+      + '个人配置都接着用)。请让同一个人来扫;换别人扫等于把这位用户的会话交给对方。继续?')) return;
+    await beginLogin({ rebindAccountId: rescan }, '重新扫码:' + rescan, e.target);
+  } else if (unbind) {
     if (!confirm('解除绑定后,下一条来信的发送者会成为新主人。继续?')) return;
     await post('/api/accounts/' + encodeURIComponent(unbind) + '/unbind');
     location.reload();

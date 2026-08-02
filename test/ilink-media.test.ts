@@ -1,7 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { ILinkConnection, formatTrace, formatSendDiag } from "../src/channels/ilink-connection.js";
+import {
+  ILinkConnection,
+  formatTrace,
+  formatSendDiag,
+  type ConnectionHooks,
+} from "../src/channels/ilink-connection.js";
 import type { AttachmentLimits } from "../src/core/attachments.js";
 import type { Account } from "../src/core/accounts.js";
 import type { Attachment } from "../src/core/attachments.js";
@@ -41,7 +46,7 @@ interface Received {
 }
 
 /** 造一条入站消息 + 收集器。 */
-function setup() {
+function setup(hooks?: ConnectionHooks) {
   const got: Received[] = [];
   const conn = new ILinkConnection(
     ACCOUNT,
@@ -49,6 +54,7 @@ function setup() {
       got.push({ userKey, text, attachments });
     },
     () => LIMITS,
+    hooks ?? {},
   );
   return { conn, got };
 }
@@ -349,4 +355,46 @@ test("发送诊断:三个判别量齐全,且不带回复正文", () => {
   assert.ok(line.includes(`${secret.length}字`), `缺长度:${line}`);
   assert.ok(line.includes("ret=-2"), `缺服务端错误:${line}`);
   assert.ok(!line.includes(secret), `正文泄漏了:${line}`);
+});
+
+// --- 重新扫码:换了对端标识仍落回原来那个 userKey ---
+
+/**
+ * 重新扫码换了一份 bot 凭据后,同一个人的 from_user_id 是否照旧由 iLink 决定。
+ * 变了的话,userKey 的第三段就变了 —— 那位用户会以新人的身份进来,会话、工作目录、
+ * 个人配置全都对不上。归一化这一步就是为了消除这个差别。
+ */
+test("拼 userKey 前先归一化 from_user_id,但回信仍发给原始标识", async (t) => {
+  const calls = mockFetch(t, Buffer.alloc(0));
+  const { conn, got } = setup({
+    canonicalUserId: (raw) => (raw === "new@im.wechat" ? "old@im.wechat" : raw),
+  });
+
+  await conn["dispatch"]({
+    from_user_id: "new@im.wechat",
+    context_token: "ctx",
+    item_list: [textItem("在吗")],
+  });
+
+  assert.equal(got[0]!.userKey, "wechat:acc1:old@im.wechat", "会话与工作目录靠这一段接上");
+
+  // 归一只服务于我们自己的身份体系:发回去必须用协议认得的那个标识,
+  // 否则消息投不到人 —— 而 replyCtx 是按归一后的 userKey 存的,最容易在这里写岔。
+  calls.length = 0;
+  const bodies: string[] = [];
+  t.mock.method(globalThis, "fetch", async (_input: unknown, init: RequestInit) => {
+    bodies.push(String(init.body));
+    return new Response(JSON.stringify({ ret: 0 }), {
+      headers: { "content-type": "application/json" },
+    });
+  });
+  await conn.send("wechat:acc1:old@im.wechat", "在的");
+  assert.match(bodies[0]!, /"to_user_id":"new@im\.wechat"/);
+});
+
+test("没装归一化钩子时,userKey 用原始 from_user_id(默认恒等)", async (t) => {
+  mockFetch(t, Buffer.alloc(0));
+  const { conn, got } = setup();
+  await conn["dispatch"]({ from_user_id: "u1", item_list: [textItem("在吗")] });
+  assert.equal(got[0]!.userKey, "wechat:acc1:u1");
 });
