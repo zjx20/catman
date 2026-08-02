@@ -20,7 +20,7 @@ import { ILinkLogin } from "./channels/ilink-login.js";
 import type { Channel } from "./channels/types.js";
 import type { AttachmentLimits } from "./core/attachments.js";
 import { Dashboard } from "./dashboard/server.js";
-import { cleanupOldSessionsAcross } from "./core/transcript.js";
+import { cleanupOldSessionsAcross, encodeProjectDir, sessionFileExists } from "./core/transcript.js";
 import { installLogStamps } from "./core/log-stamp.js";
 
 async function main(): Promise<void> {
@@ -79,6 +79,10 @@ async function main(): Promise<void> {
     turns,
     apiBase: config.apiBase,
     admission,
+    // /切换会话 切换前确认目标的 JSONL 还在 —— 记录没了 resume 必然失败,
+    // 提前给句人话并出清死引用,比让回合炸出原始报错友好得多。
+    sessionExists: (userKey, sessionId) =>
+      sessionFileExists(configDir, encodeProjectDir(users.workspaceDirOf(userKey)), sessionId),
     // 提醒轮询:取超时时长的 1/10,但不短于 1 分钟。
     reminderIntervalMs: Math.max(60_000, Math.floor(config.sessionTimeoutMs / 10)),
   });
@@ -97,7 +101,7 @@ async function main(): Promise<void> {
     adminApi: { settings, prefs, users },
   });
 
-  // 保留期清理:启动跑一次,之后按间隔跑;删除的会话同步从状态里 forget。
+  // 保留期清理:启动跑一次,之后按间隔跑;删除的会话同步从状态里出清死引用。
   // 清理范围严格来自各用户的 workspace 目录 —— 不遍历 projects/ 树。
   const runCleanup = () => {
     const scopes = listWorkspaceDirs(config.workspaceDir).map((w) => ({
@@ -105,9 +109,9 @@ async function main(): Promise<void> {
     }));
     // 保留期每次现读,所以管理员改完下一轮清理就用新值,不必重建定时器。
     const deleted = cleanupOldSessionsAcross(configDir, scopes, settings.effective().retentionMs);
-    for (const [userKey, st] of Object.entries(sessions.snapshot())) {
-      if (deleted.includes(st.sessionId)) sessions.forget(userKey);
-    }
+    // 当前会话与 /切换会话 的历史名单都要剔除死引用,否则会把用户领到
+    // 一段 resume 必然失败的会话上。
+    sessions.dropSessionIds(deleted);
     if (deleted.length) console.info(`[cleanup] 清理了 ${deleted.length} 个过期会话`);
   };
   runCleanup();

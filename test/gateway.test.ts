@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   Gateway,
-  REMINDER_TEXT,
+  reminderText,
+  shortSessionId,
   ACK_TEXT,
   formatProgress,
   ProgressThrottle,
@@ -143,6 +144,8 @@ interface BuildOpts {
   admission?: AdmissionPolicy;
   /** 预置的全局配置覆盖(并发上限、默认模型、管理员名单等)。 */
   settings?: SettingsPatch;
+  /** 会话记录存活检查(/切换会话 用)。不传则视为都活着,与生产默认一致。 */
+  sessionExists?: (userKey: string, sessionId: string) => boolean;
 }
 
 const tempDirs: string[] = [];
@@ -197,6 +200,7 @@ function build(now: () => number, opts: BuildOpts = {}) {
     reminderIntervalMs: 999_999, // 测试里手动触发,不依赖定时器
     now,
     ...(opts.admission ? { admission: opts.admission } : {}),
+    ...(opts.sessionExists ? { sessionExists: opts.sessionExists } : {}),
   });
   // 只注册 handler,不启动真实定时器/渠道。走 dispatch 才能覆盖硬指令分流。
   // 附件要一并转交 —— 与 Gateway.start() 里的接线保持一致,否则这里测不到透传。
@@ -409,7 +413,12 @@ test("超时提醒:可推送时发出提醒文案", async () => {
   await channel.receive(U1, "hi");
   t += TIMEOUT;
   await gw["flushReminders"]();
-  assert.ok(channel.sent.some((m) => m.userKey === U1 && m.text === REMINDER_TEXT));
+  const reminder = channel.sent.find(
+    (m) => m.userKey === U1 && m.text === reminderText(shortSessionId("sess-1")),
+  );
+  assert.ok(reminder, "应发出超时提醒");
+  // 提醒里必须教"怎么切回来":用户直接发新话题后,这是他知道旧会话 id 的唯一机会。
+  assert.ok(reminder.text.includes("/切换会话 sess-1"), `提醒里缺了切回指引:${reminder.text}`);
 });
 
 test("超时提醒:渠道不支持推送时静默降级,不抛错", async () => {
@@ -440,7 +449,7 @@ test("不同用户各自独立的 cwd 与会话,互不影响", async () => {
   const snap = sessions.snapshot();
   assert.equal(Object.keys(snap).length, 2);
   assert.equal(agent.calls[1]!.resume, undefined);
-  assert.notEqual(snap[U1]!.sessionId, snap[U2]!.sessionId);
+  assert.notEqual(snap[U1]!.current!.sessionId, snap[U2]!.current!.sessionId);
 });
 
 test("同一 userId 在不同账号下不串会话(核心隔离断言)", async () => {
@@ -529,7 +538,7 @@ test("greeting:指引里列全了硬指令,它是唯一的发现入口", async (
   const { channel } = build(() => t);
   await channel.receive(U1, "你好");
   const g = channel.sent[0]!.text;
-  for (const cmd of ["/帮助", "/状态", "/新会话", "/取消", "/继续"]) {
+  for (const cmd of ["/帮助", "/状态", "/新会话", "/取消", "/继续", "/切换会话"]) {
     assert.ok(g.includes(cmd), `指引里缺了 ${cmd}`);
   }
 });
@@ -643,17 +652,33 @@ test("/新会话:在飞回合结束后不把 sessionId 写回来", async () => {
   open();
   await stuck;
 
-  // 回合的 record() 发生在 try 里,finally 里的 forget 必定在其后 —— 净效果是清空。
-  assert.deepEqual(sessions.snapshot(), {});
+  // 回合的 record() 发生在 try 里,finally 里的归档必定在其后 ——
+  // 净效果:没有进行中的会话,但那段对话进了历史,还能凭 id 切回。
+  assert.equal(sessions.currentOf(U1), undefined);
+  assert.deepEqual(
+    sessions.historyOf(U1).map((h) => h.sessionId),
+    ["sess-1"],
+  );
 });
 
-test("/新会话:没有在飞回合时直接清掉状态", async () => {
+test("/新会话:没有在飞回合时立即归档,并教用户怎么切回来", async () => {
   const t = 1_000_000;
   const { channel, sessions } = build(() => t);
   await channel.receive(U1, "先聊一句");
-  assert.equal(Object.keys(sessions.snapshot()).length, 1);
+  assert.equal(sessions.currentOf(U1)?.sessionId, "sess-1");
+  channel.sent.length = 0;
+
   await channel.receive(U1, "/新会话");
-  assert.deepEqual(sessions.snapshot(), {});
+  assert.equal(sessions.currentOf(U1), undefined);
+  assert.deepEqual(
+    sessions.historyOf(U1).map((h) => h.sessionId),
+    ["sess-1"],
+  );
+  // 归档不等于删除:确认语要教切回的完整指令,这是用户知道这件事的入口之一。
+  assert.ok(
+    channel.sent.some((m) => m.text.includes("/切换会话 sess-1")),
+    `确认语里缺了切回指引:${JSON.stringify(channel.sent)}`,
+  );
 });
 
 test("/继续 由后台消化:不触发回合,续上的会话留给下一条消息", async () => {
@@ -709,10 +734,152 @@ test("/继续 排在在飞回合之后:touch 的是它刚 record 的会话,不�
 
   open();
   await Promise.all([stuck, cont]);
-  assert.equal(sessions.snapshot()[U1]!.sessionId, "sess-1");
+  assert.equal(sessions.snapshot()[U1]!.current!.sessionId, "sess-1");
   assert.ok(
     channel.sent.some((m) => m.text === "好,接上刚才的对话了,直接发消息继续聊。"),
     "排在回合之后执行,record 过的会话应当续得上",
+  );
+});
+
+// --- /切换会话 ---
+
+/** 造出「历史里躺着 sess-1、当前是 sess-2」的局面:聊一句 → /新会话 → 再聊一句。 */
+async function withTwoSessions(channel: FakeChannel) {
+  await channel.receive(U1, "聊聊 docker 镜像");
+  await channel.receive(U1, "/新会话");
+  await channel.receive(U1, "写个爬虫");
+  channel.sent.length = 0;
+}
+
+test("单发 /切换会话:列出最近会话(含主题提示),不触发回合", async () => {
+  const t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  await withTwoSessions(channel);
+  const before = agent.calls.length;
+
+  await channel.receive(U1, "/切换会话");
+  assert.equal(agent.calls.length, before, "列表不该触发 agent 回合");
+  assert.equal(channel.sent.length, 1);
+  const list = channel.sent[0]!.text;
+  assert.ok(list.includes("sess-2") && list.includes("(当前)"), `缺当前会话:${list}`);
+  assert.ok(list.includes("sess-1"), `缺历史会话:${list}`);
+  assert.ok(list.includes("聊聊 docker 镜像"), `缺主题提示:${list}`);
+});
+
+test("/切换会话 <id>:切回旧会话,之后的消息 resume 它;确认语教怎么切回来", async () => {
+  const t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  await withTwoSessions(channel);
+
+  await channel.receive(U1, "/切换会话 sess-1");
+  const confirm = channel.sent[0]!.text;
+  assert.ok(confirm.includes("sess-1"), `确认语要说切到了哪段:${confirm}`);
+  assert.ok(confirm.includes("/切换会话 sess-2"), `确认语要教切回原会话:${confirm}`);
+
+  await channel.receive(U1, "刚才那个镜像的事");
+  assert.equal(agent.calls.at(-1)!.resume, "sess-1", "切换后的消息应 resume 目标会话");
+});
+
+test("/切换会话 找不到目标:如实说明并附列表,状态不动、不起回合", async () => {
+  const t = 1_000_000;
+  const { channel, agent, sessions } = build(() => t);
+  await withTwoSessions(channel);
+  const before = agent.calls.length;
+
+  await channel.receive(U1, "/切换会话 zzzz");
+  assert.equal(agent.calls.length, before);
+  assert.equal(sessions.currentOf(U1)?.sessionId, "sess-2", "失败不该动当前会话");
+  const reply = channel.sent[0]!.text;
+  assert.ok(reply.includes("没找到"), reply);
+  assert.ok(reply.includes("sess-1"), `失败时应附上可选清单:${reply}`);
+});
+
+test("聚合:/切换会话 id + 问题连发时合成一个回合,直接落在切到的会话里", async () => {
+  const t = 1_000_000;
+  const { channel, agent } = build(() => t, { settings: { messageAggregationMs: AGG } });
+  await withTwoSessions(channel);
+
+  await Promise.all([
+    channel.receive(U1, "/切换会话 sess-1"),
+    channel.receive(U1, "那个镜像后来构建成功了吗"),
+  ]);
+  const last = agent.calls.at(-1)!;
+  assert.equal(last.prompt, "那个镜像后来构建成功了吗", "指令本身不该混进给 LLM 的文本");
+  assert.equal(last.resume, "sess-1", "问题应落在切到的会话里");
+});
+
+test("聚合:切换失败时同批的问题不处理 —— 那些话是冲着目标会话说的", async () => {
+  const t = 1_000_000;
+  const { channel, agent } = build(() => t, { settings: { messageAggregationMs: AGG } });
+  await withTwoSessions(channel);
+  const before = agent.calls.length;
+
+  await Promise.all([
+    channel.receive(U1, "/切换会话 zzzz"),
+    channel.receive(U1, "那个镜像后来构建成功了吗"),
+  ]);
+  assert.equal(agent.calls.length, before, "落在错的会话里既答非所问又白花额度");
+  assert.ok(
+    channel.sent.some((m) => m.text.includes("先不处理")),
+    `要明说消息没被处理:${JSON.stringify(channel.sent.map((m) => m.text))}`,
+  );
+});
+
+test("/切换会话 目标记录已被清理:友好提示、剔除死条目、状态不动", async () => {
+  // 保留期清理与 dropSessionIds 是同步的,但清理周期之间(或记录被外部删除)
+  // history 仍可能挂着死引用 —— 切过去让 resume 炸出原始报错,不如提前给句人话。
+  const t = 1_000_000;
+  const { channel, agent, sessions } = build(() => t, {
+    sessionExists: (_userKey, sessionId) => sessionId !== "sess-1",
+  });
+  await withTwoSessions(channel);
+  const before = agent.calls.length;
+
+  await channel.receive(U1, "/切换会话 sess-1");
+  assert.equal(agent.calls.length, before, "不该起回合");
+  assert.equal(sessions.currentOf(U1)?.sessionId, "sess-2", "当前会话不动");
+  assert.deepEqual(sessions.historyOf(U1), [], "死条目应当场剔除,不再骗第二次");
+  const reply = channel.sent[0]!.text;
+  assert.ok(reply.includes("已被自动清理"), `要说清楚是被清理了而不是打错了:${reply}`);
+});
+
+test("单发 /切换会话:清单先出清已被清理的条目,不列切不过去的会话", async () => {
+  const t = 1_000_000;
+  const { channel, sessions } = build(() => t, {
+    sessionExists: (_userKey, sessionId) => sessionId !== "sess-1",
+  });
+  await withTwoSessions(channel);
+
+  await channel.receive(U1, "/切换会话");
+  const list = channel.sent[0]!.text;
+  assert.ok(!list.includes("sess-1"), `死条目不该出现在清单里:${list}`);
+  assert.ok(list.includes("sess-2"), list);
+  assert.deepEqual(sessions.historyOf(U1), [], "出清应落到状态里,不只是显示上藏起来");
+});
+
+test("/切换会话 走队列:排在在飞回合之后,切换结果不被回合写回覆盖", async () => {
+  const t = 1_000_000;
+  const { channel, agent, sessions } = build(() => t);
+  await channel.receive(U1, "聊聊 docker 镜像"); // sess-1
+  await channel.receive(U1, "/新会话");
+  let open!: () => void;
+  agent.gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const stuck = channel.receive(U1, "写个爬虫"); // sess-2,卡住
+  await new Promise((r) => setImmediate(r));
+
+  const sw = channel.receive(U1, "/切换会话 sess-1");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(sessions.currentOf(U1), undefined, "切换不该抢在在飞回合前面执行");
+
+  open();
+  await Promise.all([stuck, sw]);
+  assert.equal(sessions.currentOf(U1)?.sessionId, "sess-1", "切换应在 record() 之后生效");
+  assert.deepEqual(
+    sessions.historyOf(U1).map((h) => h.sessionId),
+    ["sess-2"],
+    "被切走的会话应归档,能再切回去",
   );
 });
 
@@ -842,7 +1009,11 @@ test("/api/me/session/reset 打的标记在回合结束时生效", async () => {
     return m;
   };
   await channel.receive(U1, "第二条");
-  assert.deepEqual(sessions.snapshot(), {}, "标记应当在回合的 finally 里生效");
+  assert.equal(sessions.currentOf(U1), undefined, "标记应当在回合的 finally 里生效");
+  assert.ok(
+    sessions.historyOf(U1).some((h) => h.sessionId === "sess-1"),
+    "被 reset 的会话应归档而不是消失",
+  );
 });
 
 // --- 图片附件透传 ---

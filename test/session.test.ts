@@ -1,6 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { SessionManager, InMemoryStore, type StateMap } from "../src/core/session.js";
+import {
+  SessionManager,
+  InMemoryStore,
+  HISTORY_LIMIT,
+  type StateMap,
+} from "../src/core/session.js";
 
 /**
  * decide() 收的是布尔标记而不是文本 —— 指令词汇只住在 commands.ts 里,
@@ -158,11 +163,150 @@ test("状态持久化并可从 store 恢复", () => {
   assert.equal(d.resumeSessionId, "sess-A");
 });
 
-test("forget 删除用户状态", () => {
+test("archiveCurrent:结束当前会话但不丢历史,下一条消息开新会话", () => {
   const { sm } = mgr();
   sm.record("stdin:local:u1", "sess-A");
-  sm.forget("stdin:local:u1");
+  const archived = sm.archiveCurrent("stdin:local:u1");
+  assert.equal(archived?.sessionId, "sess-A");
   assert.equal(sm.decide("stdin:local:u1", GO).isNew, true);
+  // 归档不等于删除:还能凭 id 切回去。
+  assert.deepEqual(
+    sm.historyOf("stdin:local:u1").map((h) => h.sessionId),
+    ["sess-A"],
+  );
+  // 没有进行中会话时 /继续 无从续起 —— 用户明确说过要新开。
+  assert.equal(sm.touch("stdin:local:u1"), false);
+});
+
+test("archiveCurrent:没有当前会话时返回 undefined,不动状态", () => {
+  const { sm } = mgr();
+  assert.equal(sm.archiveCurrent("stdin:local:u1"), undefined);
+  assert.deepEqual(sm.snapshot(), {});
+});
+
+test("record:换会话时旧会话自动归档,hint 记的是首条消息", () => {
+  const { sm } = mgr();
+  sm.record("stdin:local:u1", "sess-A", "聊聊 docker");
+  sm.record("stdin:local:u1", "sess-A", "第二轮的话不覆盖 hint");
+  sm.record("stdin:local:u1", "sess-B", "新话题");
+
+  assert.equal(sm.currentOf("stdin:local:u1")?.sessionId, "sess-B");
+  const history = sm.historyOf("stdin:local:u1");
+  assert.equal(history.length, 1);
+  assert.equal(history[0]!.sessionId, "sess-A");
+  assert.equal(history[0]!.hint, "聊聊 docker", "hint 应保留会话首条消息的样子");
+});
+
+test("switchTo:按前缀切回历史会话,原当前会话归档", () => {
+  const { sm, c } = mgr();
+  sm.record("stdin:local:u1", "aaaa1111", "话题甲");
+  sm.archiveCurrent("stdin:local:u1");
+  sm.record("stdin:local:u1", "bbbb2222", "话题乙");
+  c.advance(5_000);
+
+  const res = sm.switchTo("stdin:local:u1", "aaaa");
+  assert.equal(res.kind, "switched");
+  assert.equal(res.kind === "switched" && res.to.sessionId, "aaaa1111");
+  assert.equal(res.kind === "switched" && res.to.hint, "话题甲", "切回后主题提示还在");
+  assert.equal(res.kind === "switched" && res.from?.sessionId, "bbbb2222");
+
+  // 切回的会话即刻生效:普通消息直接 resume,不需要 /继续。
+  const d = sm.decide("stdin:local:u1", GO);
+  assert.equal(d.resumeSessionId, "aaaa1111");
+  // 原当前会话进了历史,还能再切回去。
+  assert.deepEqual(
+    sm.historyOf("stdin:local:u1").map((h) => h.sessionId),
+    ["bbbb2222"],
+  );
+});
+
+test("switchTo:超时已久的历史会话也能切回(这正是它存在的理由)", () => {
+  const { sm, c } = mgr();
+  sm.record("stdin:local:u1", "aaaa1111");
+  sm.archiveCurrent("stdin:local:u1");
+  c.advance(TIMEOUT * 24); // 远超超时窗口
+  assert.equal(sm.switchTo("stdin:local:u1", "aaaa").kind, "switched");
+  assert.equal(sm.decide("stdin:local:u1", GO).resumeSessionId, "aaaa1111");
+});
+
+test("switchTo:大小写不敏感;目标是当前会话时如实说明", () => {
+  const { sm } = mgr();
+  sm.record("stdin:local:u1", "AbCd1234");
+  const res = sm.switchTo("stdin:local:u1", "abcd");
+  assert.equal(res.kind, "already-current");
+});
+
+test("switchTo:找不到与有歧义分别报出,状态不动", () => {
+  const { sm } = mgr();
+  sm.record("stdin:local:u1", "aaaa1111");
+  sm.archiveCurrent("stdin:local:u1");
+  sm.record("stdin:local:u1", "aaab2222");
+  sm.archiveCurrent("stdin:local:u1");
+
+  assert.equal(sm.switchTo("stdin:local:u1", "zzzz").kind, "not-found");
+  assert.equal(sm.switchTo("stdin:local:u1", "").kind, "not-found");
+  const amb = sm.switchTo("stdin:local:u1", "aaa");
+  assert.equal(amb.kind, "ambiguous");
+  assert.equal(amb.kind === "ambiguous" && amb.matches.length, 2);
+  // 歧义/未找到都不该动当前会话。
+  assert.equal(sm.currentOf("stdin:local:u1"), undefined);
+});
+
+test("switchTo:isAlive 判死的目标报 gone 并当场剔除,不做切换", () => {
+  const { sm } = mgr();
+  sm.record("stdin:local:u1", "aaaa1111", "被清理的话题");
+  sm.archiveCurrent("stdin:local:u1");
+  sm.record("stdin:local:u1", "bbbb2222");
+
+  const res = sm.switchTo("stdin:local:u1", "aaaa", () => false);
+  assert.equal(res.kind, "gone");
+  assert.equal(res.kind === "gone" && res.refs[0]?.sessionId, "aaaa1111");
+  // 记录没了 resume 必然失败,留着条目只会把用户再骗一次。
+  assert.deepEqual(sm.historyOf("stdin:local:u1"), []);
+  assert.equal(sm.currentOf("stdin:local:u1")?.sessionId, "bbbb2222", "当前会话不动");
+});
+
+test("switchTo:同前缀下死条目让位,歧义只在活着的条目之间算", () => {
+  const { sm } = mgr();
+  for (const id of ["aaaa1111", "aaab2222", "aaac3333"]) {
+    sm.record("stdin:local:u1", id);
+    sm.archiveCurrent("stdin:local:u1");
+  }
+  // 三段都以 aaa 开头,其中两段已死:活着的那段直接胜出,不再报歧义。
+  const res = sm.switchTo("stdin:local:u1", "aaa", (ref) => ref.sessionId === "aaab2222");
+  assert.equal(res.kind, "switched");
+  assert.equal(res.kind === "switched" && res.to.sessionId, "aaab2222");
+  // 死条目在判定过程中已剔除。
+  assert.deepEqual(sm.historyOf("stdin:local:u1"), []);
+});
+
+test("history 有上限:最老的被挤掉,同一 id 不重复列", () => {
+  const { sm } = mgr();
+  for (let i = 0; i < HISTORY_LIMIT + 3; i += 1) {
+    sm.record("stdin:local:u1", `sess-${i}`);
+    sm.archiveCurrent("stdin:local:u1");
+  }
+  // 重复归档同一个 id 不产生新条目。
+  sm.record("stdin:local:u1", `sess-${HISTORY_LIMIT + 2}`);
+  sm.archiveCurrent("stdin:local:u1");
+
+  const ids = sm.historyOf("stdin:local:u1").map((h) => h.sessionId);
+  assert.equal(ids.length, HISTORY_LIMIT);
+  assert.equal(ids[0], `sess-${HISTORY_LIMIT + 2}`);
+  assert.equal(new Set(ids).size, ids.length, "不该有重复 id");
+});
+
+test("dropSessionIds:当前与历史里的死引用都剔除,空壳条目整个删掉", () => {
+  const { sm } = mgr();
+  sm.record("stdin:local:u1", "sess-A");
+  sm.archiveCurrent("stdin:local:u1");
+  sm.record("stdin:local:u1", "sess-B");
+  sm.record("stdin:local:u2", "sess-C");
+
+  sm.dropSessionIds(["sess-A", "sess-C"]);
+  assert.deepEqual(sm.historyOf("stdin:local:u1"), [], "历史里的死引用应剔除");
+  assert.equal(sm.currentOf("stdin:local:u1")?.sessionId, "sess-B");
+  assert.equal(sm.snapshot()["stdin:local:u2"], undefined, "清空的条目不该留空壳");
 });
 
 test("多用户互不干扰", () => {
@@ -206,20 +350,32 @@ test("snapshot 返回副本,不泄漏内部引用", () => {
   const { sm } = mgr();
   sm.record("stdin:local:u1", "sess-A");
   const snap: StateMap = sm.snapshot();
-  snap["stdin:local:u1"]!.sessionId = "tampered";
+  snap["stdin:local:u1"]!.current!.sessionId = "tampered";
   assert.equal(sm.decide("stdin:local:u1", GO).resumeSessionId, "sess-A");
 });
 
-test("加载时丢弃非 userKey 格式的状态(不认识历史格式,也不迁移)", () => {
-  // 旧版本按裸 userId 存状态。本程序不迁移它 —— 丢掉一段最多 1 小时的上下文,
-  // 换取代码里没有任何格式分支。
+test("加载时丢弃非 userKey 或旧格式的状态(不认识历史格式,也不迁移)", () => {
+  // 旧版本按裸 userId、或扁平的 {sessionId,...} 形态存状态。本程序不迁移它们 ——
+  // 丢掉一段最多 1 小时的上下文,换取代码里没有任何格式分支。
   const store = new InMemoryStore({
-    "o9cq80yCc7@im.wechat": { sessionId: "legacy", lastActive: 0, reminded: false },
-    "stdin:local:u1": { sessionId: "sess-A", lastActive: 0, reminded: false },
-  });
+    "o9cq80yCc7@im.wechat": {
+      current: { sessionId: "legacy", lastActive: 0 },
+      reminded: false,
+      history: [],
+    },
+    // 旧版扁平格式,挂在合法 userKey 下 —— 形态校验要能认出来并丢弃。
+    "stdin:local:old": { sessionId: "flat", lastActive: 0, reminded: false },
+    "stdin:local:u1": {
+      current: { sessionId: "sess-A", lastActive: 0 },
+      reminded: false,
+      history: [{ sessionId: "sess-old", lastActive: 0, hint: "旧话题" }],
+    },
+  } as unknown as StateMap);
   const sm = new SessionManager({ store, timeoutMs: TIMEOUT, now: () => 1 });
   const snap = sm.snapshot();
   assert.deepEqual(Object.keys(snap), ["stdin:local:u1"]);
+  assert.equal(sm.historyOf("stdin:local:u1")[0]?.sessionId, "sess-old");
   // 丢弃的用户下次发消息就是全新会话,不会误 resume 到别人的上下文。
   assert.equal(sm.decide("o9cq80yCc7@im.wechat", GO).isNew, true);
+  assert.equal(sm.decide("stdin:local:old", GO).isNew, true);
 });

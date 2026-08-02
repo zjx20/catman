@@ -55,6 +55,18 @@ function projectsRoot(configDir: string): string {
 }
 
 /**
+ * 某个会话的 JSONL 是否还在磁盘上。/切换会话 在切换前用它确认目标还活着 ——
+ * 记录已被清理的话,resume 必然失败,不如提前告诉用户并出清死引用。
+ */
+export function sessionFileExists(
+  configDir: string,
+  projectDir: string,
+  sessionId: string,
+): boolean {
+  return existsSync(join(projectsRoot(configDir), projectDir, `${sessionId}.jsonl`));
+}
+
+/**
  * 列出会话文件,按修改时间倒序。
  * 必须传 projectDir(catman 自己 workspace 的编码目录名),只扫描该子目录,
  * 从设计上杜绝误碰其它项目的会话。
@@ -138,7 +150,7 @@ export function search(
 
 /**
  * 清理本 workspace 下超过保留期(按文件 mtime)的会话。返回被删除的 sessionId 列表,
- * 供会话状态层同步 forget 死引用。
+ * 供会话状态层同步剔除死引用(dropSessionIds)。
  *
  * 只在 projectDir 指定的子目录内操作;同时删除同名的会话子目录(subagents 等),
  * 避免残留孤儿文件。绝不触碰其它 project 目录。

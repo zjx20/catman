@@ -19,7 +19,7 @@ export interface TurnContext {
   readonly userKey: string;
   /**
    * agent 调了 /api/me/session/reset,或用户发了 /新会话。
-   * 网关在回合的 finally 里据此 forget —— 不能在别处直接 forget,
+   * 网关在回合的 finally 里据此把当前会话归档进历史 —— 不能在别处直接归档,
    * 因为本回合结束时的 record() 会把它写回来。
    */
   resetSession: boolean;

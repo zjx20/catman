@@ -150,8 +150,8 @@ test("session/reset 只打标记,不当场清状态", () => {
   const r = call("POST", "/api/me/session/reset", turn.token, undefined, deps);
   assert.equal(r.status, 200);
   assert.equal(turn.ctx.resetSession, true);
-  // 当场 forget 会被本回合结束时的 record() 写回来,所以只能打标记。
-  assert.equal(sessions.snapshot()[A]?.sessionId, "sess-A");
+  // 当场归档会被本回合结束时的 record() 写回来,所以只能打标记。
+  assert.equal(sessions.currentOf(A)?.sessionId, "sess-A");
 });
 
 test("请求体不是对象时 400", () => {

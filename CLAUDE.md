@@ -38,6 +38,7 @@ Channel(收消息,产出 userKey + text + 可选图片附件) → Gateway.dispat
          → admission(userKey)      不过就地返回,不建目录/不写状态/不花额度
          → users.ensureWorkspace()  该用户的 cwd
          → 首次则推送使用指引(发送成功才标记)
+       → 批里带 /切换会话 → sessions.switchTo() 先消化;失败则整批不处理(见不变量)
        → 纯 /继续 → sessions.touch() 就地答复,不起回合、不进 LLM
        → prefs.effective()        本回合的模型/回执/进度/分段长度
        → sessions.decide()        是否 resume
@@ -45,15 +46,16 @@ Channel(收消息,产出 userKey + text + 可选图片附件) → Gateway.dispat
        → 并发信号量(跨用户上限,可运行时调整)
        → Agent.run(prompt, {cwd, resume, model, env, skills, abortController, attachments})
        → sessions.record() → Channel.send(按 maxReplyChars 分段)
-       finally: resetSession 则 forget → revoke → release
+       finally: resetSession 则 archiveCurrent → revoke → release
 
 Dashboard 与清理的扫描范围 = listWorkspaceDirs(/data/workspace) 算出的那组 projectDir
 ```
 
 硬指令(`/帮助` `/状态` `/新会话` `/取消`)在 `onMessage` 就地分流,**不进队列** ——
-见下面的不变量。`/继续` 是唯一走队列的指令,但**同样不进 LLM**:单独的 `/继续` 在
-handle 里由 `sessions.touch()` 后台消化(见上图 prelude 之后那步),只有与别的消息
-攒成一批时才作为 resume 标记随批进回合。
+见下面的不变量。走队列的指令只有 `/继续` 和 `/切换会话`,但**同样不进 LLM**:
+单独的 `/继续` 在 handle 里由 `sessions.touch()` 后台消化,`/切换会话` 由
+`sessions.switchTo()` 消化(见上图 prelude 之后那两步);与别的消息攒成一批时,
+前者作为 resume 标记随批进回合,后者先切换、剩下的内容落在切到的会话里。
 
 **身份**:`userKey = <channel>:<accountId>:<userId>`(`core/identity.ts`)。
 accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 from_user_id。
@@ -79,7 +81,7 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 | `src/core/turn-tokens.ts` | 回合级一次性令牌 + 在飞回合上下文(reset 标记 / abort) |
 | `src/core/skills.ts` | 启动时生成两个 SKILL.md(接口说明按需加载,不占系统提示词) |
 | `src/core/agent.ts` | Agent SDK 封装;**必须**带 claude_code preset 三件套(见下) |
-| `src/core/session.ts` | 会话状态机(纯函数 decide + 注入时钟/store/每用户超时) |
+| `src/core/session.ts` | 会话状态机(纯函数 decide + 注入时钟/store/每用户超时;current + history,/切换会话 靠它) |
 | `src/core/gateway.ts` | 串联各层;入口分流硬指令;每用户串行队列;并发信号量;greeting |
 | `src/channels/composite.ts` | 多渠道复合 + 复合准入,按 userKey 前缀路由 |
 | `src/channels/dashboard.ts` | 管理员聊天渠道(记录落盘 + SSE 订阅 + 回执撤回) |
@@ -123,8 +125,10 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
   否则 CLAUDE_CONFIG_DIR 指向共享 ~/.claude 时会误删无关的 Claude Code 历史(有专门单测守护;
   曾真实踩过)。那组 projectDir 必须由 `listWorkspaceDirs(workspaceDir)` 算出,
   **不要改成 readdir(projects/)**。
-- **清理的真相源是 workspace 目录,不是 users.json / state.json**:后两者会因 forget()/删账号
-  丢条目,而 JSONL 还在磁盘上,只按它们清理会造成永久堆积。
+- **清理的真相源是 workspace 目录,不是 users.json / state.json**:后两者会因 history
+  被挤出/删账号丢条目,而 JSONL 还在磁盘上,只按它们清理会造成永久堆积。
+  反过来,清理删掉 JSONL 后要 `sessions.dropSessionIds()` 出清死引用(`index.ts`),
+  否则 `/切换会话` 会把用户领到一段 resume 必然失败的会话上。
 - **`userDirName()` 必须保持单射**(可读前缀 + userKey 全文哈希后缀)。只用归一化后的可读部分
   会让 `x/y` 与 `x-y` 撞到同一个目录 —— 两个用户共用 cwd,隔离直接失效。有单测守护。
 - **工作目录全路径必须远短于 200 字符**:超过后 SDK 会改用「截断 + djb2 哈希」编码 project 目录,
@@ -156,12 +160,30 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
   单独的 `/继续` 走 `touch()`(刷新时钟,不起回合),之后的消息自然命中「未超时 → resume」;
   与别的消息同批时才作为 `continueRequested` 标记进 `decide()`。
   **指令词汇不住在这里** —— `decide()` 收布尔标记,`commands.ts` 才认识 `/继续` 长什么样。
+- **离开的会话归档进 history,不删除**(`session.ts`):每用户 `current + history`
+  (上限 `HISTORY_LIMIT`,同 id 去重),`/新会话` 与被切走都走 `archiveCurrent()`,
+  `/切换会话` 用 `switchTo()` 按 id 前缀切回并刷新时钟(之后的消息自然 resume,
+  不需要 `/继续` 标记)。SDK 的 resume 默认不 fork,**同一段对话的 id 稳定不变** ——
+  history 不会被同一段对话的多轮刷爆,这是整个设计成立的前提。
+  切回的入口教育有三处:超时提醒、`/新会话` 确认语、`/切换会话` 确认语,
+  都从 `canonicalOf("switchSession")` 取指令写法。
+- **`/切换会话` 失败时整批不处理**(`gateway.handleSwitch`):同批攒着的问题是冲着
+  目标会话说的,落在错的会话里既答非所问又白花额度 —— 宁可让用户确认 id 后重发,
+  但必须明说「这批消息先不处理」。切换成功时剩下的内容照常起回合,decide() 自然
+  resume 刚切到的会话。
+- **切换前用 `sessionExists` 确认目标记录还在**(`gateway` 注入,指向
+  `transcript.sessionFileExists`):保留期清理与 `dropSessionIds` 同步出清,但清理
+  周期之间、或 JSONL 被外部删除时,history 仍可能挂着死引用 —— 切过去让 resume
+  炸出原始报错,不如提前给句人话(`gone` 分支)并当场剔除条目;会话清单也先出清
+  再展示。歧义只在活着的条目之间算,死条目直接让位。
 - **immediate 硬指令绕过每用户串行队列**(`gateway.ts` 的 `dispatch`)。这是它们存在的**全部理由**:
   agent 卡死时队列里的消息永远轮不到,包括本该救命的那条。代价是它们与在飞回合并发,
   所以只能做**幂等的只读/打标记**操作。别把需要与回合互斥的事放进去。
-- **`/新会话` 必须同时置在飞回合的 `resetSession`**:只 `sessions.forget()` 的话,
-  那个回合在 finally 里的 `record()` 会把新 sessionId 写回来,等于没重置。同理,
-  `/api/me/session/reset` 也只打标记 —— **任何地方都不要对在飞回合直接 forget**。
+  `/切换会话` 因此走队列而不是 immediate:它改会话指针,必须排在在飞回合的
+  `record()` 之后,否则会被写回覆盖。
+- **`/新会话` 必须同时置在飞回合的 `resetSession`**:只 `sessions.archiveCurrent()` 的话,
+  那个回合在 finally 里的 `record()` 会把 sessionId 写回来,等于没重置。同理,
+  `/api/me/session/reset` 也只打标记 —— **任何地方都不要对在飞回合直接归档**。
 - **子进程 env 一律剔除 `CATMAN_ADMIN_TOKEN`,只有 admin 回合加回**(`gateway.childEnv`)。
   SDK 的 `Options.env` **整体替换**子进程环境(不是合并),必须展开 `process.env` ——
   而它带着管理员令牌。这是该令牌下放的唯一出口,有单测守护。
@@ -282,4 +304,4 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
   一律拒绝** —— 漏配应当表现为不工作,而不是没防护。
 - 加配置项:只改 `SETTING_SCHEMA`。校验、`/api/*` 的 schema 字段、两个 skill 的正文、
   帮助文案会自动跟上。加硬指令同理,只改 `COMMAND_TABLE`。
-- 改指令写法时记得 `REMINDER_TEXT` 之类的文案 —— 用 `canonicalOf()` 引用而不是手写字符串。
+- 改指令写法时记得 `reminderText` 之类的文案 —— 用 `canonicalOf()` 引用而不是手写字符串。

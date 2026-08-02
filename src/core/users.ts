@@ -196,7 +196,7 @@ function assertPathFitsSdkLimit(dir: string): void {
  * 扫描 workspaceRoot 下的一级子目录,返回各用户的目录名与对应的 project 目录名。
  *
  * **这是会话清理的真相源**,而不是 users.json 或 state.json:后两者会因为
- * forget()/删账号而失去条目,但 JSONL 还躺在磁盘上,只按它们清理会造成永久堆积。
+ * history 被挤出/删账号而失去条目,但 JSONL 还躺在磁盘上,只按它们清理会造成永久堆积。
  * workspace 目录是本程序自己创建的、与用户一一对应且完备的。
  *
  * 同样重要的是它**只读自己的 workspaceRoot,完全不去遍历 projects/ 树** ——

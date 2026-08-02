@@ -69,7 +69,7 @@ export function handleSelfApi(
     ctx.resetSession = true;
     return ok({
       ok: true,
-      // 现在就 forget 会被本回合结束时的 record() 写回来,所以只打标记。
+      // 现在就归档会被本回合结束时的 record() 写回来,所以只打标记。
       effective: "本回合结束后生效,下一条消息就是新对话",
     });
   }
@@ -99,10 +99,13 @@ function describeMe(userKey: string, deps: SelfApiDeps): unknown {
       lastSeenAt: rec?.lastSeenAt,
     },
     session: {
-      sessionId: state?.sessionId,
+      sessionId: state?.current?.sessionId,
       idleMs,
       // 空闲未超时就会接着聊;超时了要 /继续 才续,否则下一条开新对话。
       willResume: idleMs !== undefined && idleMs < effective.sessionTimeoutMs,
+      // 归档的旧会话(新→旧)。用户问"帮我切回之前那段"时,助手可凭这份
+      // 名单告诉他该发哪条 /切换会话 指令 —— 切换本身仍走硬指令,不开写接口。
+      history: state?.history ?? [],
     },
     prefs: { effective, overrides: deps.prefs.get(userKey) },
     schema: describeSettings(USER_SETTING_KEYS, { modelAllowlist: globals.modelAllowlist }),

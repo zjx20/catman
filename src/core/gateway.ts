@@ -1,6 +1,6 @@
 import type { Channel } from "../channels/types.js";
 import type { Agent, AgentProgressEvent } from "./agent.js";
-import type { SessionManager } from "./session.js";
+import type { SessionManager, SessionRef } from "./session.js";
 import type { UserRegistry } from "./users.js";
 import type { PrefsStore } from "./prefs.js";
 import type { GlobalSettings } from "./settings.js";
@@ -11,10 +11,23 @@ import { canonicalOf, commandHelpLines, parseCommand, type CommandDef } from "./
 import { SETTING_SCHEMA, USER_SETTING_KEYS } from "./settings.js";
 import { ADMIN_SKILLS, USER_SKILLS } from "./skills.js";
 
-/** 超时提醒文案。指令写法从 COMMAND_TABLE 取,免得改了指令这句话变成假话。 */
-export const REMINDER_TEXT =
-  "这次对话已经安静了一会儿。再发消息我会默认开一段新对话来处理;" +
-  `如果想接着刚才的话题聊,发 ${canonicalOf("continue")} 即可。`;
+/** 会话 id 的展示形式:开头 8 位足够在 HISTORY_LIMIT 条内无歧义,也好在手机上打。 */
+export function shortSessionId(sessionId: string): string {
+  return sessionId.slice(0, 8);
+}
+
+/**
+ * 超时提醒文案。指令写法从 COMMAND_TABLE 取,免得改了指令这句话变成假话。
+ * 带上会话 id 是刻意的:用户如果直接发新话题(最常见的走向),旧会话就此归档,
+ * 这条提醒是他知道"怎么切回去"的唯一机会。
+ */
+export function reminderText(sessionShortId: string): string {
+  return (
+    "这次对话已经安静了一会儿。再发消息我会默认开一段新对话来处理;" +
+    `如果想接着刚才的话题聊,发 ${canonicalOf("continue")} 即可。` +
+    `开了新对话之后,发「${canonicalOf("switchSession")} ${sessionShortId}」也能随时切回这段。`
+  );
+}
 
 /** 收到消息后的即时回执文案。回复发出后,支持撤回的渠道会撤回这条回执。 */
 export const ACK_TEXT = "收到,正在处理中…";
@@ -41,6 +54,13 @@ export interface GatewayOptions {
   /** 谁能使用本助手。默认全放行(仅适合 stdin 这类本地通道)。 */
   admission?: AdmissionPolicy;
   /**
+   * 某段会话的 JSONL 记录是否还在磁盘上(index.ts 注入,指向 transcript 层)。
+   * /切换会话 靠它在切换前确认目标活着:保留期清理与 dropSessionIds 同步出清,
+   * 但清理周期之间、或记录被外部删除时,history 仍可能挂着死引用 ——
+   * 切过去再让 resume 炸出一句原始报错,不如提前给句人话。不传则视为都活着。
+   */
+  sessionExists?: (userKey: string, sessionId: string) => boolean;
+  /**
    * 时钟。目前只喂给进度节流 —— 它是纯计算,可以用假时钟驱动。
    *
    * 聚合窗口**刻意不用**这个:它的时刻是拿来和真实 `setTimeout` 对账的
@@ -51,6 +71,15 @@ export interface GatewayOptions {
 
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max)}…`;
+}
+
+/**
+ * 从一批消息里取一小段开头文字,记进会话历史当"主题"——
+ * 会话列表里光有 id 认不出哪段是哪段,这一眼提示就是给人认的。
+ */
+function sessionHint(text: string, hasAttachments: boolean): string {
+  const firstLine = text.trim().split("\n", 1)[0] ?? "";
+  return truncate(firstLine, 24) || (hasAttachments ? "[图片]" : "");
 }
 
 /** 从工具入参里挑一个最能说明"在干什么"的字段做摘要。 */
@@ -213,7 +242,8 @@ export function helpText(modelAllowlist: string[]): string {
     settings,
     "",
     `想接着聊被超时中断的话题,发 ${canonicalOf("continue")};`,
-    `上下文太长把我卡住了,发 ${canonicalOf("newSession")} 重新开始。`,
+    `上下文太长把我卡住了,发 ${canonicalOf("newSession")} 重新开始;`,
+    `想切回之前的某段对话,发 ${canonicalOf("switchSession")} 加上会话 id(只发指令则列出最近的对话)。`,
   ].join("\n");
 }
 
@@ -297,6 +327,8 @@ interface PendingBatch {
   texts: string[];
   attachments: Attachment[];
   continueRequested: boolean;
+  /** 批里带着 /切换会话 时的目标 id 前缀;连发多条切换指令时后到的覆盖先到的。 */
+  switchTo?: string;
   /** debounce 计时器:每来一条消息就重置。 */
   timer: NodeJS.Timeout;
   /** 第一条消息的到达时刻,用于算硬上限。 */
@@ -328,6 +360,7 @@ export class Gateway {
   private readonly turns: TurnTokens;
   private readonly apiBase: string;
   private readonly admission: AdmissionPolicy;
+  private readonly sessionExists: ((userKey: string, sessionId: string) => boolean) | undefined;
   private readonly now: () => number;
   private readonly reminderIntervalMs: number;
   private readonly semaphore: Semaphore;
@@ -348,6 +381,7 @@ export class Gateway {
     this.turns = opts.turns;
     this.apiBase = opts.apiBase;
     this.admission = opts.admission ?? allowAll;
+    this.sessionExists = opts.sessionExists;
     this.now = opts.now ?? Date.now;
     this.reminderIntervalMs = opts.reminderIntervalMs;
     this.semaphore = new Semaphore(this.settings.effective().maxConcurrentTurns);
@@ -386,20 +420,21 @@ export class Gateway {
   ): Promise<void> {
     // 带图的消息不当硬指令解析:硬指令要求整条消息只有指令本身,而「/状态 + 一张图」
     // 显然不是那个意思。让它照常走 LLM,免得图片被指令分支静默吞掉。
-    const cmd = attachments.length ? undefined : parseCommand(text);
+    const parsed = attachments.length ? undefined : parseCommand(text);
     // immediate 硬指令不进聚合窗口 —— 它们存在的全部理由就是"立刻",
     // 让救命的 /取消 先等 1.5 秒等于取消了这个理由。
-    if (cmd?.immediate) return this.runCommand(userKey, cmd);
+    if (parsed?.cmd.immediate) return this.runCommand(userKey, parsed.cmd);
 
-    // 到这里 cmd 只可能是 /继续:它贡献的是「续上会话」这个标记,不是给 LLM 的文本。
-    // 单独的 /继续 由 handle 后台消化;与别的消息攒成一批时,标记随批生效。
-    const promptText = cmd ? "" : text;
-    const continueRequested = cmd?.name === "continue";
+    // 到这里只可能是 /继续 或 /切换会话:它们贡献的是标记,不是给 LLM 的文本。
+    // 单独发时由 handle 后台消化;与别的消息攒成一批时,标记随批生效。
+    const promptText = parsed ? "" : text;
+    const continueRequested = parsed?.cmd.name === "continue";
+    const switchTo = parsed?.cmd.name === "switchSession" ? parsed.arg : undefined;
     const windowMs = this.settings.effective().messageAggregationMs;
     if (windowMs <= 0) {
-      return this.enqueue(userKey, promptText, continueRequested, attachments);
+      return this.enqueue(userKey, promptText, continueRequested, attachments, switchTo);
     }
-    return this.collect(userKey, promptText, continueRequested, attachments, windowMs);
+    return this.collect(userKey, promptText, continueRequested, attachments, switchTo, windowMs);
   }
 
   /**
@@ -414,6 +449,7 @@ export class Gateway {
     text: string,
     continueRequested: boolean,
     attachments: readonly Attachment[],
+    switchTo: string | undefined,
     windowMs: number,
   ): Promise<void> {
     const now = Date.now();
@@ -437,6 +473,7 @@ export class Gateway {
     batch.attachments.push(...attachments);
     // 同批里只要有一条是 /继续,整批就按"接着上一段聊"处理。
     batch.continueRequested ||= continueRequested;
+    if (switchTo !== undefined) batch.switchTo = switchTo;
 
     clearTimeout(batch.timer);
     const deadline = batch.firstAt + windowMs * AGGREGATION_MAX_MULTIPLIER;
@@ -464,10 +501,13 @@ export class Gateway {
     }
 
     // handle 内部已把异常都收敛成给用户的回复,这里两路都只管兑现 promise。
-    this.enqueue(userKey, batch.texts.join("\n"), batch.continueRequested, attachments).then(
-      batch.settle,
-      batch.settle,
-    );
+    this.enqueue(
+      userKey,
+      batch.texts.join("\n"),
+      batch.continueRequested,
+      attachments,
+      batch.switchTo,
+    ).then(batch.settle, batch.settle);
   }
 
   /**
@@ -489,11 +529,12 @@ export class Gateway {
     text: string,
     continueRequested = false,
     attachments: readonly Attachment[] = [],
+    switchTo?: string,
   ): Promise<void> {
     const prev = this.queues.get(userKey) ?? Promise.resolve();
     const next = prev
       .catch(() => {}) // 前一条失败不阻塞后续
-      .then(() => this.handle(userKey, text, continueRequested, attachments));
+      .then(() => this.handle(userKey, text, continueRequested, attachments, switchTo));
     this.queues.set(userKey, next);
     return next;
   }
@@ -543,18 +584,27 @@ export class Gateway {
         return;
 
       case "newSession": {
-        this.sessions.forget(userKey);
-        // 在飞回合结束时会 record() 把新 sessionId 写回来,等于抵消了上面的 forget。
-        // 所以同时给它打标记,让它在自己的 finally 里再 forget 一次。
+        const prev = this.sessions.archiveCurrent(userKey);
+        // 在飞回合结束时会 record() 把 sessionId 写回来,等于抵消了上面的归档。
+        // 所以同时给它打标记,让它在自己的 finally 里再归档一次。
         const inFlight = this.turns.currentFor(userKey);
         if (inFlight) inFlight.resetSession = true;
-        await this.trySend(
-          userKey,
+        const lines = [
           inFlight
             ? "好,当前这一轮跑完就从新对话开始。"
             : "好,下次从新对话开始,之前的上下文不带了。",
-          "新会话确认",
-        );
+        ];
+        // 归档不等于删除 —— 教用户怎么切回来,这是他知道这件事的三个入口之一
+        // (另两个:超时提醒、/切换会话 的确认语)。
+        if (prev) {
+          lines.push(
+            `想回到刚才的对话,发「${canonicalOf("switchSession")} ${shortSessionId(prev.sessionId)}」。`,
+          );
+        } else if (inFlight) {
+          // 在飞回合还没 record 过(它就是第一轮),id 要等它跑完才有。
+          lines.push(`跑完的这段之后可以用 ${canonicalOf("switchSession")} 找回。`);
+        }
+        await this.trySend(userKey, lines.join("\n"), "新会话确认");
         return;
       }
 
@@ -585,17 +635,22 @@ export class Gateway {
   private statusText(userKey: string): string {
     const p = this.prefs.effective(userKey);
     const overrides = this.prefs.get(userKey);
+    const current = this.sessions.currentOf(userKey);
     const idle = this.sessions.idleMsOf(userKey);
+    const historyCount = this.sessions.historyOf(userKey).length;
     const own = (k: keyof typeof overrides) => (overrides[k] === undefined ? "" : "(你设的)");
 
     const lines = [
       "📋 当前状态",
       `模型:${p.model ?? "由 SDK 决定"}${own("model")}`,
-      idle === undefined
-        ? "会话:还没有记录,下一条消息开新对话"
-        : `会话:${humanDuration(idle)}前活动过,下一条消息${
+      current === undefined || idle === undefined
+        ? "会话:还没有进行中的对话,下一条消息开新的"
+        : `会话:${shortSessionId(current.sessionId)},${humanDuration(idle)}前活动过,下一条消息${
             idle < p.sessionTimeoutMs ? "接着聊" : `开新对话(想续上就发 ${canonicalOf("continue")})`
           }`,
+      ...(historyCount
+        ? [`旧对话:${historyCount} 段(发 ${canonicalOf("switchSession")} 可列出并切换)`]
+        : []),
       `回执:${p.ackEnabled ? "开" : "关"}${own("ackEnabled")}  ` +
         `进度:${p.progressEnabled ? "开" : "关"}${own("progressEnabled")}`,
       `分段:${p.maxReplyChars} 字${own("maxReplyChars")}  ` +
@@ -605,14 +660,122 @@ export class Gateway {
     return lines.join("\n");
   }
 
+  /**
+   * 消化这批消息里的 /切换会话。返回这批剩下的内容(若有)要不要继续起回合:
+   * 切换成功/目标就是当前会话 → 继续,decide() 自然 resume 切到的会话;
+   * 没找到/有歧义 → 不继续 —— 那些话是冲着目标会话说的,落在错的会话里
+   * 既答非所问又白花额度,宁可让用户确认 id 后重发。
+   */
+  private async handleSwitch(
+    userKey: string,
+    idPrefix: string,
+    hasPayload: boolean,
+  ): Promise<boolean> {
+    // 只发指令本身:列出最近的会话。这就是"会话 id 从哪里来"的兜底入口。
+    if (!idPrefix) {
+      await this.trySend(userKey, this.sessionListText(userKey), "会话列表");
+      return hasPayload;
+    }
+
+    const sw = canonicalOf("switchSession");
+    const res = this.sessions.switchTo(userKey, idPrefix, (ref) =>
+      this.sessionExists ? this.sessionExists(userKey, ref.sessionId) : true,
+    );
+    switch (res.kind) {
+      case "switched": {
+        const topic = res.to.hint ? `(${res.to.hint})` : "";
+        const lines = [`好,切到对话 ${shortSessionId(res.to.sessionId)}${topic},直接发消息就是接着它聊。`];
+        if (res.from) {
+          lines.push(`刚才的对话想切回来就发「${sw} ${shortSessionId(res.from.sessionId)}」。`);
+        }
+        await this.trySend(userKey, lines.join("\n"), "切换确认");
+        return true;
+      }
+      case "already-current":
+        await this.trySend(
+          userKey,
+          `现在就在对话 ${shortSessionId(res.current.sessionId)} 里,直接发消息即可。`,
+          "切换确认",
+        );
+        return true;
+      case "ambiguous": {
+        const lines = [
+          `id 以「${idPrefix}」开头的对话有 ${res.matches.length} 段,再多给几位:`,
+          ...res.matches.map((m) => this.describeRef(m)),
+        ];
+        if (hasPayload) lines.push("这批消息先不处理,切换成功后再发一次。");
+        await this.trySend(userKey, lines.join("\n"), "切换歧义说明");
+        return false;
+      }
+      case "not-found": {
+        const lines = [
+          `没找到 id 以「${idPrefix}」开头的对话(可能已过保留期被清理)。`,
+          this.sessionListText(userKey),
+        ];
+        if (hasPayload) lines.push("这批消息先不处理,切换成功后再发一次。");
+        await this.trySend(userKey, lines.join("\n"), "切换失败说明");
+        return false;
+      }
+      case "gone": {
+        const ids = res.refs.map((r) => shortSessionId(r.sessionId)).join("、");
+        const lines = [
+          `对话 ${ids} 的记录已被自动清理(超过保留期),切不回去了,清单里也不再列它。`,
+          this.sessionListText(userKey),
+        ];
+        if (hasPayload) lines.push("这批消息先不处理,换个目标后再发一次。");
+        await this.trySend(userKey, lines.join("\n"), "切换失败说明");
+        return false;
+      }
+    }
+  }
+
+  /** 最近会话清单。当前在最上面,之后按离开时间新→旧。 */
+  private sessionListText(userKey: string): string {
+    // 先把记录已不在磁盘上的条目出清 —— 列出一段切不过去的会话,等于把用户
+    // 引向一次必然失败的切换。保留期清理会同步 dropSessionIds,这里兜的是
+    // 清理周期之间、以及记录被外部删除的空档。
+    if (this.sessionExists) {
+      const dead = this.sessions
+        .historyOf(userKey)
+        .filter((h) => !this.sessionExists!(userKey, h.sessionId))
+        .map((h) => h.sessionId);
+      if (dead.length) this.sessions.dropSessionIds(dead);
+    }
+    const current = this.sessions.currentOf(userKey);
+    const history = this.sessions.historyOf(userKey);
+    if (!current && !history.length) {
+      return "还没有任何对话记录,直接发消息就会开始新的一段。";
+    }
+    return [
+      "🗂 最近的对话:",
+      ...(current ? [`${this.describeRef(current)}(当前)`] : []),
+      ...history.map((h) => this.describeRef(h)),
+      `发「${canonicalOf("switchSession")} <会话id>」切换,id 给开头几位就行。`,
+    ].join("\n");
+  }
+
+  /** 列表里的一行:短 id + 最近活动 + 主题提示。 */
+  private describeRef(ref: SessionRef): string {
+    const topic = ref.hint ? ` · ${ref.hint}` : "";
+    return `${shortSessionId(ref.sessionId)} — ${humanDuration(this.now() - ref.lastActive)}前${topic}`;
+  }
+
   private async handle(
     userKey: string,
     text: string,
     continueRequested: boolean,
     attachments: readonly Attachment[] = [],
+    switchTo?: string,
   ): Promise<void> {
     const pre = await this.prelude(userKey);
     if (!pre) return;
+
+    // /切换会话:先把切换消化掉,再决定这批剩下的内容要不要起回合。
+    // 排在队列尾天然保证切换发生在在飞回合 record() 之后,不会被写回覆盖。
+    if (switchTo !== undefined) {
+      const proceed = await this.handleSwitch(userKey, switchTo, Boolean(text) || attachments.length > 0);
+      if (!proceed) return;
+    }
 
     // 纯 /继续(这批里没攒进任何要处理的内容):后台直接消化,不进 LLM。
     // 它的全部使命是刷新会话时钟 —— 之后的消息在 decide() 里自然命中
@@ -651,6 +814,7 @@ export class Gateway {
       : undefined;
 
     const isAdmin = this.settings.isAdmin(userKey);
+    const hint = sessionHint(text, attachments.length > 0);
     const turn = this.turns.mint(userKey);
     const release = await this.semaphore.acquire();
     try {
@@ -664,7 +828,7 @@ export class Gateway {
         ...(onProgress ? { onProgress } : {}),
         ...(attachments.length ? { attachments } : {}),
       });
-      this.sessions.record(userKey, reply.sessionId);
+      this.sessions.record(userKey, reply.sessionId, hint);
       await progress;
       await this.sendChunked(userKey, reply.text, prefs.maxReplyChars);
     } catch (err) {
@@ -680,8 +844,8 @@ export class Gateway {
     } finally {
       // reset 一律在这里做:try 里无条件 record(),finally 必在其后执行,
       // 所以成功、抛错、被 /取消 三条路径的净效果都对,顺序也一目了然。
-      // 反过来在别处直接 forget() 会被随后的 record() 写回来。
-      if (turn.ctx.resetSession) this.sessions.forget(userKey);
+      // 反过来在别处直接归档会被随后的 record() 写回来。
+      if (turn.ctx.resetSession) this.sessions.archiveCurrent(userKey);
       turn.revoke();
       release();
       if (ackId !== undefined && this.channel.recall) {
@@ -728,7 +892,14 @@ export class Gateway {
   /** 到点提醒:尝试主动推送;推送失败(如渠道不支持)则静默降级。 */
   private async flushReminders(): Promise<void> {
     for (const userKey of this.sessions.dueReminders()) {
-      const ok = await this.trySend(userKey, REMINDER_TEXT, "超时提醒");
+      // dueReminders 只返回有当前会话的用户;这里再判一次纯属防御。
+      const current = this.sessions.currentOf(userKey);
+      if (!current) continue;
+      const ok = await this.trySend(
+        userKey,
+        reminderText(shortSessionId(current.sessionId)),
+        "超时提醒",
+      );
       if (!ok) {
         // 渠道无法主动推送:降级为下次用户发消息时由会话规则处理,无需额外动作。
         console.info(`[gateway] 用户 ${userKey} 超时提醒推送失败,降级为下次消息提示`);
