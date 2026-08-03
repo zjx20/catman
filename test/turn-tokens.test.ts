@@ -49,18 +49,18 @@ test("令牌足够长且每次不同", () => {
   assert.equal(tokens.size, 50);
 });
 
-test("currentFor 找到在飞回合,供硬指令打标记/中断", () => {
+test("foregroundFor 找到前台回合,供硬指令打标记/中断", () => {
   const t = new TurnTokens();
-  assert.equal(t.currentFor(A), undefined);
+  assert.equal(t.foregroundFor(A), undefined);
   const turn = t.mint(A);
-  const ctx = t.currentFor(A);
+  const ctx = t.foregroundFor(A);
   assert.equal(ctx, turn.ctx);
 
-  ctx!.resetSession = true;
-  assert.equal(turn.ctx.resetSession, true, "拿到的是同一个对象,标记能传回回合");
+  ctx!.detached = true;
+  assert.equal(turn.ctx.detached, true, "拿到的是同一个对象,标记能传回回合");
 
   turn.revoke();
-  assert.equal(t.currentFor(A), undefined);
+  assert.equal(t.foregroundFor(A), undefined);
 });
 
 test("progress 快照:初始为零,时钟可注入", () => {
@@ -68,35 +68,55 @@ test("progress 快照:初始为零,时钟可注入", () => {
   let now = 5_000;
   const t = new TurnTokens(() => now);
   const turn = t.mint(A);
-  assert.deepEqual(turn.ctx.progress, { startedAt: 5000, steps: 0, lastAt: 5000 });
+  assert.deepEqual(turn.ctx.progress, { startedAt: 5000, steps: 0, lastAt: 5000, fed: 0 });
   assert.equal(turn.ctx.progress.running, undefined, "刚铸出来还没拿到并发名额");
+  assert.equal(turn.ctx.feed, undefined, "agent 还没跑起来,追加输入无处可折");
 
   now = 9_000;
   turn.ctx.progress.running = now;
   turn.ctx.progress.steps = 1;
   turn.ctx.progress.lastAt = now;
   turn.ctx.progress.last = "🔧 Bash: npm test";
-  // currentFor 拿到的是同一个对象,硬指令才看得见在飞回合的最新进展。
-  assert.equal(t.currentFor(A)?.progress.last, "🔧 Bash: npm test");
+  // foregroundFor 拿到的是同一个对象,硬指令才看得见在飞回合的最新进展。
+  assert.equal(t.foregroundFor(A)?.progress.last, "🔧 Bash: npm test");
 });
 
-test("resetSession 与 abort 初始都是干净的", () => {
+test("detached 与 abort 初始都是干净的", () => {
   const t = new TurnTokens();
   const turn = t.mint(A);
-  assert.equal(turn.ctx.resetSession, false);
+  assert.equal(turn.ctx.detached, false);
   assert.equal(turn.ctx.abort.signal.aborted, false);
   turn.ctx.abort.abort();
-  assert.equal(t.currentFor(A)?.abort.signal.aborted, true);
+  assert.equal(t.foregroundFor(A)?.abort.signal.aborted, true);
 });
 
-test("同一用户的新回合覆盖 currentFor;旧回合 revoke 不误删新的", () => {
-  // 同一用户串行,理论上不会重叠;但退化时也不能让旧回合把新回合的记录抹掉。
+test("一个用户可以有多个在飞回合;detached 的不再是前台", () => {
+  // 切走会话不等于停掉它的回合,所以同一用户会同时有 1 个前台 + 若干后台。
   const t = new TurnTokens();
-  const first = t.mint(A);
-  const second = t.mint(A);
-  assert.equal(t.currentFor(A), second.ctx);
-  first.revoke();
-  assert.equal(t.currentFor(A), second.ctx, "旧回合的 revoke 不该动新回合");
-  assert.equal(t.resolve(first.token), undefined);
-  assert.equal(t.resolve(second.token)?.userKey, A);
+  const bg = t.mint(A);
+  bg.ctx.detached = true; // 被 /切换会话 切走,转后台继续跑
+  const fg = t.mint(A);
+
+  assert.equal(t.foregroundFor(A), fg.ctx, "前台是那个没被切走的");
+  assert.equal(t.allFor(A).length, 2, "后台那个仍然在飞");
+
+  fg.revoke();
+  assert.equal(t.foregroundFor(A), undefined, "前台走了就没有前台了");
+  assert.equal(t.allFor(A).length, 1, "但后台还在跑");
+  assert.equal(t.resolve(fg.token), undefined);
+  assert.equal(t.resolve(bg.token)?.userKey, A);
+});
+
+test("done 在 revoke 时兑现 —— 同一会话的下一段输入靠它排队", () => {
+  const t = new TurnTokens();
+  const turn = t.mint(A);
+  let settled = false;
+  void turn.ctx.done.then(() => (settled = true));
+  return Promise.resolve()
+    .then(() => assert.equal(settled, false, "回合还在跑时不该兑现"))
+    .then(() => {
+      turn.revoke();
+      return turn.ctx.done;
+    })
+    .then(() => assert.equal(settled, true));
 });

@@ -32,30 +32,34 @@ docker compose up -d --build
 
 ```
 Channel(收消息,产出 userKey + text + 可选图片附件) → Gateway.dispatch
-  ├─ immediate 硬指令 → runCommand   **绕过聚合与队列**,与在飞回合并发(带图时不走这条)
-  └─ 其余 → collect(聚合窗口,debounce) → enqueue(每用户串行) → handle
-       prelude:
-         → admission(userKey)      不过就地返回,不建目录/不写状态/不花额度
-         → users.ensureWorkspace()  该用户的 cwd
-         → 首次则推送使用指引(发送成功才标记)
-       → 批里带 /切换会话 → sessions.switchTo() 先消化;失败则整批不处理(见不变量)
-       → 纯 /继续 → sessions.touch() 就地答复,不起回合、不进 LLM
-       → prefs.effective()        本回合的模型/回执/进度/分段长度
-       → sessions.decide()        是否 resume
-       → turns.mint()             回合令牌 + abort/reset 上下文
-       → 并发信号量(跨用户上限,可运行时调整)
-       → Agent.run(prompt, {cwd, resume, model, env, skills, abortController, attachments})
-       → sessions.record() → Channel.send(按 maxReplyChars 分段)
-       finally: resetSession 则 archiveCurrent → revoke → release
+  ├─ immediate 硬指令(/帮助 /状态 /取消) → runCommand  **绕过聚合与队列**(带图时不走这条)
+  └─ 其余 → collect(聚合窗口,debounce,切成有序的 Segment[])
+        → enqueue(每用户串行) → handleBatch = **分拣节点**
+            prelude: admission → ensureWorkspace → 首次推送使用指引
+            按到达顺序线性走每一段,**不等回合**:
+              ├─ command 段 → runQueuedCommand 原地消化(不进 LLM)
+              │     /新会话     detach 前台回合 + archiveCurrent
+              │     /继续       sessions.touch()
+              │     /切换会话   switchTo() 成功则 detach 前台回合;失败则中止剩下的段
+              └─ input 段  → deliverInput
+                    ├─ 前台回合接得住 → turn.feed()   折进正在跑的那一轮
+                    ├─ 追不进去但它还在 → 等 turn.done 再来一次(同一会话绝不并发)
+                    └─ 没有前台回合   → startTurn(mint 同步完成)→ runTurn 后台跑
+
+runTurn: prefs.effective() → sessions.decide() → 并发信号量 → Agent.run(…, onFeedReady)
+       → detached ? sessions.archiveTurn() : sessions.record()
+       → Channel.send(后台回合的正文带【后台对话 xxx 的结果】前缀,按 maxReplyChars 分段)
+       finally: 摘 feed → revoke(兑现 turn.done) → release → 撤回执
 
 Dashboard 与清理的扫描范围 = listWorkspaceDirs(/data/workspace) 算出的那组 projectDir
 ```
 
-硬指令(`/帮助` `/状态` `/新会话` `/取消`)在 `onMessage` 就地分流,**不进队列** ——
-见下面的不变量。走队列的指令只有 `/继续` 和 `/切换会话`,但**同样不进 LLM**:
-单独的 `/继续` 在 handle 里由 `sessions.touch()` 后台消化,`/切换会话` 由
-`sessions.switchTo()` 消化(见上图 prelude 之后那两步);与别的消息攒成一批时,
-前者作为 resume 标记随批进回合,后者先切换、剩下的内容落在切到的会话里。
+硬指令分两类,分界线是**会不会改会话状态**。只读/中断的(`/帮助` `/状态` `/取消`)
+是 immediate,在 `onMessage` 就地分流、绕过聚合与队列;改状态的(`/新会话` `/继续`
+`/切换会话`)走队列,在分拣节点里与消息投递保持先后。**两类都不进 LLM。**
+
+走队列不再意味着"排在回合后面":分拣节点投递完就返回、**不等回合跑完**,
+所以卡死的 agent 堵不住它 —— 这是 `/新会话` 从 immediate 改回队列的前提。
 
 **身份**:`userKey = <channel>:<accountId>:<userId>`(`core/identity.ts`)。
 accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 from_user_id。
@@ -77,13 +81,13 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 | `src/config.ts` | env 基线(**只是三层配置的最内层**);时间量用 ms 便于测试 |
 | `src/core/settings.ts` | `SETTING_SCHEMA`(全部配置项的单一真相源)+ 全局运行时层 |
 | `src/core/prefs.ts` | 每用户配置层,叠在全局默认之上 |
-| `src/core/commands.ts` | `COMMAND_TABLE`:硬指令的单一真相源 |
-| `src/core/turn-tokens.ts` | 回合级一次性令牌 + 在飞回合上下文(reset 标记 / abort) |
+| `src/core/commands.ts` | `COMMAND_TABLE`:硬指令的单一真相源(immediate = 只读/中断,其余进分拣队列) |
+| `src/core/turn-tokens.ts` | 回合级一次性令牌 + 在飞回合上下文(detached / abort / feed / done);每用户可有多个回合 |
 | `src/core/skills.ts` | 启动时生成两个 SKILL.md(接口说明按需加载,不占系统提示词) |
-| `src/core/agent.ts` | Agent SDK 封装;**必须**带 claude_code preset 三件套(见下) |
+| `src/core/agent.ts` | Agent SDK 封装;**必须**带 claude_code preset 三件套(见下);常开输入通道支持回合中途追加 |
 | `src/core/agent-trace.ts` | LLM 侧可观测性:SDK 消息 → 一行日志(纯函数,分 always/trace 两级)+ 心跳文案 |
-| `src/core/session.ts` | 会话状态机(纯函数 decide + 注入时钟/store/每用户超时;current + history,/切换会话 靠它) |
-| `src/core/gateway.ts` | 串联各层;入口分流硬指令;每用户串行队列;并发信号量;greeting |
+| `src/core/session.ts` | 会话状态机(纯函数 decide + 注入时钟/store/每用户超时;current + history;后台回合走 archiveTurn) |
+| `src/core/gateway.ts` | 串联各层;**分拣节点**(线性处理一批、不等回合);追加输入;每会话串行;并发信号量;greeting |
 | `src/channels/composite.ts` | 多渠道复合 + 复合准入,按 userKey 前缀路由 |
 | `src/channels/dashboard.ts` | 管理员聊天渠道(记录落盘 + SSE 订阅 + 回执撤回) |
 | `src/dashboard/api-self.ts` | `/api/me`:回合令牌鉴权,agent 管自己的配置 |
@@ -173,35 +177,77 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
   改白名单时**不要**去检查有没有人在用某个模型,那正是这条原则要消灭的东西。
 - **回落但不改盘**(`prefs.ts`):失效的用户覆盖只在读取时回退,不重写 `prefs.json` ——
   白名单加回来时用户当初的选择要能自动恢复。静默改盘会把意图永久抹掉。
-- **会话规则**(`session.ts`):距上次 <1h(可每用户覆盖)→ resume;超时后只有 `/继续` 才续上,
-  否则开新会话;`reminded` 标记防重复提醒,`record()` 与 `touch()` 都重置它。
-  单独的 `/继续` 走 `touch()`(刷新时钟,不起回合),之后的消息自然命中「未超时 → resume」;
-  与别的消息同批时才作为 `continueRequested` 标记进 `decide()`。
-  **指令词汇不住在这里** —— `decide()` 收布尔标记,`commands.ts` 才认识 `/继续` 长什么样。
+- **会话规则**(`session.ts`):距上次 <1h(可每用户覆盖)→ resume,否则开新会话;
+  `reminded` 标记防重复提醒,`record()` 与 `touch()` 都重置它。
+  `/继续` 一律走 `touch()`(刷新时钟,不起回合),之后的消息自然命中「未超时 → resume」——
+  同批还是单发都一样,分拣节点的线性顺序保证了"先续上、后说话"。
+  **指令词汇不住在这里**,`decide()` 连布尔标记都不收 —— `commands.ts` 才认识 `/继续`。
 - **离开的会话归档进 history,不删除**(`session.ts`):每用户 `current + history`
-  (上限 `HISTORY_LIMIT`,同 id 去重),`/新会话` 与被切走都走 `archiveCurrent()`,
+  (上限 `HISTORY_LIMIT`,同 id 去重),`/新会话` 与被切走都走 `archiveCurrent()`
+  (在飞回合同时转后台,见上面 detached 那条),
   `/切换会话` 用 `switchTo()` 按 id 前缀切回并刷新时钟(之后的消息自然 resume,
   不需要 `/继续` 标记)。SDK 的 resume 默认不 fork,**同一段对话的 id 稳定不变** ——
   history 不会被同一段对话的多轮刷爆,这是整个设计成立的前提。
   切回的入口教育有三处:超时提醒、`/新会话` 确认语、`/切换会话` 确认语,
   都从 `canonicalOf("switchSession")` 取指令写法。
-- **`/切换会话` 失败时整批不处理**(`gateway.handleSwitch`):同批攒着的问题是冲着
-  目标会话说的,落在错的会话里既答非所问又白花额度 —— 宁可让用户确认 id 后重发,
-  但必须明说「这批消息先不处理」。切换成功时剩下的内容照常起回合,decide() 自然
-  resume 刚切到的会话。
+- **`/切换会话` 失败时只中止这批**剩下的**段**(`gateway.handleBatch`):那些话是冲着
+  它本该切到的会话说的,落在当前会话里既答非所问又白花额度 —— 宁可让用户确认 id 后重发,
+  但必须明说「这批消息先不处理」。指令**之前**已投递的段不受影响,它们本就属于前一个会话。
 - **切换前用 `sessionExists` 确认目标记录还在**(`gateway` 注入,指向
   `transcript.sessionFileExists`):保留期清理与 `dropSessionIds` 同步出清,但清理
   周期之间、或 JSONL 被外部删除时,history 仍可能挂着死引用 —— 切过去让 resume
   炸出原始报错,不如提前给句人话(`gone` 分支)并当场剔除条目;会话清单也先出清
   再展示。歧义只在活着的条目之间算,死条目直接让位。
-- **immediate 硬指令绕过每用户串行队列**(`gateway.ts` 的 `dispatch`)。这是它们存在的**全部理由**:
-  agent 卡死时队列里的消息永远轮不到,包括本该救命的那条。代价是它们与在飞回合并发,
-  所以只能做**幂等的只读/打标记**操作。别把需要与回合互斥的事放进去。
-  `/切换会话` 因此走队列而不是 immediate:它改会话指针,必须排在在飞回合的
-  `record()` 之后,否则会被写回覆盖。
-- **`/新会话` 必须同时置在飞回合的 `resetSession`**:只 `sessions.archiveCurrent()` 的话,
-  那个回合在 finally 里的 `record()` 会把 sessionId 写回来,等于没重置。同理,
-  `/api/me/session/reset` 也只打标记 —— **任何地方都不要对在飞回合直接归档**。
+- **分拣节点是串行的,但它不等回合**(`gateway.handleBatch`)。整条流水线的立足点:
+  一批消息按**到达顺序**线性处理,起了回合就往下走。由此得到三件事 ——
+  ① 卡死的 agent 堵不住分拣,所以改会话状态的指令可以安全地在这里线性执行,
+  不必绕队列、也不必给在飞回合打标记等它自己收尾;
+  ② 指令**之前**的话投递给切换前的会话、**之后**的话投递给切换后的会话,顺序天然正确,
+  不需要"整批不处理"这类粗糙语义(那是压平成「一段文本 + 几个标记」之后才被迫用的);
+  ③ 指令失败时只中止**剩下的**段 —— 那些话是冲着它本该切到的会话说的,
+  已投递的不受影响,它们本就属于前一个会话。
+  **分拣链与"这批处理完了"是两条 promise**(`enqueue`):链上只等分拣本身,
+  返回给渠道的那条额外等这批起的回合 —— stdin 靠它决定何时打提示符,
+  iLink 靠它顺序处理带图的消息。两者混成一条,回合就又把队列堵上了。
+- **immediate 硬指令绕过聚合与队列**(`gateway.dispatch`):`/取消` 这种救命的等不了
+  聚合窗口那 1.5 秒,也不该排在前一批的处理(含发 greeting 那样的网络 IO)后面。
+  代价是与分拣节点、与在飞回合都并发,所以**只做幂等的只读/中断**操作。
+  改会话状态的一律走队列 —— 就地执行会与投递并发,那句话就落到谁也说不清的会话里。
+- **切走会话 ≠ 停掉它的回合**(`TurnContext.detached`):`/新会话` `/切换会话`
+  `/api/me/session/reset` 都只是把当前回合标成 detached,它继续跑完。三处行为随之改变:
+  中途进度不再推(用户已经在跟别的会话说话了)、正文带【后台对话 xxx 的结果】前缀发出
+  (否则会被当成当前对话的答复)、产出走 `sessions.archiveTurn()` 只更新 history。
+  **后台回合绝不能 `record()`** —— 那会把用户刚切过去的会话顶掉,而他正在跟它说话。
+  `archiveTurn` 必须能"插入"而不只是"更新":新会话的第一轮被切走时,sessionId 要等
+  回合跑完才存在,那时它还没进过任何名单。
+  代价说清楚:**前台与后台回合共享同一个 cwd**(每用户一个),同时改同一个文件会互相踩 ——
+  等于用户自己开了两个终端。每会话一个 cwd 更糟(切换会话就换了目录,文件不通)。
+  `/取消` 只中断前台:后台那些是用户主动切走、说了"你接着跑"的,顺手灭掉是误伤。
+- **同一会话绝不并发 resume**(`gateway.deliverInput`)。串行的粒度是**每会话**,不是每用户 ——
+  后者只是当年用不着更细。保证它的是两条:分拣节点串行且是唯一起回合的地方;
+  前台回合还在时,新输入要么追加进去,要么**等 `turn.done` 再来一次**。
+  追加失败(额度用尽/图被挤光/正在收摊)就地另起一轮是错的,两个回合 resume 同一个
+  sessionId 会把上下文撕坏 —— 有单测盯着 `peakInFlight`。
+- **回合跑到一半进来的消息优先「追加」,不必等这一轮跑完**(`gateway.deliverInput` +
+  `agent.ts` 的 `InputChannel`):它会被折进**正在跑的那个 turn**,模型下一次请求就看到。
+  排队等这一轮结束在用户那边就是「发了没反应」——纠正类的消息尤其吃亏:
+  跑错方向的那一轮还得跑到底,额度照花。三条**实测**结论撑着这个设计(SDK 0.3.220):
+  ① 中途 push 的消息折进当前 turn,全程只出**一个** `result`;
+  ② `result` 已出、输入流还开着时 push 则另起一个 turn,**session_id 不变**,再出一个 `result`;
+  ③ push 之后**立刻** `close()`,那条消息照样跑 —— close 只表示"不会再有输入",
+  不丢已 push 的。所以**不存在丢消息的竞态**:`run()` 收到 result 就关追加窗口 + close 流,
+  然后**继续消费**剩余 result 把正文按序接起来。收到第一个 result 就 break 会把挤在
+  边缘那条静默吞掉,那是最糟的失败模式。
+  `MAX_FEEDS_PER_TURN` = 100 是**兜底不是配额** —— 理由与 `AGGREGATION_MAX_MULTIPLIER`
+  一字不差:用户还在补话说明他还没说完,拒绝追加等于在他说话中间切断他,
+  而拖长的只是他自己这一轮,碍不着别人。
+  配套三条:图片上限**跨追加累计**(闸门管的是整个回合的内存峰值,不是每条消息);
+  进度节流每次追加后**重置**(追加带来新的 `context_token`,发送预算跟着回来了);
+  被折进 turn 的消息**不在 SDK 消息流里露面**,所以 `progress.fed` 只能网关自己记账 ——
+  `/状态` 那句「期间补充 N 条」是用户确认"我刚补的赶上了没"的唯一出口。
+- **`decide()` 不认识 `/继续`**(`session.ts`):规则只有一条「未超时就续上」。
+  `/继续` 由分拣节点用 `touch()` 消化 —— 把时钟拨到现在,同一批里后面的话自然命中。
+  线性处理让"先续上、后说话"的先后天然成立,不必把这件事一路传进状态机。
 - **子进程 env 一律剔除 `CATMAN_ADMIN_TOKEN`,只有 admin 回合加回**(`gateway.childEnv`)。
   SDK 的 `Options.env` **整体替换**子进程环境(不是合并),必须展开 `process.env` ——
   而它带着管理员令牌。这是该令牌下放的唯一出口,有单测守护。
@@ -243,7 +289,8 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
   除 string 外还收 `AsyncIterable<SDKUserMessage>`,其 `message` 就是 Anthropic 的 `MessageParam`,
   可以直接放 image content block(已实测:SDK 原样序列化成一行 stream-json 交给 CLI,3MB base64
   单行完整通过)。给路径让模型自己 Read 要多一次工具往返,而且**模型可能压根不去读** ——
-  用户贴图就是要它现在看。**无附件时仍旧传 string**,保持老路径的行为完全不变。
+  用户贴图就是要它现在看。**所有回合(含纯文本)一律走流式输入**,不再传 string ——
+  理由见上面「回合跑到一半进来的消息优先『追加』」那条:追加只有流式输入下才收得进。
 - **附件的格式靠嗅探 magic number,不信渠道给的 MIME**(`attachments.ts`):iLink 的图片是从 CDN
   解密出来的裸字节,协议里没有可靠的格式声明;而 `media_type` 与实际内容不符时模型侧会直接报错。
   能接的四种(jpeg/png/gif/webp)取自 `@anthropic-ai/sdk` 的 `Base64ImageSource.media_type`,

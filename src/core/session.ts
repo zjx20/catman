@@ -1,8 +1,8 @@
 /**
  * 会话状态机 —— 核心规则:
  *  - 距上次活动 < 超时(默认 1h)→ 继续当前会话
- *  - 超时后:调用方标记了 continueRequested → 恢复旧会话;否则开新会话
- *  - touch() 把会话当作刚刚活动过 —— 供「纯 /继续」保活,不必起任何回合
+ *  - 超时后开新会话;想续上就先 touch()
+ *  - touch() 把会话当作刚刚活动过 —— `/继续` 就是这么消化的,不必起任何回合
  *  - 超时到点推送一次提醒(reminded 标记防重复)
  *  - 离开的会话不丢:归档进每用户的 history(新→旧,上限 HISTORY_LIMIT),
  *    switchTo() 按 id 前缀切回其中一段 —— 微信只有一个聊天窗,这是唯一的
@@ -11,8 +11,9 @@
  * 决策逻辑是纯函数(decide),便于用假时钟单测;持久化、时钟、每用户超时
  * 都通过依赖注入。
  *
- * **本模块不认识任何指令词汇。** decide() 收的是一个布尔标记而不是原始文本 ——
- * 「/继续」「/切换会话」长什么样,只住在 commands.ts 里。状态机只管状态。
+ * **本模块不认识任何指令词汇。** decide() 只收 userKey —— 连"用户说了 /继续"这种
+ * 布尔标记都不需要:网关的分拣节点按到达顺序线性处理一批消息,`/继续` 在那里被
+ * touch() 消化掉,后面的话自然命中「未超时 → resume」。状态机只管状态。
  *
  * 状态按 **userKey**(`<channel>:<accountId>:<userId>`,见 identity.ts)索引,
  * 而不是渠道内的裸 userId —— 两份凭据下可能出现同一个 from_user_id。
@@ -71,11 +72,6 @@ export interface Decision {
   resumeSessionId?: string;
 }
 
-/** decide() 的输入。文本已在 commands.ts 里解析过,这里只收结论。 */
-export interface DecideInput {
-  /** 这批消息里带着 /继续:超时后也恢复旧会话而不是新开。 */
-  continueRequested: boolean;
-}
 
 /** switchTo() 的结果。文案由调用方组织,这里只给结论与素材。 */
 export type SwitchResult =
@@ -155,17 +151,16 @@ export class SessionManager {
   /**
    * 决定 resume 还是新开会话。纯读,不改状态。
    * 状态的更新在 agent 跑完拿到真实 sessionId 后由 record() 完成。
+   *
+   * 规则只有一条 —— **未超时就续上**。`/继续` 不需要在这里露面:它由网关的
+   * 分拣节点用 `touch()` 消化,把时钟拨到现在,后面的话自然命中"未超时"。
+   * 一批消息按到达顺序线性处理,所以"先续上、后说话"的先后是天然成立的,
+   * 不必把"用户说了 /继续"这件事一路传到状态机里来。
    */
-  decide(userKey: string, input: DecideInput): Decision {
+  decide(userKey: string): Decision {
     const cur = this.states.get(userKey)?.current;
     if (!cur) return { isNew: true };
-
-    const idle = this.now() - cur.lastActive;
-    if (idle < this.timeoutFor(userKey)) {
-      return { isNew: false, resumeSessionId: cur.sessionId };
-    }
-    // 已超时:仅当用户明确 /继续 才恢复旧会话。
-    if (input.continueRequested) {
+    if (this.now() - cur.lastActive < this.timeoutFor(userKey)) {
       return { isNew: false, resumeSessionId: cur.sessionId };
     }
     return { isNew: true };
@@ -222,6 +217,30 @@ export class SessionManager {
       };
     }
     st.reminded = false;
+    this.states.set(userKey, st);
+    this.persist();
+  }
+
+  /**
+   * 记录一个**后台回合**(会话已被切走)的产出。
+   *
+   * 与 record() 的区别是它**绝不动 current**:后台回合结束时,前台早就是别的
+   * 会话了,写 current 等于把用户刚切过去的那段顶掉。按 sessionId 找位置 ——
+   * 已在 history 里就刷新时间,不在就插进去(新会话的第一轮被切走时,
+   * sessionId 要等回合跑完才存在,那时它还没进过任何名单)。
+   *
+   * 用户切走之后又切回来的情况也照顾到了:那时它就是 current,直接刷新时间。
+   */
+  archiveTurn(userKey: string, sessionId: string, hint?: string): void {
+    const st = this.states.get(userKey) ?? { reminded: false, history: [] };
+    if (st.current?.sessionId === sessionId) {
+      st.current.lastActive = this.now();
+      st.reminded = false;
+    } else {
+      const existing = st.history.find((h) => h.sessionId === sessionId);
+      if (existing) existing.lastActive = this.now();
+      else this.pushHistory(st, { sessionId, lastActive: this.now(), ...(hint ? { hint } : {}) });
+    }
     this.states.set(userKey, st);
     this.persist();
   }

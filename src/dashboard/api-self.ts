@@ -66,11 +66,14 @@ export function handleSelfApi(
   }
 
   if (path === "/api/me/session/reset" && method === "POST") {
-    ctx.resetSession = true;
+    // 与用户发 /新会话 完全一样的两步:本回合切到后台(它继续跑完,产出进
+    // history 而不是 current),当前会话就地归档。立刻生效 —— 不再需要
+    // "打个标记等回合自己收尾",因为 detached 的回合本就不会写回 current。
+    ctx.detached = true;
+    deps.sessions.archiveCurrent(userKey);
     return ok({
       ok: true,
-      // 现在就归档会被本回合结束时的 record() 写回来,所以只打标记。
-      effective: "本回合结束后生效,下一条消息就是新对话",
+      effective: "已生效:下一条消息就是新对话;这一轮我在后台跑完再把结果发出去",
     });
   }
 

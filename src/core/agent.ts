@@ -31,6 +31,15 @@ export type AgentProgressEvent =
   | { kind: "thinking"; text: string }
   | { kind: "tool"; name: string; input: unknown };
 
+/**
+ * 往**正在跑的**回合里追加一批输入。回合已收摊则返回 false。
+ *
+ * 追加进去的内容会被 SDK 折进当前 turn,模型在下一次请求就能看到 ——
+ * 这正是"用户中途补一句话"该有的语义。调用方拿到 false 时应当回落到
+ * 起一个新回合,而不是把消息丢掉。
+ */
+export type AgentFeed = (prompt: string, attachments: readonly Attachment[]) => boolean;
+
 export interface AgentRunOptions {
   /** 传入则 resume 该会话;不传则开启新会话。 */
   resumeSessionId?: string;
@@ -66,13 +75,21 @@ export interface AgentRunOptions {
    * 工具往返,且模型可能压根不去读)。
    */
   attachments?: readonly Attachment[];
+  /**
+   * 回合已经可以接收追加输入了,把句柄交给调用方。
+   *
+   * 在 `query()` 建好之后**同步**调用一次。给出的 `feed` 在本回合收摊后失效
+   * (返回 false),调用方不必自己判断时机。
+   */
+  onFeedReady?: (feed: AgentFeed) => void;
 }
 
 /**
  * 把文本与附件拼成一条 SDK 用户消息。
  *
  * 图片放在文字**前面**:提问往往在指代图片("这张图里是什么"),先图后文才让
- * 指代有对象。纯文本回合不走这里,仍旧直接把 string 交给 SDK。
+ * 指代有对象。文本与附件**不能同时为空** —— 空 content 会被模型侧拒收;
+ * 调用方(网关的 handle 与 tryFeed)负责挡在前面。
  */
 export function buildUserMessage(
   prompt: string,
@@ -94,13 +111,41 @@ export function buildUserMessage(
 }
 
 /**
- * 把单条消息包成 SDK 要的 AsyncIterable。
+ * 回合的输入通道:一个**常开**的 AsyncIterable,回合跑起来之后仍能往里追加消息。
  *
- * 单条即结束:SDK 的 streamInput 写完就 endInput,与直接传 string 的行为一致,
- * 不会让它继续等后续输入。
+ * **为什么必须常开**:SDK 只在流式输入下接受回合中途的追加输入。喂进来的消息会被
+ * 折进**正在跑的那个 turn**,模型下一次请求就看到 —— 这正是"用户中途补一句话"
+ * 该有的语义。传 string(或一个 yield 完就结束的 iterable)等于告诉 SDK
+ * "输入到此为止",追加无从谈起。代价是纯文本回合也走流式输入,不再传 string。
+ *
+ * **关闭语义**:`close()` 只表示"不会再有新输入",**不丢**已经 push 进来的消息 ——
+ * 它们照样会被执行,只是可能各自跑成一个 turn。所以回合收尾时无脑 close 是安全的,
+ * 不存在"消息挤在 result 与 close 之间被吞掉"的竞态(实测确认,见 run 里的收尾注释)。
  */
-async function* singleMessage(msg: SDKUserMessage): AsyncIterable<SDKUserMessage> {
-  yield msg;
+export class InputChannel {
+  private readonly queue: SDKUserMessage[] = [];
+  private wake: (() => void) | undefined;
+  private closed = false;
+
+  push(msg: SDKUserMessage): void {
+    this.queue.push(msg);
+    this.wake?.();
+  }
+
+  /** 幂等:回合的正常收尾与 finally 的兜底都会调它。 */
+  close(): void {
+    this.closed = true;
+    this.wake?.();
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
+    for (;;) {
+      // 先排空再判关闭:close() 之后剩在队列里的消息仍要交出去。
+      while (this.queue.length) yield this.queue.shift()!;
+      if (this.closed) return;
+      await new Promise<void>((resolve) => (this.wake = resolve));
+    }
+  }
 }
 
 export class Agent {
@@ -122,11 +167,12 @@ export class Agent {
         `${prompt.length}字 图${attachments.length}`,
     );
 
+    // 输入一律走常开通道(不再按有无附件分叉):回合中途的追加输入只有流式输入下才收得进。
+    const input = new InputChannel();
+    input.push(buildUserMessage(prompt, attachments));
+
     const q = query({
-      // 无附件时保持传 string —— SDK 内部会包成单个 text block,行为与从前完全一致。
-      prompt: attachments.length
-        ? singleMessage(buildUserMessage(prompt, attachments))
-        : prompt,
+      prompt: input,
       options: {
         systemPrompt: { type: "preset", preset: "claude_code" },
         settingSources: ["user", "project", "local"],
@@ -152,8 +198,24 @@ export class Agent {
     });
 
     let sessionId = opts.resumeSessionId ?? "";
-    let text = "";
     let isError = false;
+    /** 各 result 的正文。正常回合只有一段;追加输入落在 turn 边界上时会多出几段。 */
+    const texts: string[] = [];
+
+    // 追加窗口。收到 result 就关,而 feed 本身是同步函数 —— JS 单线程保证两者
+    // 不会交错,不存在"判定通过之后窗口才关"的半开状态。窗口关了返回 false,
+    // 调用方据此回落去起新回合。
+    let accepting = true;
+    let fed = 0;
+    opts.onFeedReady?.((feedPrompt, feedAttachments) => {
+      if (!accepting) return false;
+      input.push(buildUserMessage(feedPrompt, feedAttachments));
+      fed += 1;
+      console.info(
+        `${tag} 追加输入 #${fed} ${feedPrompt.length}字 图${feedAttachments.length}`,
+      );
+      return true;
+    });
 
     // 心跳所需的状态。**覆盖所有 SDK 消息**而不只是 onProgress 透出的那两类:
     // 工具结果回填、API 重试同样是"还在动"的证据,漏掉它们会把正常推进的回合
@@ -205,10 +267,22 @@ export class Agent {
         }
 
         if (message.type === "result") {
-          isError = message.is_error;
-          text = message.subtype === "success" ? message.result : message.errors.join("\n");
+          // 先关追加窗口再 close 输入流。close **不会**丢掉已 push 的消息:
+          // 挤在 result 与 close 之间的那条(管道延迟造成的窄窗口)照样会跑,
+          // 只是自成一个 turn 并再吐一个 result —— 所以这里不 break,继续把
+          // 后续 result 的正文接在后面。就此收摊等于把用户那条话静默吞掉。
+          accepting = false;
+          input.close();
+          isError ||= message.is_error;
+          const body = message.subtype === "success" ? message.result : message.errors.join("\n");
+          if (body) texts.push(body);
           this.logResult(tag, message, Date.now() - startedAt, steps);
         }
+      }
+      if (texts.length > 1) {
+        console.info(
+          `${tag} 本回合产出 ${texts.length} 段正文 —— 有追加输入正好落在 turn 边界上,各自成了一轮`,
+        );
       }
     } catch (err) {
       // 回合以异常告终(abort / SDK 内部错误)也要留一行:上层网关只会打
@@ -218,10 +292,14 @@ export class Agent {
       );
       throw err;
     } finally {
+      // 抛错(abort / SDK 内部错误)路径同样要关掉窗口与输入流:
+      // 窗口不关的话,已经收摊的回合还会对 feed 返回 true,那条消息就没人跑了。
+      accepting = false;
+      input.close();
       if (heartbeat) clearInterval(heartbeat);
     }
 
-    if (!text) text = "(助手没有返回内容)";
+    const text = texts.join("\n\n") || "(助手没有返回内容)";
     return { text, sessionId, isError };
   }
 

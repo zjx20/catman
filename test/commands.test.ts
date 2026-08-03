@@ -52,11 +52,11 @@ test("必须整串匹配,正常说话不会被吞掉", () => {
   }
 });
 
-test("只有 /继续 与 /切换会话 走队列,其余都绕过队列就地执行", () => {
-  // immediate 是硬指令的存在理由(agent 卡死时队列里的消息轮不到)。
-  // 例外只有两个,理由相同:它们改会话时钟/指针,必须排在在飞回合的 record()
-  // 之后才不会被写回覆盖 —— 但都由后台消化,不进 LLM(gateway.test 守着这半句)。
-  const queued: string[] = ["continue", "switchSession"];
+test("改会话状态的指令一律走队列,只读/中断的才 immediate", () => {
+  // 分界线是"会不会改会话状态"。改状态的必须在分拣节点里与消息投递保持先后 ——
+  // 就地执行会与投递并发,那句话就落到谁也说不清的会话里。走队列不再意味着
+  // "卡在回合后面":分拣节点投递完就返回,不等回合(gateway.test 守着这半句)。
+  const queued: string[] = ["continue", "switchSession", "newSession"];
   for (const cmd of COMMAND_TABLE) {
     assert.equal(cmd.immediate, !queued.includes(cmd.name), `${cmd.canonical} 的 immediate 不对`);
   }

@@ -143,15 +143,18 @@ test("PATCH 可以改展示名", () => {
   assert.equal(users.get(A)?.displayName, "爱丽丝");
 });
 
-test("session/reset 只打标记,不当场清状态", () => {
+test("session/reset 当场生效:本回合切到后台,当前会话归档", () => {
   const { deps, turns, sessions } = make();
   sessions.record(A, "sess-A");
   const turn = turns.mint(A);
   const r = call("POST", "/api/me/session/reset", turn.token, undefined, deps);
   assert.equal(r.status, 200);
-  assert.equal(turn.ctx.resetSession, true);
-  // 当场归档会被本回合结束时的 record() 写回来,所以只能打标记。
-  assert.equal(sessions.currentOf(A)?.sessionId, "sess-A");
+  // 两步与用户发 /新会话 完全一样:回合转后台(它的产出将进 history 而不是
+  // current),当前会话就地归档。不再需要"打标记等回合收尾"——
+  // detached 的回合本就不会写回 current。
+  assert.equal(turn.ctx.detached, true);
+  assert.equal(sessions.currentOf(A), undefined, "当前会话应当已经归档");
+  assert.deepEqual(sessions.historyOf(A).map((h) => h.sessionId), ["sess-A"]);
 });
 
 test("请求体不是对象时 400", () => {

@@ -1,10 +1,10 @@
 import type { Channel } from "../channels/types.js";
 import type { Agent, AgentProgressEvent } from "./agent.js";
-import type { SessionManager, SessionRef } from "./session.js";
+import type { Decision, SessionManager, SessionRef } from "./session.js";
 import type { UserRegistry } from "./users.js";
-import type { PrefsStore } from "./prefs.js";
+import type { EffectiveUserPrefs, PrefsStore } from "./prefs.js";
 import type { GlobalSettings } from "./settings.js";
-import type { TurnTokens } from "./turn-tokens.js";
+import type { MintedTurn, TurnContext, TurnTokens } from "./turn-tokens.js";
 import { allowAll, type AdmissionPolicy } from "./admission.js";
 import type { Attachment } from "./attachments.js";
 import { describeProgress, summarizeToolInput } from "./agent-trace.js";
@@ -32,6 +32,13 @@ export function reminderText(sessionShortId: string): string {
 
 /** 收到消息后的即时回执文案。回复发出后,支持撤回的渠道会撤回这条回执。 */
 export const ACK_TEXT = "收到,正在处理中…";
+
+/**
+ * 追加输入被在飞回合接住时的回执。与 ACK_TEXT 分开说是因为处境不同:
+ * 用户此刻看到的是一轮还没结束,他需要知道的是"这句补充赶上了没",
+ * 而不是"收到了"。
+ */
+export const FEED_ACK_TEXT = "收到,一并交给正在处理的这一轮了。";
 
 /** 进度消息里思考/工具参数摘要的截断长度。 */
 const PROGRESS_MAX_CHARS = 200;
@@ -193,6 +200,20 @@ export class ProgressThrottle {
     // 长回合下这段静默可能长达好几分钟,正是最容易让人以为出事的时候。
     return this.sent === this.maxSends ? `${text}\n${PROGRESS_CAP_NOTICE}` : text;
   }
+
+  /**
+   * 追加输入之后重新开闸(条数与间隔阶梯都从头开始)。
+   *
+   * 依据是**发送预算确实回来了**:iLink 的 replyCtx 在收到新消息时换成新的
+   * `context_token`,而 maxSends 防的正是一个 token 被进度耗光。同时用户刚补完话,
+   * 正是最想知道"接住了没"的时刻 —— 不重置的话,被追加过的长回合后半段完全静默,
+   * 与卡死无从分辨。阶梯一并重来,所以重置不会变成刷屏:下一条仍要等满第一档。
+   */
+  reset(now: number): void {
+    this.sent = 0;
+    this.skipped = 0;
+    this.nextAllowedAt = now + (this.intervals[0] ?? 0);
+  }
 }
 
 /** 把毫秒说成人话。用于 /状态。 */
@@ -302,6 +323,31 @@ class Semaphore {
 const AGGREGATION_MAX_MULTIPLIER = 40;
 
 /**
+ * 一个回合最多接住几次追加输入。
+ *
+ * 与 AGGREGATION_MAX_MULTIPLIER 同一个性质,连"定得很松"的理由都一样:
+ * **想补多少补多少本身就是对的**。用户还在补话说明他还没说完,这时候拒绝追加、
+ * 把消息打回队列,等于在他说话中间切断他 —— 而拖长的只是他自己这一轮,
+ * 碍不着任何别人(图片另有 maxImagesPerTurn 管着内存,文本几乎没有成本)。
+ *
+ * 所以这个数**不是**给用户的配额,只是"回合总得有个不再增长的时刻"的兜底,
+ * 防的是失控循环往里灌消息。正常聊天永远碰不到 —— 真碰到了,
+ * 用尽之后的消息回落到队列等下一轮(不丢,只是要等),并且会记一行日志。
+ */
+export const MAX_FEEDS_PER_TURN = 100;
+
+/**
+ * 一批消息按到达顺序切成的段。
+ *
+ * **顺序是这个类型存在的全部理由**:硬指令把一批切开,指令**之前**的话投递给
+ * 切换前的会话,**之后**的话投递给切换后的会话。压平成「一段文本 + 几个标记」
+ * 就丢掉了这个信息,只能靠"整批不处理"之类的粗糙语义兜底。
+ */
+type Segment =
+  | { kind: "input"; text: string; attachments: Attachment[] }
+  | { kind: "command"; cmd: CommandDef; arg: string };
+
+/**
  * 一批正在等待聚合的消息。
  *
  * 存在的理由:微信发「图 + 文字」**不是一条消息** —— 实测两条相隔约 120ms
@@ -309,11 +355,8 @@ const AGGREGATION_MAX_MULTIPLIER = 40;
  * 必然缺另一半,于是助手先答一句"我没看到图"再答一遍,既费额度又显得莫名其妙。
  */
 interface PendingBatch {
-  texts: string[];
-  attachments: Attachment[];
-  continueRequested: boolean;
-  /** 批里带着 /切换会话 时的目标 id 前缀;连发多条切换指令时后到的覆盖先到的。 */
-  switchTo?: string;
+  /** 按到达顺序;连续的文本与图片并进同一个 input 段,指令另起一段。 */
+  segments: Segment[];
   /** debounce 计时器:每来一条消息就重置。 */
   timer: NodeJS.Timeout;
   /** 第一条消息的到达时刻,用于算硬上限。 */
@@ -321,6 +364,23 @@ interface PendingBatch {
   /** 本批处理完成时兑现;同一批的每个 dispatch 都拿到它。 */
   done: Promise<void>;
   settle: () => void;
+}
+
+/** 这批里一共攒了多少条文本与图片 —— /取消 用它交代丢掉了多少。 */
+function batchSize(segments: readonly Segment[]): number {
+  let n = 0;
+  for (const s of segments) {
+    if (s.kind === "command") n += 1;
+    else n += (s.text ? 1 : 0) + s.attachments.length;
+  }
+  return n;
+}
+
+/** 这批攒到的图片总数,用于合并后重新收一次上限。 */
+function batchImages(segments: readonly Segment[]): number {
+  let n = 0;
+  for (const s of segments) if (s.kind === "input") n += s.attachments.length;
+  return n;
 }
 
 /** prelude 的结果:被准入拒绝时为 null。 */
@@ -410,42 +470,34 @@ export class Gateway {
     // 让救命的 /取消 先等 1.5 秒等于取消了这个理由。
     if (parsed?.cmd.immediate) return this.runCommand(userKey, parsed.cmd);
 
-    // 到这里只可能是 /继续 或 /切换会话:它们贡献的是标记,不是给 LLM 的文本。
-    // 单独发时由 handle 后台消化;与别的消息攒成一批时,标记随批生效。
-    const promptText = parsed ? "" : text;
-    const continueRequested = parsed?.cmd.name === "continue";
-    const switchTo = parsed?.cmd.name === "switchSession" ? parsed.arg : undefined;
+    // 到这里只可能是 /继续 /新会话 /切换会话:它们改会话状态,必须与消息投递
+    // 保持先后,所以和普通文本一样进聚合窗口、再由分拣节点按到达顺序线性处理。
+    const seg: Segment = parsed
+      ? { kind: "command", cmd: parsed.cmd, arg: parsed.arg }
+      : { kind: "input", text, attachments: [...attachments] };
     const windowMs = this.settings.effective().messageAggregationMs;
-    if (windowMs <= 0) {
-      return this.enqueue(userKey, promptText, continueRequested, attachments, switchTo);
-    }
-    return this.collect(userKey, promptText, continueRequested, attachments, switchTo, windowMs);
+    if (windowMs <= 0) return this.enqueue(userKey, [seg]);
+    return this.collect(userKey, seg, windowMs);
   }
 
   /**
-   * 把消息并进该用户待聚合的那一批,并把计时器往后推。
+   * 把这一段并进该用户待聚合的那一批,并把计时器往后推。
    *
    * debounce 而不是固定窗口:连发的几条要一起处理,固定窗口会把跨过窗口边界的
    * 那条切到下一批去。用户还在发就继续攒 —— 攒得越多越好,见
    * AGGREGATION_MAX_MULTIPLIER 那里对"为什么上限定得很松"的说明。
+   *
+   * 连续的文本与图片并进同一个 input 段(它们本就是一次表达被拆成的几条),
+   * 指令则另起一段 —— 段边界就是"这批话该说给哪个会话听"的分界线。
    */
-  private collect(
-    userKey: string,
-    text: string,
-    continueRequested: boolean,
-    attachments: readonly Attachment[],
-    switchTo: string | undefined,
-    windowMs: number,
-  ): Promise<void> {
+  private collect(userKey: string, seg: Segment, windowMs: number): Promise<void> {
     const now = Date.now();
     let batch = this.pending.get(userKey);
     if (!batch) {
       let settle!: () => void;
       const done = new Promise<void>((resolve) => (settle = resolve));
       batch = {
-        texts: [],
-        attachments: [],
-        continueRequested: false,
+        segments: [],
         timer: undefined as unknown as NodeJS.Timeout,
         firstAt: now,
         done,
@@ -454,11 +506,13 @@ export class Gateway {
       this.pending.set(userKey, batch);
     }
 
-    if (text) batch.texts.push(text);
-    batch.attachments.push(...attachments);
-    // 同批里只要有一条是 /继续,整批就按"接着上一段聊"处理。
-    batch.continueRequested ||= continueRequested;
-    if (switchTo !== undefined) batch.switchTo = switchTo;
+    const tail = batch.segments[batch.segments.length - 1];
+    if (seg.kind === "input" && tail?.kind === "input") {
+      if (seg.text) tail.text = tail.text ? `${tail.text}\n${seg.text}` : seg.text;
+      tail.attachments.push(...seg.attachments);
+    } else {
+      batch.segments.push(seg);
+    }
 
     clearTimeout(batch.timer);
     const deadline = batch.firstAt + windowMs * AGGREGATION_MAX_MULTIPLIER;
@@ -468,31 +522,32 @@ export class Gateway {
     return batch.done;
   }
 
-  /** 把攒好的一批交给串行队列。 */
+  /** 把攒好的一批交给分拣节点。 */
   private flush(userKey: string): void {
     const batch = this.pending.get(userKey);
     if (!batch) return;
     this.pending.delete(userKey);
     clearTimeout(batch.timer);
 
-    // 上限要在合并后重新收一次:渠道只保证单条消息不超,连发几条各带图仍可能超。
+    // 图片上限要在合并后重新收一次:渠道只保证单条消息不超,连发几条各带图仍可能超。
+    // 按整批算(而不是每段),因为闸门管的是这一轮的内存峰值与图片 token 开销。
     const { maxImagesPerTurn } = this.settings.effective();
-    const attachments = batch.attachments.slice(0, maxImagesPerTurn);
-    if (attachments.length < batch.attachments.length) {
+    const total = batchImages(batch.segments);
+    if (total > maxImagesPerTurn) {
+      let room = maxImagesPerTurn;
+      for (const s of batch.segments) {
+        if (s.kind !== "input") continue;
+        s.attachments = s.attachments.slice(0, room);
+        room -= s.attachments.length;
+      }
       console.info(
-        `[gateway] ${userKey} 聚合后有 ${batch.attachments.length} 张图,` +
-          `超出上限 ${maxImagesPerTurn},丢弃 ${batch.attachments.length - attachments.length} 张`,
+        `[gateway] ${userKey} 聚合后有 ${total} 张图,` +
+          `超出上限 ${maxImagesPerTurn},丢弃 ${total - maxImagesPerTurn} 张`,
       );
     }
 
-    // handle 内部已把异常都收敛成给用户的回复,这里两路都只管兑现 promise。
-    this.enqueue(
-      userKey,
-      batch.texts.join("\n"),
-      batch.continueRequested,
-      attachments,
-      batch.switchTo,
-    ).then(batch.settle, batch.settle);
+    // handleBatch 内部已把异常都收敛成给用户的回复,这里只管兑现 promise。
+    this.enqueue(userKey, batch.segments).then(batch.settle, batch.settle);
   }
 
   /**
@@ -505,23 +560,101 @@ export class Gateway {
     this.pending.delete(userKey);
     clearTimeout(batch.timer);
     batch.settle();
-    return batch.texts.length + batch.attachments.length;
+    return batchSize(batch.segments);
   }
 
-  /** 把某用户的处理追加到其串行链尾。 */
-  private enqueue(
-    userKey: string,
-    text: string,
-    continueRequested = false,
-    attachments: readonly Attachment[] = [],
-    switchTo?: string,
-  ): Promise<void> {
+  /**
+   * 把一批交给该用户的分拣链尾。
+   *
+   * **分拣链与"这批处理完了"是两件事,故意分开**:
+   *   · 链上只等分拣本身(投递完就算),所以卡死的回合堵不住后面那批里的指令 ——
+   *     这是整条流水线的立足点;
+   *   · 返回给渠道的 promise 额外等这批起的回合跑完,"处理完了"才名副其实 ——
+   *     stdin 靠它决定何时打下一个提示符,iLink 靠它顺序处理带图的消息。
+   */
+  private enqueue(userKey: string, segments: readonly Segment[]): Promise<void> {
     const prev = this.queues.get(userKey) ?? Promise.resolve();
-    const next = prev
-      .catch(() => {}) // 前一条失败不阻塞后续
-      .then(() => this.handle(userKey, text, continueRequested, attachments, switchTo));
-    this.queues.set(userKey, next);
-    return next;
+    const sorted = prev
+      .catch(() => {}) // 前一批失败不阻塞后续
+      .then(() => this.handleBatch(userKey, segments));
+    this.queues.set(
+      userKey,
+      sorted.then(
+        () => {},
+        () => {},
+      ),
+    );
+    return sorted.then(async (turns) => {
+      await Promise.all(turns);
+    });
+  }
+
+  /**
+   * 分拣节点:按到达顺序线性处理一批消息。每用户串行(靠 `queues`)。
+   *
+   * **它不等回合跑完** —— 起了回合就往下走。这是整条流水线的关键:
+   *   · 卡死的 agent 堵不住分拣,所以改会话状态的指令能安全地在这里线性执行,
+   *     不必绕队列、也不必给在飞回合打标记等它自己收尾;
+   *   · 指令**之前**的话投递给切换前的会话,**之后**的话投递给切换后的会话 ——
+   *     顺序天然正确,不需要"整批不处理"这类粗糙语义。
+   *
+   * 指令执行失败时(比如要切的那段会话找不到)中止**剩下的**段:那些话是冲着
+   * 它本该切到的会话说的,落在当前会话里既答非所问又白花额度。已经投递出去的
+   * 段不受影响 —— 它们本来就属于前一个会话。
+   *
+   * 返回这批起的回合,交给 enqueue 去等 —— 它自己**不等**。
+   */
+  private async handleBatch(
+    userKey: string,
+    segments: readonly Segment[],
+  ): Promise<Array<Promise<void>>> {
+    const pre = await this.prelude(userKey);
+    if (!pre) return [];
+
+    const turns: Array<Promise<void>> = [];
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]!;
+      if (seg.kind !== "command") {
+        const started = this.deliverInput(userKey, seg, pre.cwd);
+        if (started) turns.push(started);
+        continue;
+      }
+      // 后面还有没有话要说 —— 决定指令要不要单独回执(有的话回执纯属噪音),
+      // 也决定指令失败时要不要交代"这些话先不处理"。
+      const more = segments
+        .slice(i + 1)
+        .some((s) => s.kind === "input" && (s.text !== "" || s.attachments.length > 0));
+      if (!(await this.runQueuedCommand(userKey, seg.cmd, seg.arg, more))) return turns;
+    }
+    return turns;
+  }
+
+  /**
+   * 把一段输入交给用户**当前**的会话:在飞的前台回合接得住就追加进去
+   * (模型下一次请求就看到),否则起一个新回合。
+   *
+   * **同步返回,不等回合**。起回合的动作里 `turns.mint()` 是同步完成的,
+   * 所以紧接着的下一段立刻就能看到这个前台回合、走追加而不是又起一轮。
+   * 真起了回合就把它的 promise 交出去,由 enqueue 汇总成"这批处理完了"。
+   */
+  private deliverInput(
+    userKey: string,
+    seg: Segment & { kind: "input" },
+    cwd: string,
+  ): Promise<void> | undefined {
+    // 既没文字也没图片:起回合等于给模型递一条空 content(它会直接拒收),额度还照花。
+    // 渠道通常已经挡了空消息,这里防的是"图在渠道那边解码失败被跳过"剩下的空壳。
+    if (!seg.text && !seg.attachments.length) return undefined;
+
+    const fg = this.turns.foregroundFor(userKey);
+    if (!fg) return this.startTurn(userKey, seg.text, seg.attachments, cwd);
+    if (fg.feed?.(seg.text, seg.attachments)) return undefined;
+    // 追不进去(额度用尽、图被挤光、或那一轮正在收摊),但它还占着当前会话 ——
+    // **绝不能就地另起一轮**:两个回合 resume 同一个 sessionId 会把上下文撕坏。
+    // 等它结束再来一次(那时前台可能已经换人,所以重走一遍判断而不是直接起)。
+    return fg.done.then(async () => {
+      await this.deliverInput(userKey, seg, cwd);
+    });
   }
 
   /**
@@ -568,15 +701,51 @@ export class Gateway {
         await this.trySend(userKey, this.statusText(userKey), "状态");
         return;
 
+      case "cancel": {
+        // 还在聚合窗口里的消息也算"正在处理" —— 用户看不见队列,他要取消的是
+        // 刚发出去的那几条,不管它们变没变成回合。
+        const dropped = this.dropPending(userKey);
+        // **只中断前台**:后台那些是用户主动切走、说了"你接着跑"的,
+        // 一条 /取消 顺手把它们也灭掉是误伤。要停后台得先切回去再取消。
+        const fg = this.turns.foregroundFor(userKey);
+        if (!fg) {
+          await this.trySend(
+            userKey,
+            dropped ? "好,刚发的还没开始处理,已经丢掉了。" : "现在没有正在跑的任务。",
+            "取消确认",
+          );
+          return;
+        }
+        fg.abort.abort();
+        // 不在这里回话:被中断的回合自己会走错误分支给用户一个交代。
+        return;
+      }
+
+      default:
+        return;
+    }
+  }
+
+  /**
+   * 执行一条走队列的硬指令(改会话状态的那几个)。返回是否继续处理这批剩下的段。
+   *
+   * 它们在分拣节点里执行,与消息投递保持先后 —— 这正是「指令之前的话落在原来
+   * 那段会话、之后的话落在切过去那段」的实现。
+   */
+  private async runQueuedCommand(
+    userKey: string,
+    cmd: CommandDef,
+    arg: string,
+    moreInputAfter: boolean,
+  ): Promise<boolean> {
+    switch (cmd.name) {
       case "newSession": {
+        // 切走当前会话:它的在飞回合**不停**,转后台跑完再把结果送来。
+        const detached = this.detachForeground(userKey);
         const prev = this.sessions.archiveCurrent(userKey);
-        // 在飞回合结束时会 record() 把 sessionId 写回来,等于抵消了上面的归档。
-        // 所以同时给它打标记,让它在自己的 finally 里再归档一次。
-        const inFlight = this.turns.currentFor(userKey);
-        if (inFlight) inFlight.resetSession = true;
         const lines = [
-          inFlight
-            ? "好,当前这一轮跑完就从新对话开始。"
+          detached
+            ? "好,新对话开始了。刚才那一轮我在后台接着跑,跑完把结果发你。"
             : "好,下次从新对话开始,之前的上下文不带了。",
         ];
         // 归档不等于删除 —— 教用户怎么切回来,这是他知道这件事的三个入口之一
@@ -585,35 +754,46 @@ export class Gateway {
           lines.push(
             `想回到刚才的对话,发「${canonicalOf("switchSession")} ${shortSessionId(prev.sessionId)}」。`,
           );
-        } else if (inFlight) {
-          // 在飞回合还没 record 过(它就是第一轮),id 要等它跑完才有。
+        } else if (detached) {
+          // 那一轮还没 record 过(它就是第一轮),id 要等它跑完才有。
           lines.push(`跑完的这段之后可以用 ${canonicalOf("switchSession")} 找回。`);
         }
         await this.trySend(userKey, lines.join("\n"), "新会话确认");
-        return;
+        return true;
       }
 
-      case "cancel": {
-        // 还在聚合窗口里的消息也算"正在处理" —— 用户看不见队列,他要取消的是
-        // 刚发出去的那几条,不管它们变没变成回合。
-        const dropped = this.dropPending(userKey);
-        const inFlight = this.turns.currentFor(userKey);
-        if (!inFlight) {
+      case "continue": {
+        // 刷新会话时钟就够了:这批后面的话在 decide() 里自然命中「未超时 → resume」。
+        // 顺序由分拣节点保证,不需要把"续上"这件事变成一个标记传下去。
+        const ok = this.sessions.touch(userKey);
+        // 后面还有话要说时不必回执 —— 它们马上就落进续上的那段会话,回执纯属噪音。
+        if (!moreInputAfter) {
           await this.trySend(
             userKey,
-            dropped ? "好,刚发的还没开始处理,已经丢掉了。" : "现在没有正在跑的任务。",
-            "取消确认",
+            ok ? "好,接上刚才的对话了,直接发消息继续聊。" : "现在没有可继续的对话,直接发消息就会开新的。",
+            "继续确认",
           );
-          return;
         }
-        inFlight.abort.abort();
-        // 不在这里回话:被中断的回合自己会走错误分支给用户一个交代。
-        return;
+        return true;
       }
 
+      case "switchSession":
+        return this.handleSwitch(userKey, arg, moreInputAfter);
+
       default:
-        return;
+        return true;
     }
+  }
+
+  /**
+   * 把当前前台回合切到后台:它继续跑完,只是进度不再推、产出进 history。
+   * 返回是否真的有这么一个回合(用于组织确认语)。
+   */
+  private detachForeground(userKey: string): boolean {
+    const fg = this.turns.foregroundFor(userKey);
+    if (!fg) return false;
+    fg.detached = true;
+    return true;
   }
 
   /**
@@ -625,7 +805,7 @@ export class Gateway {
    * 正在中断、空闲(消息压根没被受理,该重发)。
    */
   private inFlightText(userKey: string): string {
-    const ctx = this.turns.currentFor(userKey);
+    const ctx = this.turns.foregroundFor(userKey);
     if (!ctx) return "当前:空闲,没有正在处理的消息";
 
     const p = ctx.progress;
@@ -635,11 +815,34 @@ export class Gateway {
       return `当前:排队中,已等 ${waited}(并发上限满了,前面还有别的回合)`;
     }
     if (ctx.abort.signal.aborted) return `当前:正在中断这一轮(已 ${waited})`;
-    if (!p.steps) return `当前:处理中,已 ${waited},还在等模型的第一个动作`;
+    // 追加进去的消息在别处看不见(SDK 消息流里不露面),这里是用户确认
+    // 「我刚补的那句赶上了没」的唯一出口。
+    const fed = p.fed ? `,期间补充 ${p.fed} 条` : "";
+    if (!p.steps) return `当前:处理中,已 ${waited}${fed},还在等模型的第一个动作`;
     return (
-      `当前:处理中,已 ${waited} · 第 ${p.steps} 步` +
+      `当前:处理中,已 ${waited}${fed} · 第 ${p.steps} 步` +
       `(${humanDuration(now - p.lastAt)}前)${p.last ? ` · ${p.last}` : ""}`
     );
+  }
+
+  /**
+   * 后台还在跑的那几段。
+   *
+   * 被切走的回合不再推进度,所以除了这里,用户没有任何地方看得出"那一轮还活着" ——
+   * 一段几分钟前切走的对话突然吐出结果,他得能提前知道那是什么。
+   */
+  private backgroundLines(userKey: string): string[] {
+    const bg = this.turns.allFor(userKey).filter((t) => t.detached);
+    if (!bg.length) return [];
+    const now = this.now();
+    return [
+      `后台:${bg.length} 段对话还在跑(跑完把结果发你)`,
+      ...bg.map((t) => {
+        const p = t.progress;
+        const step = p.steps ? ` · 第 ${p.steps} 步(${humanDuration(now - p.lastAt)}前)` : "";
+        return `  · 已 ${humanDuration(now - p.startedAt)}${step}`;
+      }),
+    ];
   }
 
   /** /状态 的正文。纯后台生成,不花订阅额度 —— 配置错乱时唯一可靠的信息源。 */
@@ -654,6 +857,7 @@ export class Gateway {
     const lines = [
       "📋 当前状态",
       this.inFlightText(userKey),
+      ...this.backgroundLines(userKey),
       `模型:${p.model ?? "由 SDK 决定"}${own("model")}`,
       current === undefined || idle === undefined
         ? "会话:还没有进行中的对话,下一条消息开新的"
@@ -695,8 +899,12 @@ export class Gateway {
     );
     switch (res.kind) {
       case "switched": {
+        // 切走的那一轮**不停**:转后台跑完再把结果送来。detach 必须在 switchTo()
+        // 成功之后 —— 切换失败时会话没变,那一轮仍然是前台的。
+        const detached = this.detachForeground(userKey);
         const topic = res.to.hint ? `(${res.to.hint})` : "";
         const lines = [`好,切到对话 ${shortSessionId(res.to.sessionId)}${topic},直接发消息就是接着它聊。`];
+        if (detached) lines.push("刚才那一轮我在后台接着跑,跑完把结果发你。");
         if (res.from) {
           lines.push(`刚才的对话想切回来就发「${sw} ${shortSessionId(res.from.sessionId)}」。`);
         }
@@ -772,46 +980,47 @@ export class Gateway {
     return `${shortSessionId(ref.sessionId)} — ${humanDuration(this.now() - ref.lastActive)}前${topic}`;
   }
 
-  private async handle(
+  /**
+   * 起一个回合。**同步完成 `turns.mint()` 再把余下的交给后台** ——
+   * 分拣节点紧接着处理下一段时,必须立刻能看到这个前台回合,否则同一批里的
+   * 两段话会各起一轮(而不是后一段追加进前一段的回合)。
+   */
+  private startTurn(
     userKey: string,
     text: string,
-    continueRequested: boolean,
-    attachments: readonly Attachment[] = [],
-    switchTo?: string,
+    attachments: readonly Attachment[],
+    cwd: string,
   ): Promise<void> {
-    const pre = await this.prelude(userKey);
-    if (!pre) return;
-
-    // /切换会话:先把切换消化掉,再决定这批剩下的内容要不要起回合。
-    // 排在队列尾天然保证切换发生在在飞回合 record() 之后,不会被写回覆盖。
-    if (switchTo !== undefined) {
-      const proceed = await this.handleSwitch(userKey, switchTo, Boolean(text) || attachments.length > 0);
-      if (!proceed) return;
-    }
-
-    // 纯 /继续(这批里没攒进任何要处理的内容):后台直接消化,不进 LLM。
-    // 它的全部使命是刷新会话时钟 —— 之后的消息在 decide() 里自然命中
-    // 「未超时 → resume」。排在队列尾天然保证刷新发生在在飞回合 record()
-    // 之后,续上的必定是最新那个会话。
-    if (continueRequested && !text && !attachments.length) {
-      await this.trySend(
-        userKey,
-        this.sessions.touch(userKey)
-          ? "好,接上刚才的对话了,直接发消息继续聊。"
-          : "现在没有可继续的对话,直接发消息就会开新的。",
-        "继续确认",
-      );
-      return;
-    }
-
     const prefs = this.prefs.effective(userKey);
-    const decision = this.sessions.decide(userKey, { continueRequested });
+    const decision = this.sessions.decide(userKey);
+    const turn = this.turns.mint(userKey);
+    // 回合内部已把异常都收敛成给用户的回复,这里兜的是漏网的抛错 ——
+    // 交出去的 promise 绝不能 reject,否则谁也不等它时就是 unhandled rejection。
+    return this.runTurn(userKey, text, attachments, cwd, prefs, decision, turn).catch((err) => {
+      console.error(`[gateway] ${userKey} 的回合意外抛错:`, err);
+    });
+  }
+
+  private async runTurn(
+    userKey: string,
+    text: string,
+    attachments: readonly Attachment[],
+    cwd: string,
+    prefs: EffectiveUserPrefs,
+    decision: Decision,
+    turn: MintedTurn,
+  ): Promise<void> {
+    // 本回合发出的所有回执(首条 + 每次追加输入各一条),收尾时一起撤回。
+    const ackIds: string[] = [];
+    // 追加输入的回执是异步发的(feed 必须同步返回),收尾前要等它们落地才拿得到 id。
+    const ackWaits: Array<Promise<void>> = [];
     // 回执在排队之前发:并发受限时用户可能要等一会儿,先让他知道消息收到了。
-    const ackId = prefs.ackEnabled ? await this.trySendAck(userKey) : undefined;
+    const ackId = prefs.ackEnabled ? await this.trySendAck(userKey, ACK_TEXT) : undefined;
+    if (ackId !== undefined) ackIds.push(ackId);
 
     const isAdmin = this.settings.isAdmin(userKey);
     const hint = sessionHint(text, attachments.length > 0);
-    const turn = this.turns.mint(userKey);
+    const pre = { cwd };
 
     // 进度消息串行链:保证按事件产生顺序逐条发送,最终回复排在链尾之后。
     // 节流从**回合开始**起算,而不是从第一个事件 —— 用户等待的是前者。
@@ -825,7 +1034,10 @@ export class Gateway {
       snap.steps += 1;
       snap.lastAt = this.now();
       snap.last = describeProgress(ev);
-      if (!prefs.progressEnabled) return;
+      // 切到后台之后不再推进度:用户已经在跟别的会话说话了,这时候插播
+      // 另一段对话的工具调用只会让他分不清是谁在说话。快照照旧更新 ——
+      // /状态 还要靠它交代后台那几段跑到哪了。
+      if (!prefs.progressEnabled || turn.ctx.detached) return;
       // 节流判定在事件到达时就做完,不放进串行链:链上排队的时长会把
       // "这个事件是什么时候发生的"整个搞乱,节流间隔也就不准了。
       const text = throttle.offer(this.now(), ev);
@@ -834,6 +1046,11 @@ export class Gateway {
         await this.trySend(userKey, text, "进度");
       });
     };
+
+    // 追加输入的记账。图片**跨追加累计** —— maxImagesPerTurn 的理由是回合的
+    // 内存峰值与图片 token 开销,那是按整个回合算的,不是按每条消息算的。
+    let imagesUsed = attachments.length;
+    let feeds = 0;
 
     const release = await this.semaphore.acquire();
     turn.ctx.progress.running = this.now();
@@ -848,10 +1065,62 @@ export class Gateway {
         onProgress,
         logLabel: userKey,
         ...(attachments.length ? { attachments } : {}),
+        // agent 跑起来了才挂 feed:排队中的回合还没有 turn 可折,那时候
+        // 消息该照常排队。挂上之后 flush() 就会优先走追加而不是入队。
+        onFeedReady: (feed) => {
+          turn.ctx.feed = (feedText, feedAttachments) => {
+            // 已经不是前台了就不再接追加:用户此刻的话是说给新会话听的。
+            // foregroundFor() 本就过滤掉了 detached,这里是第二道防线。
+            if (turn.ctx.detached) return false;
+            if (feeds >= MAX_FEEDS_PER_TURN) {
+              // 记一行:此后用户的消息重新变成"要等这一轮跑完",而他那边
+              // 看到的又是熟悉的没反应 —— 不打日志的话这个转折点无迹可寻。
+              console.info(
+                `[gateway] ${userKey} 本回合追加已达上限 ${MAX_FEEDS_PER_TURN},这批另起一轮`,
+              );
+              return false;
+            }
+            const room = Math.max(0, this.settings.effective().maxImagesPerTurn - imagesUsed);
+            const kept = feedAttachments.slice(0, room);
+            // 图全被挤掉又没有文字:追加进去就是一条空 content,模型侧直接拒收。
+            // 回落到队列反而是更好的结果 —— 新回合有一整份图片额度。
+            if (!feedText && !kept.length) return false;
+            // agent 侧已收摊(回合结束/出错)则原样退回,由调用方起新回合。
+            if (!feed(feedText, kept)) return false;
+            feeds += 1;
+            imagesUsed += kept.length;
+            turn.ctx.progress.fed = feeds;
+            if (kept.length < feedAttachments.length) {
+              console.info(
+                `[gateway] ${userKey} 追加输入带 ${feedAttachments.length} 张图,` +
+                  `本回合累计已达上限,丢弃 ${feedAttachments.length - kept.length} 张`,
+              );
+            }
+            // 进度重新开闸 —— 追加带来了新的 context_token,发送预算跟着回来了。
+            throttle.reset(this.now());
+            if (prefs.ackEnabled) {
+              ackWaits.push(
+                this.trySendAck(userKey, FEED_ACK_TEXT).then((id) => {
+                  if (id !== undefined) ackIds.push(id);
+                }),
+              );
+            }
+            return true;
+          };
+        },
       });
-      this.sessions.record(userKey, reply.sessionId, hint);
+      // 产出记到哪,取决于这一轮还是不是前台:
+      //   前台 → record() 写 current(常规路径);
+      //   已被切走 → archiveTurn() 只更新 history —— 写 current 会把用户
+      //     刚切过去的那段顶掉,而他正在跟它说话。
+      if (turn.ctx.detached) this.sessions.archiveTurn(userKey, reply.sessionId, hint);
+      else this.sessions.record(userKey, reply.sessionId, hint);
       await progress;
-      await this.sendChunked(userKey, reply.text, prefs.maxReplyChars);
+      await this.sendChunked(
+        userKey,
+        this.labelIfDetached(turn.ctx, reply.sessionId, reply.text),
+        prefs.maxReplyChars,
+      );
     } catch (err) {
       console.error(`[gateway] 处理 ${userKey} 消息失败:`, err);
       await progress;
@@ -863,18 +1132,34 @@ export class Gateway {
         "错误说明",
       );
     } finally {
-      // reset 一律在这里做:try 里无条件 record(),finally 必在其后执行,
-      // 所以成功、抛错、被 /取消 三条路径的净效果都对,顺序也一目了然。
-      // 反过来在别处直接归档会被随后的 record() 写回来。
-      if (turn.ctx.resetSession) this.sessions.archiveCurrent(userKey);
+      // 先摘掉 feed 再 revoke:此后到达的消息一律另起一轮。
+      turn.ctx.feed = undefined;
       turn.revoke();
       release();
-      if (ackId !== undefined && this.channel.recall) {
-        await this.channel.recall(userKey, ackId).catch(() => {
-          // 撤回失败(渠道限制/消息过期)不影响回合结果,回执留在会话里即可。
-        });
+      if (this.channel.recall) {
+        // 追加回执可能还在发。不等的话拿不到它的 id,那条回执就永远留在会话里了。
+        await Promise.all(ackWaits);
+        for (const id of ackIds) {
+          await this.channel.recall(userKey, id).catch(() => {
+            // 撤回失败(渠道限制/消息过期)不影响回合结果,回执留在会话里即可。
+          });
+        }
       }
     }
+  }
+
+  /**
+   * 后台回合的正文要标明出处。
+   *
+   * 用户此刻多半正在跟另一段对话说话,一段没头没尾的回复会被当成当前对话的答复 ——
+   * 尤其它可能是几分钟前那个问题的答案。带上会话 id 还顺带告诉他怎么切回去。
+   */
+  private labelIfDetached(ctx: TurnContext, sessionId: string, text: string): string {
+    if (!ctx.detached) return text;
+    return (
+      `【后台对话 ${shortSessionId(sessionId)} 的结果】\n${text}\n\n` +
+      `(想接着这段聊,发「${canonicalOf("switchSession")} ${shortSessionId(sessionId)}」)`
+    );
   }
 
   /**
@@ -898,9 +1183,9 @@ export class Gateway {
    * 发送回执并返回消息 id(仅当渠道支持撤回且返回了 id)。
    * 回执纯属体验增强,发送失败静默忽略。
    */
-  private async trySendAck(userKey: string): Promise<string | undefined> {
+  private async trySendAck(userKey: string, text: string): Promise<string | undefined> {
     try {
-      const id = await this.channel.send(userKey, ACK_TEXT);
+      const id = await this.channel.send(userKey, text);
       return typeof id === "string" ? id : undefined;
     } catch (err) {
       // 同 trySend:静默降级,但不静默消失。回执是一个回合里**第一条**外发消息,

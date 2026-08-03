@@ -11,8 +11,6 @@ import {
  * decide() 收的是布尔标记而不是文本 —— 指令词汇只住在 commands.ts 里,
  * 状态机不认识它们。这两个常量让用例读起来仍然像在说"普通消息"/"发了 /继续"。
  */
-const GO = { continueRequested: false };
-const CONT = { continueRequested: true };
 
 const TIMEOUT = 60 * 60 * 1000; // 1h
 
@@ -40,7 +38,7 @@ function mgr(store = new InMemoryStore(), c = clock()) {
 
 test("首个用户消息 → 新会话", () => {
   const { sm } = mgr();
-  const d = sm.decide("stdin:local:u1", GO);
+  const d = sm.decide("stdin:local:u1");
   assert.equal(d.isNew, true);
   assert.equal(d.resumeSessionId, undefined);
 });
@@ -49,7 +47,7 @@ test("超时窗口内的后续消息 → 恢复当前会话", () => {
   const { sm, c } = mgr();
   sm.record("stdin:local:u1", "sess-A");
   c.advance(TIMEOUT - 1);
-  const d = sm.decide("stdin:local:u1", GO);
+  const d = sm.decide("stdin:local:u1");
   assert.equal(d.isNew, false);
   assert.equal(d.resumeSessionId, "sess-A");
 });
@@ -58,16 +56,19 @@ test("超时后的普通消息 → 开新会话", () => {
   const { sm, c } = mgr();
   sm.record("stdin:local:u1", "sess-A");
   c.advance(TIMEOUT + 1);
-  const d = sm.decide("stdin:local:u1", GO);
+  const d = sm.decide("stdin:local:u1");
   assert.equal(d.isNew, true);
   assert.equal(d.resumeSessionId, undefined);
 });
 
-test('超时后回复"继续" → 恢复旧会话', () => {
+test("超时后 /继续 → touch 保活 → 恢复旧会话", () => {
+  // /继续 不再作为标记传进 decide():网关的分拣节点收到它就 touch(),
+  // 把时钟拨到现在,同一批里后面的话自然命中「未超时 → resume」。
   const { sm, c } = mgr();
   sm.record("stdin:local:u1", "sess-A");
   c.advance(TIMEOUT + 5 * 60 * 1000); // 超时后 5 分钟
-  const d = sm.decide("stdin:local:u1", CONT);
+  assert.equal(sm.touch("stdin:local:u1"), true);
+  const d = sm.decide("stdin:local:u1");
   assert.equal(d.isNew, false);
   assert.equal(d.resumeSessionId, "sess-A");
 });
@@ -77,10 +78,11 @@ test('超时后先开新会话,之后的"继续"属于新会话(不再恢复旧�
   sm.record("stdin:local:u1", "sess-A");
   c.advance(TIMEOUT + 1);
   // 普通消息触发新会话
-  assert.equal(sm.decide("stdin:local:u1", GO).isNew, true);
+  assert.equal(sm.decide("stdin:local:u1").isNew, true);
   sm.record("stdin:local:u1", "sess-B"); // agent 返回了新会话 id
   // 紧接着"继续"应恢复 sess-B(当前会话),而不是 sess-A
-  const d = sm.decide("stdin:local:u1", CONT);
+  sm.touch("stdin:local:u1");
+  const d = sm.decide("stdin:local:u1");
   assert.equal(d.isNew, false);
   assert.equal(d.resumeSessionId, "sess-B");
 });
@@ -89,11 +91,11 @@ test("touch:超时后保活,下一条普通消息仍恢复旧会话", () => {
   const { sm, c } = mgr();
   sm.record("stdin:local:u1", "sess-A");
   c.advance(TIMEOUT + 1);
-  assert.equal(sm.decide("stdin:local:u1", GO).isNew, true, "超时后普通消息本该开新会话");
+  assert.equal(sm.decide("stdin:local:u1").isNew, true, "超时后普通消息本该开新会话");
 
   assert.equal(sm.touch("stdin:local:u1"), true);
-  const d = sm.decide("stdin:local:u1", GO);
-  assert.equal(d.isNew, false, "touch 之后普通消息也能续上,不再依赖 CONT 标记");
+  const d = sm.decide("stdin:local:u1");
+  assert.equal(d.isNew, false, "touch 之后普通消息也能续上,不再依赖任何标记");
   assert.equal(d.resumeSessionId, "sess-A");
 });
 
@@ -125,7 +127,7 @@ test("touch 持久化:重启后保活效果仍在", () => {
 
   const second = new SessionManager({ store, timeoutMs: TIMEOUT, now: c.now });
   c.advance(TIMEOUT - 1);
-  assert.equal(second.decide("stdin:local:u1", GO).resumeSessionId, "sess-A");
+  assert.equal(second.decide("stdin:local:u1").resumeSessionId, "sess-A");
 });
 
 test("dueReminders 在到点时返回用户且只提醒一次", () => {
@@ -158,7 +160,7 @@ test("状态持久化并可从 store 恢复", () => {
   // 用同一 store 新建实例,模拟重启
   const second = new SessionManager({ store, timeoutMs: TIMEOUT, now: c.now });
   c.advance(TIMEOUT - 1);
-  const d = second.decide("stdin:local:u1", GO);
+  const d = second.decide("stdin:local:u1");
   assert.equal(d.isNew, false);
   assert.equal(d.resumeSessionId, "sess-A");
 });
@@ -168,7 +170,7 @@ test("archiveCurrent:结束当前会话但不丢历史,下一条消息开新会�
   sm.record("stdin:local:u1", "sess-A");
   const archived = sm.archiveCurrent("stdin:local:u1");
   assert.equal(archived?.sessionId, "sess-A");
-  assert.equal(sm.decide("stdin:local:u1", GO).isNew, true);
+  assert.equal(sm.decide("stdin:local:u1").isNew, true);
   // 归档不等于删除:还能凭 id 切回去。
   assert.deepEqual(
     sm.historyOf("stdin:local:u1").map((h) => h.sessionId),
@@ -211,7 +213,7 @@ test("switchTo:按前缀切回历史会话,原当前会话归档", () => {
   assert.equal(res.kind === "switched" && res.from?.sessionId, "bbbb2222");
 
   // 切回的会话即刻生效:普通消息直接 resume,不需要 /继续。
-  const d = sm.decide("stdin:local:u1", GO);
+  const d = sm.decide("stdin:local:u1");
   assert.equal(d.resumeSessionId, "aaaa1111");
   // 原当前会话进了历史,还能再切回去。
   assert.deepEqual(
@@ -226,7 +228,7 @@ test("switchTo:超时已久的历史会话也能切回(这正是它存在的理�
   sm.archiveCurrent("stdin:local:u1");
   c.advance(TIMEOUT * 24); // 远超超时窗口
   assert.equal(sm.switchTo("stdin:local:u1", "aaaa").kind, "switched");
-  assert.equal(sm.decide("stdin:local:u1", GO).resumeSessionId, "aaaa1111");
+  assert.equal(sm.decide("stdin:local:u1").resumeSessionId, "aaaa1111");
 });
 
 test("switchTo:大小写不敏感;目标是当前会话时如实说明", () => {
@@ -315,8 +317,8 @@ test("多用户互不干扰", () => {
   c.advance(30 * 60 * 1000);
   sm.record("stdin:local:u2", "sess-2");
   c.advance(TIMEOUT - 30 * 60 * 1000); // u1 累计超时,u2 未超时
-  assert.equal(sm.decide("stdin:local:u1", GO).isNew, true);
-  assert.equal(sm.decide("stdin:local:u2", GO).resumeSessionId, "sess-2");
+  assert.equal(sm.decide("stdin:local:u1").isNew, true);
+  assert.equal(sm.decide("stdin:local:u2").resumeSessionId, "sess-2");
 });
 
 test("每用户超时:timeoutMsFor 覆盖全局默认", () => {
@@ -332,8 +334,8 @@ test("每用户超时:timeoutMsFor 覆盖全局默认", () => {
   sm.record("stdin:local:normal", "sess-N");
   c.advance(120_000); // 超过 short 的 1 分钟,远未到默认的 1 小时
 
-  assert.equal(sm.decide(shortFor, GO).isNew, true, "短超时的用户应当开新会话");
-  assert.equal(sm.decide("stdin:local:normal", GO).isNew, false, "默认超时的用户仍在窗口内");
+  assert.equal(sm.decide(shortFor).isNew, true, "短超时的用户应当开新会话");
+  assert.equal(sm.decide("stdin:local:normal").isNew, false, "默认超时的用户仍在窗口内");
   // dueReminders 也要按每用户超时算,否则短超时的人永远等不到提醒。
   assert.deepEqual(sm.dueReminders(), [shortFor]);
 });
@@ -351,7 +353,7 @@ test("snapshot 返回副本,不泄漏内部引用", () => {
   sm.record("stdin:local:u1", "sess-A");
   const snap: StateMap = sm.snapshot();
   snap["stdin:local:u1"]!.current!.sessionId = "tampered";
-  assert.equal(sm.decide("stdin:local:u1", GO).resumeSessionId, "sess-A");
+  assert.equal(sm.decide("stdin:local:u1").resumeSessionId, "sess-A");
 });
 
 test("加载时丢弃非 userKey 或旧格式的状态(不认识历史格式,也不迁移)", () => {
@@ -376,6 +378,6 @@ test("加载时丢弃非 userKey 或旧格式的状态(不认识历史格式,也
   assert.deepEqual(Object.keys(snap), ["stdin:local:u1"]);
   assert.equal(sm.historyOf("stdin:local:u1")[0]?.sessionId, "sess-old");
   // 丢弃的用户下次发消息就是全新会话,不会误 resume 到别人的上下文。
-  assert.equal(sm.decide("o9cq80yCc7@im.wechat", GO).isNew, true);
-  assert.equal(sm.decide("stdin:local:old", GO).isNew, true);
+  assert.equal(sm.decide("o9cq80yCc7@im.wechat").isNew, true);
+  assert.equal(sm.decide("stdin:local:old").isNew, true);
 });

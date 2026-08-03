@@ -11,6 +11,8 @@ import {
   formatProgress,
   ProgressThrottle,
   MAX_PROGRESS_PER_TURN,
+  MAX_FEEDS_PER_TURN,
+  FEED_ACK_TEXT,
 } from "../src/core/gateway.js";
 import { SessionManager, InMemoryStore } from "../src/core/session.js";
 import { UserRegistry } from "../src/core/users.js";
@@ -93,6 +95,8 @@ class FakeAgent {
   calls: FakeCall[] = [];
   private n = 0;
   nextSessionId?: string;
+  /** 各回合中途收到的追加输入,按到达顺序。 */
+  fed: Array<{ prompt: string; attachments: readonly Attachment[] }> = [];
   /** run 时依序回放给 onProgress 的事件。 */
   progressEvents: AgentProgressEvent[] = [];
   /**
@@ -122,6 +126,13 @@ class FakeAgent {
     });
     this.inFlight += 1;
     this.peakInFlight = Math.max(this.peakInFlight, this.inFlight);
+    // 如实模拟 agent 侧的追加窗口:回合一收摊就拒绝,由网关回落去起新回合。
+    let accepting = true;
+    opts.onFeedReady?.((feedPrompt, feedAttachments) => {
+      if (!accepting) return false;
+      this.fed.push({ prompt: feedPrompt, attachments: feedAttachments });
+      return true;
+    });
     try {
       // abort 会打断正在跑的回合,而不是等它跑完 —— 如实模拟 SDK 的行为。
       if (this.gate) await Promise.race([this.gate, rejectOnAbort(opts.abortController)]);
@@ -133,6 +144,7 @@ class FakeAgent {
       const sessionId = opts.resumeSessionId ?? this.nextSessionId ?? `sess-${++this.n}`;
       return { text: `echo:${prompt}`, sessionId, isError: false };
     } finally {
+      accepting = false;
       this.inFlight -= 1;
     }
   }
@@ -314,7 +326,7 @@ test("进度:progressEnabled=false 只停推送,回合快照照常更新", async
   let snapshot: { steps: number; last?: string } | undefined;
   agent.beforeProgress = () => {
     // 事件回放期间回合还在飞,此刻正是 /状态 能看到的东西。
-    const ctx = turns.currentFor(U1);
+    const ctx = turns.foregroundFor(U1);
     if (ctx) snapshot = { steps: ctx.progress.steps, last: ctx.progress.last };
   };
   await channel.receive(U1, "你好");
@@ -339,7 +351,7 @@ test("回合快照:步数与最后一步随事件推进,回合结束后清空", 
   ];
   const seen: Array<{ steps: number; last?: string }> = [];
   agent.beforeProgress = () => {
-    const ctx = turns.currentFor(U1);
+    const ctx = turns.foregroundFor(U1);
     if (ctx) seen.push({ steps: ctx.progress.steps, last: ctx.progress.last });
   };
   await channel.receive(U1, "跑个测试");
@@ -347,7 +359,7 @@ test("回合快照:步数与最后一步随事件推进,回合结束后清空", 
   // 两次采样分别发生在第 1、第 2 个事件送达之前。
   assert.deepEqual(seen[0], { steps: 0, last: undefined });
   assert.deepEqual(seen[1], { steps: 1, last: "🔧 Read: /etc/hosts" });
-  assert.equal(turns.currentFor(U1), undefined, "回合结束后不再有在飞回合");
+  assert.equal(turns.foregroundFor(U1), undefined, "回合结束后不再有在飞回合");
 });
 
 test("/状态 报告在飞回合:卡住时也答得出「在干什么」", async () => {
@@ -358,7 +370,7 @@ test("/状态 报告在飞回合:卡住时也答得出「在干什么」", async
 
   const inFlight = channel.receive(U1, "跑个长任务");
   await waitUntil(() => agent.inFlight === 1, "回合进到 agent 里挂住");
-  const ctx = turns.currentFor(U1)!;
+  const ctx = turns.foregroundFor(U1)!;
   ctx.progress.steps = 3;
   ctx.progress.last = "🔧 Bash: npm test";
   ctx.progress.lastAt = t - 30_000;
@@ -387,8 +399,8 @@ test("/状态 区分排队与真在跑:并发满时说排队", async () => {
   await waitUntil(() => agent.inFlight === 1, "U2 占住唯一的名额");
   const second = channel.receive(U1, "我在后面等");
   // U1 走完 prelude 与 mint 之后停在 semaphore.acquire 上:有回合上下文,但没名额。
-  await waitUntil(() => turns.currentFor(U1) !== undefined, "U1 铸出回合令牌");
-  assert.equal(turns.currentFor(U1)?.progress.running, undefined, "还没拿到名额");
+  await waitUntil(() => turns.foregroundFor(U1) !== undefined, "U1 铸出回合令牌");
+  assert.equal(turns.foregroundFor(U1)?.progress.running, undefined, "还没拿到名额");
 
   await channel.receive(U1, "/状态");
   const status = afterGreeting(channel.sent).find((m) => m.text.startsWith("📋"))!;
@@ -807,31 +819,27 @@ test("/继续:没有可继续的会话时如实说明,同样不触发回合", as
   );
 });
 
-test("/继续 排在在飞回合之后:touch 的是它刚 record 的会话,不抢跑", async () => {
+test("/继续 在分拣节点里就地消化,不等在飞回合、也不起新回合", async () => {
+  // 分拣节点不等回合,所以 /继续 不会被卡死的那一轮堵住 —— 这正是
+  // "走队列"不再等于"排在回合后面"的地方。
   const t = 1_000_000;
   const { channel, agent, sessions } = build(() => t);
-  let open!: () => void;
-  agent.gate = new Promise<void>((resolve) => {
-    open = resolve;
-  });
+  await channel.receive(U1, "先聊一句"); // 有个 current 会话可续
+  const open = stuckTurn(agent);
   const stuck = channel.receive(U1, "长任务");
-  await new Promise((r) => setImmediate(r));
+  await waitUntil(() => agent.inFlight === 1, "长任务进到 agent 里");
+  channel.sent.length = 0;
 
-  const cont = channel.receive(U1, "/继续"); // 走队列,应当排在在飞回合后面
-  await new Promise((r) => setImmediate(r));
-  assert.equal(agent.calls.length, 1, "/继续 不该并发起新回合");
+  await channel.receive(U1, "/继续");
+  assert.equal(agent.calls.length, 2, "/继续 不该起回合");
   assert.ok(
-    !channel.sent.some((m) => m.text.includes("没有可继续的对话")),
-    "回合还在飞时 /继续 不该抢跑 —— 抢跑会误报「没有可继续的对话」",
+    channel.sent.some((m) => m.text === "好,接上刚才的对话了,直接发消息继续聊。"),
+    `回合卡着也该立刻答复,实际:${JSON.stringify(channel.sent.map((m) => m.text))}`,
   );
 
   open();
-  await Promise.all([stuck, cont]);
-  assert.equal(sessions.snapshot()[U1]!.current!.sessionId, "sess-1");
-  assert.ok(
-    channel.sent.some((m) => m.text === "好,接上刚才的对话了,直接发消息继续聊。"),
-    "排在回合之后执行,record 过的会话应当续得上",
-  );
+  await stuck;
+  assert.equal(sessions.currentOf(U1)?.sessionId, "sess-1");
 });
 
 // --- /切换会话 ---
@@ -950,29 +958,34 @@ test("单发 /切换会话:清单先出清已被清理的条目,不列切不过�
   assert.deepEqual(sessions.historyOf(U1), [], "出清应落到状态里,不只是显示上藏起来");
 });
 
-test("/切换会话 走队列:排在在飞回合之后,切换结果不被回合写回覆盖", async () => {
+test("/切换会话 当场生效:被切走的那一轮转后台跑完,产出进 history 不顶掉 current", async () => {
   const t = 1_000_000;
-  const { channel, agent, sessions } = build(() => t);
+  const { channel, agent, sessions, turns } = build(() => t);
   await channel.receive(U1, "聊聊 docker 镜像"); // sess-1
   await channel.receive(U1, "/新会话");
-  let open!: () => void;
-  agent.gate = new Promise<void>((resolve) => {
-    open = resolve;
-  });
+  const open = stuckTurn(agent);
   const stuck = channel.receive(U1, "写个爬虫"); // sess-2,卡住
-  await new Promise((r) => setImmediate(r));
+  await waitUntil(() => agent.inFlight === 1, "第二轮进到 agent 里");
 
   const sw = channel.receive(U1, "/切换会话 sess-1");
-  await new Promise((r) => setImmediate(r));
-  assert.equal(sessions.currentOf(U1), undefined, "切换不该抢在在飞回合前面执行");
+  await waitUntil(() => sessions.currentOf(U1)?.sessionId === "sess-1", "切换当场生效");
+  assert.equal(turns.allFor(U1).length, 1, "那一轮没被停掉");
+  assert.equal(turns.foregroundFor(U1), undefined, "但它已经不是前台了");
+  assert.ok(
+    channel.sent.some((m) => m.text.includes("后台接着跑")),
+    "要告诉用户那一轮还在跑",
+  );
 
   open();
   await Promise.all([stuck, sw]);
-  assert.equal(sessions.currentOf(U1)?.sessionId, "sess-1", "切换应在 record() 之后生效");
-  assert.deepEqual(
-    sessions.historyOf(U1).map((h) => h.sessionId),
-    ["sess-2"],
-    "被切走的会话应归档,能再切回去",
+  assert.equal(sessions.currentOf(U1)?.sessionId, "sess-1", "后台回合不该顶掉当前会话");
+  assert.ok(
+    sessions.historyOf(U1).some((h) => h.sessionId === "sess-2"),
+    "后台回合的产出应当落在 history 里",
+  );
+  assert.ok(
+    channel.sent.some((m) => m.text.includes("【后台对话 sess-2 的结果】")),
+    `后台结果要标明出处,实际:${JSON.stringify(channel.sent.map((m) => m.text))}`,
   );
 });
 
@@ -1084,25 +1097,27 @@ test("把普通用户列为管理员后,他的回合也拿到管理员能力", a
   }
 });
 
-test("/api/me/session/reset 打的标记在回合结束时生效", async () => {
+test("/api/me/session/reset:回合转后台,当前会话归档,产出不写回 current", async () => {
   const t = 1_000_000;
   const { channel, sessions, turns } = build(() => t);
   await channel.receive(U1, "第一条");
   assert.equal(Object.keys(sessions.snapshot()).length, 1);
 
-  // 模拟 agent 在回合中调了 reset 接口:拿到自己的回合上下文并置位。
+  // 模拟 agent 在回合中调了 reset 接口 —— 与 api-self 里那两步一模一样:
+  // 本回合转后台,当前会话就地归档。
   let seen = false;
   const orig = turns.mint.bind(turns);
   turns.mint = (userKey: string) => {
     const m = orig(userKey);
     if (!seen) {
       seen = true;
-      m.ctx.resetSession = true;
+      m.ctx.detached = true;
+      sessions.archiveCurrent(userKey);
     }
     return m;
   };
   await channel.receive(U1, "第二条");
-  assert.equal(sessions.currentOf(U1), undefined, "标记应当在回合的 finally 里生效");
+  assert.equal(sessions.currentOf(U1), undefined, "detached 的回合不该写回 current");
   assert.ok(
     sessions.historyOf(U1).some((h) => h.sessionId === "sess-1"),
     "被 reset 的会话应归档而不是消失",
@@ -1153,19 +1168,22 @@ test("带图时不按硬指令解析:图片不会被指令分支吞掉", async (
   assert.equal(agent.calls[0]!.attachments?.length, 1);
 });
 
-test("带图的消息仍然进每用户串行队列", async () => {
+test("带图的回合跑着时,后面的话追加进去而不是另起一轮", async () => {
+  // 同一会话永远只有一个回合在跑 —— 后来的话要么追加进去,要么排在它后面。
   const { channel, agent } = build(() => 1_000_000);
-  let release!: () => void;
-  agent.gate = new Promise<void>((r) => (release = r));
+  const release = stuckTurn(agent);
 
   const first = channel.receive(U1, "第一条", [fakeImage()]);
+  await waitUntil(() => agent.inFlight === 1, "第一条进到 agent 里");
   const second = channel.receive(U1, "第二条");
   await new Promise((r) => setImmediate(r));
-  assert.equal(agent.calls.length, 1, "第二条必须等第一条跑完");
+
+  assert.equal(agent.calls.length, 1, "不该为第二条另起一轮");
+  assert.deepEqual(agent.fed.map((f) => f.prompt), ["第二条"]);
   release();
   await Promise.all([first, second]);
-  assert.equal(agent.calls.length, 2);
-  assert.equal(agent.peakInFlight, 1);
+  assert.equal(agent.calls.length, 1);
+  assert.equal(agent.peakInFlight, 1, "同一会话绝不并发");
 });
 
 // --- 消息聚合窗口 ---
@@ -1317,4 +1335,416 @@ test("聚合:stop() 把攒着的消息交出去,不静默吞掉", async () => {
   await pending;
   assert.equal(agent.calls.length, 1, "stop() 应当把攒着的那批 flush 出去");
   assert.equal(agent.calls[0]!.prompt, "关机前发的");
+});
+
+// --- 追加输入:回合跑到一半再发消息 ---
+
+/**
+ * 排队等这一轮跑完,在用户那边就是"发了没反应" —— 连回执都发不出来
+ * (回执在 handle 里,而 handle 排在队列尾)。追加进去则是模型下一次请求就看到。
+ *
+ * 这组用例把回合卡在 gate 上模拟"正在跑",再往里发消息。
+ */
+function stuckTurn(agent: FakeAgent): () => void {
+  let open!: () => void;
+  agent.gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return () => open();
+}
+
+test("追加输入:回合跑着时发的消息折进这一轮,不另起回合", async () => {
+  const { channel, agent } = build(() => 1_000_000);
+  const open = stuckTurn(agent);
+
+  const first = channel.receive(U1, "帮我改那个脚本");
+  await waitUntil(() => agent.inFlight === 1, "第一轮进到 agent 里");
+
+  await channel.receive(U1, "等下,用 sed 别用 python");
+  assert.deepEqual(
+    agent.fed.map((f) => f.prompt),
+    ["等下,用 sed 别用 python"],
+    "补充应当追加进在飞回合",
+  );
+  assert.equal(agent.calls.length, 1, "不该为补充另起一个回合");
+
+  open();
+  await first;
+  assert.equal(agent.calls.length, 1, "回合跑完后也不该补一个回合出来");
+});
+
+test("追加输入:聚合窗口照旧生效,图与文一起追加", async () => {
+  // 「图 + 文字是两条消息」那条不变量在追加路径上同样成立。
+  const { channel, agent } = build(() => 1_000_000, { settings: { messageAggregationMs: AGG } });
+  const open = stuckTurn(agent);
+  const img = fakeImage();
+
+  const first = channel.receive(U1, "先看看这个");
+  // 第一条要先走完自己的聚合窗口才会入队;waitUntil 靠 setImmediate 推进,
+  // 空转得比窗口快得多,不先睡一下会等不到。
+  await new Promise((r) => setTimeout(r, AGG * 2));
+  await waitUntil(() => agent.inFlight === 1, "第一轮进到 agent 里");
+
+  await Promise.all([channel.receive(U1, "", [img]), channel.receive(U1, "还有这张图")]);
+  assert.equal(agent.fed.length, 1, "两条应当攒成一次追加");
+  assert.equal(agent.fed[0]!.prompt, "还有这张图");
+  assert.deepEqual(agent.fed[0]!.attachments, [img]);
+
+  open();
+  await first;
+});
+
+test("追加输入:回合已收摊时回落到新回合,消息不丢", async () => {
+  const { channel, agent } = build(() => 1_000_000);
+  await channel.receive(U1, "第一句");
+  assert.equal(agent.calls.length, 1);
+
+  // 回合早跑完了,agent 侧的追加窗口已关 —— 这条该照常起新回合。
+  await channel.receive(U1, "第二句");
+  assert.equal(agent.fed.length, 0, "收摊后不该还能追加");
+  assert.equal(agent.calls.length, 2);
+  assert.equal(agent.calls[1]!.prompt, "第二句");
+  assert.equal(agent.calls[1]!.resume, "sess-1", "回落的回合照常 resume");
+});
+
+test("追加输入:/切换会话 不追加,留在队列里排在 record() 之后", async () => {
+  // 它改会话指针,折进在飞回合的话会被那一轮结束时的 record() 写回覆盖 ——
+  // 与它不走 immediate 分流是同一个理由。
+  const { channel, agent, sessions } = build(() => 1_000_000);
+  await channel.receive(U1, "第一段对话"); // 产生 sess-1
+  await channel.receive(U1, "/新会话");
+
+  const open = stuckTurn(agent);
+  const second = channel.receive(U1, "第二段对话");
+  await waitUntil(() => agent.inFlight === 1, "第二轮进到 agent 里");
+
+  const switching = channel.receive(U1, "/切换会话 sess-1");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(agent.fed.length, 0, "/切换会话 不该被折进在飞回合");
+
+  open();
+  await Promise.all([second, switching]);
+  assert.equal(sessions.currentOf(U1)?.sessionId, "sess-1", "切换应当发生在回合收尾之后");
+});
+
+test("追加输入:次数用尽后回落到队列", async () => {
+  // 兜底而非公平性限制:每次追加都把这一轮往后拖,而正文要等回合结束才发得出。
+  const { channel, agent } = build(() => 1_000_000);
+  const open = stuckTurn(agent);
+  const first = channel.receive(U1, "开工");
+  await waitUntil(() => agent.inFlight === 1, "第一轮进到 agent 里");
+
+  for (let i = 0; i < MAX_FEEDS_PER_TURN; i++) {
+    await channel.receive(U1, `补充${i}`);
+  }
+  assert.equal(agent.fed.length, MAX_FEEDS_PER_TURN, "上限之内都该追加进去");
+
+  // 第 N+1 条:追加额度没了,回落到队列 —— 它会等这一轮跑完再起回合。
+  const overflow = channel.receive(U1, "再补一条");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(agent.fed.length, MAX_FEEDS_PER_TURN, "超出的不该再追加");
+  assert.equal(agent.calls.length, 1, "它应当还在队列里等着");
+
+  open();
+  await Promise.all([first, overflow]);
+  assert.equal(agent.calls.length, 2, "回落的那条应当自己起一个回合");
+  assert.equal(agent.calls[1]!.prompt, "再补一条");
+});
+
+test("追加输入:图片上限跨追加累计 —— 闸门管的是整个回合", async () => {
+  const { channel, agent } = build(() => 1_000_000, { settings: { maxImagesPerTurn: 3 } });
+  const open = stuckTurn(agent);
+  const first = channel.receive(U1, "看图", [fakeImage(), fakeImage()]);
+  await waitUntil(() => agent.inFlight === 1, "第一轮进到 agent 里");
+
+  await channel.receive(U1, "再看这两张", [fakeImage(), fakeImage()]);
+  assert.equal(agent.fed[0]!.attachments.length, 1, "回合里已经有 2 张,只放得下 1 张");
+
+  await channel.receive(U1, "还有这张", [fakeImage()]);
+  assert.equal(agent.fed[1]!.attachments.length, 0, "额度已经用满");
+  assert.equal(agent.fed[1]!.prompt, "还有这张", "图放不下也不影响文字追加进去");
+
+  open();
+  await first;
+});
+
+test("追加输入:/状态 报出补充了几条 —— 别处看不见它们", async () => {
+  // 被折进 turn 的消息不会在 SDK 消息流里露面,不记账的话
+  // 「我刚补的那句进去了吗」没有任何地方答得出。
+  const { channel, agent } = build(() => 1_000_000);
+  const open = stuckTurn(agent);
+  const first = channel.receive(U1, "开工");
+  await waitUntil(() => agent.inFlight === 1, "第一轮进到 agent 里");
+
+  await channel.receive(U1, "补充一");
+  await channel.receive(U1, "补充二");
+  channel.sent.length = 0;
+  await channel.receive(U1, "/状态");
+  const status = channel.sent.find((m) => m.text.startsWith("📋"));
+  assert.ok(status?.text.includes("期间补充 2 条"), `实际:${status?.text}`);
+
+  open();
+  await first;
+});
+
+test("追加输入:回执发出并在回合收尾时一并撤回", async () => {
+  const { channel, agent } = build(() => 1_000_000, { supportsRecall: true });
+  const open = stuckTurn(agent);
+  const first = channel.receive(U1, "开工");
+  await waitUntil(() => agent.inFlight === 1, "第一轮进到 agent 里");
+
+  await channel.receive(U1, "补一句");
+  await waitUntil(
+    () => channel.sent.some((m) => m.text === FEED_ACK_TEXT),
+    "追加回执发出去",
+  );
+
+  open();
+  await first;
+  // greeting=msg-1、首条回执=msg-2、追加回执=msg-3;两条回执都该撤掉,
+  // 不撤的话被追加过的回合会在聊天记录里永久攒下一串"收到"。
+  assert.deepEqual(channel.recalled.sort(), ["msg-2", "msg-3"]);
+});
+
+test("追加输入:关掉回执的用户不会收到追加回执", async () => {
+  const { channel, agent, prefs } = build(() => 1_000_000);
+  prefs.set(U1, { ackEnabled: false });
+  const open = stuckTurn(agent);
+  const first = channel.receive(U1, "开工");
+  await waitUntil(() => agent.inFlight === 1, "第一轮进到 agent 里");
+
+  await channel.receive(U1, "补一句");
+  assert.equal(agent.fed.length, 1, "追加本身照常发生");
+  assert.ok(!channel.sent.some((m) => m.text === FEED_ACK_TEXT), "但不该有回执");
+
+  open();
+  await first;
+});
+
+test("追加输入:排队中的回合不接受追加 —— 那时还没有 turn 可折", async () => {
+  // 并发名额被别人占着时,自己这一轮还没进 agent。消息该照常排队。
+  const { channel, agent } = build(() => 1_000_000, { settings: { maxConcurrentTurns: 1 } });
+  const open = stuckTurn(agent);
+  const blocking = channel.receive(U2, "占住唯一的名额");
+  await waitUntil(() => agent.inFlight === 1, "U2 占住名额");
+
+  const queued = channel.receive(U1, "我先排着");
+  await new Promise((r) => setImmediate(r));
+  // 不 await:它排在 U1 队列里那条还没拿到名额的回合后面,await 会直接死锁。
+  const extra = channel.receive(U1, "再补一句");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(agent.fed.length, 0, "排队中的回合没有 feed 可挂");
+
+  open();
+  await Promise.all([blocking, queued, extra]);
+  assert.equal(agent.calls.length, 3, "两条各自成回合");
+});
+
+test("追加输入:纯 /继续 不追加,仍旧走队列里的 touch", async () => {
+  const { channel, agent } = build(() => 1_000_000);
+  const open = stuckTurn(agent);
+  const first = channel.receive(U1, "开工");
+  await waitUntil(() => agent.inFlight === 1, "第一轮进到 agent 里");
+
+  const cont = channel.receive(U1, "/继续");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(agent.fed.length, 0, "没有可追加的内容");
+
+  open();
+  await Promise.all([first, cont]);
+  assert.equal(agent.calls.length, 1, "/继续 不该起回合");
+});
+
+test("追加输入:图被额度挤光又没文字时回落到队列,不递空内容给模型", async () => {
+  // 截断后可能什么都不剩 —— 空 content 会被模型侧直接拒收。回落反而更好:
+  // 新回合有一整份图片额度。
+  const { channel, agent } = build(() => 1_000_000, { settings: { maxImagesPerTurn: 1 } });
+  const open = stuckTurn(agent);
+  const first = channel.receive(U1, "看图", [fakeImage()]);
+  await waitUntil(() => agent.inFlight === 1, "第一轮进到 agent 里");
+
+  const overflow = channel.receive(U1, "", [fakeImage()]); // 纯图片,额度已满
+  await new Promise((r) => setImmediate(r));
+  assert.equal(agent.fed.length, 0, "没东西可追加就不该追加");
+  assert.equal(agent.calls.length, 1, "它应当在队列里等着");
+
+  open();
+  await Promise.all([first, overflow]);
+  assert.equal(agent.calls.length, 2, "回落的那条自己起一个回合");
+  assert.equal(agent.calls[1]!.attachments?.length, 1, "新回合有完整的图片额度");
+});
+
+test("空批不起回合 —— 没有内容可给模型,额度也不该花", async () => {
+  // 渠道通常挡了空消息;这里防的是"纯图片消息的图在渠道那边解码失败被跳过"
+  // 之后剩下的空壳。
+  const { channel, agent } = build(() => 1_000_000);
+  await channel.receive(U1, "");
+  assert.equal(agent.calls.length, 0, "空消息不该起回合");
+});
+
+test("追加输入:「/继续 + 话」按顺序处理 —— 先 touch,话再追加进在飞回合", async () => {
+  // 线性分拣的直接结果:指令原地消化,它后面的话照常投递给当前会话。
+  // 有回合在跑说明会话根本没超时,/继续 本就是个 no-op。
+  const { channel, agent } = build(() => 1_000_000, { settings: { messageAggregationMs: AGG } });
+  const open = stuckTurn(agent);
+  const first = channel.receive(U1, "开工");
+  await new Promise((r) => setTimeout(r, AGG * 2));
+  await waitUntil(() => agent.inFlight === 1, "第一轮进到 agent 里");
+
+  const batch = Promise.all([
+    channel.receive(U1, "/继续"),
+    channel.receive(U1, "接着刚才那个"),
+  ]);
+  await new Promise((r) => setTimeout(r, AGG * 2));
+  assert.deepEqual(agent.fed.map((f) => f.prompt), ["接着刚才那个"]);
+  assert.equal(agent.calls.length, 1, "不该另起一轮");
+
+  open();
+  await Promise.all([first, batch]);
+});
+
+// --- 线性分拣与后台会话 ---
+
+test("线性分拣:指令之前的话落在原会话,之后的话落在切过去那段", async () => {
+  // 这是整个流水线的核心断言。压平成「一段文本 + 几个标记」就丢掉了顺序,
+  // 只能靠"整批不处理"兜底;按到达顺序线性处理则天然正确。
+  const { channel, agent, sessions } = build(() => 1_000_000, {
+    settings: { messageAggregationMs: AGG },
+  });
+  await channel.receive(U1, "第一段对话"); // sess-1
+  await channel.receive(U1, "/新会话");
+  await channel.receive(U1, "第二段对话"); // sess-2
+  agent.calls.length = 0;
+
+  // 一批里:先说一句 → 切回 sess-1 → 再说一句
+  await Promise.all([
+    channel.receive(U1, "这句属于第二段"),
+    channel.receive(U1, "/切换会话 sess-1"),
+    channel.receive(U1, "这句属于第一段"),
+  ]);
+
+  assert.equal(agent.calls.length, 2, "指令把这批切成了两次投递");
+  assert.equal(agent.calls[0]!.prompt, "这句属于第二段");
+  assert.equal(agent.calls[0]!.resume, "sess-2", "指令之前的话该落在原来那段");
+  assert.equal(agent.calls[1]!.prompt, "这句属于第一段");
+  assert.equal(agent.calls[1]!.resume, "sess-1", "指令之后的话该落在切过去那段");
+  assert.equal(sessions.currentOf(U1)?.sessionId, "sess-1");
+});
+
+test("线性分拣:指令失败时只中止剩下的段,已投递的不受影响", async () => {
+  const { channel, agent } = build(() => 1_000_000, { settings: { messageAggregationMs: AGG } });
+  await channel.receive(U1, "开个头"); // sess-1
+  agent.calls.length = 0;
+
+  await Promise.all([
+    channel.receive(U1, "这句照常处理"),
+    channel.receive(U1, "/切换会话 根本不存在"),
+    channel.receive(U1, "这句冲着那段说的"),
+  ]);
+
+  assert.deepEqual(
+    agent.calls.map((c) => c.prompt),
+    ["这句照常处理"],
+    "指令之前的话属于当前会话,照常投递;之后的话该被中止",
+  );
+  assert.ok(
+    channel.sent.some((m) => m.text.includes("这批消息先不处理")),
+    "要交代剩下的话没处理",
+  );
+});
+
+test("/新会话:在飞回合转后台跑完,结果带出处送来", async () => {
+  const { channel, agent, sessions, turns } = build(() => 1_000_000);
+  const open = stuckTurn(agent);
+  const stuck = channel.receive(U1, "跑个长任务");
+  await waitUntil(() => agent.inFlight === 1, "回合进到 agent 里");
+
+  await channel.receive(U1, "/新会话");
+  assert.equal(turns.allFor(U1).length, 1, "那一轮没被停掉");
+  assert.equal(turns.foregroundFor(U1), undefined, "但已经不是前台");
+  assert.ok(channel.sent.some((m) => m.text.includes("后台接着跑")));
+
+  open();
+  await stuck;
+  assert.ok(
+    channel.sent.some((m) => m.text.startsWith("【后台对话 sess-1 的结果】")),
+    `后台结果要标明出处,实际:${JSON.stringify(channel.sent.map((m) => m.text))}`,
+  );
+  assert.equal(sessions.currentOf(U1), undefined, "后台回合不该把自己写成当前会话");
+  assert.deepEqual(sessions.historyOf(U1).map((h) => h.sessionId), ["sess-1"]);
+});
+
+test("后台回合不推进度,前台的照推", async () => {
+  let t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  agent.progressEvents = [{ kind: "tool", name: "Bash", input: { command: "npm test" } }];
+  agent.beforeProgress = () => (t += 60_000);
+  const open = stuckTurn(agent);
+  const stuck = channel.receive(U1, "长任务");
+  await waitUntil(() => agent.inFlight === 1, "回合进到 agent 里");
+
+  await channel.receive(U1, "/新会话"); // 切走 → 转后台
+  channel.sent.length = 0;
+  open();
+  await stuck;
+  assert.ok(
+    !channel.sent.some((m) => m.text.startsWith("🔧")),
+    `后台回合不该推进度,实际:${JSON.stringify(channel.sent.map((m) => m.text))}`,
+  );
+});
+
+test("/取消 只中断前台,后台那些继续跑", async () => {
+  const { channel, agent, turns } = build(() => 1_000_000);
+  const open = stuckTurn(agent);
+  const bg = channel.receive(U1, "这个切到后台"); // 将成为后台
+  await waitUntil(() => agent.inFlight === 1, "第一轮进到 agent 里");
+  await channel.receive(U1, "/新会话");
+
+  // 再起一个前台回合(gate 已经换成新的,不会立刻结束)
+  const fgOpen = stuckTurn(agent);
+  const fg = channel.receive(U1, "这个是前台");
+  await waitUntil(() => turns.foregroundFor(U1) !== undefined, "前台回合起来了");
+
+  await channel.receive(U1, "/取消");
+  const bgCtx = turns.allFor(U1).find((c) => c.detached);
+  assert.equal(bgCtx?.abort.signal.aborted, false, "后台的不该被顺手灭掉");
+
+  fgOpen();
+  open();
+  await Promise.all([bg, fg]);
+});
+
+test("/状态 交代后台还有几段在跑 —— 别处看不见它们", async () => {
+  const { channel, agent } = build(() => 1_000_000);
+  const open = stuckTurn(agent);
+  const stuck = channel.receive(U1, "长任务");
+  await waitUntil(() => agent.inFlight === 1, "回合进到 agent 里");
+  await channel.receive(U1, "/新会话");
+
+  channel.sent.length = 0;
+  await channel.receive(U1, "/状态");
+  const status = channel.sent.find((m) => m.text.startsWith("📋"));
+  assert.ok(status?.text.includes("后台:1 段对话还在跑"), `实际:${status?.text}`);
+
+  open();
+  await stuck;
+});
+
+test("同一会话绝不并发:追加额度用尽的那段排在这一轮后面,不另起一轮", async () => {
+  // 追不进去就另起一轮的话,两个回合会 resume 同一个 sessionId,上下文会被撕坏。
+  const { channel, agent } = build(() => 1_000_000);
+  const open = stuckTurn(agent);
+  const first = channel.receive(U1, "开工");
+  await waitUntil(() => agent.inFlight === 1, "第一轮进到 agent 里");
+
+  for (let i = 0; i < MAX_FEEDS_PER_TURN; i++) await channel.receive(U1, `补充${i}`);
+  const overflow = channel.receive(U1, "额度之外的那条");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(agent.calls.length, 1, "它必须等这一轮结束,不能并发同一会话");
+
+  open();
+  await Promise.all([first, overflow]);
+  assert.equal(agent.calls.length, 2);
+  assert.equal(agent.calls[1]!.prompt, "额度之外的那条");
+  assert.equal(agent.peakInFlight, 1, "全程没有两个回合同时在跑");
 });
