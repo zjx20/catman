@@ -40,6 +40,16 @@ export const ACK_TEXT = "收到,正在处理中…";
  */
 export const FEED_ACK_TEXT = "收到,一并交给正在处理的这一轮了。";
 
+/**
+ * SDK 以错误结束一个回合时,正文前面加的那句话。
+ *
+ * `AgentReply.isError` 为真时,`text` 装的是 SDK 的错误原文(鉴权失败、额度耗尽、
+ * 达到轮数上限……)而不是模型的答复。不加标记的话它与一句正常回复长得一模一样 ——
+ * 用户会把「Credit balance is too low」读成助手在跟他说话,而不是"这轮根本没跑成"。
+ * 原文照发不翻译:它是去查订阅/配置的唯一线索。
+ */
+export const TURN_ERROR_PREFIX = "⚠️ 这一轮没能跑成,以下是 Claude 侧的报错原文:\n";
+
 /** 进度消息里思考/工具参数摘要的截断长度。 */
 const PROGRESS_MAX_CHARS = 200;
 
@@ -1116,19 +1126,29 @@ export class Gateway {
       if (turn.ctx.detached) this.sessions.archiveTurn(userKey, reply.sessionId, hint);
       else this.sessions.record(userKey, reply.sessionId, hint);
       await progress;
+      const body = reply.isError ? TURN_ERROR_PREFIX + reply.text : reply.text;
       await this.sendChunked(
         userKey,
-        this.labelIfDetached(turn.ctx, reply.sessionId, reply.text),
+        this.labelIfDetached(turn.ctx, reply.sessionId, body),
         prefs.maxReplyChars,
       );
     } catch (err) {
       console.error(`[gateway] 处理 ${userKey} 消息失败:`, err);
       await progress;
+      // 错误说明与正文同样要标出处 —— 后台回合报错时用户多半正在跟另一段对话
+      // 说话,一句没头没尾的「处理出错了」会被当成当前对话的答复(这正是
+      // labelIfDetached 存在的理由)。回合是抛错告终的,没有 reply 可问 sessionId:
+      // resume 的用 decide() 给的那个(SDK resume 不 fork,id 稳定),新会话的
+      // 则连 id 都还没有,只说清是后台的、切不回去。
       await this.trySend(
         userKey,
-        turn.ctx.abort.signal.aborted
-          ? "已中断这一轮。"
-          : `处理出错了:${(err as Error).message}`,
+        this.labelIfDetached(
+          turn.ctx,
+          decision.isNew ? undefined : decision.resumeSessionId,
+          turn.ctx.abort.signal.aborted
+            ? "已中断这一轮。"
+            : `处理出错了:${(err as Error).message}`,
+        ),
         "错误说明",
       );
     } finally {
@@ -1153,9 +1173,14 @@ export class Gateway {
    *
    * 用户此刻多半正在跟另一段对话说话,一段没头没尾的回复会被当成当前对话的答复 ——
    * 尤其它可能是几分钟前那个问题的答案。带上会话 id 还顺带告诉他怎么切回去。
+   *
+   * `sessionId` 允许缺失:回合抛错告终时拿不到它(新会话尤其,id 要等 SDK 吐出
+   * 结果才存在)。那种情况下"这是后台那段说的话"仍然要讲,只是切回的指令给不出 ——
+   * 与其为了凑齐格式而不标出处,不如少给一句提示。
    */
-  private labelIfDetached(ctx: TurnContext, sessionId: string, text: string): string {
+  private labelIfDetached(ctx: TurnContext, sessionId: string | undefined, text: string): string {
     if (!ctx.detached) return text;
+    if (sessionId === undefined) return `【后台对话的结果】\n${text}`;
     return (
       `【后台对话 ${shortSessionId(sessionId)} 的结果】\n${text}\n\n` +
       `(想接着这段聊,发「${canonicalOf("switchSession")} ${shortSessionId(sessionId)}」)`

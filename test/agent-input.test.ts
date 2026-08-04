@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { InputChannel, buildUserMessage } from "../src/core/agent.js";
+import { InputChannel, buildUserMessage, joinReplyTexts } from "../src/core/agent.js";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
 /**
@@ -76,4 +76,16 @@ test("close 幂等 —— 正常收尾与 finally 兜底都会调它", async () 
   ch.close();
   ch.close();
   assert.deepEqual(await drain(ch), ["唯一一条"]);
+});
+
+test("多段正文按序拼接 —— 追加输入落在 turn 边界上时会多出几段", () => {
+  assert.equal(joinReplyTexts(["第一段", "第二段"], false), "第一段\n\n第二段");
+});
+
+test("失败回合的空正文不能说成「没有返回内容」", () => {
+  // SDK 报错时 errors 可能是空数组、result 可能是空串。沿用成功路径的话术
+  // 会把一次失败(该去查订阅/配置)伪装成一次无话可说(该换个问法再问)。
+  assert.match(joinReplyTexts([], true), /回合失败/);
+  assert.equal(joinReplyTexts([], false), "(助手没有返回内容)");
+  assert.match(joinReplyTexts(["   "], true), /回合失败/, "只有空白也算没给详情");
 });

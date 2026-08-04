@@ -13,7 +13,9 @@ import {
   MAX_PROGRESS_PER_TURN,
   MAX_FEEDS_PER_TURN,
   FEED_ACK_TEXT,
+  TURN_ERROR_PREFIX,
 } from "../src/core/gateway.js";
+import { canonicalOf } from "../src/core/commands.js";
 import { SessionManager, InMemoryStore } from "../src/core/session.js";
 import { UserRegistry } from "../src/core/users.js";
 import { GlobalSettings, type SettingsPatch } from "../src/core/settings.js";
@@ -107,6 +109,12 @@ class FakeAgent {
   beforeProgress?: () => void;
   /** 设为 true 时 run 抛错,模拟 Agent 失败。 */
   fail = false;
+  /**
+   * 设为 true 时 run 正常返回但带 isError —— 模拟 SDK 以 result 报错
+   * (鉴权失败、额度耗尽、达到轮数上限)。这与 `fail` 是**两条不同的路径**:
+   * 那条抛异常走网关的 catch,这条走正常的正文发送路径。
+   */
+  replyIsError = false;
   /** 设置后 run 会等待此 promise,用于测并发控制与"卡住的回合"。 */
   gate?: Promise<void>;
   /** 当前同时在 run 里的调用数,以及历史峰值。 */
@@ -142,6 +150,9 @@ class FakeAgent {
       }
       if (this.fail) throw new Error("agent boom");
       const sessionId = opts.resumeSessionId ?? this.nextSessionId ?? `sess-${++this.n}`;
+      if (this.replyIsError) {
+        return { text: "Credit balance is too low", sessionId, isError: true };
+      }
       return { text: `echo:${prompt}`, sessionId, isError: false };
     } finally {
       accepting = false;
@@ -271,6 +282,21 @@ test("回执:Agent 失败时也撤回回执,并发出错误提示", async () => 
   await channel.receive(U1, "你好");
   assert.ok(channel.sent.some((m) => m.text.includes("处理出错了")));
   assert.deepEqual(channel.recalled, ["msg-2"]);
+});
+
+test("SDK 以 result 报错时:错误原文照发,但要标明这不是答复", async () => {
+  // 与「Agent 失败」是两条路径:那条抛异常,这条正常返回且 isError=true,
+  // 正文走的是与成功回复完全相同的发送路径 —— 不加标记的话,一句
+  // 「Credit balance is too low」在用户那边和助手说的话长得一模一样。
+  const t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  agent.replyIsError = true;
+  await channel.receive(U1, "你好");
+
+  const body = afterGreeting(channel.sent).find((m) => m.text.includes("Credit balance is too low"));
+  assert.ok(body, `错误原文要照发(它是去查订阅的唯一线索),实际:
+    ${JSON.stringify(channel.sent.map((m) => m.text))}`);
+  assert.ok(body.text.startsWith(TURN_ERROR_PREFIX), "要标明这是报错而不是答复");
 });
 
 test("回执:ackEnabled=false 时不发回执", async () => {
@@ -1672,6 +1698,47 @@ test("/新会话:在飞回合转后台跑完,结果带出处送来", async () =>
   );
   assert.equal(sessions.currentOf(U1), undefined, "后台回合不该把自己写成当前会话");
   assert.deepEqual(sessions.historyOf(U1).map((h) => h.sessionId), ["sess-1"]);
+});
+
+test("后台回合报错时,错误说明也要标明出处", async () => {
+  // 正文标出处、错误说明不标的话,这句「处理出错了」会被当成当前会话的答复 ——
+  // 而用户此刻正在跟另一段对话说话,他会以为是刚发的那句话出了问题。
+  const { channel, agent } = build(() => 1_000_000);
+  const open = stuckTurn(agent);
+  const stuck = channel.receive(U1, "跑个长任务");
+  await waitUntil(() => agent.inFlight === 1, "回合进到 agent 里");
+  await channel.receive(U1, "/新会话");
+
+  channel.sent.length = 0;
+  agent.fail = true;
+  open();
+  await stuck;
+
+  const err = channel.sent.find((m) => m.text.includes("处理出错了"));
+  assert.ok(err, `报错要送到用户那儿,实际:${JSON.stringify(channel.sent.map((m) => m.text))}`);
+  // 这一轮是新会话的首轮、又抛错告终,sessionId 压根还没存在过 ——
+  // 出处照说,切回的指令给不出就不给。
+  assert.ok(err.text.startsWith("【后台对话的结果】"), `实际:${err.text}`);
+});
+
+test("后台回合报错:resume 的那轮报得出会话 id", async () => {
+  const { channel, agent } = build(() => 1_000_000);
+  await channel.receive(U1, "第一轮"); // 建立 sess-1
+
+  const open = stuckTurn(agent);
+  const stuck = channel.receive(U1, "接着聊"); // resume sess-1,卡住
+  await waitUntil(() => agent.inFlight === 1, "第二轮进到 agent 里");
+  await channel.receive(U1, "/新会话");
+
+  channel.sent.length = 0;
+  agent.fail = true;
+  open();
+  await stuck;
+
+  const err = channel.sent.find((m) => m.text.includes("处理出错了"));
+  assert.ok(err, `报错要送到用户那儿,实际:${JSON.stringify(channel.sent.map((m) => m.text))}`);
+  assert.ok(err.text.startsWith("【后台对话 sess-1 的结果】"), `实际:${err.text}`);
+  assert.ok(err.text.includes(`${canonicalOf("switchSession")} sess-1`), "要给出切回去的写法");
 });
 
 test("后台回合不推进度,前台的照推", async () => {

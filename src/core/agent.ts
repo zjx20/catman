@@ -111,6 +111,21 @@ export function buildUserMessage(
 }
 
 /**
+ * 把一个回合产出的各段正文拼成最终回复。
+ *
+ * 正常回合只有一段;追加输入落在 turn 边界上时会多出几段(见 run 的收尾注释)。
+ *
+ * 空正文的兜底话术**必须分失败与成功两种**:SDK 以错误结束时 `errors` 可能是空数组、
+ * `result` 可能是空串,此时沿用"助手没有返回内容"会把一次失败伪装成一次无话可说 ——
+ * 而这两者用户该做的事恰好相反(去查订阅/配置 vs 换个问法再问一遍)。
+ */
+export function joinReplyTexts(texts: readonly string[], isError: boolean): string {
+  const joined = texts.filter((t) => t.trim()).join("\n\n");
+  if (joined) return joined;
+  return isError ? "(回合失败,SDK 没有给出错误详情)" : "(助手没有返回内容)";
+}
+
+/**
  * 回合的输入通道:一个**常开**的 AsyncIterable,回合跑起来之后仍能往里追加消息。
  *
  * **为什么必须常开**:SDK 只在流式输入下接受回合中途的追加输入。喂进来的消息会被
@@ -299,8 +314,7 @@ export class Agent {
       if (heartbeat) clearInterval(heartbeat);
     }
 
-    const text = texts.join("\n\n") || "(助手没有返回内容)";
-    return { text, sessionId, isError };
+    return { text: joinReplyTexts(texts, isError), sessionId, isError };
   }
 
   /**
