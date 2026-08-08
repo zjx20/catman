@@ -160,16 +160,63 @@ compose 里已经预留好透传(大小写两份都传,程序之间认哪种并�
 
 ## 启动
 
+catman 采用**源码直跑**:镜像(`catman-env`)只是一层不含业务代码的运行环境,真正跑的代码
+是数据卷里的 **release 目录**,由符号链接 `data/releases/current` 指定。所以首次部署分三步 ——
+构建基底镜像、初始化第一个 release、起服务:
+
 ```bash
-docker compose up -d --build
+# 0) /data 在宿主上的绝对路径,后面几步都要用(自进化的一次性容器靠它挂卷)
+export CATMAN_HOST_DATA_DIR="$PWD/data"
+echo "CATMAN_HOST_DATA_DIR=$CATMAN_HOST_DATA_DIR" >> .env
+
+# 1) 构建稳定基底镜像(此后极少重建 —— 升级换的是代码,不是镜像)
+docker build -t catman-env:1 -f docker/Dockerfile .
+
+# 2) 初始化:clone 源码到数据卷、制备第一个 release、立起指针
+scripts/evolve/init.sh
+
+# 3) 起服务
+docker compose up -d
 docker compose logs -f          # 看启动日志(未设令牌时这里能看到自动生成的)
 # dashboard: http://<路由器内网IP>:8787/?token=<你的令牌>
 ```
 
 首次启动还没有任何微信账号,日志会提示去 dashboard 扫码。
 
-> 上面这条命令**只产出本机架构的镜像**。如果构建机与软路由架构不同(典型:x86 开发机 →
-> arm64 路由器),见 [构建多架构镜像](#构建多架构镜像)。
+想让 catman 能自己升级自己,再固化一次部署机制(见 [自进化](#自进化)):
+
+```bash
+scripts/evolve/bless.sh
+```
+
+> **架构不必再操心**:依赖是在**目标机器上**用 `catman-env` 装的(见 `scripts/evolve/prepare.sh`),
+> 天然就是对的架构。以前那套 buildx + QEMU 多架构构建随源码直跑一起消失了 ——
+> 唯一要在目标架构下构建的是基底镜像本身,而它不含 npm 依赖,`docker build` 就地跑即可。
+
+### 日常升级
+
+```bash
+git -C data/src/catman pull            # 或让 agent 自己在 evolve/* 分支上改
+
+# 制备:装依赖 → typecheck + 全量测试 → 编译 → 版本戳 + 内容清单,产出一个 release
+docker exec catman /data/releases/current/scripts/evolve/prepare.sh HEAD
+
+# 部署:排水 → 自检 → 切换 → 健康门 → 30 分钟观察期,不通过自动回滚
+data/deploy/bin/deployer-run.sh deploy <上一步输出的 sha>
+```
+
+`deployer-run.sh` 起的是一个**独立的一次性容器**(它要停掉 catman 自己,跑在 catman 里
+会连自己一起被杀)。跑起来就返回,进度看 `docker logs -f catman-deployer`,结论写进
+部署报告 —— catman 起来后会在你下一条消息时告诉你。
+
+出事时随时可以手动退回:
+
+```bash
+data/deploy/bin/deployer-run.sh rollback
+docker logs catman-deployer            # 看这次到底发生了什么
+```
+
+在微信里(管理员)则是 `/回滚` 与 `/升级状态`,不必开电脑。
 
 ## 多人接入
 
@@ -247,6 +294,16 @@ docker compose exec catman node dist/src/scripts/ilink-login.js --rebind <账号
 | `/取消` | `/cancel` `/stop` | 中断正在进行的这一轮 |
 | `/继续` | `/continue` `/繼續` | 续上刚才的对话,之后直接发消息就是接着聊 |
 | `/切换会话 <会话id>` | `/switch` `/切換會話` | 切回指定的旧对话,id 给开头几位即可;只发指令本身则列出最近的对话 |
+
+下面两条**只有管理员能用,也只对管理员显示**(见 [自进化](#自进化)):
+
+| 指令 | 别名 | 作用 |
+|---|---|---|
+| `/升级状态` | `/version` `/升級狀態` | 当前版本、上次部署的结果、可回退的版本(不花额度) |
+| `/回滚` | `/rollback` `/回退` | 退回上一个已验证版本 |
+
+它们的影响是**全局**的 —— 一次回滚把所有用户都换到另一个版本,所以必须有这道闸。
+非管理员发这两条会被当成普通消息交给 LLM,既用不了、也看不出它们存在。
 
 **为什么要有这层。** 上下文撑爆把助手卡住时,普通消息不是排在那个卡死的回合后面,
 就是被追加进它 —— 两种下场一样:那个回合不动,它们就永远等不到答复,包括本该救命的那条。
@@ -547,130 +604,92 @@ CATMAN_CHANNEL=stdin CATMAN_DATA_DIR=./data CATMAN_ADMIN_TOKEN=devtoken \
 stdin 通道支持 `/user <名字>` 切换身份,因此**多用户隔离可以完全脱离微信在本地验证**:
 切到不同名字发消息,能看到各自独立的工作目录与会话。
 
-## 构建多架构镜像
+## 基底镜像
 
-`docker compose up -d --build` 只出**构建机自己那个架构**的镜像。软路由是 x86_64 的话就地
-构建即可,这一节可以跳过;若目标是 arm64 设备(NanoPi R4S/R5S、树莓派、各类 ARM NAS)而你
-在 x86 机器上构建,直接把镜像搬过去会在启动时报 `exec format error`。
-
-### 一条必须遵守的约束:`npm ci` 要跑在目标架构下
-
-Agent SDK 把 claude 二进制拆成一组 **optionalDependencies**
-(`@anthropic-ai/claude-agent-sdk-<os>-<arch>[-musl]`),`npm ci` 按**执行安装的那个容器**的
-`process.arch` 与 libc 挑一个装下来。由此:
-
-- 构建**必须**让 `npm ci` 在目标平台下执行 —— buildx + QEMU 模拟,或一台原生 arm64 builder。
-  Dockerfile 是多阶段的,进最终镜像的是**运行时阶段**那次 `npm ci --omit=dev`,这条约束
-  至少约束它(build 阶段的 node_modules 不发货,理论上可交叉,目前两个阶段都跑目标平台)。
-- **不要**给运行时阶段加 `FROM --platform=$BUILDPLATFORM` 那套交叉编译提速。TypeScript
-  编译本身确实与架构无关,但那一层的 `npm ci` 会装成**构建机**的架构:镜像能构建成功、
-  `tsc` 产物也正常,只有真正去起 agent 时才炸。这个坑不会在构建期暴露,别顺手"优化"掉。
-- 基础镜像是 `node:22-bookworm-slim`(glibc),因此选中的是 glibc 变体。改用 alpine 基底
-  会切到 musl 变体,需要重新验证。
-
-Dockerfile 的其余部分本身已经是架构中立的:docker apt 源那行用 `$(dpkg --print-architecture)`
-拼出来,`node:22-bookworm-slim`、`docker-ce-cli`、`ripgrep` 在 amd64 与 arm64 上都有。
-
-### 一次性准备(构建机)
+`catman-env` 是一层**不含应用代码**的运行环境:node 22 + git/ripgrep/curl + docker CLI +
+两个用户(catman 10001 跑应用、deployer 10002 拥有 release 目录)。它极少变更 ——
+改它属于要人工介入的那一类变更(见 [自进化](#自进化) 的 Tier 分级)。
 
 ```bash
-# 注册 QEMU 解释器,让本机能跑异架构容器
-docker run --privileged --rm tonistiigi/binfmt --install all
-# 多架构必须用 docker-container 驱动,默认的 docker 驱动不支持多 platform
-docker buildx create --name catman --driver docker-container --use
-docker buildx inspect --bootstrap        # Platforms 一行里应出现 linux/amd64, linux/arm64
+docker build -t catman-env:1 -f docker/Dockerfile .
 ```
 
-### 方式 A:推到 registry(要给多台不同架构的机器用时)
+**多架构不再是问题。** 以前 claude 二进制随镜像发货,而它来自 Agent SDK 的
+optionalDependencies(`@anthropic-ai/claude-agent-sdk-<os>-<arch>[-musl]`),npm 按**执行安装
+的那个容器**的架构挑包 —— 于是构建必须靠 buildx + QEMU 在目标架构下跑 `npm ci`,
+且不能用 `--platform=$BUILDPLATFORM` 交叉编译提速(那会装成构建机的架构,构建期毫无征兆,
+只在目标机起 agent 时才炸)。
 
-多架构镜像是一份 manifest list,**没法 `docker load` 进本地 daemon**(本地镜像存储只认单
-架构),所以必须经 registry 中转:
+源码直跑把 `npm ci` 挪到了**目标机器上的制备阶段**(`scripts/evolve/prepare.sh`),
+依赖天然就是对的架构,整套多架构构建流程随之消失。基底镜像本身不含 npm 依赖,
+在目标机上 `docker build` 就地构建即可;跨机器搬运时用 `docker save/load` 也行。
+
+基底是 `node:22-bookworm-slim`(glibc),因此选中的是 glibc 变体;换 alpine 基底会切到
+musl 变体,需要重新验证。
+
+验证依赖架构对不对(这条仍然要看):
 
 ```bash
-docker buildx build \
-  --platform linux/amd64,linux/arm64 \
-  -f docker/Dockerfile \
-  -t <registry>/catman:0.1.0 \
-  --provenance=false \
-  --push .
+docker compose exec catman node -p process.arch                          # → arm64 / x86_64
+docker compose exec catman sh -c 'ls $(readlink -f /data/releases/current)/node_modules/@anthropic-ai/'
 ```
 
-`--provenance=false` 关掉 buildx 默认附加的 attestation:它会让 manifest 变成较新的 OCI
-格式,老版本 dockerd(软路由上很常见)拉取时会报看不懂的 manifest 错误。
+两者对不上就说明制备跑在了错误的架构下。
 
-路由器侧把 compose 的 `build:` 一节换成拉镜像:
+## 自进化
 
-```yaml
-services:
-  catman:
-    image: <registry>/catman:0.1.0
-    # build: 一节删掉,否则 compose 仍可能在本机重新构建
+catman 可以自己改自己:管理员在微信里说一个改进想法,它改代码、跑测试、制备 release,
+汇报之后由你确认,再由**独立的 deployer 容器**完成切换与回滚。
+
+### 部署单元与指针
+
+```
+data/releases/
+  <sha>/                 一个 release:浅 clone + 自带 node_modules + dist + VERSION + MANIFEST
+  current -> <sha>       容器跑哪个(入口脚本解析它)
+  stable  -> <sha>       出事退回哪个(**只在观察期通过后前移**)
+  pinned  -> <sha>       给守护人格钉住的那个(Phase 3 用,现在占位)
+  verified-history.json  已验证版本清单,新→旧;回滚沿它往回走
 ```
 
-```bash
-docker compose pull && docker compose up -d      # 自动挑本机架构那一份
-```
+**升级不重建容器** —— 配置一个字没变,变的只是链接指向。所以 `docker-compose.yml` 平时
+一动不动,部署流程也完全不碰 compose(它的文件优先级、override 自动合并、`${PWD}` 插值、
+项目名不一致这些坑因此一个都碰不到)。
 
-### 方式 B:没有 registry,单架构直出 tar
+### 流水线
 
-只伺候一台路由器时不必搞 manifest list —— 直接构建**目标架构的单架构镜像**导成 tar 更省事:
-
-```bash
-docker buildx build --platform linux/arm64 -f docker/Dockerfile \
-  -t catman:0.1.0 -o type=docker,dest=catman-arm64.tar .
-scp catman-arm64.tar root@<路由器>:/tmp/
-ssh root@<路由器> 'docker load -i /tmp/catman-arm64.tar'
-```
-
-同样要把路由器上的 `docker-compose.yml` 改成 `image: catman:0.1.0` 且不带 `build:`。
-
-### 验证
-
-```bash
-# 构建机:确认 manifest 里真有两个架构(方式 A)
-docker buildx imagetools inspect <registry>/catman:0.1.0
-
-# 目标机:确认容器架构与装进去的 claude 二进制一致
-docker compose exec catman node -p process.arch                  # → arm64
-docker compose exec catman ls /app/node_modules/@anthropic-ai/   # → ...-linux-arm64
-```
-
-第二条是这一节真正要守的东西:两者对不上就说明 `npm ci` 跑在了错误的架构下。最后照例走一遍
-[M0 验证清单](#m0-验证清单首次部署务必先走一遍),发一条真实消息确认 agent 起得来。
-
-> QEMU 模拟下 `npm ci` 与 `tsc` 都跑在翻译过的指令上,比原生慢一个量级不奇怪。有原生 arm64
-> 机器的话,用 `docker buildx create --append --name catman ssh://<host>` 把它挂成 builder
-> 节点,buildx 会把对应架构的那一路交给它原生构建。
-
-| 变量 | 默认 | 说明 |
+| 步骤 | 谁执行 | 做什么 |
 |---|---|---|
-| `CLAUDE_CODE_OAUTH_TOKEN` | — | Claude 订阅 token(必填) |
-| `CATMAN_CHANNEL` | `stdin` | `wechat` / `stdin` |
-| `CATMAN_DATA_DIR` | `/data` | 数据卷根目录 |
-| `CATMAN_SESSION_TIMEOUT_MS` | `3600000` | 会话空闲超时(1h) |
-| `CATMAN_RETENTION_MS` | `2592000000` | 会话保留期(30 天) |
-| `CATMAN_DASHBOARD_PORT` | `8787` | dashboard 端口 |
-| `CATMAN_ADMIN_TOKEN` | 自动生成 | dashboard 访问令牌;未设则生成并写入 `./data/dashboard-token` |
-| `CATMAN_MAX_CONCURRENT_TURNS` | `2` | 同时进行的回合数上限(跨用户);软路由 CPU 与订阅限流的双重约束 |
-| `CATMAN_MODEL` | SDK 默认 | 全局默认模型 |
-| `CATMAN_MODEL_ALLOWLIST` | `opus,sonnet,haiku` | 允许用户选的模型。用别名而非完整 id —— 别名不随版本腐化 |
-| `CATMAN_ACK` | `1` | 收到消息先回"处理中"回执;`0` 关闭 |
-| `CATMAN_PROGRESS` | `1` | 转发思考/工具调用进度;`0` 关闭 |
-| `CATMAN_API_BASE` | `http://127.0.0.1:<端口>` | 告诉助手从容器内怎么访问本进程的接口 |
-| `CATMAN_SETTINGS_PATH` | `<数据卷>/settings.json` | 全局运行时配置覆盖的落盘位置 |
-| `CATMAN_PREFS_PATH` | `<数据卷>/prefs.json` | 每用户配置覆盖的落盘位置 |
-| `CATMAN_CHAT_LOG_PATH` | `<数据卷>/dashboard-chat.json` | 管理员聊天记录的落盘位置(网页没有本地记录) |
+| 制备 | agent(`prepare.sh`) | 浅 clone → 装依赖 → typecheck + 全量测试 → 编译 → 版本戳 + 内容清单 → 原子就位 |
+| 确认 | 管理员 | 看改动摘要与测试结果,回一句确认 |
+| 自检 | **deployer 亲自** | 起一次性容器跑 `CATMAN_SELFCHECK=1`,含一次真实的最小 SDK 请求 |
+| 切换 | deployer | 排水 → 停容器 → 换 current → 起容器 → 健康门(比对 `/health` 回报的 sha) |
+| 观察 | deployer | 30 分钟盯重启次数与健康;**这期间 stable 不动** |
+| 收尾 | deployer | 通过则前移 stable + 入清单 + GC;不通过则退回并写报告 |
 
-> 上表里带 ✱ 语义的几项(模型、回执、进度、超时、保留期、清理间隔、并发上限)只是**基线**:
-> 管理员在聊天里改的值写进 `settings.json`,优先级更高且**改完立即生效,不用重启**。
-> 环境变量只在两份 json 都没覆盖时起作用。
+失败的最坏结果是"这次改进没上线",而不是"catman 下线了"。结果写进部署报告,
+catman 起来后在你下一条消息时告诉你。
 
-下面两个不由 catman 读取,分别给 compose 和容器内的 docker CLI 用:
+### 几条不能改的纪律
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `DOCKER_GID` | `0` | 宿主 `/var/run/docker.sock` 的组 GID,compose 用它给 catman 补充组 |
-| `DOCKER_API_VERSION` | 自动协商 | 宿主 dockerd 过老导致 CLI 报版本不兼容时锁定 API 版本 |
+- **执法者自己取证**:自检由 deployer 亲自跑,健康门比对的 sha 由它亲自读。
+  agent 改坏了自检代码,只会让自己的版本过不了门,而不是让门失效。
+- **stable 只在观察期后前移**:观察期内 `current ≠ stable`,任何崩溃(含断电重启)
+  都自然落回 stable。反过来会让观察期变成纯仪式。
+- **回滚是"先停、再换、后起"**:不先停就换链接的话,restart 策略会在中途把旧容器拉起来,
+  crash-loop 的容器每次启动都可能再写一遍状态文件。
+- **release 目录只读挂载给主容器**,属主是 uid 10002。助手跑在 bypassPermissions 下,
+  一句"帮我清清磁盘"就足以让它把回滚目标删掉 —— 只读挂载让那种误删直接 EACCES 暴露。
+- **部署机制不随自我进化更新**:`/回滚` 执行的是 `bless.sh` 固化到 `data/deploy/bin/` 的
+  那份脚本。改了 `scripts/evolve/` 要重新 bless 才生效。门禁和逃生门是同一把锁,
+  不能让一次改坏了部署逻辑的进化把它们一起毁掉。
+- **数据向前兼容**:回滚只换代码,**不动 `data/`**。所以自动进化的改动必须能读现有格式,
+  且旧版本要能读新版本写的 —— 做不到就属于要人工介入的变更。
+
+### 相关指令(仅管理员可见可用)
+
+- `/升级状态` —— 当前版本、上次部署结果、可回退的版本
+- `/回滚` —— 退回上一个已验证版本
 
 ## 安全说明
 
@@ -700,11 +719,19 @@ docker compose exec catman ls /app/node_modules/@anthropic-ai/   # → ...-linux
   因此即便有人把 `CLAUDE_CONFIG_DIR` 指向了共享的 `~/.claude`,catman 也不会误删其它项目的
   Claude Code 会话历史(见 `src/core/transcript.ts` 的安全约束与对应单测)。
 
-## 从单账号版本升级
+## 数据格式与升级
 
-**不提供迁移,清空 `./data` 重新扫码即可** —— 为一次性场景写迁移代码,等于把旧格式的知识
-永久留在代码里。旧的 `state.json` 条目会被识别为非法格式并丢弃(日志有提示),
-旧的 `ilink-credentials.json` 不再被任何代码读取。
+**日常升级不动 `data/`。** 回滚只换代码(换 `releases/current` 的指向),数据一路向前 ——
+所以自动进化的改动必须**能读现有格式**,而且因为观察期内随时可能回滚,**旧版本也要能读
+新版本写的**。做不到的改动属于要人工介入的那一类,不走自动流水线。
+
+兜底靠代码里本来就有的防御式解析:`parseUserKey()` 对非法 key 返回 null、`SessionManager`
+加载时丢弃坏条目、prefs 失效的覆盖只在读取时回退(不改盘)、`settings.effective()` 永不抛。
+这些不是为迁移准备的分支,是解析器本就该有的防御。
+
+**跨越不兼容格式时**(比如从单账号版本升级),不提供迁移,清空 `./data` 重新扫码即可 ——
+为一次性场景写迁移代码,等于把旧格式的知识永久留在代码里。旧的 `state.json` 条目会被识别为
+非法格式并丢弃(日志有提示),旧的 `ilink-credentials.json` 不再被任何代码读取。
 
 ⚠️ 如果保留旧 `./data` 不删,`data/claude/projects/-data-workspace/` 下的旧会话会**永久残留**:
 清理只在已知用户的目录内操作(上一条的安全约束),不会去收养这个孤儿目录。要么清空 `./data`,

@@ -82,6 +82,17 @@ export interface Config {
   maxImagesPerTurn: number;
   /** 连续消息攒多久再一起处理(ms)。0 = 不聚合。 */
   messageAggregationMs: number;
+  /**
+   * 部署机制的固化目录(bless 时人工生成)。里面是 deployer 脚本、compose 副本、
+   * 以及 deployer 写的部署报告。catman 对它**只读** —— 部署机制属 Tier 3,
+   * 更新必须经人,不能被一次自我进化顺手改掉。
+   * 不存在 = 这台机器没配自进化,两条部署指令会明说。
+   */
+  deployDir: string;
+  /** release 目录(deployer 写、catman 只读)。已验证版本清单也在里面。 */
+  releasesDir: string;
+  /** 部署结果"已播报"的标记。catman 自己写,所以必须在可写区,不能放 deployDir。 */
+  deploySeenPath: string;
 }
 
 export function loadConfig(): Config {
@@ -111,5 +122,8 @@ export function loadConfig(): Config {
     maxImageBytes: num("CATMAN_MAX_IMAGE_BYTES", 3_500_000),
     maxImagesPerTurn: num("CATMAN_MAX_IMAGES_PER_TURN", 4),
     messageAggregationMs: num("CATMAN_MESSAGE_AGGREGATION_MS", 1500),
+    deployDir: str("CATMAN_DEPLOY_DIR", `${dataDir}/deploy`),
+    releasesDir: str("CATMAN_RELEASES_DIR", `${dataDir}/releases`),
+    deploySeenPath: str("CATMAN_DEPLOY_SEEN_PATH", `${dataDir}/deploy-seen.json`),
   };
 }

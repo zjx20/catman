@@ -60,6 +60,14 @@ export interface AgentRunOptions {
   env?: Record<string, string | undefined>;
   /** 本回合可见的 skill 名单。注意这是上下文过滤而非沙箱,详见 skills.ts。 */
   skills?: string[];
+  /**
+   * 本回合最多几轮。不传则不限(日常对话就该不限:回合该跑多久由任务决定)。
+   *
+   * 存在的理由是自检:smoke 要的是"大脑通不通"这一个事实,一次请求就够了,
+   * 而它跑在部署流水线里、没有人盯着 —— 万一模型开始自顾自地干活,烧的是订阅额度
+   * 且会把部署门拖到超时。给它一个硬上限,自检就不可能跑飞。
+   */
+  maxTurns?: number;
   /** 供 /取消 中断本回合。abort 后 run() 抛错,由上层的错误分支处理。 */
   abortController?: AbortController;
   /** 中间过程回调(思考/工具调用)。回调应快速返回,耗时操作自行异步化。 */
@@ -201,6 +209,7 @@ export class Agent {
         ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
         ...(opts.env ? { env: opts.env } : {}),
         ...(opts.skills ? { skills: opts.skills } : {}),
+        ...(opts.maxTurns === undefined ? {} : { maxTurns: opts.maxTurns }),
         ...(opts.abortController ? { abortController: opts.abortController } : {}),
         // CLI 子进程的 stderr 是启动失败/鉴权报错的唯一去处,不接就彻底看不见。
         // 无条件转发(不受 TRACE 开关约束):正常回合它一个字都不输出,

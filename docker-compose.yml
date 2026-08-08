@@ -3,16 +3,30 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
-      # 构建期(apt 拉 Debian 源与 docker.com、npm ci 拉 registry)的代理,与下面
-      # environment 里的运行时代理是两套设置,互不影响 —— 构建时连不上就设这里。
+      # 构建期(apt 拉 Debian 源与 docker.com)的代理,与下面 environment 里的
+      # 运行时代理是两套设置,互不影响 —— 构建时连不上就设这里。
       # HTTP_PROXY 等是 Docker 预定义 build arg,Dockerfile 里无需 ARG 声明即生效。
       args:
         HTTP_PROXY: ${HTTP_PROXY:-}
         HTTPS_PROXY: ${HTTPS_PROXY:-}
         NO_PROXY: "${NO_PROXY:-}"
-    image: catman:0.1.0
+    # 稳定基底镜像:**不含应用代码**。代码是数据卷里的 release 目录,由入口脚本
+    # 经 releases/current 符号链接找到(见 docker/Dockerfile 与 entrypoint.sh)。
+    # 因此升级**不重建容器**:换链接 + restart 就够了,这个文件平时一动不动。
+    image: catman-env:1
     container_name: catman
     restart: unless-stopped
+    # 关闭时给足时间收尾:网关要把聚合窗口里攒着的消息 flush 进队列、把在飞回合
+    # 的结果发出去。默认 10 秒对一个正在跑 agent 回合的进程太短,SIGKILL 会把
+    # 用户正等着的那句回复连人带话一起吞掉。
+    stop_grace_period: 60s
+    # 日志轮转。默认的 json-file **没有上限** —— 一个话痨日志的版本上线数周就能
+    # 吃掉几十 GB,而磁盘满会让 dockerd 全面异常,那时连回滚都做不了。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       # Claude 订阅认证:先在宿主用 `claude setup-token` 生成 1 年期 token
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}
@@ -29,6 +43,12 @@ services:
       CATMAN_AGENT_HEARTBEAT_MS: ${CATMAN_AGENT_HEARTBEAT_MS:-30000}
       CATMAN_DATA_DIR: /data
       CLAUDE_CONFIG_DIR: /data/claude
+      # /data 在**宿主**上的绝对路径。自进化的一次性容器(制备、自检、部署)要用它
+      # 做 `-v <宿主路径>:/data` —— 传容器内的 /data 会挂到宿主的 /data,
+      # dockerd 静默建一个空目录,症状是"每次制备都 ENOENT 且看不出为什么"。
+      # ⚠️ 不能写 ${PWD}:那是 shell 变量,容器进程的环境里没有,compose 对未设变量
+      # 只警告一句然后代入空串。要用自进化就在 .env 里写死绝对路径。
+      CATMAN_HOST_DATA_DIR: ${CATMAN_HOST_DATA_DIR:-}
       # 日志时间戳的时区。容器不会自动继承宿主时区,不设就是 UTC ——
       # 拿日志和微信里的消息时间对账时会差好几个小时。在 .env 里设 TZ=Asia/Shanghai。
       TZ: ${TZ:-UTC}
@@ -70,6 +90,12 @@ services:
       # DOCKER_API_VERSION: "1.43"
     volumes:
       - ./data:/data
+      # release 目录**只读**挂载给主容器。它属 uid 10002(deployer),写入只发生在
+      # deployer 系的一次性容器里。这不是洁癖:助手跑在 bypassPermissions 下、
+      # 文件系统全开,一句"帮我清清磁盘"就足以让它把回滚目标 rm 掉(硬链接复用
+      # 还会让每个 release 在 du 里都按全量计,看起来最该删)。只读挂载让那种
+      # 误删直接 EACCES 暴露,而不是成功。
+      - ./data/releases:/data/releases:ro
       # 让助手操作宿主 Docker(docker-outside-of-docker):容器内只有 CLI,daemon 是宿主的。
       # ⚠️ 这等于把宿主 root 权限交给助手 —— 有了 socket 就能 `docker run -v /:/host`
       # 读写宿主整个文件系统。容器不再是隔离边界,仅在自己完全信任的机器上开启;

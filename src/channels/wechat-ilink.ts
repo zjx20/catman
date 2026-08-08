@@ -1,4 +1,4 @@
-import type { Channel, MessageHandler } from "./types.js";
+import type { Channel, ChannelHealth, MessageHandler } from "./types.js";
 import type { AccountStore } from "../core/accounts.js";
 import { parseUserKey } from "../core/identity.js";
 import { ILinkConnection } from "./ilink-connection.js";
@@ -68,6 +68,16 @@ export class WechatILinkChannel implements Channel {
   /** 当前活动连接数(dashboard/日志用)。 */
   activeAccountIds(): string[] {
     return [...this.connections.keys()];
+  }
+
+  /**
+   * 健康自述。`live` 要求**至少有一条没失效的连接** —— 凭据失效的连接留在表里
+   * 但故意不重启(见 reconcile 的说明),此时渠道已启动却聋着,部署的健康门必须
+   * 分得出这两种状态。一个账号都还没绑时同样是 live=false:那时确实收不到消息。
+   */
+  health(): readonly ChannelHealth[] {
+    const live = [...this.connections.values()].some((c) => !c.isExpired);
+    return [{ name: this.name, started: this.started, live }];
   }
 
   /**

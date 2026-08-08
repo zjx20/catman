@@ -8,9 +8,18 @@ import type { MintedTurn, TurnContext, TurnTokens } from "./turn-tokens.js";
 import { allowAll, type AdmissionPolicy } from "./admission.js";
 import type { Attachment } from "./attachments.js";
 import { describeProgress, summarizeToolInput } from "./agent-trace.js";
-import { canonicalOf, commandHelpLines, parseCommand, type CommandDef } from "./commands.js";
+import {
+  canonicalOf,
+  commandHelpLines,
+  parseCommand,
+  type CommandDef,
+  type ParsedCommand,
+} from "./commands.js";
 import { SETTING_SCHEMA, USER_SETTING_KEYS } from "./settings.js";
 import { ADMIN_SKILLS, USER_SKILLS } from "./skills.js";
+import { readVersion, shortSha, versionLine, type VersionInfo } from "./version.js";
+import type { DeployControl } from "./deploy.js";
+import { formatDeployReport } from "./deploy-report.js";
 
 /** 会话 id 的展示形式:开头 8 位足够在 HISTORY_LIMIT 条内无歧义,也好在手机上打。 */
 export function shortSessionId(sessionId: string): string {
@@ -78,6 +87,13 @@ export interface GatewayOptions {
    * 切过去再让 resume 炸出一句原始报错,不如提前给句人话。不传则视为都活着。
    */
   sessionExists?: (userKey: string, sessionId: string) => boolean;
+  /** 版本戳。不传则运行时自己读(单测注入,免得依赖磁盘上有没有 VERSION)。 */
+  version?: VersionInfo;
+  /**
+   * 部署控制面。不传 = 这台机器没配自进化,两条部署指令会明说"没配",
+   * 而不是假装成功 —— 本地开发与 stdin 调试就是这种情况。
+   */
+  deploy?: DeployControl;
   /**
    * 时钟。目前只喂给进度节流 —— 它是纯计算,可以用假时钟驱动。
    *
@@ -238,8 +254,8 @@ function humanDuration(ms: number): string {
  * 使用指引。**由 COMMAND_TABLE 与 SETTING_SCHEMA 生成** ——
  * 加指令或加配置项时这里自动跟上,不会出现"文档说有、实际没有"。
  */
-export function helpText(modelAllowlist: string[]): string {
-  const cmds = commandHelpLines()
+export function helpText(modelAllowlist: string[], isAdmin = false): string {
+  const cmds = commandHelpLines(isAdmin)
     .map((l) => `  ${l}`)
     .join("\n");
   const settings = USER_SETTING_KEYS.map((key) => {
@@ -264,8 +280,8 @@ export function helpText(modelAllowlist: string[]): string {
 }
 
 /** 首次使用时推送的欢迎语。正文就是那份指引,不另写一份免得两处走样。 */
-export function greetingText(modelAllowlist: string[]): string {
-  return `你好,我是 catman。\n\n${helpText(modelAllowlist)}`;
+export function greetingText(modelAllowlist: string[], isAdmin = false): string {
+  return `你好,我是 catman。\n\n${helpText(modelAllowlist, isAdmin)}`;
 }
 
 /**
@@ -393,6 +409,21 @@ function batchImages(segments: readonly Segment[]): number {
   return n;
 }
 
+/**
+ * 网关向 `/health` 交出的那份计数。字段只增不改 —— 部署的排水门读它,
+ * 而读它的那份代码(deployer / 将来的看门狗)是人工钦定的、比正在跑的版本旧得多。
+ */
+export interface GatewayHealth {
+  /** 在飞回合:前台是用户正等着的,后台是被切走仍在跑的。 */
+  readonly inFlight: { foreground: number; background: number };
+  /** 已受理、分拣链上还没走完的批数。 */
+  readonly queued: number;
+  /** 还在聚合窗口里攒着的批数。 */
+  readonly aggregating: number;
+  /** 最近一个跑完的回合(观测用,不参与判死)。 */
+  readonly lastTurn?: { at: number; isError: boolean };
+}
+
 /** prelude 的结果:被准入拒绝时为 null。 */
 interface Prelude {
   cwd: string;
@@ -425,6 +456,27 @@ export class Gateway {
   private readonly queues = new Map<string, Promise<void>>();
   /** 每用户至多一批待聚合的消息。 */
   private readonly pending = new Map<string, PendingBatch>();
+  /**
+   * 已受理、分拣尚未走完的批数。
+   *
+   * 部署前的排水靠它:消息一旦离开聚合窗口进了分拣链,就不再是"待聚合",
+   * 但也还没变成回合 —— 这段空档里切换容器,那批话就静默消失了。
+   * 三个计数(aggregating / queued / inFlight)必须一起归零才算真排干。
+   */
+  private queued = 0;
+  /**
+   * 最近一个跑完的回合。**只作观测,不参与任何判死** —— 部署的健康门只看
+   * 本地可判定的事实(进程起没起、渠道通不通),把大脑状态放进门里会让一次
+   * 上游限流废掉一个完好的版本。真正的大脑探测在 SELFCHECK 里,由 deployer
+   * 在切换**之前**亲自跑。
+   */
+  private lastTurn?: { at: number; isError: boolean };
+  /**
+   * 这份 release 的版本戳。启动时读一次就够 —— 它随部署的 release 走,
+   * 一个进程的生命周期内不会变(变了说明有人在动现役目录,那是 §6 只读挂载要拦的事)。
+   */
+  private readonly version: VersionInfo | undefined;
+  private readonly deploy: DeployControl | undefined;
 
   constructor(opts: GatewayOptions) {
     this.channel = opts.channel;
@@ -439,6 +491,8 @@ export class Gateway {
     this.sessionExists = opts.sessionExists;
     this.now = opts.now ?? Date.now;
     this.reminderIntervalMs = opts.reminderIntervalMs;
+    this.version = opts.version ?? readVersion();
+    this.deploy = opts.deploy;
     this.semaphore = new Semaphore(this.settings.effective().maxConcurrentTurns);
     this.settings.onChange(() => {
       this.semaphore.setLimit(this.settings.effective().maxConcurrentTurns);
@@ -475,7 +529,7 @@ export class Gateway {
   ): Promise<void> {
     // 带图的消息不当硬指令解析:硬指令要求整条消息只有指令本身,而「/状态 + 一张图」
     // 显然不是那个意思。让它照常走 LLM,免得图片被指令分支静默吞掉。
-    const parsed = attachments.length ? undefined : parseCommand(text);
+    const parsed = attachments.length ? undefined : this.parseAllowed(userKey, text);
     // immediate 硬指令不进聚合窗口 —— 它们存在的全部理由就是"立刻",
     // 让救命的 /取消 先等 1.5 秒等于取消了这个理由。
     if (parsed?.cmd.immediate) return this.runCommand(userKey, parsed.cmd);
@@ -584,9 +638,14 @@ export class Gateway {
    */
   private enqueue(userKey: string, segments: readonly Segment[]): Promise<void> {
     const prev = this.queues.get(userKey) ?? Promise.resolve();
+    // 计数在**入链前**加、分拣走完才减:排水要的正是"还有没有话卡在这段空档里"。
+    this.queued += 1;
     const sorted = prev
       .catch(() => {}) // 前一批失败不阻塞后续
-      .then(() => this.handleBatch(userKey, segments));
+      .then(() => this.handleBatch(userKey, segments))
+      .finally(() => {
+        this.queued -= 1;
+      });
     this.queues.set(
       userKey,
       sorted.then(
@@ -682,16 +741,41 @@ export class Gateway {
     }
 
     const cwd = this.users.ensureWorkspace(userKey);
+    // 上一次部署的结果先说 —— 用户此刻多半正要问"改好了没",而且失败的那种情况下
+    // 他接下来说的话是基于"改动已生效"这个错误前提的。
+    await this.announceDeployReport(userKey);
     let justGreeted = false;
     if (this.users.needsGreeting(userKey)) {
       const allowlist = this.settings.effective().modelAllowlist;
       // 发送成功才标记 —— 失败留给下次重试,指引值得重试。
-      if (await this.trySend(userKey, greetingText(allowlist), "首次使用指引")) {
+      if (
+        await this.trySend(
+          userKey,
+          greetingText(allowlist, this.settings.isAdmin(userKey)),
+          "首次使用指引",
+        )
+      ) {
         this.users.markGreeted(userKey);
         justGreeted = true;
       }
     }
     return { cwd, justGreeted };
+  }
+
+  /**
+   * 解析硬指令,并挡掉这个用户没资格用的那几条。
+   *
+   * **挡掉 = 当它不是指令**,于是照常走 LLM(未知的斜杠开头文本本来就是这个待遇)。
+   * 这样非管理员既用不了、也看不出这些指令存在 —— 不必再写一句"你没权限",
+   * 那句话本身就是在告诉他有这么个东西。
+   *
+   * 权限现查而不是缓存:管理员名单可以在 dashboard 上随时改,提权/降权都该立刻生效。
+   */
+  private parseAllowed(userKey: string, text: string): ParsedCommand | undefined {
+    const parsed = parseCommand(text);
+    if (!parsed) return undefined;
+    if (parsed.cmd.adminOnly && !this.settings.isAdmin(userKey)) return undefined;
+    return parsed;
   }
 
   /** 执行一条 immediate 硬指令。与在飞回合并发,只做幂等操作。 */
@@ -703,12 +787,20 @@ export class Gateway {
       case "help":
         // 刚推过 greeting 的话内容一模一样,不重复刷屏。
         if (!pre.justGreeted) {
-          await this.trySend(userKey, helpText(this.settings.effective().modelAllowlist), "帮助");
+          await this.trySend(
+            userKey,
+            helpText(this.settings.effective().modelAllowlist, this.settings.isAdmin(userKey)),
+            "帮助",
+          );
         }
         return;
 
       case "status":
         await this.trySend(userKey, this.statusText(userKey), "状态");
+        return;
+
+      case "upgradeStatus":
+        await this.trySend(userKey, this.upgradeStatusText(), "升级状态");
         return;
 
       case "cancel": {
@@ -790,9 +882,96 @@ export class Gateway {
       case "switchSession":
         return this.handleSwitch(userKey, arg, moreInputAfter);
 
+      case "rollback": {
+        if (!this.deploy) {
+          await this.trySend(userKey, "这台机器没有配自进化的部署机制,回滚要人工来。", "回滚");
+          return true;
+        }
+        try {
+          await this.trySend(userKey, await this.deploy.requestRollback(userKey), "回滚");
+        } catch (err) {
+          // 起不来 deployer 是要立刻知道的事:用户以为回滚在跑,实际什么都没发生。
+          console.error(`[gateway] ${userKey} 请求回滚失败:`, err);
+          await this.trySend(
+            userKey,
+            `没能起动回滚流程:${(err as Error).message}\n版本没有任何变化,需要人上机处理。`,
+            "回滚",
+          );
+        }
+        // 回滚只在这批的这一点上发生;后面的话照常投递 —— 进程多半马上就被停了,
+        // 但那属于部署本身的语义,不必在这里假装还能保证什么。
+        return true;
+      }
+
       default:
         return true;
     }
+  }
+
+  /** `/升级状态` 的正文。纯读磁盘,不花额度 —— 升级出问题时唯一可靠的信息源。 */
+  private upgradeStatusText(): string {
+    const lines = ["🚀 升级状态", versionLine(this.version)];
+    if (!this.deploy) {
+      lines.push("这台机器没有配自进化的部署机制。");
+      return lines.join("\n");
+    }
+    const last = this.deploy.lastReport();
+    lines.push(last ? `上次部署:${formatDeployReport(last)}` : "上次部署:还没有部署记录。");
+
+    const history = this.deploy.verifiedHistory();
+    if (!history.length) {
+      lines.push("可回退版本:无(还没有版本通过过观察期)。");
+    } else {
+      lines.push(
+        `可回退版本:${history.length} 个 —— ` +
+          history.map((r) => `${shortSha(r.sha)}${r.verifiedAt ? `(${r.verifiedAt})` : ""}`).join("、"),
+      );
+      if (history.length >= 2) {
+        lines.push(`发 ${canonicalOf("rollback")} 会退到 ${shortSha(history[1]!.sha)}。`);
+      }
+    }
+    return lines.join("\n");
+  }
+
+  /**
+   * 把上一次部署的结果告诉发起人。
+   *
+   * 这是那个空档的唯一出口:用户说完「发布」那个回合就结束了(提交部署后立即收尾,
+   * 否则会与排水互锁),而结果几十分钟后才出来 —— 那时没有任何在飞回合能说话,
+   * iLink 也不支持主动推送。所以只能等他下次开口时补上。
+   *
+   * **发送成功才标记已读**:iLink 的发送本就可能失败(context_token 预算耗尽),
+   * 先标记的话这条结果就被永久吞掉了 —— 而"升级失败已回滚"恰恰是最不能丢的一条。
+   */
+  private async announceDeployReport(userKey: string): Promise<void> {
+    const report = this.deploy?.pendingReport();
+    if (!report) return;
+    // 有发起人就只告诉他:别人没等这个结果,收到一句"升级完成"只会莫名其妙。
+    // 没有发起人(比如看门狗自动回退)则告诉任一管理员 —— 那种情况更要有人知道。
+    const forHim = report.requestedBy
+      ? report.requestedBy === userKey
+      : this.settings.isAdmin(userKey);
+    if (!forHim) return;
+    if (await this.trySend(userKey, formatDeployReport(report), "部署结果")) {
+      this.deploy?.markReportAnnounced(report.id);
+    }
+  }
+
+  /**
+   * `/health` 里属于网关的那部分:排水计数与最近一个回合。
+   *
+   * **三个计数缺一不可**,它们是消息在网关里经过的三段:聚合窗口里攒着的
+   * (`aggregating`)、已受理但分拣没走完的(`queued`)、已变成回合的(`inFlight`)。
+   * 部署的排水要求三者同时归零 —— 只看在飞回合的话,窗口里和分拣链上的话会连人带
+   * 消息一起被切换杀掉,用户那边就是"发了没反应"。
+   */
+  healthSnapshot(): GatewayHealth {
+    return {
+      inFlight: this.turns.counts(),
+      queued: this.queued,
+      aggregating: this.pending.size,
+      ...(this.lastTurn ? { lastTurn: this.lastTurn } : {}),
+    };
   }
 
   /**
@@ -882,6 +1061,9 @@ export class Gateway {
       `分段:${p.maxReplyChars} 字${own("maxReplyChars")}  ` +
         `超时:${humanDuration(p.sessionTimeoutMs)}${own("sessionTimeoutMs")}`,
       `身份:${userKey}${this.settings.isAdmin(userKey) ? "(管理员)" : ""}`,
+      // 版本放最后:日常没人关心,但"我刚让它改的东西上线没有"只有这一行答得出,
+      // 而那时用户手上多半只有微信。
+      versionLine(this.version),
     ];
     return lines.join("\n");
   }
@@ -1123,6 +1305,7 @@ export class Gateway {
       //   前台 → record() 写 current(常规路径);
       //   已被切走 → archiveTurn() 只更新 history —— 写 current 会把用户
       //     刚切过去的那段顶掉,而他正在跟它说话。
+      this.lastTurn = { at: this.now(), isError: reply.isError };
       if (turn.ctx.detached) this.sessions.archiveTurn(userKey, reply.sessionId, hint);
       else this.sessions.record(userKey, reply.sessionId, hint);
       await progress;
@@ -1133,6 +1316,8 @@ export class Gateway {
         prefs.maxReplyChars,
       );
     } catch (err) {
+      // 用户主动中断不算"回合出错":把 /取消 记成失败会让观测数据长期偏红。
+      if (!turn.ctx.abort.signal.aborted) this.lastTurn = { at: this.now(), isError: true };
       console.error(`[gateway] 处理 ${userKey} 消息失败:`, err);
       await progress;
       // 错误说明与正文同样要标出处 —— 后台回合报错时用户多半正在跟另一段对话

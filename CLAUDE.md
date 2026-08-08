@@ -11,6 +11,11 @@ catman:跑在 OpenWrt / x86 软路由 Docker 里的个人 AI 助手。微信(iLi
 工作目录;dashboard 带鉴权,兼做扫码接入与账号管理。
 纯 TypeScript / ESM(NodeNext),运行时除 `@anthropic-ai/claude-agent-sdk` 外无其它依赖。
 
+**源码直跑**:镜像 `catman-env` 只是不含业务代码的运行环境,真正跑的是数据卷里的
+**release 目录**(`/data/releases/<sha>/` = 浅 clone + 自带 node_modules + dist),
+由符号链接 `current` 指定。升级 = 制备新 release + 换链接 + 重启容器,**不重建容器**。
+配套的自进化流水线在 `scripts/evolve/`,详见下面「自进化」一节。
+
 ## 常用命令
 
 ```bash
@@ -23,7 +28,17 @@ npm run build              # tsc → dist/src/**
 # 走的是与微信图片完全相同的下游链路(同一个 Attachment、同一个网关、同一个 Agent)。
 CATMAN_CHANNEL=stdin CATMAN_DATA_DIR=./data CATMAN_ADMIN_TOKEN=devtoken \
   CLAUDE_CODE_OAUTH_TOKEN=<token> npm run dev
-docker compose up -d --build
+
+# 部署(源码直跑,首次三步;之后升级只走 prepare + deploy)
+docker build -t catman-env:1 -f docker/Dockerfile .    # 基底镜像,极少重建
+CATMAN_HOST_DATA_DIR=$PWD/data scripts/evolve/init.sh  # 首个 release + 指针
+scripts/evolve/bless.sh                                # 固化部署机制(自进化要用)
+docker compose up -d
+docker exec catman scripts/evolve/prepare.sh HEAD      # 制备:测试+编译,产出 release
+scripts/evolve/deployer.sh deploy <sha>                # 排水→自检→切换→健康门→观察期
+scripts/evolve/deployer.sh rollback|status
+# 自检(smoke)单独跑:不碰真实 /data,退出码即结论,stdout 一行 JSON
+CATMAN_SELFCHECK=1 node dist/src/index.js
 ```
 
 改完务必跑 `npm run typecheck && npm test`(strict + noUncheckedIndexedAccess 全开)。
@@ -85,6 +100,13 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 | `src/core/turn-tokens.ts` | 回合级一次性令牌 + 在飞回合上下文(detached / abort / feed / done);每用户可有多个回合 |
 | `src/core/skills.ts` | 启动时生成两个 SKILL.md(接口说明按需加载,不占系统提示词) |
 | `src/core/agent.ts` | Agent SDK 封装;**必须**带 claude_code preset 三件套(见下);常开输入通道支持回合中途追加 |
+| `src/core/version.ts` | 版本戳:读 release 根目录的 VERSION;**读不到就返回 undefined,绝不编** |
+| `src/core/selfcheck.ts` | SELFCHECK 模式:自己开临时目录装配一遍 + 探一次大脑;失败分类(限流/网络/凭据/代码) |
+| `src/core/deploy-report.ts` | 部署报告契约(deployer 写、catman 读)+ 防御式解析 + 已播报标记 |
+| `src/core/deploy.ts` | 部署控制面接口 + 已验证版本清单解析 + 走固化脚本的实现 |
+| `src/dashboard/health.ts` | `GET /health` 的纯函数组装 + 排水判定;**跨版本契约,字段只增不改** |
+| `scripts/evolve/` | 自进化流水线:lib / prepare / deployer / deployer-run / bless / init |
+| `docker/entrypoint.sh` | 解析 release 链接再 exec node;解析不到进**引导模式**(慢速重试,不 crash-loop) |
 | `src/core/agent-trace.ts` | LLM 侧可观测性:SDK 消息 → 一行日志(纯函数,分 always/trace 两级)+ 心跳文案 |
 | `src/core/session.ts` | 会话状态机(纯函数 decide + 注入时钟/store/每用户超时;current + history;后台回合走 archiveTurn) |
 | `src/core/gateway.ts` | 串联各层;**分拣节点**(线性处理一批、不等回合);追加输入;每会话串行;并发信号量;greeting |
@@ -110,21 +132,23 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 - **还原 Claude Code 行为靠三个非默认选项**(`agent.ts`):`systemPrompt:{type:"preset",preset:"claude_code"}`
   + `settingSources:["user","project","local"]` + `bypassPermissions`。少任何一个"脾气"就变了。
 - **bypassPermissions 不能以 root 运行**;镜像里用 uid 10001 的 catman 用户。
+  镜像里还有 uid 10002 的 deployer:**`/data/releases` 属它所有,主容器只读挂载**
+  (compose 里 `./data/releases:/data/releases:ro`)。助手文件系统全开,一句「帮我清清磁盘」
+  就足以把回滚目标 rm 掉(硬链接复用还让每个 release 在 du 里都按全量计,看着最该删);
+  只读挂载让那种误删直接 EACCES 暴露而不是成功。
 - **宿主 Docker 访问靠运行时注入的组,不能写死进镜像**:镜像只预装 docker CLI(无 daemon),
   `/var/run/docker.sock` 由 compose 挂载、访问权限由 `group_add: ${DOCKER_GID:-0}` 给。
   该 GID 属于宿主(OpenWrt 多为 0/root,Debian 多为 999/docker),写进镜像会一换机器就
   `permission denied`。挂了 socket 就等于把宿主 root 交给助手,**隔离边界从容器退化为对助手的信任** ——
   README「安全说明」按这个口径写,改动别改回"容器即隔离边界"。
-- **镜像里的 `npm ci` 必须跑在目标架构下**:claude 二进制来自 Agent SDK 的
+- **`npm ci` 必须跑在目标架构下**:claude 二进制来自 Agent SDK 的
   optionalDependencies(`claude-agent-sdk-<os>-<arch>[-musl]`),npm 按**执行安装的那个容器**的
-  arch/libc 选包。Dockerfile 是多阶段的,发货的是**运行时阶段**那次 `npm ci --omit=dev`,
-  所以多架构要靠 buildx + QEMU(或原生 builder)让它在目标平台跑,**不能**给运行时阶段加
-  `FROM --platform=$BUILDPLATFORM` 交叉编译 —— TS 编译确实与架构无关,但那层的
-  `npm ci` 会装成构建机的架构,构建期毫无征兆,只在目标机起 agent 时炸。
-  验证手段:容器内 `node -p process.arch` 与 `ls node_modules/@anthropic-ai/` 必须对得上。
-  基底是 bookworm(glibc),换 alpine 会切到 musl 变体。步骤见 README「构建多架构镜像」。
-  另两条镜像体积不变量在 Dockerfile 注释里:npm 缓存清理、`chown -R /app` 都必须与
-  `npm ci` 同层,分层会把整个 node_modules 的体积在镜像里再算一遍。
+  arch/libc 选包。源码直跑之后这条自动满足 —— 依赖是在**目标机器上**制备 release 时装的
+  (`prepare.sh` 用的就是本机那个 `catman-env`),整套 buildx + QEMU 多架构构建随之消失。
+  基底镜像本身不含 npm 依赖,就地 `docker build` 即可。
+  验证手段不变:`node -p process.arch` 与
+  `ls $(readlink -f /data/releases/current)/node_modules/@anthropic-ai/` 必须对得上。
+  基底是 bookworm(glibc),换 alpine 会切到 musl 变体。
 - **清理严格限定在本程序自己建的 workspace 目录**(`transcript.ts` 全部函数都要 `projectDir`
   参数;多用户版的 `*Across` 函数接受调用方给定的一组 scope)。**绝不遍历整个 projects/ 树** ——
   否则 CLAUDE_CONFIG_DIR 指向共享 ~/.claude 时会误删无关的 Claude Code 历史(有专门单测守护;
@@ -386,9 +410,83 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 - **两个 CLAUDE.md**:本文件是开发指南;运行时 agent 加载的是 `/data/workspace/CLAUDE.md`
   (在数据卷内),那才是塑造助手人设/行为的地方。多用户下它是**共享**人设,
   每人目录下还有一个自己的 `CLAUDE.md`(首行 import 共享的那份)。
-- **不做数据迁移**:升级方式是清空 `./data` 重新扫码。代码不认识任何历史格式,
-  `parseUserKey()` 对非法 key 返回 null、`SessionManager` 加载时丢弃 —— 这是解析器本就该有的
-  防御,不是迁移分支。别为一次性场景把旧格式的知识永久留在代码里。
+- **数据向前兼容,不做迁移**(源码直跑之后这条改过口径,别按旧的写):
+  **日常升级与回滚都不动 `/data`** —— 回滚只换 `releases/current` 的指向。所以改动必须
+  **能读盘上现有格式**,而且因为观察期内随时可能回滚,**旧版本要能读新版本写的**。
+  做不到的属于要人工介入的变更,不走自动流水线。兜底靠既有的防御式解析
+  (`parseUserKey()` 非法返回 null、`SessionManager` 加载时丢弃、prefs 回落不改盘、
+  `settings.effective()` 永不抛)—— 那是解析器本就该有的防御,不是迁移分支。
+  跨越不兼容格式(如从单账号版本升级)才是清空 `./data` 重新扫码:
+  别为一次性场景把旧格式的知识永久留在代码里。
+
+## 自进化
+
+目标:管理员在微信里说一个改进想法,catman 自己改代码、跑测试、制备 release,汇报后由人
+确认,再由**独立的 deployer 容器**完成切换与回滚。失败的最坏结果是"这次改进没上线",
+而不是"catman 下线了"。完整设计(含四轮对抗评审推翻的方案与理由)见设计文档;
+下面只列实现层必须守住的不变量。
+
+- **更新者不能是被更新者**:切换与回滚跑在独立的一次性容器里(`deployer-run.sh` 起,
+  容器名固定 = 天然串行互斥)。它做的第一件事就是 `docker stop catman` —— 跑在 catman 里的
+  子进程会在那一刻连同父进程一起被杀,切换停在半路。
+- **执法者自己取证**:smoke 由 deployer **亲自**跑(不是让 agent 递一份"我测过了"的证明),
+  健康门比对的 sha 是它从 `/health` 亲自读的。agent 改坏了自检代码,结果只会是它自己的版本
+  过不了门,而不是门失效。
+- **`stable` 只在观察期结束后前移**(`deployer.sh`)。观察期内 `current ≠ stable`,
+  所以那段时间的任何崩溃(含宿主断电重启)都自然落回 stable。反过来(切换成功就前移)
+  会让观察期变成纯仪式:真出事时"回滚目标"恰恰就是刚上线的坏版本。
+- **回滚是"先停、再换、后起"**:不先停就换链接的话,restart 策略会在中途把旧容器拉起来,
+  而 crash-loop 的容器每次启动都可能再写一遍状态文件 —— 回滚这个最后防线自己产出损坏状态。
+- **换链接必须可从任意断点重跑**(`pointer_set`):deployer 可能在 `ln` 与 `mv` 之间被杀,
+  残留的 `.tmp` 会让下一次部署在 `ln -s` 上 EEXIST 失败,而那时容器已经停了 —— 没人拉起它。
+  所以开头无条件清残留并用 `-f`。
+- **GC 的保留集 = 已验证清单 ∪ 全部指针的 realpath**(`gc`)。指针那一半不能省:守护人格
+  钉住的 release 天然是最老的,只按"保留最近 N 个"会把它的脚下抽空 —— 而活进程握着已删
+  inode 照样在跑,直到某次断电重启才暴露,那正是最需要它的时刻。
+- **`docker build` 不进部署路径**:切换不重建容器(配置没变),所以流水线完全不碰
+  docker compose。它的文件优先级(`compose.yaml` 盖 `docker-compose.yml`)、override 自动合并、
+  `${PWD}` 在容器里插值成空串、项目名不一致导致认领失败、两个 compose 版本算出的
+  config hash 不同引发反复 recreate —— 这些坑不用它就一个都不存在。改 compose 仍然要人。
+- **devDependencies 保留,绝不 prune**(`prepare.sh`)。曾经的设计是"装全量→跑测试→prune",
+  而下一次制备若 lockfile 没变就 `cp -al` 硬链接复用上一个 release 的 node_modules ——
+  那棵树里已经没有 tsc/tsx,**最常见的那条路径必然失败**;补装又会就地写文件,透过硬链接
+  污染上一个(可能正是 stable)release 的字节。不 prune 让两个坑同时消失。
+  配套纪律:**复用之后对那棵树零 npm 写操作**。
+- **不用 `git worktree` 制备**,用浅 clone:worktree 的 `.git` 只是指向共享仓库的指针,
+  清理时 `rm -rf` 会留下元数据残骸,导致**同一个 sha 无法再次 worktree add** ——
+  恰好死在"回滚之后想重新制备旧版本"这条事故恢复路径上。
+- **完整性靠内容清单不靠 git**(`release_verify`):`dist/` 与 `node_modules/` 都在
+  `.gitignore` 里,`git status` 对它们**全盲**,而那才是真正被执行的字节。有人往 dist 里
+  打个热补丁,git 一无所知。所以制备时生成 MANIFEST,切换到任何 release 之前重验。
+  目录去写权限只做**目录**不做文件:目录 inode 不被硬链接共享,chmod 文件会穿透到复用
+  同一批文件的旧 release。
+- **smoke 失败要分类**(`selfcheck.ts` 的 `classifyFailure`):限流与网络是**环境**的错,
+  退避重试;把它们判成"新版本坏了"会让一次二十分钟的上游抖动废掉一个完好的版本。
+  分类错的代价不对称,有单测逐类钉死。
+- **健康门只看本地可判定项**(`health.ts`):进程起没起、渠道通不通、`version.sha` 对不对。
+  大脑状态(`lastTurn`)只是观测位,**不参与判死** —— 真正的大脑探测在 SELFCHECK 里,
+  由 deployer 在切换**之前**跑。
+- **排水要三个计数同时归零**(`GatewayHealth`):聚合窗口(`aggregating`)、分拣链(`queued`)、
+  在飞回合(`inFlight.foreground`)。只看在飞回合的话,卡在前两段的消息会被切换连人带话
+  一起杀掉,用户那边就是"发了没反应"。后台回合**不算**(用户主动切走的长任务,等它们等于
+  永远切不了),被中断的条数写进报告如实相告。
+- **版本戳读不到就是 undefined,绝不编**(`version.ts`):健康门拿它比对,编造的值会让门
+  放行一次实际没切成功的部署 —— 那正是这道门存在的理由。
+- **两份 JSON 是跨版本契约**:部署报告(`deploy-report.ts`)与已验证清单(`deploy.ts`)由
+  钦定版本的 deployer 写、每周都在进化的 catman 读。字段只增不改,读取端一律防御式解析,
+  读不懂就当没有(而不是抛错拖垮启动)。`/health` 同理,golden 测试钉着形状。
+- **部署机制不随自我进化更新**:`/回滚` 执行的是 `bless.sh` 固化到 `/data/deploy/bin/` 的
+  那份脚本,不是当前 release 里的。改了 `scripts/evolve/` 要重新 bless 才生效 ——
+  门禁和逃生门是同一把锁,不能让一次改坏了部署逻辑的进化把它们一起毁掉。
+- **部署类指令是 `adminOnly`**(`commands.ts`):影响是全局的(一次回滚把所有用户都换版本),
+  而 catman 是多用户的。**挡掉 = 当它不是指令**,于是照常走 LLM ——
+  非管理员既用不了、也看不出它们存在,不必回一句"你没权限"(那句话本身就在告诉他有这个东西)。
+- **部署结果发送成功才标记已播报**(`announceDeployReport`):iLink 的发送本就可能失败
+  (context_token 预算耗尽),先标记就等于把这条结果永久吞掉 —— 而「升级失败已回滚」
+  恰恰是最不能丢的一条(用户接下来的话都基于"改动已生效"这个错误前提)。
+- **入口脚本解析不到 release 时进引导模式**(`entrypoint.sh`),慢速重试而不是 crash-loop:
+  全新机器上数据卷是空的,而能造出第一个 release 的 `prepare.sh` 要在容器里跑 ——
+  直接 exec 的结果是最快速度反复重启刷屏,真正该做的事(跑 `init.sh`)却没有任何提示。
 
 ## 约定
 

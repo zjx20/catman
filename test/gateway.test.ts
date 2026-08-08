@@ -28,6 +28,8 @@ import type { AdmissionPolicy } from "../src/core/admission.js";
 import type { Channel, MessageHandler } from "../src/channels/types.js";
 import type { Attachment } from "../src/core/attachments.js";
 import type { Agent, AgentProgressEvent, AgentReply, AgentRunOptions } from "../src/core/agent.js";
+import type { DeployControl, VerifiedRelease } from "../src/core/deploy.js";
+import type { DeployReport } from "../src/core/deploy-report.js";
 
 const TIMEOUT = 60 * 60 * 1000;
 
@@ -169,6 +171,35 @@ interface BuildOpts {
   settings?: SettingsPatch;
   /** 会话记录存活检查(/切换会话 用)。不传则视为都活着,与生产默认一致。 */
   sessionExists?: (userKey: string, sessionId: string) => boolean;
+  /** 部署控制面。不传 = 这台机器没配自进化(本地开发就是这样)。 */
+  deploy?: DeployControl;
+}
+
+/** 可编排的假部署控制面:记录回滚请求,报告与清单由用例摆好。 */
+class FakeDeploy implements DeployControl {
+  rollbackRequests: string[] = [];
+  rollbackError?: Error;
+  report?: DeployReport;
+  announced: string[] = [];
+  history: VerifiedRelease[] = [];
+
+  async requestRollback(requestedBy: string): Promise<string> {
+    if (this.rollbackError) throw this.rollbackError;
+    this.rollbackRequests.push(requestedBy);
+    return "已请求回滚。";
+  }
+  pendingReport(): DeployReport | undefined {
+    return this.report && !this.announced.includes(this.report.id) ? this.report : undefined;
+  }
+  markReportAnnounced(id: string): void {
+    this.announced.push(id);
+  }
+  lastReport(): DeployReport | undefined {
+    return this.report;
+  }
+  verifiedHistory(): readonly VerifiedRelease[] {
+    return this.history;
+  }
 }
 
 const tempDirs: string[] = [];
@@ -224,6 +255,7 @@ function build(now: () => number, opts: BuildOpts = {}) {
     now,
     ...(opts.admission ? { admission: opts.admission } : {}),
     ...(opts.sessionExists ? { sessionExists: opts.sessionExists } : {}),
+    ...(opts.deploy ? { deploy: opts.deploy } : {}),
   });
   // 只注册 handler,不启动真实定时器/渠道。走 dispatch 才能覆盖硬指令分流。
   // 附件要一并转交 —— 与 Gateway.start() 里的接线保持一致,否则这里测不到透传。
@@ -1814,4 +1846,167 @@ test("同一会话绝不并发:追加额度用尽的那段排在这一轮后面,
   assert.equal(agent.calls.length, 2);
   assert.equal(agent.calls[1]!.prompt, "额度之外的那条");
   assert.equal(agent.peakInFlight, 1, "全程没有两个回合同时在跑");
+});
+
+// ── 部署指令与升级播报 ──────────────────────────────────────────────
+//
+// 这一组守的核心是**权限的机械性**:部署类指令的影响是全局的(一次回滚把所有
+// 用户都换到另一个版本),而 catman 是多用户的 —— 朋友扫码就能接入。没有这道闸,
+// 任何人打一句带斜杠的话就能触发,那正是「防失误」要拦的东西。
+
+const REPORT: DeployReport = {
+  schema: 1,
+  id: "d-1",
+  outcome: "rolled-back",
+  sha: "newsha1234",
+  revertedTo: "oldsha5678",
+  finishedAt: "2026-08-08T10:00:00Z",
+  detail: "健康门超时",
+  requestedBy: U1,
+};
+
+test("非管理员的 /回滚 不生效,而且当它不是指令 —— 连「你没权限」都不说", async () => {
+  const t = 1_000_000;
+  const deploy = new FakeDeploy();
+  deploy.history = [{ sha: "a", verifiedAt: "t2" }, { sha: "b", verifiedAt: "t1" }];
+  const { channel, agent } = build(() => t, { deploy });
+
+  await channel.receive(U1, "/回滚");
+  assert.deepEqual(deploy.rollbackRequests, [], "普通用户不该能触发回滚");
+  // 当它不是指令 → 照常走 LLM(未知斜杠文本本来就是这个待遇)。这样既用不了、
+  // 也看不出这条指令存在 —— 回一句"你没权限"本身就是在告诉他有这么个东西。
+  assert.equal(agent.calls.length, 1);
+  assert.equal(agent.calls[0]!.prompt, "/回滚");
+});
+
+test("非管理员的 /升级状态 同样当作普通文本", async () => {
+  const t = 1_000_000;
+  const deploy = new FakeDeploy();
+  const { channel, agent } = build(() => t, { deploy });
+  await channel.receive(U1, "/升级状态");
+  assert.equal(agent.calls.length, 1, "走了 LLM,没走硬指令分支");
+});
+
+test("管理员的 /回滚 请求回滚,并把发起人传下去", async () => {
+  const t = 1_000_000;
+  const deploy = new FakeDeploy();
+  deploy.history = [{ sha: "a", verifiedAt: "t2" }, { sha: "b", verifiedAt: "t1" }];
+  const { channel, agent } = build(() => t, { deploy, settings: { adminUserKeys: [U1] } });
+
+  await channel.receive(U1, "/回滚");
+  assert.deepEqual(deploy.rollbackRequests, [U1]);
+  assert.equal(agent.calls.length, 0, "硬指令不进 LLM");
+});
+
+test("起不动 deployer 时必须明说版本没变 —— 用户以为回滚在跑,实际什么都没发生", async () => {
+  const t = 1_000_000;
+  const deploy = new FakeDeploy();
+  deploy.rollbackError = new Error("no such file");
+  const { channel } = build(() => t, { deploy, settings: { adminUserKeys: [U1] } });
+
+  await channel.receive(U1, "/回滚");
+  const last = afterGreeting(channel.sent).at(-1)!;
+  assert.match(last.text, /no such file/);
+  assert.match(last.text, /没有任何变化/);
+});
+
+test("没配部署机制时 /回滚 明说没配,而不是假装成功", async () => {
+  const t = 1_000_000;
+  const { channel } = build(() => t, { settings: { adminUserKeys: [U1] } });
+  await channel.receive(U1, "/回滚");
+  assert.match(afterGreeting(channel.sent).at(-1)!.text, /没有配自进化/);
+});
+
+test("/升级状态 列出可回退版本与上次部署结果", async () => {
+  const t = 1_000_000;
+  const deploy = new FakeDeploy();
+  deploy.report = REPORT;
+  deploy.history = [
+    { sha: "current999", verifiedAt: "t2" },
+    { sha: "previous11", verifiedAt: "t1" },
+  ];
+  const { channel } = build(() => t, { deploy, settings: { adminUserKeys: [U1] } });
+
+  await channel.receive(U1, "/升级状态");
+  const text = afterGreeting(channel.sent).at(-1)!.text;
+  assert.match(text, /previou/, "要列出可回退的版本(短 sha,7 位)");
+  assert.match(text, /健康门超时/, "要带上次失败的原因");
+});
+
+test("部署结果在发起人下次开口时播报一次,之后不再重复", async () => {
+  const t = 1_000_000;
+  const deploy = new FakeDeploy();
+  deploy.report = REPORT; // requestedBy = U1
+  const { channel } = build(() => t, { deploy, settings: { adminUserKeys: [U1] } });
+
+  await channel.receive(U1, "改好了吗");
+  const first = channel.sent.filter((m) => m.text.includes("已自动回滚"));
+  assert.equal(first.length, 1, "该播报一次");
+  assert.deepEqual(deploy.announced, ["d-1"]);
+
+  await channel.receive(U1, "再说一句");
+  const again = channel.sent.filter((m) => m.text.includes("已自动回滚"));
+  assert.equal(again.length, 1, "播报过就不再重复");
+});
+
+test("部署结果只发给发起人 —— 别人收到一句「升级完成」只会莫名其妙", async () => {
+  const t = 1_000_000;
+  const deploy = new FakeDeploy();
+  deploy.report = REPORT; // requestedBy = U1
+  const { channel } = build(() => t, { deploy, settings: { adminUserKeys: [U1, U2] } });
+
+  await channel.receive(U2, "你好");
+  assert.equal(
+    channel.sent.filter((m) => m.text.includes("已自动回滚")).length,
+    0,
+    "U2 不是发起人,不该收到",
+  );
+  assert.deepEqual(deploy.announced, [], "也不该被标记成已播报");
+
+  await channel.receive(U1, "你好");
+  assert.equal(channel.sent.filter((m) => m.text.includes("已自动回滚")).length, 1);
+});
+
+test("没有发起人的报告(比如看门狗自动回退)发给任一管理员,但不发给普通用户", async () => {
+  const t = 1_000_000;
+  const deploy = new FakeDeploy();
+  const { requestedBy: _drop, ...noOwner } = REPORT;
+  deploy.report = noOwner as DeployReport;
+  const { channel } = build(() => t, { deploy, settings: { adminUserKeys: [U2] } });
+
+  await channel.receive(U1, "你好"); // 普通用户
+  assert.equal(channel.sent.filter((m) => m.text.includes("已自动回滚")).length, 0);
+  await channel.receive(U2, "你好"); // 管理员
+  assert.equal(channel.sent.filter((m) => m.text.includes("已自动回滚")).length, 1);
+});
+
+test("播报发送失败时不标记已读 —— 否则这条结果就被永久吞掉了", async () => {
+  const t = 1_000_000;
+  const deploy = new FakeDeploy();
+  deploy.report = REPORT;
+  const { channel } = build(() => t, {
+    deploy,
+    failSend: true, // 模拟 iLink 发送失败(context_token 预算耗尽是常态)
+    settings: { adminUserKeys: [U1] },
+  });
+
+  await channel.receive(U1, "你好");
+  assert.deepEqual(deploy.announced, [], "发送失败就不该记成已播报");
+  // 下次发得出去时还得能播 —— 「升级失败已回滚」是最不能丢的一条。
+  channel.failSend = false;
+  await channel.receive(U1, "再来一次");
+  assert.equal(channel.sent.filter((m) => m.text.includes("已自动回滚")).length, 1);
+});
+
+test("普通用户的帮助文案里没有部署指令,管理员的有", async () => {
+  const t = 1_000_000;
+  const { channel } = build(() => t, { settings: { adminUserKeys: [U2] } });
+
+  await channel.receive(U1, "/帮助");
+  const plain = channel.sent.map((m) => m.text).join("\n");
+  assert.equal(plain.includes(canonicalOf("rollback")), false);
+
+  await channel.receive(U2, "/帮助");
+  const withAdmin = channel.sent.map((m) => m.text).join("\n");
+  assert.equal(withAdmin.includes(canonicalOf("rollback")), true);
 });

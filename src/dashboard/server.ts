@@ -13,6 +13,7 @@ import { renderPage, type UserRow } from "./ui.js";
 import { DashboardAuth, urlWithoutToken } from "./auth.js";
 import { handleSelfApi, isSelfApiPath, SESSION_HEADER, type SelfApiDeps } from "./api-self.js";
 import { handleAdminApi, isAdminApiPath, type AdminApiDeps } from "./api-admin.js";
+import { buildHealth, isHealthPath, type HealthDeps } from "./health.js";
 
 /**
  * dashboard。整站需要 token(见 auth.ts:会话记录本身就是敏感内容)。
@@ -42,9 +43,12 @@ import { handleAdminApi, isAdminApiPath, type AdminApiDeps } from "./api-admin.j
  *   GET/PATCH /api/me                       agent 读写自己这个用户的配置
  *   POST   /api/me/session/reset            本回合结束后开新会话
  *   GET    /api/me/sessions                 自己的历史会话
+ * 无鉴权(只有标量与版本号,见 health.ts):
+ *   GET    /health                          部署流水线的健康门/排水门/版本确证
  *
- * ⚠️ **`/api/me` 必须在 admin 读闸门之前分发。** handle() 的第一件事是
- * allowsRead(),而回合令牌过不了那道闸 —— 放到后面会静默 401,且极难查。
+ * ⚠️ **`/api/me` 与 `/health` 必须在 admin 读闸门之前分发。** handle() 的第一件事
+ * 是 allowsRead(),回合令牌与 deployer 都过不了那道闸 —— 放到后面会静默 401,
+ * 且极难查。
  */
 
 export interface DashboardOptions {
@@ -61,6 +65,10 @@ export interface DashboardOptions {
   chat: DashboardChannel;
   selfApi: SelfApiDeps;
   adminApi: AdminApiDeps;
+  /**
+   * `/health` 的数据源。不传则不开这个端点 —— 单测里起 Dashboard 不必装配整个网关。
+   */
+  health?: HealthDeps;
 }
 
 export class Dashboard {
@@ -129,6 +137,14 @@ export class Dashboard {
     const isApi = path.startsWith("/api/");
 
     try {
+      // ⚠️ /health 与 /api/me 一样,必须排在 admin 读闸门**之前**。
+      // deployer 与看门狗拿不到 admin token(那是用户的凭据,不该下放给部署机制),
+      // 放到闸门后面会静默 401 —— 表现为"每次部署都在健康门超时",极难查。
+      // 不鉴权的代价已在 health.ts 里控住:这份 payload 只有标量与版本号。
+      if (isHealthPath(path) && this.opts.health) {
+        return json(res, buildHealth(this.opts.health));
+      }
+
       // ⚠️ 回合令牌的接口必须排在 admin 读闸门**之前** —— 它过不了那道闸。
       if (isSelfApiPath(path)) {
         const raw = req.headers[SESSION_HEADER];

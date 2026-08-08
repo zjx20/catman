@@ -27,6 +27,20 @@ export interface IncomingMessage {
 
 export type MessageHandler = (msg: IncomingMessage) => Promise<void>;
 
+/**
+ * 渠道的健康自述,供 `/health` 汇报、部署的健康门查验。
+ *
+ * **`started` 与 `live` 必须分开**:iLink 凭据失效(errcode=-14)的连接是
+ * **故意不重启**的(它等的就是重新扫码),此刻渠道"已启动"却一条消息也收不到 ——
+ * 只看 started 会把一个已经聋掉的系统报成健康,而部署的健康门正是靠这份自述
+ * 判断"新版本真的在服务"。没有连接概念的渠道(stdin / dashboard)两者相等。
+ */
+export interface ChannelHealth {
+  readonly name: string;
+  readonly started: boolean;
+  readonly live: boolean;
+}
+
 export interface Channel {
   /** 渠道名,用于日志与 dashboard 展示。 */
   readonly name: string;
@@ -47,6 +61,12 @@ export interface Channel {
    * 不支持撤回的渠道不实现该方法;上层须在调用前判断其存在,失败也应容忍。
    */
   recall?(userKey: string, messageId: string): Promise<void>;
+
+  /**
+   * 可选:自述健康状况(可能多条 —— 复合渠道会把各成员展开)。
+   * 不实现的渠道在 `/health` 里不出现,而不是被当成健康。
+   */
+  health?(): readonly ChannelHealth[];
 
   /** 启动渠道(建立连接/开始轮询)。 */
   start(): Promise<void>;

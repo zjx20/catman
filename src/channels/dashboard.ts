@@ -1,6 +1,6 @@
 import { BUILTIN_ADMIN_USER_KEY } from "../core/identity.js";
 import { readJsonFile, writeJsonFileAtomic } from "../core/file-store.js";
-import type { Channel, MessageHandler } from "./types.js";
+import type { Channel, ChannelHealth, MessageHandler } from "./types.js";
 
 /**
  * dashboard 聊天渠道。只有一个固定用户 —— 内置管理员。
@@ -98,6 +98,15 @@ export class DashboardChannel implements Channel {
     this.buffer.splice(i, 1);
     this.persist();
     this.emit({ type: "delete", id });
+  }
+
+  /**
+   * 网页渠道永远"活着":它不建任何对外连接,HTTP 服务在不在由 Dashboard 自己管。
+   * 说 live=true 不是敷衍 —— 这条渠道的可用性等价于进程还在,而进程不在时
+   * 整个 `/health` 都答不出来。
+   */
+  health(): readonly ChannelHealth[] {
+    return [{ name: this.name, started: true, live: true }];
   }
 
   async start(): Promise<void> {}

@@ -163,4 +163,24 @@ export class TurnTokens {
   allFor(userKey: string): readonly TurnContext[] {
     return this.byUser.get(userKey) ?? [];
   }
+
+  /**
+   * 全局在飞回合数,前台与后台分开数。
+   *
+   * 部署前的**排水**要它:切换必须等前台回合收尾,否则用户正等着的那一轮会被
+   * 连人带话一起杀掉。前台与后台分开是因为处置不同 —— 后台那些是用户主动切走、
+   * 说过"你接着跑"的长任务,排水给它们更长的预算,等不及也只是记进报告,
+   * 不能因为它们就永远切不了。
+   */
+  counts(): { foreground: number; background: number } {
+    let foreground = 0;
+    let background = 0;
+    for (const list of this.byUser.values()) {
+      for (const ctx of list) {
+        if (ctx.detached) background += 1;
+        else foreground += 1;
+      }
+    }
+    return { foreground, background };
+  }
 }

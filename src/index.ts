@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { loadConfig, type Config } from "./config.js";
 import { Agent } from "./core/agent.js";
@@ -22,11 +22,21 @@ import type { AttachmentLimits } from "./core/attachments.js";
 import { Dashboard } from "./dashboard/server.js";
 import { cleanupOldSessionsAcross, encodeProjectDir, sessionFileExists } from "./core/transcript.js";
 import { installLogStamps } from "./core/log-stamp.js";
+import { readVersion, versionLine } from "./core/version.js";
+import { runSelfCheck } from "./core/selfcheck.js";
+import { ScriptDeployControl } from "./core/deploy.js";
 
 async function main(): Promise<void> {
   // 第一件事:给所有 console 输出加时间戳。放在最前面,连启动期的日志也带上 ——
   // 排查发送失败之类的问题时,"这两条隔了多久"是最基本的信息。
   installLogStamps();
+
+  // 自检模式:装配一遍 + 探一次大脑就退出,不起渠道、不起 dashboard、不碰真实数据。
+  // 部署流水线在**切换之前**跑它,所以这个分支必须排在任何会碰 /data 的动作前面。
+  if (process.env["CATMAN_SELFCHECK"]) return await selfCheckMain();
+
+  const version = readVersion();
+  console.info(`catman 启动中,${versionLine(version)}`);
 
   const config = loadConfig();
 
@@ -62,6 +72,8 @@ async function main(): Promise<void> {
   // 接口说明做成 skill(按需加载,常态不占 token)。每次启动覆盖写,保证跟代码同步。
   writeSkills(configDir, { modelAllowlist: settings.effective().modelAllowlist });
 
+  const deploy = resolveDeployControl(config);
+
   // 聊天记录落盘:网页没有本地记录,不存的话重启后页面空白、而助手那边的会话还在。
   const chat = new DashboardChannel({ path: config.chatLogPath });
   // 闭包读 settings:改了上限立刻生效,与 maxConcurrentTurns 那套一致。
@@ -79,6 +91,8 @@ async function main(): Promise<void> {
     turns,
     apiBase: config.apiBase,
     admission,
+    version,
+    ...(deploy ? { deploy } : {}),
     // /切换会话 切换前确认目标的 JSONL 还在 —— 记录没了 resume 必然失败,
     // 提前给句人话并出清死引用,比让回合炸出原始报错友好得多。
     sessionExists: (userKey, sessionId) =>
@@ -88,6 +102,10 @@ async function main(): Promise<void> {
   });
 
   const adminToken = resolveAdminToken(config);
+  // 渠道起来之前一律报 bootOk=false:部署的健康门等的就是这个翻转,
+  // 提前报 true 会让它把一个还没就绪的进程判成部署成功。
+  let bootOk = false;
+  const startedAt = Date.now();
   const dashboard = new Dashboard({
     configDir,
     workspaceRoot: config.workspaceDir,
@@ -99,6 +117,13 @@ async function main(): Promise<void> {
     chat,
     selfApi: { turns, prefs, users, sessions, settings, configDir },
     adminApi: { settings, prefs, users },
+    health: {
+      version,
+      bootOk: () => bootOk,
+      channels: () => channel.health?.() ?? [],
+      gateway: () => gateway.healthSnapshot(),
+      startedAt,
+    },
   });
 
   // 保留期清理:启动跑一次,之后按间隔跑;删除的会话同步从状态里出清死引用。
@@ -138,9 +163,25 @@ async function main(): Promise<void> {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
+  // dashboard 先起:渠道连接可能要好几秒,这期间 /health 就该答得出
+  // (bootOk=false),否则 deployer 的健康门只能干等到超时,分不清"还在起"
+  // 与"起不来"。
   dashboard.start();
   await gateway.start();
-  console.info(`catman 已启动,渠道=${channel.name}`);
+  bootOk = true;
+  console.info(`catman 已启动,渠道=${channel.name},${versionLine(version)}`);
+}
+
+/**
+ * 自检入口。结论以**单行 JSON** 打到 stdout —— deployer 是脚本,人也可能直接
+ * `docker run` 它,两边都要能读。退出码只有 0/1:分类信息在 JSON 里,
+ * 用退出码编码分类会诱使调用方去记一张数字表。
+ */
+async function selfCheckMain(): Promise<void> {
+  const result = await runSelfCheck();
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  console.info(`[selfcheck] ${result.ok ? "通过" : `失败(${result.category})`}:${result.detail}`);
+  process.exit(result.ok ? 0 : 1);
 }
 
 /**
@@ -179,6 +220,25 @@ function createChannel(
     channel: new CompositeChannel([primary, chat]),
     admission: compositeAdmission(byChannel),
   };
+}
+
+/**
+ * 装配部署控制面 —— 只在这台机器**真的固化过部署脚本**时才给。
+ *
+ * 判据是那个脚本存不存在,而不是某个开关:开关会与现实脱节(配了开关但没 bless,
+ * 于是 `/回滚` 起一个不存在的脚本然后报一句看不懂的 ENOENT)。没有它时网关会
+ * 明说"这台机器没配自进化",本地开发与 stdin 调试就是这种情况。
+ */
+function resolveDeployControl(config: Config): ScriptDeployControl | undefined {
+  const runnerPath = `${config.deployDir}/bin/deployer-run.sh`;
+  if (!existsSync(runnerPath)) return undefined;
+  console.info(`[deploy] 已固化的部署脚本:${runnerPath}`);
+  return new ScriptDeployControl({
+    runnerPath,
+    reportPath: `${config.deployDir}/report.json`,
+    seenPath: config.deploySeenPath,
+    historyPath: `${config.releasesDir}/verified-history.json`,
+  });
 }
 
 /**

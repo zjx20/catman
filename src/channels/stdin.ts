@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import type { Channel, MessageHandler } from "./types.js";
+import type { Channel, ChannelHealth, MessageHandler } from "./types.js";
 import { makeUserKey, parseUserKey } from "../core/identity.js";
 import {
   describeReject,
@@ -43,6 +43,11 @@ export class StdinChannel implements Channel {
     process.stdout.write(`\n[${who}] ${text}\n> `);
   }
 
+  /** 没有对外连接的概念,started 即 live。 */
+  health(): readonly ChannelHealth[] {
+    return [{ name: this.name, started: this.rl !== undefined, live: this.rl !== undefined }];
+  }
+
   async start(): Promise<void> {
     this.rl = createInterface({ input: process.stdin });
     process.stdout.write(`(当前身份 ${this.currentUser};用 "/user <名字>" 切换)\n> `);
@@ -72,6 +77,7 @@ export class StdinChannel implements Channel {
 
   async stop(): Promise<void> {
     this.rl?.close();
+    this.rl = undefined;
   }
 
   /** 读本地图片文件当作附件发出去。校验用的是与微信那条路一模一样的函数。 */

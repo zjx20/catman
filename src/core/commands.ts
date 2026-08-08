@@ -33,7 +33,9 @@ export type CommandName =
   | "newSession"
   | "cancel"
   | "continue"
-  | "switchSession";
+  | "switchSession"
+  | "rollback"
+  | "upgradeStatus";
 
 export interface CommandDef {
   readonly name: CommandName;
@@ -47,6 +49,15 @@ export interface CommandDef {
   readonly takesArg?: boolean;
   /** 参数在帮助文案里的占位名,如「会话id」。 */
   readonly argHint?: string;
+  /**
+   * 只有管理员能用,且**只对管理员显示**。
+   *
+   * 这个字段不是装饰:部署类指令的影响是**全局**的 —— 一次回滚会把所有用户
+   * 都换到另一个版本。而 catman 是多用户的(朋友扫码即可接入),没有这道闸的话,
+   * 任何人打一句带斜杠的话就能触发,这正是"失误"本身,必须机械拦截而不是靠
+   * 文案劝阻。非管理员发这些指令按"未知指令"处理(见 gateway),不透露它们存在。
+   */
+  readonly adminOnly?: boolean;
 }
 
 export const COMMAND_TABLE: readonly CommandDef[] = [
@@ -104,6 +115,26 @@ export const COMMAND_TABLE: readonly CommandDef[] = [
     takesArg: true,
     argHint: "会话id",
   },
+  {
+    name: "upgradeStatus",
+    canonical: "/升级状态",
+    aliases: ["/version", "/升級狀態"],
+    desc: "看当前版本、上次升级的结果、可回退的版本(不花额度)",
+    // 纯读磁盘上的报告与版本戳,幂等 —— 符合 immediate 的约束。
+    // 而它恰恰是升级出问题时最该立刻答得出的那条:回合可能正卡着。
+    immediate: true,
+    adminOnly: true,
+  },
+  {
+    name: "rollback",
+    canonical: "/回滚",
+    aliases: ["/rollback", "/回退"],
+    desc: "把版本退回上一个已验证的 release(升级后发现不对劲时用)",
+    // 走队列而不是 immediate:它会重启进程,与"只做幂等只读/中断操作"的
+    // immediate 约束正相反。走队列也不意味着排在回合后面 —— 分拣节点不等回合。
+    immediate: false,
+    adminOnly: true,
+  },
 ];
 
 const BY_TOKEN = new Map<string, CommandDef>();
@@ -137,9 +168,14 @@ export function parseCommand(text: string): ParsedCommand | undefined {
   return { cmd, arg: t.slice(sp + 1).trim() };
 }
 
-/** 帮助文案里的指令清单,每行形如 `/帮助（/help）— 看这份使用指引`。 */
-export function commandHelpLines(): string[] {
-  return COMMAND_TABLE.map((c) => {
+/**
+ * 帮助文案里的指令清单,每行形如 `/帮助（/help）— 看这份使用指引`。
+ *
+ * `isAdmin` 决定要不要列出 adminOnly 的那几条。默认不列 —— 漏传的后果应当是
+ * "少显示几条"而不是"把管理员指令告诉所有人"。
+ */
+export function commandHelpLines(isAdmin = false): string[] {
+  return COMMAND_TABLE.filter((c) => isAdmin || !c.adminOnly).map((c) => {
     const arg = c.takesArg && c.argHint ? ` <${c.argHint}>` : "";
     const alt = c.aliases.length ? `(${c.aliases.join(" ")})` : "";
     return `${c.canonical}${arg}${alt} — ${c.desc}`;

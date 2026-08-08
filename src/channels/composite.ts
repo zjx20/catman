@@ -1,6 +1,6 @@
 import { parseUserKey } from "../core/identity.js";
 import type { AdmissionPolicy, AdmissionResult } from "../core/admission.js";
-import type { Channel, MessageHandler } from "./types.js";
+import type { Channel, ChannelHealth, MessageHandler } from "./types.js";
 
 /**
  * 多渠道复合。按 userKey 的第一段(channel)把 send/recall 路由到对应渠道,
@@ -40,6 +40,11 @@ export class CompositeChannel implements Channel {
 
   async send(userKey: string, text: string): Promise<string | void> {
     return this.route(userKey).send(userKey, text);
+  }
+
+  /** 把各成员的自述摊平。不实现 health() 的成员不出现 —— 不替它编一个健康状态。 */
+  health(): readonly ChannelHealth[] {
+    return [...this.byName.values()].flatMap((c) => c.health?.() ?? []);
   }
 
   async start(): Promise<void> {

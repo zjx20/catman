@@ -52,13 +52,39 @@ test("必须整串匹配,正常说话不会被吞掉", () => {
   }
 });
 
-test("改会话状态的指令一律走队列,只读/中断的才 immediate", () => {
-  // 分界线是"会不会改会话状态"。改状态的必须在分拣节点里与消息投递保持先后 ——
+test("改状态的指令一律走队列,只读/中断的才 immediate", () => {
+  // 分界线是"会不会改状态"。改状态的必须在分拣节点里与消息投递保持先后 ——
   // 就地执行会与投递并发,那句话就落到谁也说不清的会话里。走队列不再意味着
   // "卡在回合后面":分拣节点投递完就返回,不等回合(gateway.test 守着这半句)。
-  const queued: string[] = ["continue", "switchSession", "newSession"];
+  // /回滚 同属这一类:它会重启进程,与 immediate 的"幂等只读"约束正相反。
+  const queued: string[] = ["continue", "switchSession", "newSession", "rollback"];
   for (const cmd of COMMAND_TABLE) {
     assert.equal(cmd.immediate, !queued.includes(cmd.name), `${cmd.canonical} 的 immediate 不对`);
+  }
+});
+
+test("部署类指令必须是 adminOnly —— 它们的影响是全局的", () => {
+  // 一次回滚把所有用户都换到另一个版本。catman 是多用户的(朋友扫码即可接入),
+  // 没有这道闸的话任何人打一句带斜杠的话就能触发 —— 那正是"失误"本身。
+  for (const name of ["rollback", "upgradeStatus"]) {
+    const cmd = COMMAND_TABLE.find((c) => c.name === name);
+    assert.equal(cmd?.adminOnly, true, `${name} 必须 adminOnly`);
+  }
+});
+
+test("日常指令一个都不能是 adminOnly —— 那会让普通用户连 /取消 都用不了", () => {
+  for (const name of ["help", "status", "cancel", "continue", "newSession", "switchSession"]) {
+    const cmd = COMMAND_TABLE.find((c) => c.name === name);
+    assert.notEqual(cmd?.adminOnly, true, `${name} 不该是 adminOnly`);
+  }
+});
+
+test("帮助文案默认不列管理员指令,漏传 isAdmin 的后果是少显示而不是泄露", () => {
+  const plain = commandHelpLines().join("\n");
+  const admin = commandHelpLines(true).join("\n");
+  for (const cmd of COMMAND_TABLE.filter((c) => c.adminOnly)) {
+    assert.equal(plain.includes(cmd.canonical), false, `普通用户不该看到 ${cmd.canonical}`);
+    assert.equal(admin.includes(cmd.canonical), true, `管理员该看到 ${cmd.canonical}`);
   }
 });
 
@@ -75,7 +101,9 @@ test("每个指令的规范形式与别名都以 / 开头且互不冲突", () =>
 });
 
 test("帮助文案覆盖全部指令 —— 它是唯一的发现入口", () => {
-  const lines = commandHelpLines().join("\n");
+  // 用管理员视角查全集:普通用户那份少了 adminOnly 那几条是**故意**的,
+  // 但除此之外一条都不能漏 —— 硬指令没有别的发现途径。
+  const lines = commandHelpLines(true).join("\n");
   for (const cmd of COMMAND_TABLE) {
     assert.ok(lines.includes(cmd.canonical), `帮助里缺了 ${cmd.canonical}`);
     assert.ok(lines.includes(cmd.desc), `帮助里缺了 ${cmd.canonical} 的说明`);
