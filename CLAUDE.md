@@ -473,11 +473,18 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
   比没有门更糟。改道不是静音:诊断全进 stderr,由 deployer 的容器日志收着。
   读取端同样防御式(`deployer.sh` 只取以 `{` 开头的最后一行)—— 自检代码属 Tier 1,每周都在变。
 - **制备要先让 git 接受属主不同的仓库**(`lib.sh` 的 `git_trust_repo`):`/data/src/catman`
-  归 catman(10001)—— agent 在上面开分支;而制备跑在 deployer(10002)下,属主一不同
-  git 就 "detected dubious ownership",**第一条 git 命令就失败**。开发机上两者是同一个人,
-  所以这条路径只会在真机上炸。**两条 safe.directory 都要**:`rev-parse` 认仓库目录,
-  `clone` 认它下面的 `.git` —— 少一条会一路正常到 clone 那步再炸。
-  单测用 git 自带的 `GIT_TEST_ASSUME_DIFFERENT_OWNER` 开关钉住。
+  归 catman(10001)—— agent 在上面开分支;而制备跑在 deployer(10002)下。这个跨属主是
+  **设计使然**(两个平面各写各的),不是意外,所以放行机制必须可靠。属主一不同 git 就
+  "detected dubious ownership",**第一条 git 命令就失败**;开发机上两者是同一个人,
+  所以这条路径只会在真机上炸。三条缺一不可:
+  ① **两个路径都要放行** —— `rev-parse` 认仓库目录,`clone` 认它下面的 `.git`;
+  ② **必须走 `GIT_CONFIG_GLOBAL` 配置文件,不能用 `GIT_CONFIG_COUNT` 那族环境变量** ——
+  `git clone <本地路径>` 会 fork `git-upload-pack` 去读源仓库,而 git 在 fork 前显式
+  `unset GIT_CONFIG_COUNT`(trace 里看得见),子进程一个例外都收不到,只留下一句
+  "Could not read from remote repository";
+  ③ 配置文件写在 `/tmp`,**每个容器各自调一次**,不要把 `GIT_CONFIG_GLOBAL` 传给别的容器 ——
+  那边没有这个文件,而 git 对读不到的 global 配置是静默当空的,例外无声无息地丢掉。
+  单测用 git 自带的 `GIT_TEST_ASSUME_DIFFERENT_OWNER` 钉住,并专门模拟一次子进程环境清洗。
 - **一次性容器要显式补 docker.sock 的属组**(`init.sh` / `deployer-run.sh` / `bless.sh` 的
   `DOCKER_GID`):它们以 uid 10002 跑,而 socket 的属组是**宿主**的事实(OpenWrt 多为 0,
   Debian 多为 999),镜像里无从得知 —— 与 compose 给主容器 `group_add` 是同一个决定。

@@ -76,19 +76,29 @@ json_write() { # json_write <file> <json字符串>
 #
 # **两条都要**:`rev-parse` 认的是仓库目录本身,而 `clone` 认的是它下面的 `.git`
 # (报错里的路径带 `.git` 后缀)—— 只加前一条会一路正常到 clone 那步再炸。
-# 有单测用 git 自带的 GIT_TEST_ASSUME_DIFFERENT_OWNER 开关钉着这两条。
-# 用环境变量而不是 `-c`:调用方还要把它们透传给一次性容器里的一串 git 命令。
+#
+# **必须走配置文件(`GIT_CONFIG_GLOBAL`),不能用 `GIT_CONFIG_COUNT` 那族环境变量。**
+# `git clone <本地路径>` 会 fork 一个 `git-upload-pack` 去读**源仓库**,而 git 把
+# `GIT_CONFIG_COUNT` 划进"仅属于当前仓库、换仓库就得清掉"的那一类,fork 前显式 unset:
+#     trace: run_command: unset GIT_CONFIG_COUNT GIT_DIR; git-upload-pack '…/.git'
+# 于是子进程看不到任何例外,自己做属主检查、自己 fatal,父进程只剩一句
+# "Could not read from remote repository" —— 症状指向网络/权限,离真正的原因很远。
+# 换成 `GIT_CONFIG_GLOBAL` 后被清的只有 `GIT_DIR`,配置活着穿过每一层子进程。
+#
+# 文件写在 /tmp(哪个 uid 都写得进),所以**每个进程/容器各自调一次**;
+# 不要把 `GIT_CONFIG_GLOBAL` 传给另一个容器 —— 那边的 /tmp 里没有这个文件,
+# 而 git 对读不到的 global 配置是静默当空的,例外就这么无声无息地丢了。
 git_trust_repo() { # git_trust_repo <仓库目录>...
-  local n=0 dir
+  local cfg="${CATMAN_GIT_CONFIG:-/tmp/catman-gitconfig}" dir
+  : > "$cfg"
+  # 保留原有的 global 配置(用户名/邮箱等):我们是往上叠两条例外,不是替掉人家的配置。
+  local prev="${GIT_CONFIG_GLOBAL:-${HOME:-}/.gitconfig}"
+  if [ -f "$prev" ]; then git config --file "$cfg" --add include.path "$prev"; fi
   for dir in "$@"; do
-    export "GIT_CONFIG_KEY_$n=safe.directory"
-    export "GIT_CONFIG_VALUE_$n=$dir"
-    n=$((n + 1))
-    export "GIT_CONFIG_KEY_$n=safe.directory"
-    export "GIT_CONFIG_VALUE_$n=$dir/.git"
-    n=$((n + 1))
+    git config --file "$cfg" --add safe.directory "$dir"
+    git config --file "$cfg" --add safe.directory "$dir/.git"
   done
-  export GIT_CONFIG_COUNT="$n"
+  export GIT_CONFIG_GLOBAL="$cfg"
 }
 
 # ── 部署锁 ─────────────────────────────────────────────────────────

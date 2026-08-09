@@ -75,14 +75,18 @@ docker run --rm \
   --add-host host.docker.internal:host-gateway \
   "${PROXY_ENV[@]}" \
   -e "TZ=${TZ:-UTC}" \
-  -e "GIT_CONFIG_COUNT=$GIT_CONFIG_COUNT" \
-  -e "GIT_CONFIG_KEY_0=$GIT_CONFIG_KEY_0" -e "GIT_CONFIG_VALUE_0=$GIT_CONFIG_VALUE_0" \
-  -e "GIT_CONFIG_KEY_1=$GIT_CONFIG_KEY_1" -e "GIT_CONFIG_VALUE_1=$GIT_CONFIG_VALUE_1" \
   -e "SHA=$SHA" -e "BRANCH=$BRANCH" -e "PREV_SHA=$PREV_SHA" \
-  -e "SRC_DIR=$SRC_DIR" -e "RELEASES_DIR=$RELEASES_DIR" -e "NPM_CACHE_DIR=$NPM_CACHE_DIR" \
+  -e "CATMAN_SRC_DIR=$SRC_DIR" -e "CATMAN_RELEASES_DIR=$RELEASES_DIR" \
+  -e "CATMAN_NPM_CACHE_DIR=$NPM_CACHE_DIR" -e "LIB=$HERE/lib.sh" \
   -v "${CATMAN_HOST_DATA_DIR:?必须给出 /data 在宿主上的绝对路径}:/data" \
   "$CATMAN_IMAGE" \
   bash -euo pipefail -c '
+    # 同一份 lib.sh —— 它就在 /data 下面,这个容器也挂着 /data,路径原样有效。
+    # 让内层自己 source 而不是把值一个个 -e 进来,是为了 git_trust_repo 只有一份实现:
+    # 属主放行必须**在这个容器里**重做一遍(见 lib.sh —— 配置文件在 /tmp,不跨容器)。
+    . "$LIB"
+    git_trust_repo "$SRC_DIR"
+
     WORK="$RELEASES_DIR/$SHA.tmp"
     rm -rf "$WORK"
     # clone 而不是 git worktree:worktree 的 .git 只是一个指向共享仓库的指针,

@@ -210,6 +210,23 @@ test("git 属主放行:git_trust_repo 之后 rev-parse 与 clone 都能过", () 
   });
 });
 
+test("git 属主放行:必须扛得住 git 对子进程的环境清洗", () => {
+  // `git clone <本地路径>` 会 fork `git-upload-pack` 去读源仓库,而 git 在 fork 前
+  // 把 GIT_CONFIG_COUNT 这一族显式 unset 掉(trace 里看得见:
+  //   run_command: unset GIT_CONFIG_COUNT GIT_DIR; git-upload-pack '…/.git')。
+  // 所以放行**不能**靠那族环境变量 —— 子进程一个都收不到,自己 fatal,父进程只剩
+  // 一句 "Could not read from remote repository",症状离原因十万八千里。
+  // 这里直接模拟那次清洗:把 GIT_CONFIG_COUNT / GIT_CONFIG_PARAMETERS 抹掉再跑。
+  withDir((dir) => {
+    const repo = makeSrcRepo(dir);
+    const script =
+      `export GIT_TEST_ASSUME_DIFFERENT_OWNER=1; git_trust_repo "${repo}"; ` +
+      `env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS git -C "${repo}" rev-parse HEAD >/dev/null ` +
+      `&& echo SURVIVED-CLEANSING`;
+    assert.equal(inLib(dir, script), "SURVIVED-CLEANSING");
+  });
+});
+
 test("git 属主放行:一次可以放行多个仓库(init 要同时碰源仓库与目标仓库)", () => {
   withDir((dir) => {
     const a = makeSrcRepo(dir);
