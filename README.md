@@ -211,14 +211,15 @@ export CATMAN_NPM_REGISTRY=https://registry.npmmirror.com
 # export CATMAN_PREPARE_MEMORY=2500m
 # export CATMAN_TEST_FLAGS="--test-concurrency=2"
 
-# ① 源码 clone 进数据卷。以 uid 10001 跑,产出目录的属主天然就对(agent 要在上面开分支)。
-#    私有仓库把部署密钥放 $DATA/ssh/id_ed25519(见下一节),公开仓库用 https:// 即可。
-docker run --rm -u 10001:10001 -v "$DATA:/data" \
+# ① 源码 clone 进数据卷。以 root 跑再 chown 给 10001 —— 部署密钥归 10002(见下一节),
+#    只有 root 读得到它。公开仓库用 https:// 就不需要密钥这一行。
+docker run --rm -u 0:0 -v "$DATA:/data" \
   -e HTTP_PROXY -e HTTPS_PROXY -e NO_PROXY -e http_proxy -e https_proxy -e no_proxy \
   -e GIT_SSH_COMMAND="ssh -i /data/ssh/id_ed25519 -o IdentitiesOnly=yes \
       -o UserKnownHostsFile=/data/ssh/known_hosts -o StrictHostKeyChecking=accept-new" \
   catman-env:1 \
-  sh -c 'mkdir -p /data/src && git clone -b <分支> git@github.com:<你>/catman.git /data/src/catman'
+  sh -c 'mkdir -p /data/src && git clone -b <分支> git@github.com:<你>/catman.git /data/src/catman \
+         && chown -R 10001:10001 /data/src'
 
 # ② init + bless。要 root(得 chown 给 10001/10002),要 docker.sock(要起制备容器)。
 #    CATMAN_DATA_DIR 是容器内的路径,CATMAN_HOST_DATA_DIR 是宿主路径 —— 两者都要给:
@@ -264,25 +265,32 @@ docker run --rm -e HTTP_PROXY -e HTTPS_PROXY -e http_proxy -e https_proxy catman
 mkdir -p "$DATA/ssh"
 cp ~/deploy_key "$DATA/ssh/id_ed25519"
 chmod 700 "$DATA/ssh" && chmod 600 "$DATA/ssh/id_ed25519"
-chown -R 10001:10001 "$DATA/ssh"
+chown -R 10002:10002 "$DATA/ssh"      # 10002 = deployer,不是助手那个 uid
 ```
 
-`chown` 到 10001 不是随手写的:**ssh 对私钥有属主检查** —— 文件必须归**当前用户**
-(或 root)且权限 0600,否则一律拒用。所以约定归 agent 那个 uid,网络 git 操作也就
-统一以 10001 的身份做。`init.sh` 会自动探测 `$DATA/ssh/id_ed25519` 并设好
-`GIT_SSH_COMMAND`(也可以用 `CATMAN_GIT_SSH_KEY` 指到别处)。
+`chown` 到 **10002** 不是随手写的:**ssh 对私钥有属主检查** —— 文件必须归**当前用户**
+(或 root)且权限 0600,否则一律拒用。于是这个属主本身就成了一道闸:助手以 10001 跑,
+读不到这把钥匙,也就没有任何一条能改写远端历史的路径。
 
-给 catman 容器加上同一行 env,agent 就能自己 fetch/push:
+代价与收益都说清楚:
 
-```yaml
-GIT_SSH_COMMAND: "ssh -i /data/ssh/id_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=/data/ssh/known_hosts"
-```
+- 助手**不能** fetch/push。要把远端的改动拉进来,得你上机 `git -C data/src/catman pull`。
+- 远端由 **deployer 在部署成功、观察期通过之后**自动推进(`push_upstream`),所以
+  GitHub 上出现的永远是**真正上线过并且活下来**的提交。推失败(多半是远端也有人提交了)
+  只记一行日志,不影响这次部署;**绝不 `--force`**。
+- 手机上因此看不到 diff,只能看 catman 的汇报摘要。想要在 GitHub 上审阅的话,
+  把密钥改回 10001 并给 catman 容器加一行 `GIT_SSH_COMMAND` 即可 —— 那时请在 GitHub 侧
+  开分支保护(禁 force-push、保护主线)补回这道闸。
+
+`init.sh` 会自动探测 `$DATA/ssh/id_ed25519` 并设好 `GIT_SSH_COMMAND`(也可以用
+`CATMAN_GIT_SSH_KEY` 指到别处);它以 root 跑,读得到 0600 的它。
 
 > **SSH 出不去的话改用 HTTPS + token。** 部署密钥只能走 SSH,而 HTTP 代理转发不了裸 TCP;
 > 端口 22 被挡时可试 `ssh.github.com:443`,再不行就用细粒度只读 PAT 走
 > `https://<token>@github.com/...`(注意 token 会明文留在 `.git/config` 里)。
-> 另外密钥读得到 = 助手也读得到 —— 它跑在 `bypassPermissions` 下、`/data` 全开。
-> 考虑到挂了 docker.sock 的助手本来就等同宿主 root,这不构成新的提权,但值得知道。
+> 属主那道闸对 PAT 不成立 —— 它就写在仓库配置里,助手读得到。
+> 另外:挂了 docker.sock 的助手本来就等同宿主 root,理论上总能绕过属主,
+> 所以这道闸防的是**失误**(顺手一个 `git push`),不是对抗。
 
 > **架构不必再操心**:依赖是在**目标机器上**用 `catman-env` 装的(见 `scripts/evolve/prepare.sh`),
 > 天然就是对的架构。以前那套 buildx + QEMU 多架构构建随源码直跑一起消失了 ——
@@ -294,7 +302,8 @@ GIT_SSH_COMMAND: "ssh -i /data/ssh/id_ed25519 -o IdentitiesOnly=yes -o UserKnown
 git -C data/src/catman pull            # 或让 agent 自己在 evolve/* 分支上改
 
 # 制备:装依赖 → typecheck + 全量测试 → 编译 → 版本戳 + 内容清单,产出一个 release
-docker exec catman /data/releases/current/scripts/evolve/prepare.sh HEAD
+# 跑的是 **bless 固化的那份** —— 制备门就在这个脚本里,理由见「自进化」
+docker exec catman /data/deploy/bin/prepare.sh HEAD
 
 # 部署:排水 → 自检 → 切换 → 健康门 → 30 分钟观察期,不通过自动回滚
 data/deploy/bin/deployer-run.sh deploy <上一步输出的 sha>
@@ -390,15 +399,16 @@ docker compose exec catman node dist/src/scripts/ilink-login.js --rebind <账号
 | `/继续` | `/continue` `/繼續` | 续上刚才的对话,之后直接发消息就是接着聊 |
 | `/切换会话 <会话id>` | `/switch` `/切換會話` | 切回指定的旧对话,id 给开头几位即可;只发指令本身则列出最近的对话 |
 
-下面两条**只有管理员能用,也只对管理员显示**(见 [自进化](#自进化)):
+下面三条**只有管理员能用,也只对管理员显示**(见 [自进化](#自进化)):
 
 | 指令 | 别名 | 作用 |
 |---|---|---|
-| `/升级状态` | `/version` `/升級狀態` | 当前版本、上次部署的结果、可回退的版本(不花额度) |
+| `/发布 <版本号前6位>` | `/publish` `/發布` | 把制备好的那个版本部署上线;那串 sha 就是确认口令本身 |
+| `/升级状态` | `/version` `/升級狀態` | 当前版本、上次部署的结果、待发布的候选、可回退的版本(不花额度) |
 | `/回滚` | `/rollback` `/回退` | 退回上一个已验证版本 |
 
-它们的影响是**全局**的 —— 一次回滚把所有用户都换到另一个版本,所以必须有这道闸。
-非管理员发这两条会被当成普通消息交给 LLM,既用不了、也看不出它们存在。
+它们的影响是**全局**的 —— 一次部署或回滚把所有用户都换到另一个版本,所以必须有这道闸。
+非管理员发这三条会被当成普通消息交给 LLM,既用不了、也看不出它们存在。
 
 **为什么要有这层。** 上下文撑爆把助手卡住时,普通消息不是排在那个卡死的回合后面,
 就是被追加进它 —— 两种下场一样:那个回合不动,它们就永远等不到答复,包括本该救命的那条。
@@ -772,15 +782,48 @@ data/releases/
 
 | 步骤 | 谁执行 | 做什么 |
 |---|---|---|
-| 制备 | agent(`prepare.sh`) | 浅 clone → 装依赖 → typecheck + 全量测试 → 编译 → 版本戳 + 内容清单 → 原子就位 |
-| 确认 | 管理员 | 看改动摘要与测试结果,回一句确认 |
+| 编码 | agent | 在 `data/src/catman` 上开 `evolve/<slug>` 分支改代码、跑测试、提交 |
+| 制备 | agent(`data/deploy/bin/prepare.sh`) | 浅 clone → 装依赖 → typecheck + 全量测试 → 编译 → 版本戳 + 内容清单 → 原子就位 |
+| 汇报 | agent | 改动摘要 + 测试结果 + **变更分级** + 「回一句 `/发布 <前6位>`」 |
+| 确认 | **管理员亲手打** | `/发布 <版本号前 6 位>` —— 那串 sha 就是确认口令本身 |
 | 自检 | **deployer 亲自** | 起一次性容器跑 `CATMAN_SELFCHECK=1`,含一次真实的最小 SDK 请求 |
 | 切换 | deployer | 排水 → 停容器 → 换 current → 起容器 → 健康门(比对 `/health` 回报的 sha) |
 | 观察 | deployer | 30 分钟盯重启次数与健康;**这期间 stable 不动** |
-| 收尾 | deployer | 通过则前移 stable + 入清单 + GC;不通过则退回并写报告 |
+| 收尾 | deployer | 通过则前移 stable + 入清单 + GC + 推远端;不通过则退回并写报告 |
 
 失败的最坏结果是"这次改进没上线",而不是"catman 下线了"。结果写进部署报告,
 catman 起来后在你下一条消息时告诉你。
+
+在微信里大致长这样:
+
+```
+你  :把使用指引开头那句改得短一点
+它  :改好了 —— <摘要>。全量 554 条测试全绿。
+      变更分级:Tier 1(常规改动,全流水线自动)。
+      回一句「/发布 a1b2c3d」我就提交部署。
+你  :/发布 a1b2c3d
+它  :已提交部署 a1b2c3d(evolve/shorter-greeting)。
+      接下来是自检 → 切换 → 30 分钟观察期,期间我会失联几分钟。
+      (半小时后你再开口时)升级完成:a1b2c3d 已上线并通过 1800s 观察期。
+```
+
+`/升级状态` 随时能查当前版本、上次部署结果、**待发布的候选**(忘了那几位数字时看它)
+和可回退的版本。这条指令不进 LLM、不花额度,回合卡死时照样答得出。
+
+### 变更分级(Tier)
+
+制备完会打一段分级,agent 会转述给你。它**不拦任何事** —— Tier 3 的东西改了本就不会
+自动生效,那才是机械闸;分级做的是**说出来**,免得你以为"部署成功 = 我要的都生效了"。
+
+| 级别 | 范围 | 你还要做什么 |
+|---|---|---|
+| Tier 1 | `src/**`、`test/**`、文档 | 没有,全自动 |
+| Tier 1★ | 门禁本体(`health.ts`、`selfcheck.ts`、`commands.ts`、部署相关模块与它们的 golden 测试) | 没有,但汇报会单独点名 —— 改坏它的后果是"门失效",而那看起来跟一切正常一样 |
+| Tier 2 | `package.json` / lockfile | 没有,但制备会真跑 `npm ci`,明显更慢 |
+| Tier 3 | `scripts/evolve/`、`docker/`、compose、`.env` | **要人**:重新 `bless` / 重建镜像 / recreate 容器 |
+
+分类表住在 `data/deploy/bin/lib.sh`(固化侧)而不是 `src/` 里 —— 它要是住在被自我进化
+改写的那棵树里,一行 case 就能把 Tier 3 报成 Tier 1。
 
 ### 几条不能改的纪律
 
@@ -794,14 +837,23 @@ catman 起来后在你下一条消息时告诉你。
   一句"帮我清清磁盘"就足以让它把回滚目标删掉 —— 只读挂载让那种误删直接 EACCES 暴露。
 - **部署机制不随自我进化更新**:`/回滚` 执行的是 `bless.sh` 固化到 `data/deploy/bin/` 的
   那份脚本。改了 `scripts/evolve/` 要重新 bless 才生效。门禁和逃生门是同一把锁,
-  不能让一次改坏了部署逻辑的进化把它们一起毁掉。
+  不能让一次改坏了部署逻辑的进化把它们一起毁掉。**`prepare.sh` 同属固化侧**:
+  制备门(全量测试)就在它里面,跑 release 里那份等于让被考的人自己出卷子。
+- **确认口令是硬指令**:`/发布 <前6位>` 由你亲手打、由网关按字面解析,是整条流水线里
+  唯一一处把「你批准了什么」和「机器部署了什么」机械绑在一起的地方。交给助手转述的话,
+  这把锁就挂在一个会看错字、而且正是被部署的那一方的环节上。网关也不替你补全或纠错 ——
+  太短、找不到、有歧义、已经是当前版本,四种情况各回各的话。
 - **数据向前兼容**:回滚只换代码,**不动 `data/`**。所以自动进化的改动必须能读现有格式,
   且旧版本要能读新版本写的 —— 做不到就属于要人工介入的变更。
 
 ### 相关指令(仅管理员可见可用)
 
-- `/升级状态` —— 当前版本、上次部署结果、可回退的版本
+- `/发布 <版本号前6位>` —— 把制备好的那个版本部署上线
+- `/升级状态` —— 当前版本、上次部署结果、待发布的候选、可回退的版本
 - `/回滚` —— 退回上一个已验证版本
+
+非管理员发这几条会**按普通文本走 LLM**,既用不了也看不出它们存在 —— 回一句"你没权限"
+本身就是在告诉他有这么个东西。
 
 ## 安全说明
 

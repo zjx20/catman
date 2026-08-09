@@ -22,7 +22,7 @@ import type { AttachmentLimits } from "./core/attachments.js";
 import { Dashboard } from "./dashboard/server.js";
 import { cleanupOldSessionsAcross, encodeProjectDir, sessionFileExists } from "./core/transcript.js";
 import { installLogStamps, redirectConsoleToStderr } from "./core/log-stamp.js";
-import { readVersion, versionLine } from "./core/version.js";
+import { readVersion, versionLine, type VersionInfo } from "./core/version.js";
 import { runSelfCheck } from "./core/selfcheck.js";
 import { ScriptDeployControl } from "./core/deploy.js";
 import { formatDeployReport } from "./core/deploy-report.js";
@@ -71,9 +71,17 @@ async function main(): Promise<void> {
   const turns = new TurnTokens();
 
   // 接口说明做成 skill(按需加载,常态不占 token)。每次启动覆盖写,保证跟代码同步。
-  writeSkills(configDir, { modelAllowlist: settings.effective().modelAllowlist });
+  writeSkills(
+    configDir,
+    { modelAllowlist: settings.effective().modelAllowlist },
+    {
+      srcDir: config.srcDir,
+      deployBinDir: `${config.deployDir}/bin`,
+      releasesDir: config.releasesDir,
+    },
+  );
 
-  const deploy = resolveDeployControl(config);
+  const deploy = resolveDeployControl(config, version);
 
   // 有一条还没送出去的部署结果就在启动时打出来,**无条件**。
   // 它平时靠"下次有人开口时捎给他"送达,而"该收到的人"取决于:发起人是谁(从微信发起
@@ -245,7 +253,10 @@ function createChannel(
  * 于是 `/回滚` 起一个不存在的脚本然后报一句看不懂的 ENOENT)。没有它时网关会
  * 明说"这台机器没配自进化",本地开发与 stdin 调试就是这种情况。
  */
-function resolveDeployControl(config: Config): ScriptDeployControl | undefined {
+function resolveDeployControl(
+  config: Config,
+  version: VersionInfo | undefined,
+): ScriptDeployControl | undefined {
   const runnerPath = `${config.deployDir}/bin/deployer-run.sh`;
   if (!existsSync(runnerPath)) return undefined;
   console.info(`[deploy] 已固化的部署脚本:${runnerPath}`);
@@ -253,7 +264,9 @@ function resolveDeployControl(config: Config): ScriptDeployControl | undefined {
     runnerPath,
     reportPath: `${config.deployDir}/report.json`,
     seenPath: config.deploySeenPath,
+    releasesDir: config.releasesDir,
     historyPath: `${config.releasesDir}/verified-history.json`,
+    runningSha: version?.sha,
   });
 }
 

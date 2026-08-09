@@ -15,16 +15,12 @@
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# 固化环境(bless 生成)。catman 直接执行本脚本,而它的 env 里没有宿主路径这类值 ——
-# 从这里读,一处定义,免得两边各写一份然后慢慢走样。手工执行时不存在也无妨,
-# 那种场合由调用者自己 export。
-if [ -f "$HERE/../env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  . "$HERE/../env"
-  set +a
-fi
+# source lib.sh 只为了它开头那句 `load_blessed_env` —— 固化环境(宿主路径、镜像名、
+# docker.sock 属组)由它统一读进来。这里曾经有一份自己的 `set -a; . ../env`,
+# 与 lib.sh 那份**语义不同**(前者覆盖已有值,后者不覆盖);两份写法慢慢走样正是
+# 这类脚本最难查的一类问题,所以收敛成一处。手工执行时那个文件不存在也无妨。
+# shellcheck source=lib.sh
+. "$HERE/lib.sh"
 
 CONTAINER="${CATMAN_DEPLOYER_CONTAINER:-catman-deployer}"
 IMAGE="${CATMAN_IMAGE:-catman-env:1}"

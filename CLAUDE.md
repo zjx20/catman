@@ -36,10 +36,12 @@ docker build -t catman-env:1 -f docker/Dockerfile .
 CATMAN_HOST_DATA_DIR=$PWD/data scripts/evolve/init.sh  # 首个 release + 指针
 scripts/evolve/bless.sh                                # 固化部署机制(自进化要用)
 docker compose up -d
-# 制备:测试+编译,产出 release。路径要写全 —— 镜像没设 WORKDIR,docker exec 从 / 起步。
-docker exec catman /data/releases/current/scripts/evolve/prepare.sh HEAD
+# 制备:测试+编译,产出 release。跑的是 **bless 固化的那份**(制备门在它里面,
+# 见下面「自进化」);路径要写全 —— 镜像没设 WORKDIR,docker exec 从 / 起步。
+docker exec catman /data/deploy/bin/prepare.sh HEAD
 scripts/evolve/deployer.sh deploy <sha>                # 排水→自检→切换→健康门→观察期
 scripts/evolve/deployer.sh rollback|status
+# 微信里(管理员)则是 /发布 <前6位> 与 /回滚,不必开电脑。
 # 自检(smoke)单独跑:不碰真实 /data,退出码即结论,stdout 一行 JSON
 CATMAN_SELFCHECK=1 node dist/src/index.js
 ```
@@ -107,6 +109,7 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 | `src/core/selfcheck.ts` | SELFCHECK 模式:自己开临时目录装配一遍 + 探一次大脑;失败分类(限流/网络/凭据/代码) |
 | `src/core/deploy-report.ts` | 部署报告契约(deployer 写、catman 读)+ 防御式解析 + 已播报标记 |
 | `src/core/deploy.ts` | 部署控制面接口 + 已验证版本清单解析 + 走固化脚本的实现 |
+| `src/core/releases.ts` | release 目录的**只读**视图:枚举已制备的候选 + `/发布` 的 sha 前缀解析 |
 | `src/dashboard/health.ts` | `GET /health` 的纯函数组装 + 排水判定;**跨版本契约,字段只增不改** |
 | `scripts/evolve/` | 自进化流水线:lib / prepare / deployer / deployer-run / bless / init |
 | `docker/entrypoint.sh` | 解析 release 链接再 exec node;解析不到进**引导模式**(慢速重试,不 crash-loop) |
@@ -440,6 +443,18 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 而不是"catman 下线了"。完整设计(含四轮对抗评审推翻的方案与理由)见设计文档;
 下面只列实现层必须守住的不变量。
 
+闭环的五步与各自的执行者:
+
+```
+改代码 → 制备 release → 汇报 → /发布 <前6位> → 切换+观察期
+ agent    agent            agent   **管理员亲手打**   deployer
+(/data/src/catman         (末行是                    (自检→排水→切换→
+ 上开 evolve/<slug> 分支)  新 sha)                    健康门→30min→前移 stable→push)
+```
+
+agent 那一侧的全部知识写在 `catman-evolve` skill 里(`skills.ts`,只对管理员回合可见),
+包括开工前要核对的三件事、分支纪律、固化的制备路径、汇报格式、以及"绝不自己起 deployer"。
+
 - **更新者不能是被更新者**:切换与回滚跑在独立的一次性容器里(`deployer-run.sh` 起,
   容器名固定 = 天然串行互斥)。它做的第一件事就是 `docker stop catman` —— 跑在 catman 里的
   子进程会在那一刻连同父进程一起被杀,切换停在半路。
@@ -529,6 +544,40 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 - **部署机制不随自我进化更新**:`/回滚` 执行的是 `bless.sh` 固化到 `/data/deploy/bin/` 的
   那份脚本,不是当前 release 里的。改了 `scripts/evolve/` 要重新 bless 才生效 ——
   门禁和逃生门是同一把锁,不能让一次改坏了部署逻辑的进化把它们一起毁掉。
+  **`prepare.sh` 同属固化侧,理由一字不差**:制备门(typecheck + 全量测试)就在它里面,
+  跑 release 里那份等于让被考的人自己出卷子 —— 一次把 `npm test` 改没了的进化,会让
+  **此后每一次**制备都不再跑测试,而日志上看起来一切正常。所以 agent 跑的是
+  `/data/deploy/bin/prepare.sh`,skill 与 README 只写这条路径(有单测钉着 skill 不教旧路径)。
+  固化不是沙箱(谁都还能 `bash` 那份源码副本),它拦的是"约定路径悄悄变了"。
+- **确认口令必须是硬指令**(`/发布 <版本号前6位>`,`commands.ts`):它是整条流水线里唯一一处
+  把「人批准了什么」与「机器部署了什么」机械绑在一起的地方 —— sha 由人亲手打进来、
+  由网关按字面解析。交给 LLM 识别「发布 abc123」再去起 deployer 的话,这把锁就挂在一个
+  会看错字、会自作主张、而且**正是被部署的那一方**的环节上。网关在这里也**不做任何解释**
+  (不补全、不纠错、不挑最近的一个),四种拒绝各说各的话:太短 / 没有(列候选)/ 歧义 /
+  已经是当前版本。前缀下限 6 位,展示一律用 `shortSha()`(7 位),照抄汇报里那串永远合规。
+- **判「已经是当前版本」看版本戳,不看 `current` 指针**(`deploy.ts` 的 `runningSha`):
+  指针与运行中的进程对不上时(换了链接没重启、crash-loop 卡在旧代码上),重新部署一次
+  **恰恰是修复手段**,按指针拒绝会把这条修复路径堵死。
+- **Tier 分类表必须住在固化侧**(`lib.sh` 的 `tier_of`,不是 `src/` 里的 TS):它要是住在
+  被自我进化改写的那棵树里,agent 顺手改一行 case 就能把 Tier 3 报成 Tier 1 ——
+  而人正是靠这份报告决定还欠什么(重新 bless / 重建镜像 / recreate 容器)。
+  分级**不拦任何事**也拦不住:Tier 3 的东西改了本就不会自动生效,那才是机械闸;
+  这里做的是**说出来**,免得人以为"部署成功 = 我要的都生效了"。
+  `gateway.ts` 故意不列进 1★:排水计数确实出自它,但它每周都在改,列进来会让几乎每次
+  改动都是 1★,点名就失去意义 —— 守住排水语义的是 health 那份 golden 测试,而它在表上。
+- **部署密钥只进 deployer(uid 10002),agent 完全不碰网络 git**:ssh 对私钥有属主检查
+  (必须归当前用户或 root 且 0600),于是这个属主本身就是一道真闸 —— agent(10001)读不到它,
+  也就没有任何一条能改写远端历史的路径。**远端只由 deployer 在部署成功、stable 前移之后
+  推进**(`lib.sh` 的 `push_upstream`),所以 GitHub 上出现的永远是真正上线过并活下来的提交。
+  推失败(多半是远端也有人提交了)**只记日志,绝不反过来判部署失败**;同理**绝不 `--force`**,
+  快进失败正是它该失败的样子。代价说清楚:手机上看不到 diff,拉远端改动要人上机。
+- **固化环境由 lib.sh 自己读**(`load_blessed_env`):谁 source 了 lib.sh 谁就自动拿到
+  `/data/deploy/env` 里的宿主路径、镜像名、docker.sock 属组,调用点不必记得 export。
+  这是 agent 能直接跑 `prepare.sh` 的前提(它的进程环境里没有宿主路径,而制备要拿它去
+  `docker run -v`)。**已经有值的一律不覆盖** —— 命令行上的显式覆盖是排查时唯一的旋钮。
+- **agent 的 git 身份在仓库级设**(`init.sh`):镜像里什么都没配,而 `git commit` 没有
+  `user.name`/`user.email` 就直接失败 —— 自进化的第一步就是提交。写仓库级而不是 global,
+  不依赖 HOME 可写,且这份配置随仓库走。
 - **部署类指令是 `adminOnly`**(`commands.ts`):影响是全局的(一次回滚把所有用户都换版本),
   而 catman 是多用户的。**挡掉 = 当它不是指令**,于是照常走 LLM ——
   非管理员既用不了、也看不出它们存在,不必回一句"你没权限"(那句话本身就在告诉他有这个东西)。

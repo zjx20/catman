@@ -887,30 +887,49 @@ export class Gateway {
       case "switchSession":
         return this.handleSwitch(userKey, arg, moreInputAfter);
 
-      case "rollback": {
-        if (!this.deploy) {
-          await this.trySend(userKey, "这台机器没有配自进化的部署机制,回滚要人工来。", "回滚");
-          return true;
-        }
-        try {
-          await this.trySend(userKey, await this.deploy.requestRollback(userKey), "回滚");
-        } catch (err) {
-          // 起不来 deployer 是要立刻知道的事:用户以为回滚在跑,实际什么都没发生。
-          console.error(`[gateway] ${userKey} 请求回滚失败:`, err);
-          await this.trySend(
-            userKey,
-            `没能起动回滚流程:${(err as Error).message}\n版本没有任何变化,需要人上机处理。`,
-            "回滚",
-          );
-        }
-        // 回滚只在这批的这一点上发生;后面的话照常投递 —— 进程多半马上就被停了,
-        // 但那属于部署本身的语义,不必在这里假装还能保证什么。
-        return true;
-      }
+      case "publish":
+        return this.handleDeployRequest(userKey, "发布", async (d) =>
+          d.requestDeploy(arg, userKey),
+        );
+
+      case "rollback":
+        return this.handleDeployRequest(userKey, "回滚", async (d) => d.requestRollback(userKey));
 
       default:
         return true;
     }
+  }
+
+  /**
+   * `/发布` 与 `/回滚` 共用的外壳。两者的差别只在"请求什么",而周边三件事完全一样:
+   * 没配部署机制要说人话、起不来 deployer 要立刻告诉人、这批后面的话照常投递。
+   *
+   * **起不来 deployer 必须当场说**:用户以为流程在跑,实际上什么都没发生 ——
+   * 而他接下来的话全都建立在"版本已经在换了"这个错误前提上。
+   */
+  private async handleDeployRequest(
+    userKey: string,
+    label: string,
+    request: (deploy: DeployControl) => Promise<string>,
+  ): Promise<boolean> {
+    const deploy = this.deploy;
+    if (!deploy) {
+      await this.trySend(userKey, `这台机器没有配自进化的部署机制,${label}要人工来。`, label);
+      return true;
+    }
+    try {
+      await this.trySend(userKey, await request(deploy), label);
+    } catch (err) {
+      console.error(`[gateway] ${userKey} 请求${label}失败:`, err);
+      await this.trySend(
+        userKey,
+        `没能起动${label}流程:${(err as Error).message}\n版本没有任何变化,需要人上机处理。`,
+        label,
+      );
+    }
+    // 切换只在这批的这一点上发生;后面的话照常投递 —— 进程多半马上就被停了,
+    // 但那属于部署本身的语义,不必在这里假装还能保证什么。
+    return true;
   }
 
   /** `/升级状态` 的正文。纯读磁盘,不花额度 —— 升级出问题时唯一可靠的信息源。 */
@@ -922,6 +941,17 @@ export class Gateway {
     }
     const last = this.deploy.lastReport();
     lines.push(last ? `上次部署:${formatDeployReport(last)}` : "上次部署:还没有部署记录。");
+
+    // 待发布的候选。它是 `/发布` 那几位数字的唯一查法 —— 制备的汇报早被聊天顶上去了,
+    // 而这条指令不进 LLM、不花额度,任何时候问都答得出。
+    const waiting = this.deploy.publishable().filter((c) => !c.running);
+    if (waiting.length) {
+      lines.push(
+        `待发布:${waiting
+          .map((c) => `${shortSha(c.sha)}${c.branch ? `(${c.branch})` : ""}`)
+          .join("、")} —— 发「${canonicalOf("publish")} <前6位>」上线。`,
+      );
+    }
 
     const history = this.deploy.verifiedHistory();
     if (!history.length) {

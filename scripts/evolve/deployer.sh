@@ -264,6 +264,8 @@ do_deploy() {
   pointer_set stable "$sha"
   history_push "$sha"
   release_gc
+  # 推远端**放在这里**:此刻这个提交才真的"上线过并且活下来了"。失败不阻塞。
+  push_upstream "$sha"
   local note="已上线并通过 ${BAKE_SECONDS}s 观察期。"
   [ "$drained_ok" = "1" ] || note="$note(切换时还有消息在处理,可能有丢失)"
   report deployed "$sha" "$note" "" "$bg"

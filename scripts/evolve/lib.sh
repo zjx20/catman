@@ -18,6 +18,36 @@
 
 set -euo pipefail
 
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── 固化环境的兜底 ─────────────────────────────────────────────────
+# bless 会把 `/data` 的宿主绝对路径这类"只有人知道"的值写进 `/data/deploy/env`。
+# 固化之后 lib.sh 就住在 `/data/deploy/bin/`,于是这份 env 正好在隔壁 —— 谁 source 了
+# lib.sh 谁就自动拿到它,不必每个调用点都记得 export 一遍。
+#
+# 这是 prepare.sh 能被 agent 直接跑起来的前提:agent 的进程环境里没有宿主路径,
+# 而 prepare 要拿它去 `docker run -v`。缺了就是一句 `CATMAN_HOST_DATA_DIR: 必须给出…`,
+# 而那句话不会告诉他值该从哪来。
+#
+# **已经有值的一律不覆盖。** 命令行上显式给的(`CATMAN_IMAGE=foo prepare.sh …`)必须赢 ——
+# 那是排查时唯一的旋钮,被一份静态文件盖掉的话,人会以为自己的覆盖没生效而去怀疑别处。
+load_blessed_env() {
+  local file="${CATMAN_BLESSED_ENV:-$LIB_DIR/../env}" line key val
+  [ -f "$file" ] || return 0
+  # 末行没有换行符时 read 会返回非零但 $line 有内容,所以补一个 `|| [ -n "$line" ]`。
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in \#* | "") continue ;; esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    # 不像环境变量名的行一概跳过:这份文件是机器生成的,但读它的这段代码要能
+    # 扛住有人手改出一行奇怪的东西 —— 我们在这里 export,写错了就是注入。
+    case "$key" in *[!A-Za-z0-9_]* | "") continue ;; esac
+    if [ -z "${!key:-}" ]; then export "$key=$val"; fi
+  done < "$file"
+  return 0
+}
+load_blessed_env
+
 RELEASES_DIR="${CATMAN_RELEASES_DIR:-/data/releases}"
 DEPLOY_DIR="${CATMAN_DEPLOY_DIR:-/data/deploy}"
 SRC_DIR="${CATMAN_SRC_DIR:-/data/src/catman}"
@@ -107,6 +137,23 @@ git_trust_repo() { # git_trust_repo <仓库目录>...
     git config --file "$cfg" --add safe.directory "$dir/.git"
   done
   export GIT_CONFIG_GLOBAL="$cfg"
+}
+
+# ── 部署密钥 ───────────────────────────────────────────────────────
+# 密钥就放在数据卷里(`/data/ssh/id_ed25519`),所以任何挂了 `/data` 的容器天然看得到。
+#
+# **属主是 deployer(10002),不是 agent(10001)** —— ssh 对私钥有属主检查(必须归当前
+# 用户或 root 且 0600),于是这个属主就是一道真闸:agent 读不到它,也就没有任何一条
+# 能改写远端历史的路径。代价是 agent 不能 fetch/push,拉远端改动要人上机;
+# 换来的是"GitHub 上出现的永远是真正上线过的提交"(见 deployer.sh 的 push_upstream)。
+#
+# 已经有 GIT_SSH_COMMAND 时不动它:调用方显式给的优先(与 load_blessed_env 同一取向)。
+git_ssh_env() {
+  local key="${CATMAN_GIT_SSH_KEY:-/data/ssh/id_ed25519}"
+  if [ -n "${GIT_SSH_COMMAND:-}" ]; then return 0; fi
+  if [ ! -f "$key" ]; then return 0; fi
+  export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$(dirname "$key")/known_hosts -o StrictHostKeyChecking=accept-new"
+  return 0
 }
 
 # ── 部署锁 ─────────────────────────────────────────────────────────
@@ -363,6 +410,126 @@ release_verify() { # release_verify <sha>
   if ! mismatch="$(cd "$dir" && sha256sum --quiet -c MANIFEST 2>&1)"; then
     log "release $sha:内容清单校验不通过 —— 有人改过里面的字节:$(echo "$mismatch" | tr '\n' ' ')"
     return 1
+  fi
+  return 0
+}
+
+# ── 变更分级(Tier) ───────────────────────────────────────────────
+# 一次改动里有没有"光靠流水线上不了线"的东西。分级本身不拦任何事 —— 它拦不住,
+# 也不该拦:Tier 3 的东西**改了也不会自动生效**(部署脚本走 bless 固化副本、
+# compose 与镜像根本不进部署路径),那才是机械闸。这里做的是**说出来**,
+# 免得人以为"部署成功了 = 我要的改动都生效了",而实际上还欠一次 bless 或一次镜像重建。
+#
+# ⚠️ **这张分类表必须住在固化侧**(所以是 lib.sh 里的 shell,不是 src/ 里的 TS)。
+# 它要是住在被自我进化改写的那棵树里,agent 只要顺手改一行 case,就能把 Tier 3
+# 的改动报成 Tier 1 —— 而人正是靠这份报告决定要不要额外做点什么。
+tier_of() { # tier_of <仓库相对路径> → 3 / 2 / 1star / 1
+  case "$1" in
+    # 部署机制自身。改了要重新 bless,否则跑的还是固化的旧版本。
+    scripts/evolve/*) echo 3 ;;
+    # 基底镜像与容器配置。前者要重建镜像,后者要人改 compose 并 recreate 容器。
+    docker/* | docker-compose.yml | compose.yaml | compose.yml | .env | .env.*) echo 3 ;;
+    # 依赖变更:流水线自己能处理,但 lockfile 一变就是真 npm ci,制备明显更久。
+    package.json | package-lock.json) echo 2 ;;
+    # 门禁本体。自动上线,但确认时要单独点名 —— 改坏它的后果是"门失效",
+    # 而门失效在日志里长得跟一切正常一模一样。
+    #
+    # gateway.ts 故意**不**在这张表里:排水计数确实出自它,但它每周都在改,
+    # 列进来会让几乎每次改动都是 1★,点名也就失去了意义。守住排水语义的是
+    # health 那份 golden 测试 —— 语义一变它必须跟着改,而它在表上。
+    src/dashboard/health.ts | src/core/selfcheck.ts | src/core/commands.ts) echo 1star ;;
+    src/core/deploy.ts | src/core/deploy-report.ts | src/core/releases.ts | src/core/version.ts) echo 1star ;;
+    test/health.test.ts | test/selfcheck.test.ts | test/deploy-report.test.ts) echo 1star ;;
+    test/entrypoint.test.ts | test/evolve-lib.test.ts) echo 1star ;;
+    *) echo 1 ;;
+  esac
+}
+
+# 报告块**不逐行打时间戳**:它是给人读的一段结构化文字(agent 会原样转述给管理员),
+# 每行前面挂一个 ISO 时间戳会把它读成日志流。时间信息由上面那句 log 头承担。
+tier_report() { # tier_report <base-ref> <head-ref>
+  local base="$1"
+  local head="$2"
+  local files
+  git_trust_repo "$SRC_DIR"
+  if ! files="$(git -C "$SRC_DIR" diff --name-only "$base" "$head" 2>/dev/null)"; then
+    log "变更分级:算不出 ${base:0:7}..${head:0:7} 的差异(基线可能不在这个仓库里),跳过"
+    return 0
+  fi
+  # 刻意不写成 `[ -n "$files" ] && log … || { …; return 0; }`:那个三段式在中间那条
+  # 命令失败时会**同时**执行第三段,是这类脚本最经典的静默错误来源。
+  if [ -z "$files" ]; then
+    log "变更分级:与 ${base:0:7} 没有差异"
+    return 0
+  fi
+  log "变更分级(相对 ${base:0:7}):"
+
+  local f t
+  local t3="" t2="" t1s="" t1=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    t="$(tier_of "$f")"
+    case "$t" in
+      3) t3="$t3  $f
+" ;;
+      2) t2="$t2  $f
+" ;;
+      1star) t1s="$t1s  $f
+" ;;
+      *) t1="$t1  $f
+" ;;
+    esac
+  done <<< "$files"
+
+  {
+    if [ -n "$t3" ]; then
+      echo "Tier 3 —— 流水线上不了线,应用要人:"
+      printf '%s' "$t3"
+      echo "  → scripts/evolve/ 改了要重新跑 bless;docker/ 改了要重建镜像;compose 改了要 recreate 容器。"
+    fi
+    if [ -n "$t2" ]; then
+      echo "Tier 2 —— 依赖变更(自动上线,制备会明显变慢):"
+      printf '%s' "$t2"
+    fi
+    if [ -n "$t1s" ]; then
+      echo "Tier 1★ —— 触碰了门禁本体(自动上线,但要在确认时单独点名):"
+      printf '%s' "$t1s"
+    fi
+    if [ -n "$t1" ]; then
+      echo "Tier 1 —— 常规改动,全流水线自动:"
+      printf '%s' "$t1"
+    fi
+  } >&2
+  return 0
+}
+
+# ── 把已上线的提交推到远端 ─────────────────────────────────────────
+# 时机是**部署成功、stable 前移之后**:于是 GitHub 上出现的永远是真正上线过、
+# 过完观察期的提交。推得更早(比如制备完就推)会让远端记录一堆从未运行过的东西,
+# 而人恰恰是靠远端判断"线上现在是什么"。
+#
+# **失败只记日志,绝不反过来判部署失败** —— 版本已经在跑了,远端没跟上是另一件事,
+# 而且多半是"有人在 GitHub 上也提交了",要人来合。同理**绝不 --force**:
+# 这把密钥能改写远端历史是最不该发生的事,而快进失败正是它该失败的样子。
+push_upstream() { # push_upstream <sha>
+  local sha="$1"
+  local dir="$RELEASES_DIR/$sha"
+  local url branch out
+  git_trust_repo "$SRC_DIR"
+  url="$(git -C "$SRC_DIR" remote get-url origin 2>/dev/null || true)"
+  case "$url" in
+    "") log "push:源码仓库没有 origin,跳过"; return 0 ;;
+    /* | ./* | ../*) log "push:origin 是本地路径($url),跳过"; return 0 ;;
+  esac
+  branch="$(json_get "$dir/VERSION" 'd.branch')"
+  # detached 制备(prepare 传的是裸 sha)时 branch 是 "HEAD" 或空,那就推主线:
+  # 走到这一步的提交已经上线并过了观察期,主线本就该是它。
+  case "$branch" in "" | HEAD) branch="${CATMAN_UPSTREAM_BRANCH:-main}" ;; esac
+  git_ssh_env
+  if out="$(git -C "$dir" push "$url" "$sha:refs/heads/$branch" 2>&1)"; then
+    log "push:${sha:0:7} → $branch"
+  else
+    log "push 失败(不影响本次部署,版本已经在跑了):$(echo "$out" | tr '\n' ' ')"
   fi
   return 0
 }

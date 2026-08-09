@@ -34,6 +34,7 @@ export type CommandName =
   | "cancel"
   | "continue"
   | "switchSession"
+  | "publish"
   | "rollback"
   | "upgradeStatus";
 
@@ -123,6 +124,22 @@ export const COMMAND_TABLE: readonly CommandDef[] = [
     // 纯读磁盘上的报告与版本戳,幂等 —— 符合 immediate 的约束。
     // 而它恰恰是升级出问题时最该立刻答得出的那条:回合可能正卡着。
     immediate: true,
+    adminOnly: true,
+  },
+  {
+    name: "publish",
+    canonical: "/发布",
+    aliases: ["/publish", "/發布"],
+    desc: "把制备好的版本部署上线,参数是版本号前 6 位(制备完我会报给你)",
+    // **确认口令必须是硬指令,不能交给 LLM 转述。**
+    // 它是自进化流水线里那把"人批准了什么 = 机器部署了什么"的机械锁:sha 由人亲手打进来、
+    // 由网关按字面解析。让 agent 代为识别「发布 abc123」再去起 deployer 的话,这把锁就
+    // 挂在一个会看错字、会自作主张、而且**正是被部署的那一方**的环节上 —— 那等于没有锁。
+    //
+    // 走队列而不是 immediate:它会重启进程,与 immediate 的「只做幂等只读/中断」正相反。
+    immediate: false,
+    takesArg: true,
+    argHint: "版本号前6位",
     adminOnly: true,
   },
   {

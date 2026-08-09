@@ -1,6 +1,8 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { canonicalOf } from "./commands.js";
 import { BUILTIN_ADMIN_USER_KEY } from "./identity.js";
+import { MIN_SHA_PREFIX } from "./releases.js";
 import { SETTING_SCHEMA, USER_SETTING_KEYS, type SettingContext, type SettingKey } from "./settings.js";
 
 /**
@@ -23,11 +25,18 @@ import { SETTING_SCHEMA, USER_SETTING_KEYS, type SettingContext, type SettingKey
 
 export const USER_SKILL = "catman-settings";
 export const ADMIN_SKILL = "catman-admin";
+export const EVOLVE_SKILL = "catman-evolve";
 
 /** 普通回合可见的 skill。 */
 export const USER_SKILLS: readonly string[] = [USER_SKILL];
-/** admin 回合可见的 skill。 */
-export const ADMIN_SKILLS: readonly string[] = [USER_SKILL, ADMIN_SKILL];
+/**
+ * admin 回合可见的 skill。
+ *
+ * `catman-evolve` **只在这里**:改自己的代码并推上线是全局影响的事(一次部署把所有
+ * 用户都换了版本),与 `/发布` `/回滚` 的 adminOnly 是同一个决定。普通用户的回合里
+ * 连这份说明都不该出现 —— 它的 description 常驻上下文,列出来等于告诉每个人有这条路。
+ */
+export const ADMIN_SKILLS: readonly string[] = [USER_SKILL, ADMIN_SKILL, EVOLVE_SKILL];
 
 function settingRows(keys: readonly SettingKey[], ctx: SettingContext): string {
   const rows = keys.map((key) => {
@@ -197,14 +206,125 @@ curl -s -X DELETE -H "X-Catman-Token: $CATMAN_ADMIN_TOKEN" "$CATMAN_API_BASE/api
 `;
 }
 
+/** 自进化 skill 里那几个路径。由 config 传进来,免得正文写死后与部署布局脱节。 */
+export interface EvolvePaths {
+  /** 源码工作区(agent 在这上面开分支)。 */
+  srcDir: string;
+  /** bless 固化的部署脚本目录。制备脚本就在里面。 */
+  deployBinDir: string;
+  /** release 目录(只读)。`current` 指针告诉 agent 线上跑的是哪个 sha。 */
+  releasesDir: string;
+}
+
+export function evolveSkillBody(paths: EvolvePaths): string {
+  const prepare = `${paths.deployBinDir}/prepare.sh`;
+  const publish = canonicalOf("publish");
+  return `${frontmatter(
+    EVOLVE_SKILL,
+    "改 catman 自己的代码并把它部署上线:开分支、改、跑测试、制备 release、汇报给管理员确认。" +
+      "管理员说想加个功能、改个行为、修个 bug(指 catman 本身,不是他的项目)时用它。",
+  )}
+# 改 catman 自己
+
+你就是 catman。这份 skill 讲怎么改你自己的代码并把它推上线。
+
+**流水线一共五步,你只做前三步:**
+改代码 → 制备 release → 汇报 → **管理员发 \`${publish} <版本号前${MIN_SHA_PREFIX}位>\`** → deployer 切换。
+最后两步不归你,理由见下面「不要自己起 deployer」。
+
+## 开工前先看三件事
+
+\`\`\`bash
+cd ${paths.srcDir}
+git status --short          # ① 工作区干净吗?不干净说明上一件事没收尾,先问管理员
+git log --oneline -3 main
+readlink ${paths.releasesDir}/current   # ② 线上跑的是哪个 sha
+\`\`\`
+
+② 要对上 \`main\` 的 tip。**对不上就先弄清为什么**:最常见的原因是上一次部署失败被回滚了,
+而那个提交还留在 \`main\` 上 —— 直接往下改就会把它一起带上线,而它已经被判定为坏的。
+
+第三件事是上次部署的结果,发 \`${canonicalOf("upgradeStatus")}\` 或读部署报告都行。
+
+## 改
+
+\`\`\`bash
+git checkout main && git checkout -b evolve/<短横线-描述>
+# …改代码…
+npm run typecheck && npm test     # 先在这里跑一遍,反馈快得多
+git add <具体文件>                 # 不要 git add -A
+git commit -F <写好提交信息的文件>  # 长的中文提交信息不要用 -m,反引号会被 shell 吃掉
+\`\`\`
+
+规矩与仓库里 \`CLAUDE.md\` 一致:conventional commits、中文正文、注释与文档在**同一个提交**里更新。
+**一次只做一件事** —— 部署是串行的,两件事挤在一个 release 里,出问题时你分不清是哪一件。
+
+## 制备
+
+\`\`\`bash
+${prepare} HEAD
+\`\`\`
+
+它起一个一次性容器,浅 clone → 装依赖 → typecheck + **全量测试** → 编译 → 版本戳 + 内容清单。
+跑完会打一段**变更分级**,末行是新 release 的 sha。制备失败就是没上线,线上一根汗毛没动。
+
+⚠️ **必须跑这个路径**,不要跑 \`releases/current/scripts/evolve/prepare.sh\`。
+上面那份是 bless 固化的,不随你的改动变 —— 制备门(那句全量测试)就在这个脚本里,
+跑仓库里那份等于让被考的人自己出卷子。
+
+制备成功后把分支落回 main 并删掉它:
+
+\`\`\`bash
+git checkout main && git merge --ff-only evolve/<slug> && git branch -d evolve/<slug>
+\`\`\`
+
+这样 \`main\` 永远等于最后一次成功制备的版本,下次开工的基线天然正确。
+
+## 汇报
+
+给管理员四样东西,缺一不可:
+
+1. **改了什么**,一两句人话(不是文件列表)。
+2. **测试结果**:全量多少条、全绿没有。
+3. **变更分级**:把 \`${prepare}\` 打出来的那段原样转述。
+   有 Tier 3 就明说「这部分部署上不了线,你还要 ⋯⋯」;有 Tier 1★ 就单独点一句
+   「这次动到了门禁本体」。
+4. **确认怎么发**:「回一句 \`${publish} <sha 前 7 位>\` 我就提交部署」。
+
+然后**结束回合**,别追问、别等。
+
+## 不要自己起 deployer
+
+\`${publish}\` 是硬指令,由管理员亲手打、由网关按字面解析 —— 这是整条流水线唯一一处
+把「人批准了什么」和「机器部署了什么」机械绑在一起的地方。你去代劳(直接跑 deployer 脚本、
+或者把 sha 转述错)就等于把这把锁拆了,而你恰好是被部署的那一方。
+
+技术上你当然跑得动那个脚本。**这是纪律不是沙箱** —— 就像不能替人按下确认键一样。
+管理员说「你直接发吧」时,正确的回答是把口令告诉他,不是替他发。
+
+## 什么改动不能走这条路
+
+- **改不了盘上现有数据格式的**:部署随时可能回滚,所以新代码必须能读旧数据,
+  **旧代码也必须能读新代码写的**。做不到就只提案,让人来做。
+- **Tier 3**:\`scripts/evolve/\`(要重新 bless)、\`docker/\`(要重建镜像)、
+  compose 与 \`.env\`(要 recreate 容器)。这些改了也不会自动生效,汇报时必须说清欠什么。
+
+## 出事了
+
+管理员发 \`${canonicalOf("rollback")}\` 退回上一个已验证版本。部署失败会自动回滚,
+结果写进部署报告,他下次开口时你会收到。**不要自己去修部署机制** —— 那是 Tier 3。
+`;
+}
+
 /**
- * 把两个 skill 写到 CLAUDE_CONFIG_DIR/skills/ 下。启动时调用一次。
- * 内容由 SETTING_SCHEMA 生成,所以加配置项时这里自动跟上。
+ * 把 skill 写到 CLAUDE_CONFIG_DIR/skills/ 下。启动时调用一次。
+ * 内容由 SETTING_SCHEMA、COMMAND_TABLE 与配置里的路径生成,所以那几处一改这里自动跟上。
  */
-export function writeSkills(configDir: string, ctx: SettingContext): void {
+export function writeSkills(configDir: string, ctx: SettingContext, paths: EvolvePaths): void {
   const bodies: Array<[string, string]> = [
     [USER_SKILL, userSkillBody(ctx)],
     [ADMIN_SKILL, adminSkillBody(ctx)],
+    [EVOLVE_SKILL, evolveSkillBody(paths)],
   ];
   for (const [name, body] of bodies) {
     const dir = join(configDir, "skills", name);

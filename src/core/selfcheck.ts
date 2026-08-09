@@ -127,7 +127,15 @@ export async function runSelfCheck(opts: SelfCheckOptions = {}): Promise<SelfChe
     const users = new UserRegistry({ path: config.usersPath, workspaceRoot: config.workspaceDir });
     const turns = new TurnTokens();
     turns.counts();
-    writeSkills(configDir, { modelAllowlist: settings.effective().modelAllowlist });
+    writeSkills(
+      configDir,
+      { modelAllowlist: settings.effective().modelAllowlist },
+      {
+        srcDir: config.srcDir,
+        deployBinDir: `${config.deployDir}/bin`,
+        releasesDir: config.releasesDir,
+      },
+    );
     // 工作目录派生 + 长度闸门也走一遍:它会在真实部署里拦下路径过长的会话目录,
     // 自检里跑通它才谈得上"这份代码能服务一个用户"。
     const probeKey = "selfcheck:probe:local";

@@ -372,3 +372,288 @@ test("锁:释放后可以再次获取", () => {
     assert.equal(inLib(dir, `lock_acquire a; lock_release; lock_acquire b && echo OK`), "OK");
   });
 });
+
+// ── 固化环境的兜底 ───────────────────────────────────────────────
+// prepare.sh 能被 agent 直接跑起来全靠它:agent 的进程环境里没有宿主路径,
+// 而 prepare 要拿它去 docker run -v。读不到就是一句 `必须给出…`,而那句话
+// 不会告诉他值该从哪来。
+
+/** 造一份"固化目录":bin/lib.sh + env,与 bless 的产出同形。 */
+function blessInto(dir: string, env: string): string {
+  const bin = join(dir, "bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "lib.sh"), readFileSync(LIB, "utf8"));
+  writeFileSync(join(dir, "env"), env);
+  return join(bin, "lib.sh");
+}
+
+/** source 固化副本(而不是源码树里那份),回显一个变量。 */
+function inBlessedLib(libPath: string, script: string, extraEnv: Record<string, string> = {}): string {
+  return execFileSync("bash", ["-c", `set -euo pipefail; . "${libPath}"; ${script}`], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "", ...extraEnv },
+  }).trim();
+}
+
+test("固化环境:lib.sh 自己把隔壁的 env 读进来 —— 调用点不必记得 export", () => {
+  withDir((dir) => {
+    const lib = blessInto(dir, "CATMAN_HOST_DATA_DIR=/srv/catman/data\nCATMAN_IMAGE=catman-env:9\n");
+    assert.equal(inBlessedLib(lib, `echo "$CATMAN_HOST_DATA_DIR"`), "/srv/catman/data");
+    assert.equal(inBlessedLib(lib, `echo "$CATMAN_IMAGE"`), "catman-env:9");
+  });
+});
+
+test("固化环境:已经有值的绝不覆盖 —— 命令行上的显式覆盖是排查时唯一的旋钮", () => {
+  withDir((dir) => {
+    const lib = blessInto(dir, "CATMAN_IMAGE=catman-env:9\n");
+    assert.equal(
+      inBlessedLib(lib, `echo "$CATMAN_IMAGE"`, { CATMAN_IMAGE: "catman-env:test" }),
+      "catman-env:test",
+      "被静态文件盖掉的话,人会以为自己的覆盖没生效而去怀疑别处",
+    );
+  });
+});
+
+test("固化环境:注释、空行、不像环境变量名的行一律跳过,后面的好行照样生效", () => {
+  withDir((dir) => {
+    // 这份文件是机器生成的,但读它的代码要扛得住有人手改出一行奇怪的东西 ——
+    // 这里是 export,一行畸形不能把整份配置带塌(那会让部署以"路径没给"告终)。
+    const lib = blessInto(
+      dir,
+      "# 由 bless 生成\n\nFOO-BAR=x\nrm -rf /=nope\nCATMAN_IMAGE=ok\n",
+    );
+    assert.equal(inBlessedLib(lib, `echo "$CATMAN_IMAGE"`), "ok", "畸形行之后的好行必须还在");
+    assert.equal(
+      inBlessedLib(lib, `env | grep -c '^FOO' || true`),
+      "0",
+      "键名不合法的一行不该被 export 出去",
+    );
+  });
+});
+
+test("固化环境:env 不存在时静默跳过 —— 源码树里跑就是这种情况", () => {
+  withDir((dir) => {
+    const bin = join(dir, "bin");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "lib.sh"), readFileSync(LIB, "utf8"));
+    assert.equal(inBlessedLib(join(bin, "lib.sh"), `echo "${"$"}{CATMAN_IMAGE:-默认}"`), "catman-env:1");
+  });
+});
+
+// ── 部署密钥 ─────────────────────────────────────────────────────
+
+test("部署密钥:文件不在就不设 GIT_SSH_COMMAND —— 公开仓库走 https,没有密钥是常态", () => {
+  withDir((dir) => {
+    const out = inLib(dir, `CATMAN_GIT_SSH_KEY="${dir}/nope" git_ssh_env; echo "${"$"}{GIT_SSH_COMMAND:-未设}"`);
+    assert.equal(out, "未设");
+  });
+});
+
+test("部署密钥:文件在就设上,known_hosts 跟密钥放一起", () => {
+  withDir((dir) => {
+    writeFileSync(join(dir, "id_ed25519"), "fake\n");
+    const out = inLib(dir, `CATMAN_GIT_SSH_KEY="${dir}/id_ed25519" git_ssh_env; echo "$GIT_SSH_COMMAND"`);
+    assert.match(out, new RegExp(`-i ${dir}/id_ed25519`));
+    assert.match(out, new RegExp(`UserKnownHostsFile=${dir}/known_hosts`));
+    assert.match(out, /IdentitiesOnly=yes/);
+  });
+});
+
+test("部署密钥:调用方已经给了 GIT_SSH_COMMAND 就不动它", () => {
+  withDir((dir) => {
+    writeFileSync(join(dir, "id_ed25519"), "fake\n");
+    const out = inLib(
+      dir,
+      `export GIT_SSH_COMMAND="ssh -i /custom/key"; CATMAN_GIT_SSH_KEY="${dir}/id_ed25519" git_ssh_env; echo "$GIT_SSH_COMMAND"`,
+    );
+    assert.equal(out, "ssh -i /custom/key");
+  });
+});
+
+// ── 变更分级 ─────────────────────────────────────────────────────
+// 这张分类表**必须住在固化侧**:它要是住在被自我进化改写的那棵树里,agent 只要
+// 顺手改一行 case 就能把 Tier 3 报成 Tier 1 —— 而人正是靠这份报告决定还欠什么。
+
+test("分级:部署机制、镜像、compose 一律 Tier 3 —— 它们改了也不会自动生效", () => {
+  withDir((dir) => {
+    for (const f of [
+      "scripts/evolve/deployer.sh",
+      "scripts/evolve/lib.sh",
+      "docker/Dockerfile",
+      "docker/entrypoint.sh",
+      "docker-compose.yml",
+      ".env",
+      ".env.example",
+    ]) {
+      assert.equal(inLib(dir, `tier_of "${f}"`), "3", f);
+    }
+  });
+});
+
+test("分级:依赖变更是 Tier 2 —— 自动上线,但制备会真跑 npm ci", () => {
+  withDir((dir) => {
+    assert.equal(inLib(dir, `tier_of package.json`), "2");
+    assert.equal(inLib(dir, `tier_of package-lock.json`), "2");
+  });
+});
+
+test("分级:门禁本体是 Tier 1★ —— 改坏它的后果是「门失效」,而那看起来跟一切正常一样", () => {
+  withDir((dir) => {
+    for (const f of [
+      "src/dashboard/health.ts",
+      "src/core/selfcheck.ts",
+      "src/core/commands.ts",
+      "src/core/deploy.ts",
+      "src/core/releases.ts",
+      "test/health.test.ts",
+      "test/evolve-lib.test.ts",
+    ]) {
+      assert.equal(inLib(dir, `tier_of "${f}"`), "1star", f);
+    }
+  });
+});
+
+test("分级:gateway.ts 故意不是 1★ —— 它每周都在改,列进来点名就没意义了", () => {
+  withDir((dir) => {
+    // 守住排水语义的是 health 那份 golden 测试(它在表上),不是这个文件。
+    assert.equal(inLib(dir, `tier_of src/core/gateway.ts`), "1");
+    assert.equal(inLib(dir, `tier_of src/core/session.ts`), "1");
+    assert.equal(inLib(dir, `tier_of README.md`), "1");
+  });
+});
+
+test("分级报告:按级分组打到 stderr,并说清 Tier 3 还欠什么", () => {
+  withDir((dir) => {
+    const repo = join(dir, "src-repo");
+    mkdirSync(join(repo, "scripts", "evolve"), { recursive: true });
+    mkdirSync(join(repo, "src", "core"), { recursive: true });
+    const git = (args: string) =>
+      execFileSync("bash", ["-c", `cd "${repo}" && git ${args}`], { encoding: "utf8" });
+    git("init -q");
+    git("config user.email t@t");
+    git("config user.name t");
+    writeFileSync(join(repo, "README.md"), "a\n");
+    git("add -A && git commit -qm base");
+    const base = git("rev-parse HEAD").trim();
+    writeFileSync(join(repo, "scripts", "evolve", "deployer.sh"), "x\n");
+    writeFileSync(join(repo, "src", "core", "commands.ts"), "x\n");
+    writeFileSync(join(repo, "src", "core", "gateway.ts"), "x\n");
+    git("add -A && git commit -qm change");
+    const head = git("rev-parse HEAD").trim();
+
+    // stderr 才是报告的去处 —— stdout 是结果通道,prepare 的调用方在捕获末行的 sha。
+    const out = execFileSync(
+      "bash",
+      [
+        "-c",
+        `set -euo pipefail; export CATMAN_RELEASES_DIR="${dir}"; export CATMAN_SRC_DIR="${repo}"; ` +
+          `export CATMAN_GIT_CONFIG="${dir}/gitconfig"; unset GIT_CONFIG_GLOBAL; ` +
+          `. "${LIB}"; tier_report "${base}" "${head}" 2>&1 >/dev/null`,
+      ],
+      { encoding: "utf8" },
+    );
+    assert.match(out, /Tier 3/);
+    assert.match(out, /scripts\/evolve\/deployer\.sh/);
+    assert.match(out, /重新跑 bless/, "必须说清 Tier 3 还欠一步人工动作");
+    assert.match(out, /Tier 1★/);
+    assert.match(out, /src\/core\/commands\.ts/);
+    assert.match(out, /Tier 1 ——/);
+    assert.match(out, /src\/core\/gateway\.ts/);
+  });
+});
+
+test("分级报告:算不出差异时只说一句就跳过,绝不让制备失败", () => {
+  withDir((dir) => {
+    const repo = join(dir, "empty-repo");
+    mkdirSync(repo, { recursive: true });
+    execFileSync("bash", ["-c", `cd "${repo}" && git init -q`]);
+    const out = execFileSync(
+      "bash",
+      [
+        "-c",
+        `set -euo pipefail; export CATMAN_RELEASES_DIR="${dir}"; export CATMAN_SRC_DIR="${repo}"; ` +
+          `export CATMAN_GIT_CONFIG="${dir}/gitconfig"; unset GIT_CONFIG_GLOBAL; ` +
+          `. "${LIB}"; tier_report deadbeef cafebabe 2>&1 >/dev/null; echo "存活"`,
+      ],
+      { encoding: "utf8" },
+    );
+    assert.match(out, /算不出/);
+    assert.match(out, /存活/, "分级失败不该让整个制备挂掉");
+  });
+});
+
+// ── 固化链路(bless → deployer-run)────────────────────────────────
+// `/回滚` 走的就是这条路。它是逃生门,组装错了不会有任何提示 —— 真机上的症状是
+// "起了容器却什么都没干"。所以拿一个假 docker 把参数原样接下来验。
+
+const EVOLVE_DIR = fileURLToPath(new URL("../scripts/evolve", import.meta.url));
+
+/** 在临时目录里跑一次 bless,返回固化目录。 */
+function blessTo(dataDir: string): string {
+  execFileSync("bash", [join(EVOLVE_DIR, "bless.sh")], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      CATMAN_DATA_DIR: dataDir,
+      CATMAN_HOST_DATA_DIR: dataDir,
+      DOCKER_GID: "999",
+      GIT_CONFIG_GLOBAL: "",
+    },
+  });
+  return join(dataDir, "deploy");
+}
+
+/** 造一个只回显参数的假 docker,返回它所在的 bin 目录。 */
+function fakeDocker(dir: string): string {
+  const bin = join(dir, "fakebin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "docker"), '#!/bin/sh\necho "$*"\n');
+  execFileSync("chmod", ["+x", join(bin, "docker")]);
+  return bin;
+}
+
+test("bless 固化四个脚本 —— prepare.sh 与 deployer.sh 一起,制备门才不会被自我进化改掉", () => {
+  withDir((dir) => {
+    mkdirSync(join(dir, "data"), { recursive: true });
+    const deployDir = blessTo(join(dir, "data"));
+    const names = execFileSync("ls", [join(deployDir, "bin")], { encoding: "utf8" }).split("\n");
+    for (const want of ["lib.sh", "deployer.sh", "deployer-run.sh", "prepare.sh"]) {
+      assert.ok(names.includes(want), `${want} 必须被固化`);
+    }
+  });
+});
+
+test("固化链路:deployer-run 组装出的 docker 参数 —— 属组、镜像、跑的是固化那份 deployer", () => {
+  withDir((dir) => {
+    const dataDir = join(dir, "data");
+    mkdirSync(dataDir, { recursive: true });
+    const deployDir = blessTo(dataDir);
+    const out = execFileSync("bash", [join(deployDir, "bin", "deployer-run.sh"), "rollback"], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${fakeDocker(dir)}:${process.env["PATH"]}` },
+    });
+    assert.match(out, /--user 10002:10002/);
+    assert.match(out, /--group-add 999/, "漏了属组的症状是一句 permission denied,而那正是最需要它的时刻");
+    assert.match(out, /\/data\/deploy\/bin\/deployer\.sh rollback/, "跑的必须是固化副本");
+    assert.match(out, new RegExp(`-v ${dataDir}:/data`), "宿主绝对路径来自固化 env");
+  });
+});
+
+test("固化链路:命令行上显式给的 CATMAN_IMAGE 赢过固化 env", () => {
+  withDir((dir) => {
+    const dataDir = join(dir, "data");
+    mkdirSync(dataDir, { recursive: true });
+    const deployDir = blessTo(dataDir);
+    const out = execFileSync("bash", [join(deployDir, "bin", "deployer-run.sh"), "status"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${fakeDocker(dir)}:${process.env["PATH"]}`,
+        CATMAN_IMAGE: "catman-env:test",
+      },
+    });
+    assert.match(out, /catman-env:test/);
+  });
+});

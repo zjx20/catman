@@ -43,7 +43,11 @@ esac
 [ -d "$DATA_DIR" ] || { echo "数据目录不存在:$DATA_DIR" >&2; exit 1; }
 
 mkdir -p "$DEPLOY_DIR/bin"
-install -m 0755 "$HERE"/lib.sh "$HERE"/deployer.sh "$HERE"/deployer-run.sh "$DEPLOY_DIR/bin/"
+# prepare.sh 与 deployer.sh 一起固化,理由完全相同:**制备门就在 prepare.sh 里**。
+# 让 agent 跑 release 里那份的话,一次把 `npm test` 改没了的进化会让此后每一次制备
+# 都不再跑测试,而日志上看起来一切正常。能改门的人不能是被门管的人。
+install -m 0755 "$HERE"/lib.sh "$HERE"/deployer.sh "$HERE"/deployer-run.sh "$HERE"/prepare.sh \
+  "$DEPLOY_DIR/bin/"
 
 # docker.sock 的属组。deployer 以 uid 10002 跑,不补这个组就连不上 dockerd。
 # 在**宿主上** stat 是最权威的取法(容器里那份是挂进去的同一个 inode,但这个脚本

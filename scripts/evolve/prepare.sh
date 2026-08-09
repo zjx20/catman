@@ -2,7 +2,18 @@
 # 制备一个 release —— 自进化流水线里 agent 负责的那一步。
 #
 # 用法(在 catman 容器里跑,由 agent 或人调用):
-#   scripts/evolve/prepare.sh <git-ref>
+#   /data/deploy/bin/prepare.sh <git-ref>
+#
+# ## 跑的必须是 bless 固化的那一份
+#
+# **制备门(typecheck + 全量测试)就在这个脚本里**,而这个脚本住在同一个仓库里 ——
+# 自我进化改得到它。跑 release 里那份(`/data/releases/current/scripts/evolve/prepare.sh`)
+# 的话,一次把 `npm test` 改没了的进化,会让**此后每一次**制备都不再跑测试,
+# 而日志上看起来一切正常。这与 deployer.sh 是同一个理由、同一个解法:
+# 能改门的人不能是被门管的人,所以 bless 把它固化到 `/data/deploy/bin/`。
+#
+# 固化不是沙箱(谁都还能 `bash` 那份源码副本),它拦的是"约定路径悄悄变了"这件事 ——
+# 与本项目其它地方一样:不防恶意,只防失误。
 #
 # 它起一个**一次性容器**(与生产同一个 catman-env 镜像、uid 10002)完成全部工作:
 #   浅 clone → 装依赖 → typecheck + 全量测试 → 编译 → 版本戳 → 内容清单 → 原子就位
@@ -163,4 +174,13 @@ docker run --rm \
 
 release_verify "$SHA" || die "制备完成但校验不通过 —— 这是个 bug,别部署它"
 log "制备完成:$SHA"
+
+# 分级报告。基线取**正在跑的那个版本**:人关心的是"相对线上多了什么",
+# 而不是相对某个分支点。打在 stderr —— stdout 是结果通道,调用方在捕获末行那个 sha。
+CURRENT_SHA="$(pointer_sha current)"
+if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" != "$SHA" ]; then
+  tier_report "$CURRENT_SHA" "$SHA"
+fi
+
+log "确认发布:在微信里发「/发布 ${SHA:0:7}」"
 echo "$SHA"

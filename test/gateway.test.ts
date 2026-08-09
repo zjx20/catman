@@ -28,7 +28,7 @@ import type { AdmissionPolicy } from "../src/core/admission.js";
 import type { Channel, MessageHandler } from "../src/channels/types.js";
 import type { Attachment } from "../src/core/attachments.js";
 import type { Agent, AgentProgressEvent, AgentReply, AgentRunOptions } from "../src/core/agent.js";
-import type { DeployControl, VerifiedRelease } from "../src/core/deploy.js";
+import type { DeployControl, PublishCandidate, VerifiedRelease } from "../src/core/deploy.js";
 import type { DeployReport } from "../src/core/deploy-report.js";
 
 const TIMEOUT = 60 * 60 * 1000;
@@ -175,14 +175,25 @@ interface BuildOpts {
   deploy?: DeployControl;
 }
 
-/** 可编排的假部署控制面:记录回滚请求,报告与清单由用例摆好。 */
+/** 可编排的假部署控制面:记录发布与回滚请求,报告、清单、候选由用例摆好。 */
 class FakeDeploy implements DeployControl {
   rollbackRequests: string[] = [];
   rollbackError?: Error;
+  deployRequests: Array<{ prefix: string; requestedBy: string }> = [];
+  deployError?: Error;
+  candidates: PublishCandidate[] = [];
   report?: DeployReport;
   announced: string[] = [];
   history: VerifiedRelease[] = [];
 
+  async requestDeploy(shaPrefix: string, requestedBy: string): Promise<string> {
+    if (this.deployError) throw this.deployError;
+    this.deployRequests.push({ prefix: shaPrefix, requestedBy });
+    return "已提交部署。";
+  }
+  publishable(): readonly PublishCandidate[] {
+    return this.candidates;
+  }
   async requestRollback(requestedBy: string): Promise<string> {
     if (this.rollbackError) throw this.rollbackError;
     this.rollbackRequests.push(requestedBy);
@@ -1925,6 +1936,46 @@ test("起不动 deployer 时必须明说版本没变 —— 用户以为回滚�
   assert.match(last.text, /没有任何变化/);
 });
 
+test("非管理员的 /发布 同样当它不是指令 —— 一次部署把所有人都换了版本", async () => {
+  const deploy = new FakeDeploy();
+  const { channel, agent } = build(() => 1_000_000, { deploy });
+
+  await channel.receive(U1, "/发布 a1b2c3d");
+  assert.deepEqual(deploy.deployRequests, []);
+  assert.equal(agent.calls.length, 1, "照常走 LLM,不透露这条指令存在");
+});
+
+test("管理员的 /发布 把那几位原样交给部署层 —— 网关不做任何解释", async () => {
+  // 确认口令的全部意义是"人打进来的与机器部署的是同一个东西"。网关在这里多做
+  // 一步(补全、纠错、挑一个最近的)都会把那把锁拆掉,所以它只负责原样透传。
+  const deploy = new FakeDeploy();
+  const { channel, agent } = build(() => 1_000_000, {
+    deploy,
+    settings: { adminUserKeys: [U1] },
+  });
+
+  await channel.receive(U1, "/发布 a1b2c3d");
+  assert.deepEqual(deploy.deployRequests, [{ prefix: "a1b2c3d", requestedBy: U1 }]);
+  assert.equal(agent.calls.length, 0, "硬指令不进 LLM");
+});
+
+test("起不动 deployer 时 /发布 也要明说版本没变", async () => {
+  const deploy = new FakeDeploy();
+  deploy.deployError = new Error("no such file");
+  const { channel } = build(() => 1_000_000, { deploy, settings: { adminUserKeys: [U1] } });
+
+  await channel.receive(U1, "/发布 a1b2c3d");
+  const last = afterGreeting(channel.sent).at(-1)!;
+  assert.match(last.text, /no such file/);
+  assert.match(last.text, /没有任何变化/);
+});
+
+test("没配部署机制时 /发布 明说没配", async () => {
+  const { channel } = build(() => 1_000_000, { settings: { adminUserKeys: [U1] } });
+  await channel.receive(U1, "/发布 a1b2c3d");
+  assert.match(afterGreeting(channel.sent).at(-1)!.text, /没有配自进化/);
+});
+
 test("没配部署机制时 /回滚 明说没配,而不是假装成功", async () => {
   const t = 1_000_000;
   const { channel } = build(() => t, { settings: { adminUserKeys: [U1] } });
@@ -1946,6 +1997,24 @@ test("/升级状态 列出可回退版本与上次部署结果", async () => {
   const text = afterGreeting(channel.sent).at(-1)!.text;
   assert.match(text, /previou/, "要列出可回退的版本(短 sha,7 位)");
   assert.match(text, /健康门超时/, "要带上次失败的原因");
+});
+
+test("/升级状态 列出待发布的候选 —— 那是 /发布 后面那几位的唯一查法", async () => {
+  // 制备时的汇报早被后面的聊天顶上去了,而这条指令不进 LLM、不花额度、
+  // 回合卡死时也答得出。少了它,人就只能翻聊天记录找那串十六进制。
+  const deploy = new FakeDeploy();
+  deploy.candidates = [
+    { sha: "f".repeat(40), preparedAt: "t2", branch: "evolve/x", running: false },
+    { sha: "e".repeat(40), preparedAt: "t1", running: true },
+  ];
+  const { channel } = build(() => 1_000_000, { deploy, settings: { adminUserKeys: [U1] } });
+
+  await channel.receive(U1, "/升级状态");
+  const text = afterGreeting(channel.sent).at(-1)!.text;
+  assert.match(text, /待发布/);
+  assert.match(text, /fffffff/, "候选要给短 sha");
+  assert.match(text, /evolve\/x/, "带上分支名,人一眼认得出是哪次改动");
+  assert.equal(text.includes("eeeeeee"), false, "正在跑的那个不是候选");
 });
 
 test("部署结果在发起人下次开口时播报一次,之后不再重复", async () => {

@@ -91,6 +91,12 @@ export interface Config {
   deployDir: string;
   /** release 目录(deployer 写、catman 只读)。已验证版本清单也在里面。 */
   releasesDir: string;
+  /**
+   * 源码工作区 —— 自进化时 agent 在这上面开分支干活。属主是 catman(10001),
+   * 与只读的 release 目录是两回事:release 是从这里 clone 出去的、不可变的快照。
+   * 默认值必须与 `scripts/evolve/lib.sh` 的 `SRC_DIR` 一致(两边读同一个 env)。
+   */
+  srcDir: string;
   /** 部署结果"已播报"的标记。catman 自己写,所以必须在可写区,不能放 deployDir。 */
   deploySeenPath: string;
 }
@@ -124,6 +130,7 @@ export function loadConfig(): Config {
     messageAggregationMs: num("CATMAN_MESSAGE_AGGREGATION_MS", 1500),
     deployDir: str("CATMAN_DEPLOY_DIR", `${dataDir}/deploy`),
     releasesDir: str("CATMAN_RELEASES_DIR", `${dataDir}/releases`),
+    srcDir: str("CATMAN_SRC_DIR", `${dataDir}/src/catman`),
     deploySeenPath: str("CATMAN_DEPLOY_SEEN_PATH", `${dataDir}/deploy-seen.json`),
   };
 }

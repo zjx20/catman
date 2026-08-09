@@ -60,10 +60,12 @@ mkdir -p "$RELEASES_HOST" "$DATA_DIR/src" "$DATA_DIR/npm-cache"
 git_trust_repo "$SRC_DIR_HOST" "$REPO"
 
 # 部署密钥(可选)。它就放在数据卷里,所以任何挂了 /data 的容器天然看得到,
-# 不需要额外挂载 —— 这也是唯一能同时喂给引导容器和将来 agent 的位置。
-# ⚠️ ssh 对私钥有属主检查:文件必须归**当前用户**(或 root)且权限 0600,
-# 否则一律拒用。所以约定归 uid 10001(agent 是它的长期使用者),网络 git 操作
-# 也就都以 10001 的身份做。known_hosts 与它放一起,免得每次都要交互确认。
+# 不需要额外挂载。
+# ⚠️ ssh 对私钥有属主检查:文件必须归**当前用户**(或 root)且权限 0600,否则一律拒用。
+# 约定归 **uid 10002(deployer)** —— 那个属主本身就是一道闸:agent(10001)读不到它,
+# 于是没有任何一条能改写远端历史的路径。远端只由 deployer 在**部署成功之后**推进
+# (见 lib.sh 的 push_upstream),所以 GitHub 上出现的永远是真正上线过的提交。
+# 这个脚本以 root 跑,读得到 0600 的它;known_hosts 与它放一起,免得交互确认。
 SSH_KEY="${CATMAN_GIT_SSH_KEY:-$DATA_DIR/ssh/id_ed25519}"
 if [ -f "$SSH_KEY" ] && [ -z "${GIT_SSH_COMMAND:-}" ]; then
   export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$DATA_DIR/ssh/known_hosts -o StrictHostKeyChecking=accept-new"
@@ -82,6 +84,13 @@ else
   git -C "$SRC_DIR_HOST" fetch origin --quiet || echo "  拉取失败,用本地已有的引用继续"
 fi
 
+# agent 的 git 身份。镜像里什么都没配,而 `git commit` 没有 user.name/user.email 就直接
+# 失败(那句 "Please tell me who you are" 后面跟着一大段配置指引)—— 自进化的第一步
+# 就是提交,所以这一步不做的话,agent 第一次干活必然卡在这里。
+# 写**仓库级**而不是 global:不依赖 HOME 可写,而且这份配置随仓库走。幂等,已有仓库也补。
+git -C "$SRC_DIR_HOST" config user.name "${CATMAN_GIT_USER_NAME:-catman}"
+git -C "$SRC_DIR_HOST" config user.email "${CATMAN_GIT_USER_EMAIL:-catman@localhost}"
+
 # 属主必须交给对应的 uid。制备与部署跑在以 10002 运行的一次性容器里,而 agent 以
 # 10001 在 /data/src 上开分支干活 —— 这个脚本却是宿主上的人(通常 root)跑的。
 # 不 chown 的话第一次制备就 EACCES,而报错信息(npm 写不了 node_modules)跟真正的
@@ -92,10 +101,14 @@ fi
 if [ "$(id -u)" = "0" ]; then
   chown -R 10002:10002 "$RELEASES_HOST" "$DATA_DIR/npm-cache"
   chown -R 10001:10001 "$DATA_DIR/src"
+  # 部署密钥归 deployer:ssh 的属主检查因此成为一道真闸,agent 读不到它。
+  # 这一步幂等,也是从"密钥曾经归 10001"那版迁移过来的唯一动作。
+  if [ -d "$DATA_DIR/ssh" ]; then chown -R 10002:10002 "$DATA_DIR/ssh"; fi
 else
-  echo "⚠️  当前不是 root,跳过 chown。请确认下面两条成立(否则制备会 EACCES):"
+  echo "⚠️  当前不是 root,跳过 chown。请确认下面三条成立(否则制备会 EACCES):"
   echo "    $RELEASES_HOST 与 $DATA_DIR/npm-cache 可被 uid 10002 写"
   echo "    $DATA_DIR/src 可被 uid 10001 写"
+  echo "    $DATA_DIR/ssh(若有部署密钥)归 uid 10002 且密钥 0600"
 fi
 
 SHA="$(git -C "$SRC_DIR_HOST" rev-parse "$REF")"

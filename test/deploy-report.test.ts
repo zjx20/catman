@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -172,6 +172,7 @@ test("只有一个已验证版本时拒绝回滚,而不是起一个注定失败�
       runnerPath: join(dir, "run.sh"),
       reportPath: join(dir, "report.json"),
       seenPath: join(dir, "seen.json"),
+      releasesDir: join(dir, "releases"),
       historyPath,
       spawnRunner: async () => {
         spawned += 1;
@@ -204,6 +205,7 @@ test("回滚目标是清单里的第二个(当前是第一个),并把发起人�
       runnerPath: join(dir, "run.sh"),
       reportPath: join(dir, "report.json"),
       seenPath: join(dir, "seen.json"),
+      releasesDir: join(dir, "releases"),
       historyPath,
       spawnRunner: async (_p, args) => {
         gotArgs = args;
@@ -234,4 +236,126 @@ test("报告是契约:golden 形状 —— 改字段名/删字段会在这里失
     "schema",
     "sha",
   ]);
+});
+
+// ── /发布:确认口令落到具体 sha 上 ────────────────────────────────
+// 四种拒绝各说各的话不是排版讲究:处置完全不同(重打 / 先制备 / 多打几位 / 根本不用动)。
+// 含糊一句"发布失败"会让人反复重试同一串,而每一次都在等一个不会来的结果。
+
+const SHA_A = "a".repeat(40);
+const SHA_B = `bbbbbb${"0".repeat(34)}`;
+const SHA_B2 = `bbbbbb${"1".repeat(34)}`;
+
+function makePrepared(releasesDir: string, sha: string, branch?: string): void {
+  const d = join(releasesDir, sha);
+  mkdirSync(d, { recursive: true });
+  writeFileSync(
+    join(d, "VERSION"),
+    JSON.stringify({ sha, preparedAt: "2026-08-09T00:00:00Z", ...(branch ? { branch } : {}) }),
+  );
+  writeFileSync(join(d, "MANIFEST"), "x  VERSION\n");
+}
+
+/**
+ * 起一个带 release 目录的控制面。runningSha 决定"哪个是正在跑的那份"。
+ *
+ * **必须 await 回调**:不 await 的话临时目录会在异步工作跑完之前就被删掉,
+ * 而回调里的断言失败会变成未处理的 rejection —— 用例不是变红,是挂住。
+ */
+async function withControl(
+  fn: (
+    ctl: ScriptDeployControl,
+    spawned: () => readonly string[][],
+    releasesDir: string,
+  ) => Promise<void>,
+  runningSha?: string,
+): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "catman-publish-"));
+  try {
+    const releasesDir = join(dir, "releases");
+    mkdirSync(releasesDir, { recursive: true });
+    const calls: string[][] = [];
+    const ctl = new ScriptDeployControl({
+      runnerPath: join(dir, "run.sh"),
+      reportPath: join(dir, "report.json"),
+      seenPath: join(dir, "seen.json"),
+      releasesDir,
+      historyPath: join(releasesDir, "verified-history.json"),
+      ...(runningSha ? { runningSha } : {}),
+      spawnRunner: async (_p, args) => {
+        calls.push([...args]);
+      },
+    });
+    await fn(ctl, () => calls, releasesDir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("/发布:命中唯一候选就起 deployer,并把发起人传下去", async () => {
+  await withControl(async (ctl, spawned, releasesDir) => {
+    makePrepared(releasesDir, SHA_A, "evolve/copy");
+    const msg = await ctl.requestDeploy(SHA_A.slice(0, 7), "wechat:a:u");
+    assert.match(msg, /已提交部署/);
+    assert.match(msg, /evolve\/copy/, "要说清发的是哪次改动");
+    assert.deepEqual(spawned(), [["deploy", SHA_A, "--requested-by", "wechat:a:u"]]);
+  });
+});
+
+test("/发布:前缀太短一律拒绝 —— 哪怕它其实只匹配一个", async () => {
+  await withControl(async (ctl, spawned, releasesDir) => {
+    makePrepared(releasesDir, SHA_A);
+    const msg = await ctl.requestDeploy("aaa", "wechat:a:u");
+    assert.match(msg, /至少/);
+    assert.deepEqual(spawned(), [], "拒绝就不该起 deployer");
+  });
+});
+
+test("/发布:没有这个版本时列出有哪些,人多半只是记错了几位", async () => {
+  await withControl(async (ctl, spawned, releasesDir) => {
+    makePrepared(releasesDir, SHA_A);
+    const msg = await ctl.requestDeploy("ffffff", "wechat:a:u");
+    assert.match(msg, /没有以/);
+    assert.match(msg, /aaaaaaa/, "要把候选摆出来");
+    assert.deepEqual(spawned(), []);
+  });
+});
+
+test("/发布:一个候选都没有时明说要先制备,而不是干说找不到", async () => {
+  await withControl(async (ctl, spawned) => {
+    const msg = await ctl.requestDeploy("abcdef", "wechat:a:u");
+    assert.match(msg, /先制备/);
+    assert.deepEqual(spawned(), []);
+  });
+});
+
+test("/发布:前缀有歧义时要求多打几位,绝不替人挑一个", async () => {
+  await withControl(async (ctl, spawned, releasesDir) => {
+    makePrepared(releasesDir, SHA_B);
+    makePrepared(releasesDir, SHA_B2);
+    const msg = await ctl.requestDeploy("bbbbbb", "wechat:a:u");
+    assert.match(msg, /多打几位/);
+    assert.deepEqual(spawned(), []);
+  });
+});
+
+test("/发布:目标就是正在跑的那份时不动 —— 否则是 30 分钟观察期的空转", async () => {
+  await withControl(async (ctl, spawned, releasesDir) => {
+    makePrepared(releasesDir, SHA_A);
+    const msg = await ctl.requestDeploy(SHA_A.slice(0, 7), "wechat:a:u");
+    assert.match(msg, /就是我现在跑的/);
+    assert.deepEqual(spawned(), []);
+  }, SHA_A);
+});
+
+test("/发布:判「已经是当前版本」看的是版本戳,不是 current 指针", async () => {
+  // 指针与运行中的进程对不上时(有人换了链接却没重启、或 crash-loop 卡在旧代码上),
+  // 重新部署一次**恰恰是修复手段**。按指针拒绝会把这条修复路径堵死。
+  await withControl(async (ctl, spawned, releasesDir) => {
+    makePrepared(releasesDir, SHA_A);
+    symlinkSync(SHA_A, join(releasesDir, "current")); // 指针已经指过去了
+    const msg = await ctl.requestDeploy(SHA_A.slice(0, 7), "wechat:a:u");
+    assert.match(msg, /已提交部署/, "跑的还是别的版本,这次部署必须放行");
+    assert.deepEqual(spawned(), [["deploy", SHA_A, "--requested-by", "wechat:a:u"]]);
+  }, SHA_B); // 进程实际跑的是另一份
 });

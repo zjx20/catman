@@ -57,7 +57,7 @@ test("改状态的指令一律走队列,只读/中断的才 immediate", () => {
   // 就地执行会与投递并发,那句话就落到谁也说不清的会话里。走队列不再意味着
   // "卡在回合后面":分拣节点投递完就返回,不等回合(gateway.test 守着这半句)。
   // /回滚 同属这一类:它会重启进程,与 immediate 的"幂等只读"约束正相反。
-  const queued: string[] = ["continue", "switchSession", "newSession", "rollback"];
+  const queued: string[] = ["continue", "switchSession", "newSession", "rollback", "publish"];
   for (const cmd of COMMAND_TABLE) {
     assert.equal(cmd.immediate, !queued.includes(cmd.name), `${cmd.canonical} 的 immediate 不对`);
   }
@@ -66,10 +66,26 @@ test("改状态的指令一律走队列,只读/中断的才 immediate", () => {
 test("部署类指令必须是 adminOnly —— 它们的影响是全局的", () => {
   // 一次回滚把所有用户都换到另一个版本。catman 是多用户的(朋友扫码即可接入),
   // 没有这道闸的话任何人打一句带斜杠的话就能触发 —— 那正是"失误"本身。
-  for (const name of ["rollback", "upgradeStatus"]) {
+  for (const name of ["rollback", "upgradeStatus", "publish"]) {
     const cmd = COMMAND_TABLE.find((c) => c.name === name);
     assert.equal(cmd?.adminOnly, true, `${name} 必须 adminOnly`);
   }
+});
+
+test("/发布 必须带得了参数 —— 那个 sha 就是确认口令本身", () => {
+  // 它是整条自进化流水线里唯一一处把「人批准了什么」与「机器部署了什么」机械绑在
+  // 一起的地方。不 takesArg 的话 sha 只能由 LLM 转述 —— 而 LLM 正是被部署的那一方。
+  const cmd = COMMAND_TABLE.find((c) => c.name === "publish");
+  assert.equal(cmd?.takesArg, true);
+
+  const parsed = parseCommand("/发布 a1b2c3d");
+  assert.equal(parsed?.cmd.name, "publish");
+  assert.equal(parsed?.arg, "a1b2c3d", "参数要原样透传,不做任何加工");
+
+  // 不带参数也认得出来 —— 那时由 deploy 层回一句"至少给 6 位",
+  // 而不是让它退化成一段普通文本被 LLM 接走。
+  assert.equal(parseCommand("/发布")?.cmd.name, "publish");
+  assert.equal(parseCommand("/发布")?.arg, "");
 });
 
 test("日常指令一个都不能是 adminOnly —— 那会让普通用户连 /取消 都用不了", () => {
