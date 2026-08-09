@@ -89,11 +89,17 @@ smoke() { # smoke <sha>
     attempt=$((attempt + 1))
     log "smoke 第 $attempt 次(release $sha)"
     lock_beat
+    # 自检的 stdout 是**结果通道**,约定只有一行 JSON(它自己把 console 改道到了
+    # stderr,见 log-stamp.ts)。这里仍然只挑以 `{` 开头的最后一行 —— 跨版本契约
+    # 的读取端一律防御式:自检代码属 Tier 1、每周都在变,某次改动把一行日志漏回
+    # stdout,后果是好版本被判死,而那种误判在日志里长得跟真故障一模一样。
+    # stderr **不丢弃**,它进 deployer 的容器日志 —— 自检失败时的现场只在那里。
     out="$(docker run --rm \
       --user 10001:10001 \
       --memory "${CATMAN_SMOKE_MEMORY:-1000m}" \
       --add-host host.docker.internal:host-gateway \
       -e CATMAN_SELFCHECK=1 \
+      -e "TZ=${TZ:-UTC}" \
       -e "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}" \
       $(for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
           [ -n "${!v:-}" ] && printf -- '-e %s=%s ' "$v" "${!v}"
@@ -101,11 +107,11 @@ smoke() { # smoke <sha>
       -v "${CATMAN_HOST_DATA_DIR:?}:/data:ro" \
       -w "$dir" \
       "$CATMAN_IMAGE" \
-      node dist/src/index.js 2>/dev/null | tail -1)" || true
+      node dist/src/index.js | grep -E '^\{' | tail -1)" || true
 
     if [ -z "$out" ]; then
-      log "smoke 没有输出 —— 当作代码问题(连自检都跑不起来)"
-      SMOKE_DETAIL="自检没有任何输出,多半是这份 release 根本起不来"
+      log "smoke 没有给出可解析的结论 —— 当作代码问题(连自检都跑不起来)"
+      SMOKE_DETAIL="自检的 stdout 里没有 JSON 结论,多半是这份 release 根本起不来(现场见 deployer 日志)"
       return 1
     fi
     echo "$out" > /tmp/smoke.json

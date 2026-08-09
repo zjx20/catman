@@ -168,8 +168,14 @@ history_push() { # history_push <sha>
 
 # ── 健康查询 ───────────────────────────────────────────────────────
 
+# `--noproxy '*'`:健康检查按定义打的是**本机那个 catman**,永远不该走代理。
+# 而代理环境变量是必须透传给这个容器的(smoke 要够得着 Anthropic API),于是
+# curl 会连 host.docker.internal 也送去代理 —— NO_PROXY 里的 CIDR 只对 IP 字面量
+# 生效,对**主机名**是后缀匹配,`172.16.0.0/12` 拦不住 `host.docker.internal`。
+# 后果:健康门永远超时 → 每一次部署都在最后一步自动回滚,而新版本其实是好的。
+# 靠配置里记得写一条排除项挡不住这个,所以在这里钉死。
 health_json() {
-  curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null || true
+  curl -fsS --noproxy '*' --max-time 5 "$HEALTH_URL" 2>/dev/null || true
 }
 
 # 健康门:进程起来了、渠道起来了,**而且跑的确实是我们刚切过去的那份**。

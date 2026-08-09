@@ -47,3 +47,31 @@ export function installLogStamps(
   }
   target[INSTALLED as unknown as string] = true;
 }
+
+/** Node 里默认写 stdout 的那几档(`warn`/`error` 本来就走 stderr)。 */
+const STDOUT_LEVELS = ["log", "info", "debug"] as const;
+
+/**
+ * 把默认走 stdout 的那几档 console 整体改道到 stderr。
+ *
+ * **给 stdout 当结果通道的进程用。** 自检模式(`CATMAN_SELFCHECK=1`)就是这样:
+ * 它的 stdout 只该有一行 JSON,deployer 靠解析那一行判定这份 release 能不能上线。
+ * 而装配与那一次真实请求会经 console 打不少日志 —— agent-trace 的 always 级别
+ * 不受开关约束,SDK 自己也打 —— 其中 `console.log/info/debug` 在 Node 里默认就是
+ * stdout。**只要漏一行进去,deployer 读到的就不是 JSON**,于是每一次部署都以
+ * 「自检没过」告终,而那份 release 完全是好的:一个把好版本判死的门,比没有门更糟。
+ *
+ * 改道而不是静音:诊断信息一条不少地进 stderr(deployer 的容器日志收的就是它),
+ * 只是不再污染那条唯一的结果通道。与 `installLogStamps` 可任意先后 —— 时间戳由
+ * `error` 那一档统一加,不会叠成两个。
+ */
+export function redirectConsoleToStderr(
+  target: Record<string, unknown> = console as unknown as Record<string, unknown>,
+): void {
+  const toStderr = target["error"];
+  if (typeof toStderr !== "function") return;
+  const bound = (toStderr as (...a: unknown[]) => void).bind(target);
+  for (const level of STDOUT_LEVELS) {
+    target[level] = (...args: unknown[]) => bound(...args);
+  }
+}

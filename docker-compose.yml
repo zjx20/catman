@@ -62,11 +62,13 @@ services:
       # 大小写两份都给:程序之间认哪种并不统一(curl 的 http_proxy 只认小写)。
       http_proxy: ${HTTP_PROXY:-}
       https_proxy: ${HTTPS_PROXY:-}
-      # 必须绕开代理的地址。自定义时是**整体替换**而非追加,下面三类要一并补回:
+      # 必须绕开代理的地址。自定义时是**整体替换**而非追加,下面四类要一并补回:
       # 微信服务器(.qq.com)是境内地址,走代理只会更慢甚至不通;本机与内网若不排除,
-      # 助手访问 127.0.0.1 上的服务(含 catman 自己的 dashboard)会被送去代理然后失败。
-      NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.qq.com}"
-      no_proxy: "${NO_PROXY:-localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.qq.com}"
+      # 助手访问 127.0.0.1 上的服务(含 catman 自己的 dashboard)会被送去代理然后失败;
+      # host.docker.internal 必须**按名字**列出 —— 它解析出来的 172.17.0.1 确实落在
+      # 172.16.0.0/12 里,但 NO_PROXY 的 CIDR 只对 IP 字面量生效,对主机名是后缀匹配。
+      NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,::1,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.qq.com}"
+      no_proxy: "${NO_PROXY:-localhost,127.0.0.1,::1,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.qq.com}"
       # dashboard 访问令牌(整站生效)。留空则首次启动自动生成,写入 /data/dashboard-token
       # 并打印在日志里 —— 不存在"无鉴权"这个选项:能打开 dashboard 的人可以扫码接入,
       # 而接入者拥有宿主 root 级别的能力。

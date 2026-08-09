@@ -463,6 +463,21 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 - **smoke 失败要分类**(`selfcheck.ts` 的 `classifyFailure`):限流与网络是**环境**的错,
   退避重试;把它们判成"新版本坏了"会让一次二十分钟的上游抖动废掉一个完好的版本。
   分类错的代价不对称,有单测逐类钉死。
+- **自检模式的 stdout 是结果通道,只出一行 JSON**(`index.ts` 的 `selfCheckMain` 调
+  `redirectConsoleToStderr`)。Node 的 `console.log/info/debug` 默认写 stdout,而自检期间
+  装配、SDK、agent-trace 的 always 级别都在打日志 —— 漏一行进去,deployer 解析到的就不是
+  JSON,于是**每一次部署都以「自检没过」告终,而 release 完全是好的**。把好版本判死的门
+  比没有门更糟。改道不是静音:诊断全进 stderr,由 deployer 的容器日志收着。
+  读取端同样防御式(`deployer.sh` 只取以 `{` 开头的最后一行)—— 自检代码属 Tier 1,每周都在变。
+- **一次性容器要显式补 docker.sock 的属组**(`init.sh` / `deployer-run.sh` / `bless.sh` 的
+  `DOCKER_GID`):它们以 uid 10002 跑,而 socket 的属组是**宿主**的事实(OpenWrt 多为 0,
+  Debian 多为 999),镜像里无从得知 —— 与 compose 给主容器 `group_add` 是同一个决定。
+  漏了的症状是 `/回滚` 起了容器却什么都没干,日志里只有一句 permission denied。
+  取值:bless 时在宿主 `stat -c %g` 记进 `/data/deploy/env`,运行时兜底再 stat 一次。
+- **健康检查的 curl 必须 `--noproxy '*'`**(`lib.sh` 的 `health_json`):代理环境变量是
+  **必须**透传给 deployer 的(smoke 要够得着 Anthropic API),而 `NO_PROXY` 里的 CIDR
+  只对 IP 字面量生效、对主机名是后缀匹配 —— `172.16.0.0/12` 拦不住 `host.docker.internal`。
+  于是健康门永远超时,每次部署都在最后一步自动回滚。靠"配置里记得写排除项"挡不住,钉在代码里。
 - **健康门只看本地可判定项**(`health.ts`):进程起没起、渠道通不通、`version.sha` 对不对。
   大脑状态(`lastTurn`)只是观测位,**不参与判死** —— 真正的大脑探测在 SELFCHECK 里,
   由 deployer 在切换**之前**跑。

@@ -21,7 +21,7 @@ import type { Channel } from "./channels/types.js";
 import type { AttachmentLimits } from "./core/attachments.js";
 import { Dashboard } from "./dashboard/server.js";
 import { cleanupOldSessionsAcross, encodeProjectDir, sessionFileExists } from "./core/transcript.js";
-import { installLogStamps } from "./core/log-stamp.js";
+import { installLogStamps, redirectConsoleToStderr } from "./core/log-stamp.js";
 import { readVersion, versionLine } from "./core/version.js";
 import { runSelfCheck } from "./core/selfcheck.js";
 import { ScriptDeployControl } from "./core/deploy.js";
@@ -178,6 +178,10 @@ async function main(): Promise<void> {
  * 用退出码编码分类会诱使调用方去记一张数字表。
  */
 async function selfCheckMain(): Promise<void> {
+  // stdout 在这个模式下是**结果通道**,只该有最后那一行 JSON —— deployer 解析它来
+  // 判定这份 release 能不能上线。console.log/info/debug 在 Node 里默认也写 stdout,
+  // 漏一行进去 deployer 就读不到 JSON,于是好版本被判死。见 redirectConsoleToStderr。
+  redirectConsoleToStderr();
   const result = await runSelfCheck();
   process.stdout.write(`${JSON.stringify(result)}\n`);
   console.info(`[selfcheck] ${result.ok ? "通过" : `失败(${result.category})`}:${result.detail}`);

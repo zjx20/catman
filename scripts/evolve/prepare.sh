@@ -71,6 +71,7 @@ docker run --rm \
   --memory "${CATMAN_PREPARE_MEMORY:-1500m}" \
   --add-host host.docker.internal:host-gateway \
   "${PROXY_ENV[@]}" \
+  -e "TZ=${TZ:-UTC}" \
   -e "SHA=$SHA" -e "BRANCH=$BRANCH" -e "PREV_SHA=$PREV_SHA" \
   -e "SRC_DIR=$SRC_DIR" -e "RELEASES_DIR=$RELEASES_DIR" -e "NPM_CACHE_DIR=$NPM_CACHE_DIR" \
   -v "${CATMAN_HOST_DATA_DIR:?必须给出 /data 在宿主上的绝对路径}:/data" \

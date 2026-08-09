@@ -31,6 +31,13 @@ IMAGE="${CATMAN_IMAGE:-catman-env:1}"
 DEPLOY_DIR="${CATMAN_DEPLOY_DIR:-/data/deploy}"
 HOST_DATA_DIR="${CATMAN_HOST_DATA_DIR:?必须给出 /data 在宿主上的绝对路径}"
 DOCKER_SOCK="${DOCKER_SOCK_PATH:-/var/run/docker.sock}"
+# deployer 以 uid 10002 跑,而它做的每一件事(停容器、起容器、跑 smoke)都要过
+# docker.sock。socket 的属组是**宿主**的事实(OpenWrt 多为 root/0,Debian 多为
+# docker/999),镜像里无从得知,所以运行时补组 —— 与 compose 给主容器的 group_add
+# 是同一个决定。取值优先用 bless 时记下来的(宿主上 stat 出来的那个,最权威),
+# 否则就地 stat 一次。漏了这一步的症状是 `/回滚` 起了容器却什么都没做,
+# 日志里只有一句 permission denied —— 而那正是最需要它工作的时刻。
+DOCKER_GID="${DOCKER_GID:-$(stat -c '%g' "$DOCKER_SOCK" 2>/dev/null || echo 0)}"
 
 # 跑的必须是**固化过的**那份 deployer,不是当前 release 里的那份。理由见 bless.sh:
 # 门禁和逃生门是同一把锁,不能让一次改坏了部署逻辑的进化把它们一起毁掉。
@@ -55,9 +62,11 @@ done
 exec docker run -d \
   --name "$CONTAINER" \
   --user 10002:10002 \
+  --group-add "$DOCKER_GID" \
   --restart no \
   --add-host host.docker.internal:host-gateway \
   "${PROXY_ENV[@]}" \
+  -e "TZ=${TZ:-UTC}" \
   -e "CATMAN_HOST_DATA_DIR=$HOST_DATA_DIR" \
   -e "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}" \
   -e "CATMAN_IMAGE=$IMAGE" \

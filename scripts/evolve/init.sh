@@ -25,6 +25,13 @@ IMAGE="${CATMAN_IMAGE:-catman-env:1}"
 SRC_DIR_HOST="$DATA_DIR/src/catman"
 RELEASES_HOST="$DATA_DIR/releases"
 REF="${1:-HEAD}"
+DOCKER_SOCK="${DOCKER_SOCK_PATH:-/var/run/docker.sock}"
+
+# 一次性容器以 uid 10002 跑,而 docker.sock 的属组是**宿主**的事实(OpenWrt 多为
+# root/0,Debian 多为 docker/999),镜像里无从得知。不补这个组,容器里的 docker
+# 直接 "permission denied while trying to connect to the Docker daemon socket" ——
+# 报错只字不提"组",而它离真正的原因隔着好几层。与 compose 的 group_add 同一个道理。
+DOCKER_GID="${DOCKER_GID:-$(stat -c '%g' "$DOCKER_SOCK" 2>/dev/null || echo 0)}"
 
 case "$HOST_DATA_DIR" in
   /*) ;;
@@ -39,19 +46,6 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
 
 mkdir -p "$RELEASES_HOST" "$DATA_DIR/src" "$DATA_DIR/npm-cache"
 
-# 属主必须交给 deployer(uid 10002)。制备与部署都跑在以 10002 运行的一次性容器里,
-# 而这个脚本是宿主上的人跑的 —— 不 chown 的话第一次制备就 EACCES,而报错信息
-# (npm 写不了 node_modules)跟真正的原因隔着好几层,极难对号。
-# 主容器对 releases 是**只读**挂载,所以这个属主同时也是"助手删不掉回滚目标"的那道闸。
-if [ "$(id -u)" = "0" ]; then
-  chown -R 10002:10002 "$RELEASES_HOST" "$DATA_DIR/npm-cache"
-  chown -R 10001:10001 "$DATA_DIR/src"
-else
-  echo "⚠️  当前不是 root,跳过 chown。请确认下面两条成立(否则制备会 EACCES):"
-  echo "    $RELEASES_HOST 与 $DATA_DIR/npm-cache 可被 uid 10002 写"
-  echo "    $DATA_DIR/src 可被 uid 10001 写"
-fi
-
 # 源码仓库落到数据卷里:此后 agent 在它上面开分支干活,而它与 release 目录
 # 是两回事 —— release 是从这里 clone 出去的、只读的、可回滚的快照。
 if [ ! -d "$SRC_DIR_HOST/.git" ]; then
@@ -60,6 +54,22 @@ if [ ! -d "$SRC_DIR_HOST/.git" ]; then
 else
   echo "源码仓库已存在,拉取最新提交"
   git -C "$SRC_DIR_HOST" fetch origin --quiet || true
+fi
+
+# 属主必须交给对应的 uid。制备与部署跑在以 10002 运行的一次性容器里,而 agent 以
+# 10001 在 /data/src 上开分支干活 —— 这个脚本却是宿主上的人(通常 root)跑的。
+# 不 chown 的话第一次制备就 EACCES,而报错信息(npm 写不了 node_modules)跟真正的
+# 原因隔着好几层,极难对号。
+# **必须排在 clone 之后**:先 chown 再 clone 的话,新建出来的 catman/ 归创建者所有,
+# 上面那次 chown 一个字节都没盖到它 —— 症状要等到 agent 第一次想改代码时才出现。
+# 主容器对 releases 是**只读**挂载,所以 10002 这个属主同时也是"助手删不掉回滚目标"的那道闸。
+if [ "$(id -u)" = "0" ]; then
+  chown -R 10002:10002 "$RELEASES_HOST" "$DATA_DIR/npm-cache"
+  chown -R 10001:10001 "$DATA_DIR/src"
+else
+  echo "⚠️  当前不是 root,跳过 chown。请确认下面两条成立(否则制备会 EACCES):"
+  echo "    $RELEASES_HOST 与 $DATA_DIR/npm-cache 可被 uid 10002 写"
+  echo "    $DATA_DIR/src 可被 uid 10001 写"
 fi
 
 SHA="$(git -C "$SRC_DIR_HOST" rev-parse "$REF")"
@@ -77,13 +87,15 @@ else
   # 那种差异最难查。这里直接调 prepare.sh 本身。
   docker run --rm \
     --user 10002:10002 \
+    --group-add "$DOCKER_GID" \
     --memory "${CATMAN_PREPARE_MEMORY:-1500m}" \
     --add-host host.docker.internal:host-gateway \
     "${PROXY_ENV[@]}" \
+    -e "TZ=${TZ:-UTC}" \
     -e "CATMAN_HOST_DATA_DIR=$HOST_DATA_DIR" \
     -e "CATMAN_IMAGE=$IMAGE" \
     -v "$HOST_DATA_DIR:/data" \
-    -v "${DOCKER_SOCK_PATH:-/var/run/docker.sock}:/var/run/docker.sock" \
+    -v "$DOCKER_SOCK:/var/run/docker.sock" \
     -w /data/src/catman \
     "$IMAGE" \
     bash /data/src/catman/scripts/evolve/prepare.sh "$SHA"
@@ -100,14 +112,23 @@ for name in current stable pinned; do
 done
 
 # 首个 release 直接进已验证清单:它是人工引导出来的,而且下面马上要跑起来。
-node -e '
-  const fs = require("fs");
-  const [file, sha] = process.argv.slice(1);
-  fs.writeFileSync(file, JSON.stringify({
-    schema: 1,
-    releases: [{ sha, verifiedAt: new Date().toISOString() }],
-  }, null, 2));
-' "$RELEASES_HOST/verified-history.json" "$SHA"
+# 用 shell 写而不是 `node -e`:这个脚本跑在**宿主**上,而宿主(软路由)多半没有
+# node —— 整个设计的前提就是"宿主只需要 docker"。内容是固定形状的两个字段,
+# 不存在需要 JSON 库的转义问题(sha 是十六进制,时间戳是 date 给的)。
+cat > "$RELEASES_HOST/verified-history.json" <<EOF
+{
+  "schema": 1,
+  "releases": [
+    { "sha": "$SHA", "verifiedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)" }
+  ]
+}
+EOF
+
+# 清单此后由 deployer(10002)重写,而这个文件是宿主上的人建的。目录属主已经对了,
+# 重写走的是 tmp + rename(只要目录可写就行),但把文件也交过去更省心。
+if [ "$(id -u)" = "0" ]; then
+  chown 10002:10002 "$RELEASES_HOST/verified-history.json"
+fi
 
 echo
 echo "初始化完成。"

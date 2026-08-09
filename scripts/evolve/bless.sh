@@ -40,6 +40,12 @@ esac
 mkdir -p "$DEPLOY_DIR/bin"
 install -m 0755 "$HERE"/lib.sh "$HERE"/deployer.sh "$HERE"/deployer-run.sh "$DEPLOY_DIR/bin/"
 
+# docker.sock 的属组。deployer 以 uid 10002 跑,不补这个组就连不上 dockerd。
+# 在**宿主上** stat 是最权威的取法(容器里那份是挂进去的同一个 inode,但这个脚本
+# 本来就跑在宿主上,不必绕);人可以用 DOCKER_GID 覆盖。
+DOCKER_SOCK="${DOCKER_SOCK_PATH:-/var/run/docker.sock}"
+DOCKER_GID="${DOCKER_GID:-$(stat -c '%g' "$DOCKER_SOCK" 2>/dev/null || echo 0)}"
+
 # 固化环境。deployer-run.sh 与 catman 都读它 —— 一处定义,免得两边各写一份
 # 然后慢慢走样。
 cat > "$DEPLOY_DIR/env" <<EOF
@@ -47,6 +53,7 @@ cat > "$DEPLOY_DIR/env" <<EOF
 CATMAN_HOST_DATA_DIR=$HOST_DATA_DIR
 CATMAN_IMAGE=${CATMAN_IMAGE:-catman-env:1}
 CATMAN_CONTAINER=${CATMAN_CONTAINER:-catman}
+DOCKER_GID=$DOCKER_GID
 EOF
 chmod 0644 "$DEPLOY_DIR/env"
 
@@ -61,6 +68,7 @@ fi
 
 echo "已固化到 $DEPLOY_DIR"
 echo "  宿主 /data 路径:$HOST_DATA_DIR"
+echo "  docker.sock 属组:$DOCKER_GID"
 echo "  脚本:$(ls "$DEPLOY_DIR/bin" | tr '\n' ' ')"
 echo
 echo "提醒:以后改了 scripts/evolve/ 下的任何脚本,都要重新跑一次 bless 才会生效。"
