@@ -614,6 +614,23 @@ stdin 通道支持 `/user <名字>` 切换身份,因此**多用户隔离可以�
 docker build -t catman-env:1 -f docker/Dockerfile .
 ```
 
+**构建期连不上 `download.docker.com` 时**(它是整个构建里唯一容易够不着的地方),两条路:
+
+```bash
+# ① 走代理。大小写都要传 —— apt 的 http 方法只读小写、curl 只认大写 HTTPS_PROXY,
+#    只给一种的症状是"GPG key 拉得下来、apt-get update 却连不上"。
+#    ⚠️ 地址不能写 host.docker.internal:那个名字靠 compose 的 extra_hosts 在**运行时**
+#    注入,构建期不存在。填代理机的内网 IP。
+P=http://192.168.1.2:7890
+docker build -t catman-env:1 -f docker/Dockerfile \
+  --build-arg HTTP_PROXY="$P"  --build-arg HTTPS_PROXY="$P" \
+  --build-arg http_proxy="$P"  --build-arg https_proxy="$P" .
+
+# ② 不配代理,换一个够得着的镜像源(布局都是 <base>/linux/debian)
+docker build -t catman-env:1 -f docker/Dockerfile \
+  --build-arg DOCKER_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/docker-ce .
+```
+
 **多架构不再是问题。** 以前 claude 二进制随镜像发货,而它来自 Agent SDK 的
 optionalDependencies(`@anthropic-ai/claude-agent-sdk-<os>-<arch>[-musl]`),npm 按**执行安装
 的那个容器**的架构挑包 —— 于是构建必须靠 buildx + QEMU 在目标架构下跑 `npm ci`,

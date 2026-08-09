@@ -6,10 +6,19 @@ services:
       # 构建期(apt 拉 Debian 源与 docker.com)的代理,与下面 environment 里的
       # 运行时代理是两套设置,互不影响 —— 构建时连不上就设这里。
       # HTTP_PROXY 等是 Docker 预定义 build arg,Dockerfile 里无需 ARG 声明即生效。
+      # **大小写都要给**:apt 的 http 方法只读小写,curl 只认大写 HTTPS_PROXY ——
+      # 只给一种的症状是"GPG key 拉得下来、apt-get update 却连不上"。
+      # ⚠️ 值里不能写 host.docker.internal:那个名字靠 extra_hosts 在运行时注入,
+      # 构建期不存在。填代理机的内网 IP。
       args:
         HTTP_PROXY: ${HTTP_PROXY:-}
         HTTPS_PROXY: ${HTTPS_PROXY:-}
         NO_PROXY: "${NO_PROXY:-}"
+        http_proxy: ${HTTP_PROXY:-}
+        https_proxy: ${HTTPS_PROXY:-}
+        no_proxy: "${NO_PROXY:-}"
+        # 够不着 download.docker.com 时换个镜像源(见 docker/Dockerfile 的说明)。
+        DOCKER_APT_MIRROR: ${DOCKER_APT_MIRROR:-https://download.docker.com}
     # 稳定基底镜像:**不含应用代码**。代码是数据卷里的 release 目录,由入口脚本
     # 经 releases/current 符号链接找到(见 docker/Dockerfile 与 entrypoint.sh)。
     # 因此升级**不重建容器**:换链接 + restart 就够了,这个文件平时一动不动。

@@ -23,6 +23,26 @@
 # buildx + QEMU 那套多架构构建。基底是 bookworm(glibc);换 alpine 会切到 musl 变体。
 # 验证手段不变:容器内 `node -p process.arch` 与 `ls node_modules/@anthropic-ai/` 要对得上。
 
+# ## 构建期的网络:代理与镜像源
+#
+# `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 及其**小写**同名变量是 Docker 的
+# **预定义 build arg** —— 不需要在这里 `ARG` 声明就能生效,`--build-arg` 传进来即可。
+# 刻意不声明:一旦显式 `ARG`,它们就从"预定义"降级成普通构建参数,会进入构建缓存的
+# key,于是换一次代理地址就让整个镜像重建一遍。
+#
+# ⚠️ **大小写都要传。** apt 的 http 方法只读**小写**的 `http_proxy`/`https_proxy`
+# (二进制里没有大写那几个字符串),而 curl 只认大写的 `HTTPS_PROXY`。只传一种的
+# 症状是"GPG key 拉得下来、apt-get update 却连不上",看起来像镜像源本身的问题:
+#   docker build -t catman-env:1 -f docker/Dockerfile \
+#     --build-arg HTTP_PROXY="$P" --build-arg HTTPS_PROXY="$P" \
+#     --build-arg http_proxy="$P" --build-arg https_proxy="$P" .
+#
+# ⚠️ 代理地址里**不能写 host.docker.internal**:那个名字靠 compose 的 extra_hosts
+# 在**运行时**注入,构建期不存在。构建时填代理机的内网 IP,或给 build 也补一句
+# `--add-host host.docker.internal:host-gateway`。
+#
+# 完全不想配代理的话,用下面的 DOCKER_APT_MIRROR 换一个够得着的镜像源。
+
 FROM node:22-bookworm-slim
 
 # 运行时需要 git/ripgrep 等常用工具(助手在容器内执行命令时常用;
@@ -31,15 +51,21 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends git ripgrep ca-certificates curl tini \
   && rm -rf /var/lib/apt/lists/*
 
+# Docker CE 的 apt 源。默认官方站,但它是整个构建里**唯一**一处容易够不着的地方 ——
+# 与其为它整套配代理,不如允许换一个国内镜像(布局都是 <base>/linux/debian,
+# 清华 / 阿里 / 中科大都对得上):
+#   --build-arg DOCKER_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/docker-ce
+ARG DOCKER_APT_MIRROR=https://download.docker.com
+
 # Docker CLI(仅客户端,不含 daemon):助手通过挂载进来的 /var/run/docker.sock
 # 操作宿主的 Docker(docker-outside-of-docker),deployer 也靠它停/起容器。
 # socket 由 compose 挂载,访问权限由 compose 的 group_add 提供。
 # apt 源的 codename 从 base image 自身读取,base 升级后不会指向错误的 Debian 版本。
 RUN . /etc/os-release \
   && install -m 0755 -d /etc/apt/keyrings \
-  && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+  && curl -fsSL "${DOCKER_APT_MIRROR}/linux/debian/gpg" -o /etc/apt/keyrings/docker.asc \
   && chmod a+r /etc/apt/keyrings/docker.asc \
-  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian ${VERSION_CODENAME} stable" \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] ${DOCKER_APT_MIRROR}/linux/debian ${VERSION_CODENAME} stable" \
      > /etc/apt/sources.list.d/docker.list \
   && apt-get update \
   && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \

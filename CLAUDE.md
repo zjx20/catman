@@ -30,7 +30,9 @@ CATMAN_CHANNEL=stdin CATMAN_DATA_DIR=./data CATMAN_ADMIN_TOKEN=devtoken \
   CLAUDE_CODE_OAUTH_TOKEN=<token> npm run dev
 
 # 部署(源码直跑,首次三步;之后升级只走 prepare + deploy)
-docker build -t catman-env:1 -f docker/Dockerfile .    # 基底镜像,极少重建
+# 基底镜像,极少重建。构建期够不着 download.docker.com 时:代理要**大小写都传**
+# (apt 只读小写、curl 只认大写),或 --build-arg DOCKER_APT_MIRROR=<国内镜像>。
+docker build -t catman-env:1 -f docker/Dockerfile .
 CATMAN_HOST_DATA_DIR=$PWD/data scripts/evolve/init.sh  # 首个 release + 指针
 scripts/evolve/bless.sh                                # 固化部署机制(自进化要用)
 docker compose up -d
