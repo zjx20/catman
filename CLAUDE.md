@@ -34,7 +34,8 @@ docker build -t catman-env:1 -f docker/Dockerfile .    # 基底镜像,极少重�
 CATMAN_HOST_DATA_DIR=$PWD/data scripts/evolve/init.sh  # 首个 release + 指针
 scripts/evolve/bless.sh                                # 固化部署机制(自进化要用)
 docker compose up -d
-docker exec catman scripts/evolve/prepare.sh HEAD      # 制备:测试+编译,产出 release
+# 制备:测试+编译,产出 release。路径要写全 —— 镜像没设 WORKDIR,docker exec 从 / 起步。
+docker exec catman /data/releases/current/scripts/evolve/prepare.sh HEAD
 scripts/evolve/deployer.sh deploy <sha>                # 排水→自检→切换→健康门→观察期
 scripts/evolve/deployer.sh rollback|status
 # 自检(smoke)单独跑:不碰真实 /data,退出码即结论,stdout 一行 JSON
