@@ -25,6 +25,7 @@ import { installLogStamps, redirectConsoleToStderr } from "./core/log-stamp.js";
 import { readVersion, versionLine } from "./core/version.js";
 import { runSelfCheck } from "./core/selfcheck.js";
 import { ScriptDeployControl } from "./core/deploy.js";
+import { formatDeployReport } from "./core/deploy-report.js";
 
 async function main(): Promise<void> {
   // 第一件事:给所有 console 输出加时间戳。放在最前面,连启动期的日志也带上 ——
@@ -73,6 +74,17 @@ async function main(): Promise<void> {
   writeSkills(configDir, { modelAllowlist: settings.effective().modelAllowlist });
 
   const deploy = resolveDeployControl(config);
+
+  // 有一条还没送出去的部署结果就在启动时打出来,**无条件**。
+  // 它平时靠"下次有人开口时捎给他"送达,而"该收到的人"取决于:发起人是谁(从微信发起
+  // 的才有),没有发起人时则是管理员名单 —— 名单为空就没有任何人收得到。
+  // 而这恰恰是最不能丢的一条:用户接下来说的话,都建立在"改动已生效"这个错误前提上。
+  // 日志是它唯一不依赖任何配置的出口,所以不管播不播得出去,先在这里留一份。
+  // 只打不标记已播报:该收到的人下次开口时照样会收到。
+  const pendingReport = deploy?.pendingReport();
+  if (pendingReport) {
+    console.warn(`[deploy] 有一条尚未播报的部署结果:${formatDeployReport(pendingReport)}`);
+  }
 
   // 聊天记录落盘:网页没有本地记录,不存的话重启后页面空白、而助手那边的会话还在。
   const chat = new DashboardChannel({ path: config.chatLogPath });
