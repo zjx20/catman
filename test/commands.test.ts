@@ -119,8 +119,12 @@ test("每个指令的规范形式与别名都以 / 开头且互不冲突", () =>
 test("帮助文案覆盖全部指令 —— 它是唯一的发现入口", () => {
   // 用管理员视角查全集:普通用户那份少了 adminOnly 那几条是**故意**的,
   // 但除此之外一条都不能漏 —— 硬指令没有别的发现途径。
+  //
+  // `hidden` 的那几条同样是故意的,但理由不同:它们对**能看到帮助的人**没有意义
+  // (目前只有 `/绑定` —— 看得到帮助就说明已经绑定过了)。这是"相关性"不是"权限",
+  // 所以单独排除,而不是混进 adminOnly 那一类。
   const lines = commandHelpLines(true).join("\n");
-  for (const cmd of COMMAND_TABLE) {
+  for (const cmd of COMMAND_TABLE.filter((c) => !c.hidden)) {
     assert.ok(lines.includes(cmd.canonical), `帮助里缺了 ${cmd.canonical}`);
     assert.ok(lines.includes(cmd.desc), `帮助里缺了 ${cmd.canonical} 的说明`);
   }

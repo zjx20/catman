@@ -36,7 +36,26 @@ export type CommandName =
   | "switchSession"
   | "publish"
   | "rollback"
-  | "upgradeStatus";
+  | "upgradeStatus"
+  | "rescue"
+  | "primaryPersona"
+  | "bind";
+
+/**
+ * 谁执行这条指令。
+ *
+ * `courier` 的那几条(路由切换、应急绑定)由**信使**在消息进人格之前就地消化 ——
+ * 它们的语义住在信使的路由表与准入里,而不是人格的会话状态里。
+ *
+ * 仍然登记在这张表里,是因为**帮助文案必须列全**:这张表是指令的单一真相源,
+ * 而发现性全靠 greeting 与 `/帮助`。分成两张表的结果一定是"信使加了条指令,
+ * 用户永远不知道它存在"。
+ *
+ * 人格侧收到 `where === "courier"` 的指令一律**当它不是指令**(照常走 LLM)——
+ * 正常情况下它压根到不了人格;真到了,说明跑着的信使版本比人格老、还不认识它,
+ * 这时候安静地退化成普通消息,比回一句"这条我不管"有用。
+ */
+export type CommandWhere = "persona" | "courier";
 
 export interface CommandDef {
   readonly name: CommandName;
@@ -59,6 +78,16 @@ export interface CommandDef {
    * 文案劝阻。非管理员发这些指令按"未知指令"处理(见 gateway),不透露它们存在。
    */
   readonly adminOnly?: boolean;
+  /** 谁执行(见 CommandWhere)。缺省是人格。 */
+  readonly where?: CommandWhere;
+  /**
+   * 不列进帮助文案。
+   *
+   * 与 `adminOnly` 是两件事:那个是**权限**,这个是**相关性**。目前只有 `/绑定` ——
+   * 它只在"还没绑定"时有意义,而能看到 `/帮助` 的人全都已经绑定过了,
+   * 对它的全部受众来说那是一行死文案。发现性由安装时给出的那份带外口令承担。
+   */
+  readonly hidden?: boolean;
 }
 
 export const COMMAND_TABLE: readonly CommandDef[] = [
@@ -152,6 +181,40 @@ export const COMMAND_TABLE: readonly CommandDef[] = [
     immediate: false,
     adminOnly: true,
   },
+
+  // ── 下面三条由**信使**执行(见 CommandWhere) ──────────────────────
+  {
+    name: "rescue",
+    canonical: "/救援",
+    aliases: ["/rescue"],
+    desc: "把自己切到守护人格 —— 主人格卡死或答非所问时用它",
+    // 信使就地消化,不进任何人格的队列:主人格卡死时它照样管用,那正是它存在的理由。
+    immediate: true,
+    adminOnly: true,
+    where: "courier",
+  },
+  {
+    name: "primaryPersona",
+    canonical: "/主人格",
+    aliases: ["/primary"],
+    desc: "从守护人格切回主人格",
+    immediate: true,
+    adminOnly: true,
+    where: "courier",
+  },
+  {
+    name: "bind",
+    canonical: "/绑定",
+    aliases: ["/bind"],
+    desc: "用安装时给的应急口令强制完成账号绑定(准入出问题时的逃生阀)",
+    // **刻意不是 adminOnly**:它要救的恰恰是"主人被准入挡在门外、因而不可能被认作
+    // 管理员"这种处境。安全前提是口令本身(带外给出、0600 落盘)。
+    immediate: true,
+    takesArg: true,
+    argHint: "口令",
+    where: "courier",
+    hidden: true,
+  },
 ];
 
 const BY_TOKEN = new Map<string, CommandDef>();
@@ -192,7 +255,7 @@ export function parseCommand(text: string): ParsedCommand | undefined {
  * "少显示几条"而不是"把管理员指令告诉所有人"。
  */
 export function commandHelpLines(isAdmin = false): string[] {
-  return COMMAND_TABLE.filter((c) => isAdmin || !c.adminOnly).map((c) => {
+  return COMMAND_TABLE.filter((c) => !c.hidden && (isAdmin || !c.adminOnly)).map((c) => {
     const arg = c.takesArg && c.argHint ? ` <${c.argHint}>` : "";
     const alt = c.aliases.length ? `(${c.aliases.join(" ")})` : "";
     return `${c.canonical}${arg}${alt} — ${c.desc}`;

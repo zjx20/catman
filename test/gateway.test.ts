@@ -1936,6 +1936,18 @@ test("起不动 deployer 时必须明说版本没变 —— 用户以为回滚�
   assert.match(last.text, /没有任何变化/);
 });
 
+test("信使执行的指令到了人格这儿一律当它不是指令 —— 那说明信使版本比人格老", () => {
+  // /救援 /主人格 /绑定 正常情况下压根到不了人格:信使在消息进人格之前就消化掉了。
+  // 真到了,说明跑着的那份 pinned 信使还不认识这条指令(它是人工 bless 的,可以比
+  // 人格老几十个版本)。那时安静地退化成普通消息,比回一句"这条我不管"有用。
+  return (async () => {
+    const { channel, agent } = build(() => 1_000_000, { settings: { adminUserKeys: [U1] } });
+    await channel.receive(U1, "/救援");
+    assert.equal(agent.calls.length, 1, "该照常走 LLM");
+    assert.equal(agent.calls[0]!.prompt, "/救援");
+  })();
+});
+
 test("非管理员的 /发布 同样当它不是指令 —— 一次部署把所有人都换了版本", async () => {
   const deploy = new FakeDeploy();
   const { channel, agent } = build(() => 1_000_000, { deploy });

@@ -779,6 +779,10 @@ export class Gateway {
   private parseAllowed(userKey: string, text: string): ParsedCommand | undefined {
     const parsed = parseCommand(text);
     if (!parsed) return undefined;
+    // 信使执行的那几条(路由切换、应急绑定)正常情况下压根到不了这里 —— 信使在消息
+    // 进人格之前就消化掉了。真到了,说明跑着的信使版本比人格老、还不认识这条指令;
+    // 那时安静地退化成普通消息(照常走 LLM),比回一句"这条我不管"有用。
+    if (parsed.cmd.where === "courier") return undefined;
     if (parsed.cmd.adminOnly && !this.settings.isAdmin(userKey)) return undefined;
     return parsed;
   }
