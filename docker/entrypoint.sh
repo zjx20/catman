@@ -25,6 +25,20 @@
 
 set -eu
 
+# ## 给了显式命令就跑显式命令
+#
+# Docker 的惯例:ENTRYPOINT 在**没有**命令时跑默认的那个程序,给了命令就跑命令。
+# 这里不是风格问题 —— 整条自进化流水线全靠一次性容器干活(制备、自检、部署,
+# 以及宿主没有 bash 时的 init/bless),它们都是 `docker run <镜像> <命令>` 的形式。
+# 不认显式命令的话,那个命令会变成 node 的 argv,于是:还没有 release 时容器进引导
+# 模式**永远转下去**(首次初始化就此挂死),已经有 release 时更糟 —— 它会**再起一个
+# 完整的 catman**,两个进程同时写同一份 /data。两种都不报错,只是不干你让它干的事。
+#
+# tini 仍在:显式命令也在它下面跑,npm/agent 那些子进程的僵尸照样有人收。
+if [ "$#" -gt 0 ]; then
+  exec "$@"
+fi
+
 LINK="${CATMAN_RELEASE_LINK:-/data/releases/current}"
 ENTRY="dist/src/index.js"
 # 引导模式的重试间隔。60 秒:足够让日志保持可读,又不至于让人跑完 init 后干等太久。
@@ -41,7 +55,8 @@ while true; do
   if [ -n "$RELEASE" ] && [ -f "$RELEASE/$ENTRY" ]; then
     echo "[entrypoint] release=$RELEASE"
     cd "$RELEASE"
-    exec node "$ENTRY" "$@"
+    # 走到这里必然没有显式命令(有的话上面已经 exec 掉了),所以不必再转发 "$@"。
+    exec node "$ENTRY"
   fi
 
   echo "[entrypoint] 还没有可运行的 release:$LINK 解析不到 $ENTRY。"

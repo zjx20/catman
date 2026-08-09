@@ -511,6 +511,14 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 - **入口脚本解析不到 release 时进引导模式**(`entrypoint.sh`),慢速重试而不是 crash-loop:
   全新机器上数据卷是空的,而能造出第一个 release 的 `prepare.sh` 要在容器里跑 ——
   直接 exec 的结果是最快速度反复重启刷屏,真正该做的事(跑 `init.sh`)却没有任何提示。
+- **入口脚本必须让显式命令穿透**(`entrypoint.sh` 开头的 `[ "$#" -gt 0 ] && exec "$@"`)。
+  整条流水线全靠一次性容器干活(制备、自检、部署,以及宿主没有 bash 时的 init/bless),
+  它们都是 `docker run <镜像> <命令>` 的形式;不认显式命令的话那个命令会变成 node 的 argv,
+  于是**没有 release 时容器在引导模式里永远转下去**(首次初始化就此挂死),
+  **已有 release 时更糟 —— 再起一个完整的 catman,两个进程同时写同一份 `/data`**。
+  两种都不报错,只是不干你让它干的事。调用方补 `--entrypoint` 不算修好:那要求每个
+  调用点(含将来新增的)都记得写,而且会绕开 tini,子进程僵尸没人收。
+  `test/entrypoint.test.ts` 把三条分流都跑起来验(纯 sh,不需要 docker)。
 
 ## 约定
 
