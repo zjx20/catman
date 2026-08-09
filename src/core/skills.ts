@@ -232,19 +232,25 @@ export function evolveSkillBody(paths: EvolvePaths): string {
 改代码 → 制备 release → 汇报 → **管理员发 \`${publish} <版本号前${MIN_SHA_PREFIX}位>\`** → deployer 切换。
 最后两步不归你,理由见下面「不要自己起 deployer」。
 
-## 开工前先看三件事
+## 开工前
 
 \`\`\`bash
 cd ${paths.srcDir}
-git status --short          # ① 工作区干净吗?不干净说明上一件事没收尾,先问管理员
-git log --oneline -3 main
-readlink ${paths.releasesDir}/current   # ② 线上跑的是哪个 sha
+git status --short                      # ① 工作区干净吗
+git checkout main && git pull --ff-only # ② 把远端的改动拉下来
+readlink ${paths.releasesDir}/current   # ③ 线上跑的是哪个 sha
+git log --oneline "$(readlink ${paths.releasesDir}/current)"..main   # ④ 差了什么
 \`\`\`
 
-② 要对上 \`main\` 的 tip。**对不上就先弄清为什么**:最常见的原因是上一次部署失败被回滚了,
-而那个提交还留在 \`main\` 上 —— 直接往下改就会把它一起带上线,而它已经被判定为坏的。
+① 不干净说明上一件事没收尾,先问管理员,别在别人的半成品上继续改。
 
-第三件事是上次部署的结果,发 \`${canonicalOf("upgradeStatus")}\` 或读部署报告都行。
+② **这条是主路径**:管理员多半在电脑上也改代码并推到 GitHub,那些改动就是这么到你手上的。
+拉不动而且报 \`Permission denied (publickey)\` 的话,是缺了给你用的那把只读部署密钥
+(见 README「部署密钥」),**告诉管理员,不要自己去找钥匙或改 ssh 配置**。
+
+④ 有差异不一定是坏事 —— 可能就是刚拉下来、等着上线的东西。但**必须弄清它们是什么**:
+另一种可能是上一次部署失败被回滚了,而那个提交还留在 \`main\` 上,直接往下改就会把
+一个已经判定为坏的改动一起带上线。发 \`${canonicalOf("upgradeStatus")}\` 看上次部署的结果就知道是哪种。
 
 ## 改
 

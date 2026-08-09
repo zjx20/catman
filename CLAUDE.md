@@ -565,12 +565,24 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(`skills.ts`,只�
   这里做的是**说出来**,免得人以为"部署成功 = 我要的都生效了"。
   `gateway.ts` 故意不列进 1★:排水计数确实出自它,但它每周都在改,列进来会让几乎每次
   改动都是 1★,点名就失去意义 —— 守住排水语义的是 health 那份 golden 测试,而它在表上。
-- **部署密钥只进 deployer(uid 10002),agent 完全不碰网络 git**:ssh 对私钥有属主检查
-  (必须归当前用户或 root 且 0600),于是这个属主本身就是一道真闸 —— agent(10001)读不到它,
-  也就没有任何一条能改写远端历史的路径。**远端只由 deployer 在部署成功、stable 前移之后
-  推进**(`lib.sh` 的 `push_upstream`),所以 GitHub 上出现的永远是真正上线过并活下来的提交。
-  推失败(多半是远端也有人提交了)**只记日志,绝不反过来判部署失败**;同理**绝不 `--force`**,
-  快进失败正是它该失败的样子。代价说清楚:手机上看不到 diff,拉远端改动要人上机。
+- **部署密钥是两把不是一把**(`lib.sh` 的 `fetch_key_path` / `push_key_path`):ssh 对私钥有
+  属主检查(必须归当前用户或 root 且 0600),所以**一把钥匙只能服务一个 uid** —— 这是硬约束,
+  不是设计选择。`/data/ssh/fetch/id_ed25519`(10001,**只读** deploy key)给 agent 拉代码;
+  `/data/ssh/id_ed25519`(10002,可写)给 deployer 推远端。
+  **agent 的 pull 是主路径,不能省**:人在开发机上改完 push 到 GitHub,catman 得拉得下来
+  才谈得上制备。曾经把密钥整个归 10002,结果 agent 一行 `git pull` 都跑不了,而软路由宿主上
+  连 git 都没有 —— "人上机 pull"实际是"再起一个容器、以 root 跑、跑完还得把 `.git` 里新生成的
+  root 属主对象 chown 回去"。「agent 改不了远端历史」这道闸因此从**文件属主**上移到
+  **GitHub 侧的只读 deploy key**,而后者更强:属主挡不住挂了 docker.sock 的助手,只读密钥挡得住。
+  agent 那把写进**仓库配置**(`core.sshCommand`,`init.sh` 设)而不是容器 env —— env 要改
+  compose(Tier 3,每次都要人),写进仓库之后 agent 一句朴素的 `git pull` 就能跑。
+  **`init.sh` 绝不 chown 密钥**:属主就是"这把给谁用"的唯一声明,猜错等于把一份凭据改坏;
+  它只诊断并按**属主**(不是可读性 —— 它以 root 跑,`[ -r ]` 永远为真)报告两个槽位的状态。
+- **远端只由 deployer 在部署成功、stable 前移之后推进**(`lib.sh` 的 `push_upstream`):
+  GitHub 上出现的永远是真正上线过并活下来的提交(推得更早会让远端记录一堆从未运行过的东西,
+  而人恰恰靠远端判断线上是什么)。推失败(多半是远端也有人提交了)**只记日志,绝不反过来
+  判部署失败**;同理**绝不 `--force`**,快进失败正是它该失败的样子。没有可写密钥时先说一句
+  「跳过」再返回 —— 否则每次部署都会甩一段 ssh 的 Permission denied,看着像部署出了问题。
 - **固化环境由 lib.sh 自己读**(`load_blessed_env`):谁 source 了 lib.sh 谁就自动拿到
   `/data/deploy/env` 里的宿主路径、镜像名、docker.sock 属组,调用点不必记得 export。
   这是 agent 能直接跑 `prepare.sh` 的前提(它的进程环境里没有宿主路径,而制备要拿它去

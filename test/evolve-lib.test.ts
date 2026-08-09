@@ -443,29 +443,78 @@ test("固化环境:env 不存在时静默跳过 —— 源码树里跑就是这�
 
 // ── 部署密钥 ─────────────────────────────────────────────────────
 
-test("部署密钥:文件不在就不设 GIT_SSH_COMMAND —— 公开仓库走 https,没有密钥是常态", () => {
+test("部署密钥:两个槽位一读一写 —— 一把钥匙只能服务一个 uid,那是 ssh 的硬约束", () => {
+  // 曾经把密钥整个归 10002,结果 agent 一行 `git pull` 都跑不了 —— 而那条恰恰是主路径
+  // (人在开发机上改完 push 到 GitHub,路由器上的 catman 得拉得下来才谈得上制备)。
   withDir((dir) => {
-    const out = inLib(dir, `CATMAN_GIT_SSH_KEY="${dir}/nope" git_ssh_env; echo "${"$"}{GIT_SSH_COMMAND:-未设}"`);
-    assert.equal(out, "未设");
+    const ssh = join(dir, "ssh");
+    mkdirSync(join(ssh, "fetch"), { recursive: true });
+    writeFileSync(join(ssh, "id_ed25519"), "push\n");
+    writeFileSync(join(ssh, "fetch", "id_ed25519"), "fetch\n");
+    const env = `export CATMAN_SSH_DIR="${ssh}"; `;
+    assert.equal(inLib(dir, `${env} push_key_path`), join(ssh, "id_ed25519"));
+    assert.equal(inLib(dir, `${env} fetch_key_path`), join(ssh, "fetch", "id_ed25519"));
   });
 });
 
-test("部署密钥:文件在就设上,known_hosts 跟密钥放一起", () => {
+test("部署密钥:只放一把且归 10001 时,它就是 fetch key —— pull 通、push 跳过", () => {
+  // 「我只做了一个 deploy key 并给了助手」是最省事的配法,必须能跑。少了这条兜底,
+  // 那种配置下 agent 会拿到一把自己读不了的钥匙,报错停在 ssh 的属主检查上。
   withDir((dir) => {
-    writeFileSync(join(dir, "id_ed25519"), "fake\n");
-    const out = inLib(dir, `CATMAN_GIT_SSH_KEY="${dir}/id_ed25519" git_ssh_env; echo "$GIT_SSH_COMMAND"`);
-    assert.match(out, new RegExp(`-i ${dir}/id_ed25519`));
-    assert.match(out, new RegExp(`UserKnownHostsFile=${dir}/known_hosts`));
+    const ssh = join(dir, "ssh");
+    mkdirSync(ssh, { recursive: true });
+    const key = join(ssh, "id_ed25519");
+    writeFileSync(key, "only\n");
+    const env = `export CATMAN_SSH_DIR="${ssh}"; `;
+    // 属主不是 10001(测试进程跑在别的 uid 下)→ 不该被当成 fetch key。
+    assert.equal(inLib(dir, `${env} fetch_key_path`), "");
+    // 把属主判定桩掉,验的是"归 10001 就认"这条规则本身。
+    const stub = `stat() { echo 10001; }; export -f stat 2>/dev/null || true; `;
+    assert.equal(inLib(dir, `${stub}${env} fetch_key_path`), key);
+  });
+});
+
+test("部署密钥:显式 CATMAN_GIT_FETCH_KEY 优先于约定路径", () => {
+  withDir((dir) => {
+    const ssh = join(dir, "ssh");
+    mkdirSync(join(ssh, "fetch"), { recursive: true });
+    writeFileSync(join(ssh, "fetch", "id_ed25519"), "x\n");
+    const custom = join(dir, "custom_key");
+    writeFileSync(custom, "y\n");
+    assert.equal(
+      inLib(dir, `export CATMAN_SSH_DIR="${ssh}" CATMAN_GIT_FETCH_KEY="${custom}"; fetch_key_path`),
+      custom,
+    );
+  });
+});
+
+test("部署密钥:一把都没有时两个槽位都返回空,绝不返回一个不存在的路径", () => {
+  // 返回不存在的路径会让调用方以为"有钥匙",于是 ssh 报一句 No such identity file,
+  // 而那句话看起来像配置错了,不像"压根没配"。
+  withDir((dir) => {
+    const env = `export CATMAN_SSH_DIR="${join(dir, "ssh")}"; `;
+    assert.equal(inLib(dir, `${env} push_key_path`), "");
+    assert.equal(inLib(dir, `${env} fetch_key_path`), "");
+  });
+});
+
+test("部署密钥:ssh_command_for 带上 IdentitiesOnly 与同目录的 known_hosts", () => {
+  withDir((dir) => {
+    const out = inLib(dir, `ssh_command_for "${dir}/ssh/id_ed25519"`);
+    assert.match(out, new RegExp(`-i ${dir}/ssh/id_ed25519`));
+    assert.match(out, new RegExp(`UserKnownHostsFile=${dir}/ssh/known_hosts`));
     assert.match(out, /IdentitiesOnly=yes/);
   });
 });
 
 test("部署密钥:调用方已经给了 GIT_SSH_COMMAND 就不动它", () => {
   withDir((dir) => {
-    writeFileSync(join(dir, "id_ed25519"), "fake\n");
+    const ssh = join(dir, "ssh");
+    mkdirSync(ssh, { recursive: true });
+    writeFileSync(join(ssh, "id_ed25519"), "fake\n");
     const out = inLib(
       dir,
-      `export GIT_SSH_COMMAND="ssh -i /custom/key"; CATMAN_GIT_SSH_KEY="${dir}/id_ed25519" git_ssh_env; echo "$GIT_SSH_COMMAND"`,
+      `export CATMAN_SSH_DIR="${ssh}" GIT_SSH_COMMAND="ssh -i /custom/key"; git_ssh_env; echo "$GIT_SSH_COMMAND"`,
     );
     assert.equal(out, "ssh -i /custom/key");
   });

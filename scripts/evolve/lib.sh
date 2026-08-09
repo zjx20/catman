@@ -139,20 +139,69 @@ git_trust_repo() { # git_trust_repo <仓库目录>...
   export GIT_CONFIG_GLOBAL="$cfg"
 }
 
-# ── 部署密钥 ───────────────────────────────────────────────────────
-# 密钥就放在数据卷里(`/data/ssh/id_ed25519`),所以任何挂了 `/data` 的容器天然看得到。
+# ── 部署密钥:两个槽位,一读一写 ───────────────────────────────────
+# 密钥放在数据卷里,所以任何挂了 `/data` 的容器天然看得到。**两把,不是一把**:
 #
-# **属主是 deployer(10002),不是 agent(10001)** —— ssh 对私钥有属主检查(必须归当前
-# 用户或 root 且 0600),于是这个属主就是一道真闸:agent 读不到它,也就没有任何一条
-# 能改写远端历史的路径。代价是 agent 不能 fetch/push,拉远端改动要人上机;
-# 换来的是"GitHub 上出现的永远是真正上线过的提交"(见 deployer.sh 的 push_upstream)。
+#   /data/ssh/fetch/id_ed25519   属主 10001(agent) —— **只读** deploy key,用来 pull
+#   /data/ssh/id_ed25519         属主 10002(deployer)—— 可写 deploy key,用来 push
 #
-# 已经有 GIT_SSH_COMMAND 时不动它:调用方显式给的优先(与 load_blessed_env 同一取向)。
+# ssh 对私钥有属主检查(必须归当前用户或 root 且 0600),所以一把钥匙只能服务一个 uid ——
+# 这不是设计选择,是 ssh 的硬约束。分成两把之后:
+#
+# - **agent 拉得到代码**。这条路是主路径:人在开发机上改完 push 到 GitHub,
+#   路由器上的 catman 得把它拉下来才谈得上制备。曾经把密钥整个归 10002,
+#   结果 agent 一行 `git pull` 都跑不了,而软路由宿主上连 git 都没有,
+#   "人上机 pull"实际是"再起一个容器,以 root 跑,跑完还要把 .git 里新生成的
+#   root 属主对象 chown 回去"—— 那不是一条能长期走的路。
+# - **agent 依然改不了远端历史**。这道闸从"文件属主"上移到了 **GitHub 侧的只读
+#   deploy key**,而那比属主强:属主挡不住一个挂了 docker.sock 的助手,只读密钥挡得住。
+#
+# 只放一把也能跑,按属主决定谁能用(见 fetch_key_path):放给 10001 则 pull 通、push 跳过;
+# 放给 10002 则反过来。**pull 比 push 重要** —— 后者只是让远端记录上线过的版本。
+
+# 那把用来 push 的(deployer 侧)。找不到或读不到都返回空 —— 调用方据此跳过并说明。
+push_key_path() {
+  local key="${CATMAN_GIT_SSH_KEY:-${CATMAN_SSH_DIR:-/data/ssh}/id_ed25519}"
+  [ -r "$key" ] && echo "$key"
+  return 0
+}
+
+# 那把用来 fetch 的(agent 侧)。解析顺序:显式指定 → 专用的 fetch/ → 只放了一把
+# **且那把归 10001** 的兜底。最后这条是为"我只做了一个 deploy key 并给了助手"准备的,
+# 少了它,那种配置下 agent 会拿到一把自己读不了的钥匙,报错停在 ssh 的属主检查上。
+fetch_key_path() {
+  local ssh_dir="${CATMAN_SSH_DIR:-/data/ssh}"
+  local explicit="${CATMAN_GIT_FETCH_KEY:-}"
+  if [ -n "$explicit" ]; then
+    [ -f "$explicit" ] && echo "$explicit"
+    return 0
+  fi
+  local dedicated="$ssh_dir/fetch/id_ed25519"
+  if [ -f "$dedicated" ]; then
+    echo "$dedicated"
+    return 0
+  fi
+  local single="$ssh_dir/id_ed25519"
+  if [ -f "$single" ] && [ "$(stat -c '%u' "$single" 2>/dev/null || echo -1)" = "10001" ]; then
+    echo "$single"
+  fi
+  return 0
+}
+
+# 拼一条 ssh 命令。known_hosts 跟密钥放一起,免得每次都要交互确认。
+ssh_command_for() { # ssh_command_for <私钥路径>
+  echo "ssh -i $1 -o IdentitiesOnly=yes -o UserKnownHostsFile=$(dirname "$1")/known_hosts -o StrictHostKeyChecking=accept-new"
+}
+
+# 给**当前进程**设上 push 用的密钥。已经有 GIT_SSH_COMMAND 时不动它:
+# 调用方显式给的优先(与 load_blessed_env 同一取向)。
 git_ssh_env() {
-  local key="${CATMAN_GIT_SSH_KEY:-/data/ssh/id_ed25519}"
   if [ -n "${GIT_SSH_COMMAND:-}" ]; then return 0; fi
-  if [ ! -f "$key" ]; then return 0; fi
-  export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$(dirname "$key")/known_hosts -o StrictHostKeyChecking=accept-new"
+  local key
+  key="$(push_key_path)"
+  if [ -z "$key" ]; then return 0; fi
+  GIT_SSH_COMMAND="$(ssh_command_for "$key")"
+  export GIT_SSH_COMMAND
   return 0
 }
 
@@ -525,6 +574,16 @@ push_upstream() { # push_upstream <sha>
   # detached 制备(prepare 传的是裸 sha)时 branch 是 "HEAD" 或空,那就推主线:
   # 走到这一步的提交已经上线并过了观察期,主线本就该是它。
   case "$branch" in "" | HEAD) branch="${CATMAN_UPSTREAM_BRANCH:-main}" ;; esac
+  # 先说清"有没有钥匙"。没有这一句的话,没配可写密钥的机器上每次部署都会在这里
+  # 甩一段 ssh 的 Permission denied,看起来像部署出了问题,其实只是没打算推远端。
+  case "$url" in
+    *ssh://* | *@*:*)
+      if [ -z "$(push_key_path)" ]; then
+        log "push:没有可读的可写密钥(deployer 侧),跳过 —— 远端不会记录这次上线"
+        return 0
+      fi
+      ;;
+  esac
   git_ssh_env
   if out="$(git -C "$dir" push "$url" "$sha:refs/heads/$branch" 2>&1)"; then
     log "push:${sha:0:7} → $branch"

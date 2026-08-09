@@ -62,14 +62,15 @@ git_trust_repo "$SRC_DIR_HOST" "$REPO"
 # 部署密钥(可选)。它就放在数据卷里,所以任何挂了 /data 的容器天然看得到,
 # 不需要额外挂载。
 # ⚠️ ssh 对私钥有属主检查:文件必须归**当前用户**(或 root)且权限 0600,否则一律拒用。
-# 约定归 **uid 10002(deployer)** —— 那个属主本身就是一道闸:agent(10001)读不到它,
-# 于是没有任何一条能改写远端历史的路径。远端只由 deployer 在**部署成功之后**推进
-# (见 lib.sh 的 push_upstream),所以 GitHub 上出现的永远是真正上线过的提交。
-# 这个脚本以 root 跑,读得到 0600 的它;known_hosts 与它放一起,免得交互确认。
-SSH_KEY="${CATMAN_GIT_SSH_KEY:-$DATA_DIR/ssh/id_ed25519}"
-if [ -f "$SSH_KEY" ] && [ -z "${GIT_SSH_COMMAND:-}" ]; then
-  export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$DATA_DIR/ssh/known_hosts -o StrictHostKeyChecking=accept-new"
-  echo "使用部署密钥:$SSH_KEY"
+# 所以一把钥匙只能服务一个 uid,而我们有两个(见 lib.sh 的「两个槽位,一读一写」)。
+# 这个脚本以 root 跑,两把都读得到,用哪把都能完成首次 clone。
+export CATMAN_SSH_DIR="$DATA_DIR/ssh"
+SSH_KEY="${CATMAN_GIT_SSH_KEY:-}"
+[ -n "$SSH_KEY" ] || SSH_KEY="$(push_key_path)"
+[ -n "$SSH_KEY" ] || SSH_KEY="$(fetch_key_path)"
+if [ -n "$SSH_KEY" ] && [ -z "${GIT_SSH_COMMAND:-}" ]; then
+  export GIT_SSH_COMMAND="$(ssh_command_for "$SSH_KEY")"
+  echo "首次 clone 使用密钥:$SSH_KEY"
 fi
 
 # 源码仓库落到数据卷里:此后 agent 在它上面开分支干活,而它与 release 目录
@@ -91,6 +92,22 @@ fi
 git -C "$SRC_DIR_HOST" config user.name "${CATMAN_GIT_USER_NAME:-catman}"
 git -C "$SRC_DIR_HOST" config user.email "${CATMAN_GIT_USER_EMAIL:-catman@localhost}"
 
+# agent 拉代码用哪把钥匙 —— 写进**仓库配置**(`core.sshCommand`)而不是容器 env。
+# 理由:env 要改 compose,而 compose 属 Tier 3(每次调整都要人);仓库配置由这个脚本
+# 写一次,此后 agent 一句朴素的 `git pull` 就能跑,不必知道钥匙在哪。
+# 这条路是**主路径**:人在开发机上改完 push 到 GitHub,路由器上的 catman 得拉得下来。
+FETCH_KEY="$(fetch_key_path)"
+if [ -n "$FETCH_KEY" ]; then
+  git -C "$SRC_DIR_HOST" config core.sshCommand "$(ssh_command_for "$FETCH_KEY")"
+  echo "agent 拉代码用:$FETCH_KEY"
+else
+  # 公开仓库走 https 不需要密钥,所以这不是错误 —— 但私有仓库下 agent 会拉不动,
+  # 而那时的报错(Permission denied (publickey))离真正的原因隔着好几层。
+  git -C "$SRC_DIR_HOST" config --unset core.sshCommand 2>/dev/null || true
+  echo "⚠️  没有找到给 agent 用的密钥($DATA_DIR/ssh/fetch/id_ed25519)。"
+  echo "    公开仓库(https)无妨;私有仓库的话 agent 拉不到远端改动 —— 见 README「部署密钥」。"
+fi
+
 # 属主必须交给对应的 uid。制备与部署跑在以 10002 运行的一次性容器里,而 agent 以
 # 10001 在 /data/src 上开分支干活 —— 这个脚本却是宿主上的人(通常 root)跑的。
 # 不 chown 的话第一次制备就 EACCES,而报错信息(npm 写不了 node_modules)跟真正的
@@ -101,15 +118,40 @@ git -C "$SRC_DIR_HOST" config user.email "${CATMAN_GIT_USER_EMAIL:-catman@localh
 if [ "$(id -u)" = "0" ]; then
   chown -R 10002:10002 "$RELEASES_HOST" "$DATA_DIR/npm-cache"
   chown -R 10001:10001 "$DATA_DIR/src"
-  # 部署密钥归 deployer:ssh 的属主检查因此成为一道真闸,agent 读不到它。
-  # 这一步幂等,也是从"密钥曾经归 10001"那版迁移过来的唯一动作。
-  if [ -d "$DATA_DIR/ssh" ]; then chown -R 10002:10002 "$DATA_DIR/ssh"; fi
+  # **密钥的属主一个字都不动。** 属主就是"这把钥匙给谁用"的唯一声明,而这里分不清
+  # 你放的那把是想给 agent 拉代码还是给 deployer 推远端 —— 猜错的后果是把好好的
+  # 配置改坏,且改的是一份凭据。所以只诊断、只报告,改由人来。
+  :
 else
-  echo "⚠️  当前不是 root,跳过 chown。请确认下面三条成立(否则制备会 EACCES):"
+  echo "⚠️  当前不是 root,跳过 chown。请确认下面两条成立(否则制备会 EACCES):"
   echo "    $RELEASES_HOST 与 $DATA_DIR/npm-cache 可被 uid 10002 写"
   echo "    $DATA_DIR/src 可被 uid 10001 写"
-  echo "    $DATA_DIR/ssh(若有部署密钥)归 uid 10002 且密钥 0600"
 fi
+
+# 密钥现状诊断。两个槽位各自独立,缺哪个就少哪半边能力 —— 说清楚比默默少一半好。
+#
+# 判据是**属主**不是可读性:这个脚本以 root 跑,root 读得了所有东西,拿 `[ -r ]`
+# 报出来的"✓"对真正要用它的那个 uid 毫无意义 —— 那种诊断比不诊断更坏。
+key_report() { # key_report <标签> <路径> <期望uid> <缺了会怎样>
+  local label="$1" path="$2" want="$3" lack="$4" owner
+  if [ -z "$path" ] || [ ! -f "$path" ]; then
+    echo "  ✗ $label:没有 —— $lack"
+    return 0
+  fi
+  owner="$(stat -c '%u' "$path" 2>/dev/null || echo '?')"
+  if [ "$owner" = "$want" ]; then
+    echo "  ✓ $label:$path"
+  else
+    echo "  ⚠ $label:$path 属主是 $owner,应为 $want —— ssh 会以属主检查拒用它"
+    echo "      chown $want:$want '$path' && chmod 600 '$path'"
+  fi
+}
+
+echo
+echo "部署密钥(两个槽位,一读一写;ssh 的属主检查决定一把钥匙只能服务一个 uid):"
+key_report "agent 拉代码" "$FETCH_KEY" 10001 "私有仓库下拉不到远端改动(主路径,建议补上)"
+key_report "deployer 推远端" "${CATMAN_GIT_SSH_KEY:-$DATA_DIR/ssh/id_ed25519}" 10002 \
+  "上线后远端不会自动跟上(不影响部署本身)"
 
 SHA="$(git -C "$SRC_DIR_HOST" rev-parse "$REF")"
 echo "首个 release:$SHA"

@@ -261,36 +261,49 @@ docker run --rm -e HTTP_PROXY -e HTTPS_PROXY -e http_proxy -e https_proxy catman
 密钥**就放在数据卷里**,于是任何挂了 `/data` 的容器天然看得到,不需要额外挂载 ——
 这也是唯一能同时喂给引导容器和将来 agent 的位置。
 
+**两把,不是一把。** ssh 对私钥有属主检查(必须归**当前用户**或 root 且 0600,否则一律
+拒用),所以一把钥匙只能服务一个 uid —— 这不是设计选择,是 ssh 的硬约束。而这里有两个
+用得上钥匙的角色:
+
 ```bash
-mkdir -p "$DATA/ssh"
-cp ~/deploy_key "$DATA/ssh/id_ed25519"
-chmod 700 "$DATA/ssh" && chmod 600 "$DATA/ssh/id_ed25519"
-chown -R 10002:10002 "$DATA/ssh"      # 10002 = deployer,不是助手那个 uid
+mkdir -p "$DATA/ssh/fetch"
+chmod 700 "$DATA/ssh" "$DATA/ssh/fetch"
+
+# ① 助手拉代码用的:GitHub 上建一个**只读** deploy key
+cp ~/catman_readonly     "$DATA/ssh/fetch/id_ed25519"
+chmod 600 "$DATA/ssh/fetch/id_ed25519"
+chown -R 10001:10001 "$DATA/ssh/fetch"
+
+# ② deployer 推远端用的:一个**可写** deploy key
+cp ~/catman_readwrite    "$DATA/ssh/id_ed25519"
+chmod 600 "$DATA/ssh/id_ed25519"
+chown 10002:10002 "$DATA/ssh/id_ed25519"
 ```
 
-`chown` 到 **10002** 不是随手写的:**ssh 对私钥有属主检查** —— 文件必须归**当前用户**
-(或 root)且权限 0600,否则一律拒用。于是这个属主本身就成了一道闸:助手以 10001 跑,
-读不到这把钥匙,也就没有任何一条能改写远端历史的路径。
+**① 是主路径,别省。** 你在电脑上改完 push 到 GitHub,路由器上的 catman 得把它拉下来才
+谈得上制备 —— 这个仓库的提交就是这么到那台机器上的。软路由宿主上连 git 都没有,所以
+"你自己上机 pull"实际是"再起一个容器、以 root 跑、跑完还得把 `.git` 里新生成的 root
+属主对象 chown 回去",那不是一条能长期走的路。
 
-代价与收益都说清楚:
+**② 只是让远端记录上线过的版本**,缺了不影响部署,只会在日志里留一行「跳过」。
 
-- 助手**不能** fetch/push。要把远端的改动拉进来,得你上机 `git -C data/src/catman pull`。
-- 远端由 **deployer 在部署成功、观察期通过之后**自动推进(`push_upstream`),所以
-  GitHub 上出现的永远是**真正上线过并且活下来**的提交。推失败(多半是远端也有人提交了)
-  只记一行日志,不影响这次部署;**绝不 `--force`**。
-- 手机上因此看不到 diff,只能看 catman 的汇报摘要。想要在 GitHub 上审阅的话,
-  把密钥改回 10001 并给 catman 容器加一行 `GIT_SSH_COMMAND` 即可 —— 那时请在 GitHub 侧
-  开分支保护(禁 force-push、保护主线)补回这道闸。
+这样分之后,「助手改不了远端历史」这道闸从**文件属主**上移到了 **GitHub 侧的只读
+deploy key** —— 而后者更强:属主挡不住一个挂了 docker.sock 的助手,只读密钥挡得住。
 
-`init.sh` 会自动探测 `$DATA/ssh/id_ed25519` 并设好 `GIT_SSH_COMMAND`(也可以用
-`CATMAN_GIT_SSH_KEY` 指到别处);它以 root 跑,读得到 0600 的它。
+只做一把也能跑:放 `$DATA/ssh/id_ed25519` 并 `chown 10001`,`init.sh` 会认出它是给助手用的
+(pull 通、push 跳过)。`init.sh` 跑完会打一段诊断,把两个槽位各自的状态和属主说清楚。
+
+助手那把是写进**仓库配置**的(`core.sshCommand`,由 `init.sh` 设),不走容器 env ——
+env 要改 compose,而 compose 属 Tier 3、每次调整都要人;写进仓库之后助手一句朴素的
+`git pull` 就能跑,不必知道钥匙在哪。也可以用 `CATMAN_GIT_FETCH_KEY` / `CATMAN_GIT_SSH_KEY`
+把两个槽位分别指到别处。
 
 > **SSH 出不去的话改用 HTTPS + token。** 部署密钥只能走 SSH,而 HTTP 代理转发不了裸 TCP;
 > 端口 22 被挡时可试 `ssh.github.com:443`,再不行就用细粒度只读 PAT 走
-> `https://<token>@github.com/...`(注意 token 会明文留在 `.git/config` 里)。
-> 属主那道闸对 PAT 不成立 —— 它就写在仓库配置里,助手读得到。
-> 另外:挂了 docker.sock 的助手本来就等同宿主 root,理论上总能绕过属主,
-> 所以这道闸防的是**失误**(顺手一个 `git push`),不是对抗。
+> `https://<token>@github.com/...`(注意 token 会明文留在 `.git/config` 里,
+> 属主那道闸对它不成立 —— 助手读得到)。
+> 另外:挂了 docker.sock 的助手本来就等同宿主 root,理论上总能绕过属主,所以属主防的是
+> **失误**(顺手一个 `git push`),真正的边界是 GitHub 侧那把钥匙的权限。
 
 > **架构不必再操心**:依赖是在**目标机器上**用 `catman-env` 装的(见 `scripts/evolve/prepare.sh`),
 > 天然就是对的架构。以前那套 buildx + QEMU 多架构构建随源码直跑一起消失了 ——
