@@ -64,6 +64,19 @@ for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
   [ -n "${!v:-}" ] && PROXY_ENV+=(-e "$v=${!v}")
 done
 
+# npm registry。目标网络够不着 registry.npmjs.org 时换个镜像:
+#   CATMAN_NPM_REGISTRY=https://registry.npmmirror.com
+# `npm ci` 照样可用 —— lockfile 里记的 tarball 主机是 registry.npmjs.org,而 npm 的
+# `replace-registry-host` 默认值(npmjs)就是"把它替换成配置的 registry";完整性哈希
+# 仍然逐个校验,换镜像不降低这一层保证。
+NPM_ENV=()
+[ -n "${CATMAN_NPM_REGISTRY:-}" ] && NPM_ENV+=(-e "npm_config_registry=$CATMAN_NPM_REGISTRY")
+
+# 把网络配置**说出来**。这一层失败时 npm 只会甩几百行日志外加一句自己的
+# "Exit handler never called!",真因(ENOTFOUND)埋在中间 —— 而它十有八九就是
+# "代理没传进来"。传没传进来是这里唯一说得清的地方,所以在这里说。
+log "网络:registry=${CATMAN_NPM_REGISTRY:-默认} 代理=${HTTPS_PROXY:-${https_proxy:-无}}"
+
 mkdir -p "$NPM_CACHE_DIR"
 
 # 全程在一次性容器里跑。--memory 让 npm ci 的内存峰值死在容器里,而不是让内核的
@@ -74,6 +87,7 @@ docker run --rm \
   --memory "${CATMAN_PREPARE_MEMORY:-1500m}" \
   --add-host host.docker.internal:host-gateway \
   "${PROXY_ENV[@]}" \
+  "${NPM_ENV[@]}" \
   -e "TZ=${TZ:-UTC}" \
   -e "SHA=$SHA" -e "BRANCH=$BRANCH" -e "PREV_SHA=$PREV_SHA" \
   -e "CATMAN_SRC_DIR=$SRC_DIR" -e "CATMAN_RELEASES_DIR=$RELEASES_DIR" \

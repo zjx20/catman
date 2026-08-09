@@ -196,6 +196,15 @@ docker compose logs -f          # 看启动日志(未设令牌时这里能看到
 DATA=/opt/services/catman/data                 # ← 换成你的绝对路径
 GID=$(stat -c '%g' /var/run/docker.sock)
 
+# ⚠️ 代理必须先在**当前 shell** 里存在,下面的 `-e HTTP_PROXY`(不带值)才有东西可传 ——
+# docker 对未设的变量是整个跳过,于是最内层的 npm ci 直接 ENOTFOUND,而 npm 会把真因
+# 埋在几百行日志中间再甩一句它自己的 "Exit handler never called!"。
+set -a; . ./.env; set +a
+
+# 够不着 registry.npmjs.org 时换镜像(npm ci 会连带把 lockfile 里的 tarball 主机也换掉,
+# 完整性哈希照常逐个校验)。不需要就别设。
+export CATMAN_NPM_REGISTRY=https://registry.npmmirror.com
+
 # ① 源码 clone 进数据卷。以 uid 10001 跑,产出目录的属主天然就对(agent 要在上面开分支)。
 #    私有仓库把部署密钥放 $DATA/ssh/id_ed25519(见下一节),公开仓库用 https:// 即可。
 docker run --rm -u 10001:10001 -v "$DATA:/data" \
@@ -211,10 +220,20 @@ docker run --rm -u 10001:10001 -v "$DATA:/data" \
 docker run --rm -u 0:0 \
   -v "$DATA:/data" -v /var/run/docker.sock:/var/run/docker.sock \
   -e HTTP_PROXY -e HTTPS_PROXY -e NO_PROXY -e http_proxy -e https_proxy -e no_proxy \
-  -e "TZ=${TZ:-UTC}" -e "DOCKER_GID=$GID" \
+  -e "TZ=${TZ:-UTC}" -e "DOCKER_GID=$GID" -e CATMAN_NPM_REGISTRY \
   -e CATMAN_DATA_DIR=/data -e "CATMAN_HOST_DATA_DIR=$DATA" \
   catman-env:1 \
   sh -c '/data/src/catman/scripts/evolve/init.sh && /data/src/catman/scripts/evolve/bless.sh'
+```
+
+制备那一步会打一行 `网络:registry=… 代理=…` —— 卡在 `npm ci` 时先看它,
+「代理=无」就说明上面那句 `set -a` 没生效。也可以单独探一次:
+
+```bash
+docker run --rm -e HTTP_PROXY -e HTTPS_PROXY -e http_proxy -e https_proxy catman-env:1 \
+  sh -c 'echo "proxy=[${https_proxy:-未设}]";
+         getent hosts registry.npmjs.org || echo "DNS 解析失败";
+         curl -sS -o /dev/null -m 10 -w "registry HTTP %{http_code}\n" https://registry.npmjs.org/'
 ```
 
 ### 私有仓库:部署密钥放哪、怎么进容器
