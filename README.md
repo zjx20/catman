@@ -175,7 +175,10 @@ docker build -t catman-env:1 -f docker/Dockerfile .
 # 2) 初始化:clone 源码到数据卷、制备第一个 release、立起指针
 scripts/evolve/init.sh
 
-# 3) 起服务
+# 3) 固化部署机制(自进化与 /回滚 要用,见「自进化」)
+scripts/evolve/bless.sh
+
+# 4) 起服务
 docker compose up -d
 docker compose logs -f          # 看启动日志(未设令牌时这里能看到自动生成的)
 # dashboard: http://<路由器内网IP>:8787/?token=<你的令牌>
@@ -183,11 +186,65 @@ docker compose logs -f          # 看启动日志(未设令牌时这里能看到
 
 首次启动还没有任何微信账号,日志会提示去 dashboard 扫码。
 
-想让 catman 能自己升级自己,再固化一次部署机制(见 [自进化](#自进化)):
+### 宿主上没有 bash / git / node 怎么办
+
+软路由(OpenWrt 等)常常只有 busybox 和 docker,连 `bash` 都没有。
+**第 2、3 步整个搬进容器跑就行** —— `catman-env` 里 bash、git、node、docker CLI 全都有,
+而它们要读写的东西本来就在数据卷里。宿主上需要的只有 `docker` 一个命令。
 
 ```bash
-scripts/evolve/bless.sh
+DATA=/opt/services/catman/data                 # ← 换成你的绝对路径
+GID=$(stat -c '%g' /var/run/docker.sock)
+
+# ① 源码 clone 进数据卷。以 uid 10001 跑,产出目录的属主天然就对(agent 要在上面开分支)。
+#    私有仓库把部署密钥放 $DATA/ssh/id_ed25519(见下一节),公开仓库用 https:// 即可。
+docker run --rm -u 10001:10001 -v "$DATA:/data" \
+  -e HTTP_PROXY -e HTTPS_PROXY -e NO_PROXY -e http_proxy -e https_proxy -e no_proxy \
+  -e GIT_SSH_COMMAND="ssh -i /data/ssh/id_ed25519 -o IdentitiesOnly=yes \
+      -o UserKnownHostsFile=/data/ssh/known_hosts -o StrictHostKeyChecking=accept-new" \
+  catman-env:1 \
+  sh -c 'mkdir -p /data/src && git clone -b <分支> git@github.com:<你>/catman.git /data/src/catman'
+
+# ② init + bless。要 root(得 chown 给 10001/10002),要 docker.sock(要起制备容器)。
+#    CATMAN_DATA_DIR 是容器内的路径,CATMAN_HOST_DATA_DIR 是宿主路径 —— 两者都要给:
+#    前者是它自己要写的地方,后者是它转手传给下一层 `docker run -v` 的。
+docker run --rm -u 0:0 \
+  -v "$DATA:/data" -v /var/run/docker.sock:/var/run/docker.sock \
+  -e HTTP_PROXY -e HTTPS_PROXY -e NO_PROXY -e http_proxy -e https_proxy -e no_proxy \
+  -e "TZ=${TZ:-UTC}" -e "DOCKER_GID=$GID" \
+  -e CATMAN_DATA_DIR=/data -e "CATMAN_HOST_DATA_DIR=$DATA" \
+  catman-env:1 \
+  sh -c '/data/src/catman/scripts/evolve/init.sh && /data/src/catman/scripts/evolve/bless.sh'
 ```
+
+### 私有仓库:部署密钥放哪、怎么进容器
+
+密钥**就放在数据卷里**,于是任何挂了 `/data` 的容器天然看得到,不需要额外挂载 ——
+这也是唯一能同时喂给引导容器和将来 agent 的位置。
+
+```bash
+mkdir -p "$DATA/ssh"
+cp ~/deploy_key "$DATA/ssh/id_ed25519"
+chmod 700 "$DATA/ssh" && chmod 600 "$DATA/ssh/id_ed25519"
+chown -R 10001:10001 "$DATA/ssh"
+```
+
+`chown` 到 10001 不是随手写的:**ssh 对私钥有属主检查** —— 文件必须归**当前用户**
+(或 root)且权限 0600,否则一律拒用。所以约定归 agent 那个 uid,网络 git 操作也就
+统一以 10001 的身份做。`init.sh` 会自动探测 `$DATA/ssh/id_ed25519` 并设好
+`GIT_SSH_COMMAND`(也可以用 `CATMAN_GIT_SSH_KEY` 指到别处)。
+
+给 catman 容器加上同一行 env,agent 就能自己 fetch/push:
+
+```yaml
+GIT_SSH_COMMAND: "ssh -i /data/ssh/id_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=/data/ssh/known_hosts"
+```
+
+> **SSH 出不去的话改用 HTTPS + token。** 部署密钥只能走 SSH,而 HTTP 代理转发不了裸 TCP;
+> 端口 22 被挡时可试 `ssh.github.com:443`,再不行就用细粒度只读 PAT 走
+> `https://<token>@github.com/...`(注意 token 会明文留在 `.git/config` 里)。
+> 另外密钥读得到 = 助手也读得到 —— 它跑在 `bypassPermissions` 下、`/data` 全开。
+> 考虑到挂了 docker.sock 的助手本来就等同宿主 root,这不构成新的提权,但值得知道。
 
 > **架构不必再操心**:依赖是在**目标机器上**用 `catman-env` 装的(见 `scripts/evolve/prepare.sh`),
 > 天然就是对的架构。以前那套 buildx + QEMU 多架构构建随源码直跑一起消失了 ——

@@ -78,13 +78,17 @@ json_write() { # json_write <file> <json字符串>
 # (报错里的路径带 `.git` 后缀)—— 只加前一条会一路正常到 clone 那步再炸。
 # 有单测用 git 自带的 GIT_TEST_ASSUME_DIFFERENT_OWNER 开关钉着这两条。
 # 用环境变量而不是 `-c`:调用方还要把它们透传给一次性容器里的一串 git 命令。
-git_trust_repo() { # git_trust_repo <仓库目录>
-  local dir="$1"
-  export GIT_CONFIG_COUNT=2
-  export GIT_CONFIG_KEY_0=safe.directory
-  export GIT_CONFIG_VALUE_0="$dir"
-  export GIT_CONFIG_KEY_1=safe.directory
-  export GIT_CONFIG_VALUE_1="$dir/.git"
+git_trust_repo() { # git_trust_repo <仓库目录>...
+  local n=0 dir
+  for dir in "$@"; do
+    export "GIT_CONFIG_KEY_$n=safe.directory"
+    export "GIT_CONFIG_VALUE_$n=$dir"
+    n=$((n + 1))
+    export "GIT_CONFIG_KEY_$n=safe.directory"
+    export "GIT_CONFIG_VALUE_$n=$dir/.git"
+    n=$((n + 1))
+  done
+  export GIT_CONFIG_COUNT="$n"
 }
 
 # ── 部署锁 ─────────────────────────────────────────────────────────

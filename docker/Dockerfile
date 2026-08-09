@@ -47,8 +47,14 @@ FROM node:22-bookworm-slim
 
 # 运行时需要 git/ripgrep 等常用工具(助手在容器内执行命令时常用;
 # git 还是制备 release 的必需品 —— 每个 release 是一次浅 clone)。
+#
+# `openssh-client` 必须显式列出:它只是 git 的 **Recommends**,而这里用了
+# `--no-install-recommends`,所以不写就没有 —— 而没有它,任何 `git@github.com:` 形式的
+# 远端(部署密钥的唯一用法)都会以 "cannot run ssh: No such file or directory" 失败。
+# 私有仓库的拉取是自进化的必经之路,这一条不算可选。
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git ripgrep ca-certificates curl tini \
+  && apt-get install -y --no-install-recommends \
+       git openssh-client ripgrep ca-certificates curl tini \
   && rm -rf /var/lib/apt/lists/*
 
 # Docker CE 的 apt 源。默认官方站,但它是整个构建里**唯一**一处容易够不着的地方 ——

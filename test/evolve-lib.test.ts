@@ -210,6 +210,19 @@ test("git 属主放行:git_trust_repo 之后 rev-parse 与 clone 都能过", () 
   });
 });
 
+test("git 属主放行:一次可以放行多个仓库(init 要同时碰源仓库与目标仓库)", () => {
+  withDir((dir) => {
+    const a = makeSrcRepo(dir);
+    execFileSync("bash", ["-c", `git clone -q "${a}" "${join(dir, "second")}"`]);
+    const b = join(dir, "second");
+    const script =
+      `export GIT_TEST_ASSUME_DIFFERENT_OWNER=1; git_trust_repo "${a}" "${b}"; ` +
+      `git -C "${a}" rev-parse HEAD >/dev/null && echo A-OK; ` +
+      `git -C "${b}" rev-parse HEAD >/dev/null && echo B-OK`;
+    assert.deepEqual(inLib(dir, script).split("\n"), ["A-OK", "B-OK"]);
+  });
+});
+
 test("JSON:写入是原子的且能读回来,含特殊字符也不破坏结构", () => {
   withDir((dir) => {
     const file = join(dir, "x.json");

@@ -4,6 +4,11 @@
 # 用法(在宿主上,catman 项目目录里):
 #   CATMAN_HOST_DATA_DIR=/absolute/path/to/data scripts/evolve/init.sh
 #
+# 宿主上没有 bash/git/node(软路由常态)时,**整个搬进容器跑**:镜像里这些都有,
+# 而它要读写的东西本来就在数据卷里。那时 CATMAN_DATA_DIR 给容器内的 /data、
+# CATMAN_HOST_DATA_DIR 给宿主路径 —— 前者是它自己要写的地方,后者是它转手传给
+# 下一层 `docker run -v` 的。具体命令见 README「宿主上没有 bash / git / node 怎么办」。
+#
 # ## 它解决的是一个鸡生蛋问题
 #
 # 源码直跑之后,容器的 command 指向数据卷里的 `releases/current` —— 而全新机器上
@@ -18,6 +23,9 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
+# 只为了 git_trust_repo —— 见下面调用处的说明。lib.sh 只定义函数与默认值,没有副作用。
+# shellcheck source=lib.sh
+. "$HERE/lib.sh"
 
 DATA_DIR="${CATMAN_DATA_DIR:-$REPO/data}"
 HOST_DATA_DIR="${CATMAN_HOST_DATA_DIR:-$DATA_DIR}"
@@ -46,14 +54,32 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
 
 mkdir -p "$RELEASES_HOST" "$DATA_DIR/src" "$DATA_DIR/npm-cache"
 
+# 源码仓库可能是别人(uid 10001)clone 的,而这个脚本通常以 root 跑 —— 属主一不同
+# git 就 "detected dubious ownership",下面的 rev-parse 直接死掉。见 lib.sh 的说明。
+# 两个仓库都放行:引导副本($REPO)与数据卷里那份可能分属不同用户。
+git_trust_repo "$SRC_DIR_HOST" "$REPO"
+
+# 部署密钥(可选)。它就放在数据卷里,所以任何挂了 /data 的容器天然看得到,
+# 不需要额外挂载 —— 这也是唯一能同时喂给引导容器和将来 agent 的位置。
+# ⚠️ ssh 对私钥有属主检查:文件必须归**当前用户**(或 root)且权限 0600,
+# 否则一律拒用。所以约定归 uid 10001(agent 是它的长期使用者),网络 git 操作
+# 也就都以 10001 的身份做。known_hosts 与它放一起,免得每次都要交互确认。
+SSH_KEY="${CATMAN_GIT_SSH_KEY:-$DATA_DIR/ssh/id_ed25519}"
+if [ -f "$SSH_KEY" ] && [ -z "${GIT_SSH_COMMAND:-}" ]; then
+  export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$DATA_DIR/ssh/known_hosts -o StrictHostKeyChecking=accept-new"
+  echo "使用部署密钥:$SSH_KEY"
+fi
+
 # 源码仓库落到数据卷里:此后 agent 在它上面开分支干活,而它与 release 目录
 # 是两回事 —— release 是从这里 clone 出去的、只读的、可回滚的快照。
 if [ ! -d "$SRC_DIR_HOST/.git" ]; then
   echo "把源码 clone 到 $SRC_DIR_HOST"
   git clone "$REPO" "$SRC_DIR_HOST"
 else
-  echo "源码仓库已存在,拉取最新提交"
-  git -C "$SRC_DIR_HOST" fetch origin --quiet || true
+  # 拉不到就跳过(网络不通、密钥归属对不上都算)。这一步只是顺手刷新,
+  # 真正要制备哪个提交由下面的 rev-parse 说了算 —— 本地已有的引用足够。
+  echo "源码仓库已存在,顺手拉一次最新提交(失败则跳过)"
+  git -C "$SRC_DIR_HOST" fetch origin --quiet || echo "  拉取失败,用本地已有的引用继续"
 fi
 
 # 属主必须交给对应的 uid。制备与部署跑在以 10002 运行的一次性容器里,而 agent 以

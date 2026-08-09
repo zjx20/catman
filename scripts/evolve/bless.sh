@@ -4,6 +4,8 @@
 # 用法(在宿主上,catman 项目目录里):
 #   CATMAN_HOST_DATA_DIR=/absolute/path/to/data scripts/evolve/bless.sh
 #
+# 宿主上没有 bash 时同样可以整个搬进容器跑(与 init.sh 一样,见 README)。
+#
 # ## 它固化什么,为什么
 #
 # 把 `scripts/evolve/` 里的脚本拷进 `/data/deploy/bin/`,并记下 `/data` 在**宿主上
@@ -35,7 +37,10 @@ case "$HOST_DATA_DIR" in
   /*) ;;
   *) echo "CATMAN_HOST_DATA_DIR 必须是绝对路径,拿到的是:$HOST_DATA_DIR" >&2; exit 1 ;;
 esac
-[ -d "$HOST_DATA_DIR" ] || { echo "宿主目录不存在:$HOST_DATA_DIR" >&2; exit 1; }
+# 存在性只能查 $DATA_DIR —— 也就是这个脚本**自己要写进去**的那个路径。
+# $HOST_DATA_DIR 是给宿主上的 `docker run -v` 用的,本脚本在容器里跑时它在
+# 这个文件系统里根本不存在;拿它做 `-d` 判断会让容器内的 bless 必然失败。
+[ -d "$DATA_DIR" ] || { echo "数据目录不存在:$DATA_DIR" >&2; exit 1; }
 
 mkdir -p "$DEPLOY_DIR/bin"
 install -m 0755 "$HERE"/lib.sh "$HERE"/deployer.sh "$HERE"/deployer-run.sh "$DEPLOY_DIR/bin/"
