@@ -171,6 +171,45 @@ test("release 校验:缺关键文件一律拒绝", () => {
   }
 });
 
+/**
+ * git 的属主检查。制备时 deployer(10002)要读 agent(10001)的仓库,属主不同
+ * git 就拒绝打开 —— 而开发机上两者是同一个人,这条路径**永远碰不到**,
+ * 只会在真机第一次制备时炸。用 git 自带的测试开关把它搬到这里。
+ */
+function makeSrcRepo(dir: string): string {
+  const repo = join(dir, "srcrepo");
+  execFileSync("bash", [
+    "-c",
+    `set -e; git init -q "${repo}"; cd "${repo}"; ` +
+      `git -c user.email=a@b -c user.name=a commit -q --allow-empty -m init`,
+  ]);
+  return repo;
+}
+
+test("git 属主放行:没放行时 rev-parse 与 clone 都过不去(这就是真机上的症状)", () => {
+  withDir((dir) => {
+    const repo = makeSrcRepo(dir);
+    const script =
+      `export GIT_TEST_ASSUME_DIFFERENT_OWNER=1; ` +
+      `git -C "${repo}" rev-parse HEAD >/dev/null 2>&1 && echo REV-OK || echo REV-FAIL; ` +
+      `git clone -q --no-checkout "${repo}" "${join(dir, "a")}" >/dev/null 2>&1 && echo CLONE-OK || echo CLONE-FAIL`;
+    assert.deepEqual(inLib(dir, script).split("\n"), ["REV-FAIL", "CLONE-FAIL"]);
+  });
+});
+
+test("git 属主放行:git_trust_repo 之后 rev-parse 与 clone 都能过", () => {
+  // clone 认的是仓库下面的 `.git`,rev-parse 认的是仓库目录本身 —— 少放行一条,
+  // 就会一路正常到 clone 那步再炸。这个测试的全部价值就在于同时钉住这两条。
+  withDir((dir) => {
+    const repo = makeSrcRepo(dir);
+    const script =
+      `export GIT_TEST_ASSUME_DIFFERENT_OWNER=1; git_trust_repo "${repo}"; ` +
+      `git -C "${repo}" rev-parse HEAD >/dev/null && echo REV-OK; ` +
+      `git clone -q --no-checkout "${repo}" "${join(dir, "b")}" && echo CLONE-OK`;
+    assert.deepEqual(inLib(dir, script).split("\n"), ["REV-OK", "CLONE-OK"]);
+  });
+});
+
 test("JSON:写入是原子的且能读回来,含特殊字符也不破坏结构", () => {
   withDir((dir) => {
     const file = join(dir, "x.json");

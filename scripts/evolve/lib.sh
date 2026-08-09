@@ -68,6 +68,25 @@ json_write() { # json_write <file> <json字符串>
   ' "$file" "$payload"
 }
 
+# ── git:接受属主不同的仓库 ─────────────────────────────────────────
+# `/data/src/catman` 归 catman(10001)所有 —— agent 在上面开分支干活;而制备跑在
+# deployer(10002)下。属主一不同,git 就以 "detected dubious ownership" 拒绝打开它,
+# **第一条 git 命令就失败**,而这条路径在开发机上永远碰不到(那里两者是同一个人)。
+# 不是绕过安全检查:这个目录的属主正是 init.sh 自己设定的,不是外来仓库。
+#
+# **两条都要**:`rev-parse` 认的是仓库目录本身,而 `clone` 认的是它下面的 `.git`
+# (报错里的路径带 `.git` 后缀)—— 只加前一条会一路正常到 clone 那步再炸。
+# 有单测用 git 自带的 GIT_TEST_ASSUME_DIFFERENT_OWNER 开关钉着这两条。
+# 用环境变量而不是 `-c`:调用方还要把它们透传给一次性容器里的一串 git 命令。
+git_trust_repo() { # git_trust_repo <仓库目录>
+  local dir="$1"
+  export GIT_CONFIG_COUNT=2
+  export GIT_CONFIG_KEY_0=safe.directory
+  export GIT_CONFIG_VALUE_0="$dir"
+  export GIT_CONFIG_KEY_1=safe.directory
+  export GIT_CONFIG_VALUE_1="$dir/.git"
+}
+
 # ── 部署锁 ─────────────────────────────────────────────────────────
 # 带心跳的锁,不是简单的 mkdir 互斥:deployer 可能在 bake 期间(半小时)被 OOM
 # 杀掉,一个没有心跳的锁会把部署能力永久锁死;而看门狗要靠心跳超时来判断

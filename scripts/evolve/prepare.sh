@@ -30,6 +30,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 REF="${1:-HEAD}"
 
+# 源码仓库归 catman(10001),制备跑在 deployer(10002)下 —— 见 lib.sh 的说明。
+git_trust_repo "$SRC_DIR"
+
 command -v docker >/dev/null || die "容器里没有 docker CLI"
 [ -d "$SRC_DIR/.git" ] || die "源码仓库不在 $SRC_DIR —— 先 clone 一份(见 README「自进化」)"
 
@@ -72,6 +75,9 @@ docker run --rm \
   --add-host host.docker.internal:host-gateway \
   "${PROXY_ENV[@]}" \
   -e "TZ=${TZ:-UTC}" \
+  -e "GIT_CONFIG_COUNT=$GIT_CONFIG_COUNT" \
+  -e "GIT_CONFIG_KEY_0=$GIT_CONFIG_KEY_0" -e "GIT_CONFIG_VALUE_0=$GIT_CONFIG_VALUE_0" \
+  -e "GIT_CONFIG_KEY_1=$GIT_CONFIG_KEY_1" -e "GIT_CONFIG_VALUE_1=$GIT_CONFIG_VALUE_1" \
   -e "SHA=$SHA" -e "BRANCH=$BRANCH" -e "PREV_SHA=$PREV_SHA" \
   -e "SRC_DIR=$SRC_DIR" -e "RELEASES_DIR=$RELEASES_DIR" -e "NPM_CACHE_DIR=$NPM_CACHE_DIR" \
   -v "${CATMAN_HOST_DATA_DIR:?必须给出 /data 在宿主上的绝对路径}:/data" \
@@ -84,7 +90,8 @@ docker run --rm \
     # 那恰好死在"回滚之后想重新制备旧版本"这条事故恢复路径上。clone 出来的
     # release 自带 .git,删起来干干净净。
     # 不加 --shared:那会让 release 的 git 通过 alternates 依赖 /data/src 存活,
-    # release 就不再自包含了。本地路径 clone 默认硬链接对象,已经足够快。
+    # release 就不再自包含了。本地路径 clone 会尽量硬链接对象(属主不同 + 内核的
+    # protected_hardlinks 不允许时,git 自己退化成复制),两种都比走网络快得多。
     git clone --quiet --no-checkout "$SRC_DIR" "$WORK"
     git -C "$WORK" checkout --quiet --detach "$SHA"
 

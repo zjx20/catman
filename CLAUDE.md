@@ -469,6 +469,12 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
   JSON,于是**每一次部署都以「自检没过」告终,而 release 完全是好的**。把好版本判死的门
   比没有门更糟。改道不是静音:诊断全进 stderr,由 deployer 的容器日志收着。
   读取端同样防御式(`deployer.sh` 只取以 `{` 开头的最后一行)—— 自检代码属 Tier 1,每周都在变。
+- **制备要先让 git 接受属主不同的仓库**(`lib.sh` 的 `git_trust_repo`):`/data/src/catman`
+  归 catman(10001)—— agent 在上面开分支;而制备跑在 deployer(10002)下,属主一不同
+  git 就 "detected dubious ownership",**第一条 git 命令就失败**。开发机上两者是同一个人,
+  所以这条路径只会在真机上炸。**两条 safe.directory 都要**:`rev-parse` 认仓库目录,
+  `clone` 认它下面的 `.git` —— 少一条会一路正常到 clone 那步再炸。
+  单测用 git 自带的 `GIT_TEST_ASSUME_DIFFERENT_OWNER` 开关钉住。
 - **一次性容器要显式补 docker.sock 的属组**(`init.sh` / `deployer-run.sh` / `bless.sh` 的
   `DOCKER_GID`):它们以 uid 10002 跑,而 socket 的属组是**宿主**的事实(OpenWrt 多为 0,
   Debian 多为 999),镜像里无从得知 —— 与 compose 给主容器 `group_add` 是同一个决定。
