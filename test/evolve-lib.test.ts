@@ -1,7 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, symlinkSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+  symlinkSync,
+  existsSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -258,6 +266,59 @@ test("git 属主放行:一次可以放行多个仓库(init 要同时碰源仓库
       `git -C "${a}" rev-parse HEAD >/dev/null && echo A-OK; ` +
       `git -C "${b}" rev-parse HEAD >/dev/null && echo B-OK`;
     assert.deepEqual(inLib(dir, script).split("\n"), ["A-OK", "B-OK"]);
+  });
+});
+
+/**
+ * GC。这是整套脚本里最危险的一个函数 —— 它是唯一会 `rm -rf` 的地方,而它删错的
+ * 东西恰恰是出事时要回退的目标。真机上发生过一次:三个指针被当成 release 目录,
+ * 顺着链接把 current 与全部回滚目标的内容一起掏空了。
+ */
+
+/** release 目录一律以 40 位十六进制命名(prepare 用的是 `git rev-parse` 的输出)。 */
+const SHA = (c: string) => c.repeat(40);
+
+test("GC:指针不是 release —— 绝不能顺着 current/stable/pinned 把目标掏空", () => {
+  // 带尾斜杠的 glob 会把**指向目录的符号链接**一并列出来,而它们的名字当然不在
+  // 保留集里;`rm -rf current/` 于是跟着链接进去删内容,链接本身完好无损 ——
+  // 日志上只有一句"GC 清理 release current",而 current 与回滚目标同时变成空目录。
+  withDir((dir) => {
+    const [a, b] = [SHA("a"), SHA("b")];
+    makeRelease(dir, a);
+    makeRelease(dir, b);
+    inLib(dir, `history_push ${a}`);
+    inLib(dir, `pointer_set current ${a}; pointer_set stable ${a}; pointer_set pinned ${b}`);
+    inLib(dir, `release_gc`);
+
+    assert.ok(existsSync(join(dir, a, "VERSION")), "current/stable 指着的 release 被掏空了");
+    assert.ok(existsSync(join(dir, b, "VERSION")), "pinned 指着的 release 被掏空了");
+    assert.equal(inLib(dir, `pointer_sha current`), a, "指针本身也得还在");
+    assert.equal(inLib(dir, `pointer_sha pinned`), b);
+  });
+});
+
+test("GC:清单与指针都不认的才删", () => {
+  withDir((dir) => {
+    const [a, c] = [SHA("a"), SHA("c")];
+    makeRelease(dir, a);
+    makeRelease(dir, c);
+    inLib(dir, `history_push ${a}; pointer_set current ${a}; release_gc`);
+    assert.ok(existsSync(join(dir, a)), "清单里的要留");
+    assert.ok(!existsSync(join(dir, c)), "谁都不认的该删,否则磁盘会被历史版本吃光");
+  });
+});
+
+test("GC:名字不像 release 的一概不碰 —— 宁可漏删,不可错删", () => {
+  // 第二道闸。制备中途留下的 `<sha>.tmp`、人手工放进来的东西,都不该被 GC 处置:
+  // 漏删只是占点磁盘(人看得见),错删的却是出事时唯一能回退的东西。
+  withDir((dir) => {
+    const a = SHA("a");
+    makeRelease(dir, a);
+    makeRelease(dir, `${a.slice(0, 39)}.tmp`);
+    mkdirSync(join(dir, "某个手工放进来的目录"), { recursive: true });
+    inLib(dir, `history_push ${a}; pointer_set current ${a}; release_gc`);
+    assert.ok(existsSync(join(dir, `${a.slice(0, 39)}.tmp`)), "制备中途的 .tmp 不该被动");
+    assert.ok(existsSync(join(dir, "某个手工放进来的目录")), "不认识的目录不该被动");
   });
 });
 

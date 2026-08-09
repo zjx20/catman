@@ -212,33 +212,9 @@ pick_rollback_target() {
 }
 
 # ── GC ─────────────────────────────────────────────────────────────
-# 保留集 = 已验证清单 ∪ **全部指针指向的目录**。
-# 指针那一半不能少:守护人格钉住的那个 release 天然是最老的,只按"保留最近 N 个"
-# 清理会把它的脚下抽空 —— 而活着的进程握着已删除的 inode 照样在跑,直到某次
-# 断电重启才暴露,那正是最需要它的时刻。
-gc() {
-  local keep_file; keep_file="$(mktemp)"
-  history_shas > "$keep_file"
-  local name p
-  for name in current stable pinned pinned-prev; do
-    p="$(pointer_sha "$name")"
-    [ -n "$p" ] && echo "$p" >> "$keep_file"
-  done
-  sort -u "$keep_file" -o "$keep_file"
-
-  local dir sha
-  for dir in "$RELEASES_DIR"/*/; do
-    [ -d "$dir" ] || continue
-    sha="$(basename "$dir")"
-    case "$sha" in *.tmp) continue ;; esac
-    if ! grep -qx "$sha" "$keep_file"; then
-      log "GC 清理 release $sha"
-      chmod -R u+w "$dir" 2>/dev/null || true
-      rm -rf "$dir"
-    fi
-  done
-  rm -f "$keep_file"
-}
+# 实现在 lib.sh(release_gc):它是这套脚本里最危险的一个函数,放在 lib.sh 才能被
+# shell 层的单测直接跑起来验 —— 曾经有一版把 current/stable/pinned 三个指针当成
+# release 目录删掉,把它们指向的内容全部掏空。
 
 # ── 三种模式 ───────────────────────────────────────────────────────
 
@@ -287,7 +263,7 @@ do_deploy() {
   # 到这里才前移 stable —— 观察期是真正的门。
   pointer_set stable "$sha"
   history_push "$sha"
-  gc
+  release_gc
   local note="已上线并通过 ${BAKE_SECONDS}s 观察期。"
   [ "$drained_ok" = "1" ] || note="$note(切换时还有消息在处理,可能有丢失)"
   report deployed "$sha" "$note" "" "$bg"

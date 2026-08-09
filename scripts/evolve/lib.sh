@@ -295,6 +295,50 @@ container_restarts() {
 # 而那恰恰是真正被执行的字节。所以完整性靠制备时生成的内容清单:
 # 切换到任何一个 release 之前重验一次,不符就拒绝并往回找下一个可验证的目标。
 
+# ── GC ─────────────────────────────────────────────────────────────
+# 保留集 = 已验证清单 ∪ **全部指针指向的目录**。
+# 指针那一半不能少:守护人格钉住的那个 release 天然是最老的,只按"保留最近 N 个"
+# 清理会把它的脚下抽空 —— 而活着的进程握着已删除的 inode 照样在跑,直到某次
+# 断电重启才暴露,那正是最需要它的时刻。
+#
+# ⚠️ **指针本身不是 release,枚举时必须跳过。** 带尾斜杠的 glob(`"$DIR"/*/`)会把
+# current/stable/pinned 这些**指向目录的符号链接**一并列出来,而它们的名字当然不在
+# 保留集里 —— 于是 `rm -rf current/` 顺着链接进去**把目标 release 的内容掏空**,
+# 链接本身完好无损,日志上只有一句轻描淡写的"GC 清理 release current"。
+# 结果是 current 与全部回滚目标同时变成空目录:保留集算得再对也白搭,因为删错的
+# 不是"没被保留的那些",而是"保留集本身指着的那些"。真机上发生过。
+release_gc() {
+  local keep_file
+  keep_file="$(mktemp)"
+  history_shas > "$keep_file"
+  local name p
+  for name in current stable pinned pinned-prev; do
+    p="$(pointer_sha "$name")"
+    [ -n "$p" ] && echo "$p" >> "$keep_file"
+  done
+  sort -u "$keep_file" -o "$keep_file"
+
+  local dir sha
+  for dir in "$RELEASES_DIR"/*/; do
+    dir="${dir%/}"
+    [ -L "$dir" ] && continue   # 指针,不是 release
+    [ -d "$dir" ] || continue
+    sha="$(basename "$dir")"
+    # 第二道闸:只认 release 的命名。prepare 一律用 `git rev-parse` 的 40 位十六进制,
+    # 所以"名字不像 release 的东西"一概不碰 —— 包括制备中途留下的 `<sha>.tmp`。
+    # 宁可漏删(占点磁盘,人能看见),不可错删(删掉的正是出事时要回退的东西)。
+    case "$sha" in *[!0-9a-f]* | "") continue ;; esac
+    [ "${#sha}" -eq 40 ] || continue
+    if ! grep -qx "$sha" "$keep_file"; then
+      log "GC 清理 release $sha"
+      chmod -R u+w "$dir" 2>/dev/null || true
+      rm -rf "$dir"
+    fi
+  done
+  rm -f "$keep_file"
+}
+
+# ── release 校验 ───────────────────────────────────────────────────
 release_verify() { # release_verify <sha>
   # ⚠️ 分两句写。`local a="$1" b="…$a"` 在 `set -u` 下会炸:local 先把两个名字都
   # 建成**未赋值**的局部变量,再逐个赋值 —— 第二个赋值里的 $a 因此是 unbound,
