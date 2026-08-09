@@ -205,6 +205,12 @@ set -a; . ./.env; set +a
 # 完整性哈希照常逐个校验)。不需要就别设。
 export CATMAN_NPM_REGISTRY=https://registry.npmmirror.com
 
+# 制备容器的内存上限。node 的测试运行器按 CPU 数并行开进程,小机器上很容易顶到它 ——
+# 被杀掉的测试文件在汇总里表现为 **cancelled** 而不是 fail,光看汇总看不出是内存。
+# 两个方向二选一(或都用):放宽上限,或压住测试并发。
+# export CATMAN_PREPARE_MEMORY=2500m
+# export CATMAN_TEST_FLAGS="--test-concurrency=2"
+
 # ① 源码 clone 进数据卷。以 uid 10001 跑,产出目录的属主天然就对(agent 要在上面开分支)。
 #    私有仓库把部署密钥放 $DATA/ssh/id_ed25519(见下一节),公开仓库用 https:// 即可。
 docker run --rm -u 10001:10001 -v "$DATA:/data" \
@@ -220,14 +226,27 @@ docker run --rm -u 10001:10001 -v "$DATA:/data" \
 docker run --rm -u 0:0 \
   -v "$DATA:/data" -v /var/run/docker.sock:/var/run/docker.sock \
   -e HTTP_PROXY -e HTTPS_PROXY -e NO_PROXY -e http_proxy -e https_proxy -e no_proxy \
-  -e "TZ=${TZ:-UTC}" -e "DOCKER_GID=$GID" -e CATMAN_NPM_REGISTRY \
+  -e "TZ=${TZ:-UTC}" -e "DOCKER_GID=$GID" \
+  -e CATMAN_NPM_REGISTRY -e CATMAN_PREPARE_MEMORY -e CATMAN_TEST_FLAGS \
   -e CATMAN_DATA_DIR=/data -e "CATMAN_HOST_DATA_DIR=$DATA" \
   catman-env:1 \
   sh -c '/data/src/catman/scripts/evolve/init.sh && /data/src/catman/scripts/evolve/bless.sh'
 ```
 
-制备那一步会打一行 `网络:registry=… 代理=…` —— 卡在 `npm ci` 时先看它,
-「代理=无」就说明上面那句 `set -a` 没生效。也可以单独探一次:
+制备那一步会打两行 `网络:…` 与 `资源:…` —— 卡住时先看它们:
+`npm ci` 报 ENOTFOUND 而「代理=无」,说明上面那句 `set -a` 没生效;
+测试汇总里出现 **cancelled**(不是 fail),八成是顶到了内存上限,调那两个旋钮。
+
+制备失败后 `<sha>.tmp` 会留在原地(下次制备开头才清),所以**不必重跑整条流水线**,
+直接在那棵已经装好依赖的树上复现:
+
+```bash
+docker run --rm -u 10002:10002 -v "$DATA:/data" \
+  -w "/data/releases/$(ls -d $DATA/releases/*.tmp | head -1 | xargs basename)" \
+  catman-env:1 npm test 2>&1 | tail -60
+```
+
+网络问题也可以单独探一次:
 
 ```bash
 docker run --rm -e HTTP_PROXY -e HTTPS_PROXY -e http_proxy -e https_proxy catman-env:1 \

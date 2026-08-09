@@ -20,11 +20,18 @@ const LIB = fileURLToPath(new URL("../scripts/evolve/lib.sh", import.meta.url));
 
 /** 在一个临时 RELEASES_DIR 里 source lib.sh 并执行一段脚本,返回 stdout。 */
 function inLib(releasesDir: string, script: string): string {
-  return execFileSync(
-    "bash",
-    ["-c", `set -euo pipefail; export CATMAN_RELEASES_DIR="${releasesDir}"; . "${LIB}"; ${script}`],
-    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-  ).trim();
+  // 每个用例一份独立的 git 配置,并且**清掉继承来的 GIT_CONFIG_GLOBAL** ——
+  // 制备时 prepare 会导出它,而 `npm test` 就跑在那之后:测试必须验的是这份 lib.sh
+  // 的行为,不是它碰巧继承到什么。
+  const prelude =
+    `set -euo pipefail; ` +
+    `export CATMAN_RELEASES_DIR="${releasesDir}"; ` +
+    `export CATMAN_GIT_CONFIG="${releasesDir}/gitconfig"; ` +
+    `unset GIT_CONFIG_GLOBAL; `;
+  return execFileSync("bash", ["-c", `${prelude} . "${LIB}"; ${script}`], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
 }
 
 function withDir(fn: (dir: string) => void): void {
@@ -224,6 +231,20 @@ test("git 属主放行:必须扛得住 git 对子进程的环境清洗", () => {
       `env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS git -C "${repo}" rev-parse HEAD >/dev/null ` +
       `&& echo SURVIVED-CLEANSING`;
     assert.equal(inLib(dir, script), "SURVIVED-CLEANSING");
+  });
+});
+
+test("git 属主放行:调两次不能把 git 弄坏(制备导出后 npm test 会再调一次)", () => {
+  // 第二次调用时 GIT_CONFIG_GLOBAL 已经指向我们自己那份配置。若照旧把它 include
+  // 进自己,就是循环 include —— git 会以 "exceeded maximum include depth" 拒掉
+  // **该进程里的每一条 git 命令**,不是某一条失败,是全废。
+  // 真机上这条路径确实走到了:prepare 调一次并导出,`npm test` 继承,测试里再调。
+  withDir((dir) => {
+    const repo = makeSrcRepo(dir);
+    const script =
+      `git_trust_repo "${repo}"; git_trust_repo "${repo}"; ` +
+      `git -C "${repo}" rev-parse HEAD >/dev/null && echo STILL-WORKS`;
+    assert.equal(inLib(dir, script), "STILL-WORKS");
   });
 });
 

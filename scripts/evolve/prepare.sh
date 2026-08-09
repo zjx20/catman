@@ -76,6 +76,10 @@ NPM_ENV=()
 # "Exit handler never called!",真因(ENOTFOUND)埋在中间 —— 而它十有八九就是
 # "代理没传进来"。传没传进来是这里唯一说得清的地方,所以在这里说。
 log "网络:registry=${CATMAN_NPM_REGISTRY:-默认} 代理=${HTTPS_PROXY:-${https_proxy:-无}}"
+# 内存上限同理。node 的测试运行器按 CPU 数并行开进程,小机器上很容易顶到 --memory,
+# 被杀掉的那些文件在汇总里表现为 **cancelled**(不是 fail)—— 而汇总里看不出内存这回事。
+# CATMAN_TEST_FLAGS 就是那时候要用的旋钮,比如 --test-concurrency=2。
+log "资源:内存=${CATMAN_PREPARE_MEMORY:-1500m} 测试参数=${CATMAN_TEST_FLAGS:-默认}"
 
 mkdir -p "$NPM_CACHE_DIR"
 
@@ -88,7 +92,7 @@ docker run --rm \
   --add-host host.docker.internal:host-gateway \
   "${PROXY_ENV[@]}" \
   "${NPM_ENV[@]}" \
-  -e "TZ=${TZ:-UTC}" \
+  -e "TZ=${TZ:-UTC}" -e "CATMAN_TEST_FLAGS=${CATMAN_TEST_FLAGS:-}" \
   -e "SHA=$SHA" -e "BRANCH=$BRANCH" -e "PREV_SHA=$PREV_SHA" \
   -e "CATMAN_SRC_DIR=$SRC_DIR" -e "CATMAN_RELEASES_DIR=$RELEASES_DIR" \
   -e "CATMAN_NPM_CACHE_DIR=$NPM_CACHE_DIR" -e "LIB=$HERE/lib.sh" \

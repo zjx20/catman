@@ -4,7 +4,7 @@
   "description": "Personal Claude assistant on OpenWrt Docker with WeChat (iLink) gateway",
   "main": "index.js",
   "scripts": {
-    "test": "node --import tsx --test test/**/*.test.ts",
+    "test": "node --import tsx --test ${CATMAN_TEST_FLAGS:-} test/**/*.test.ts",
     "build": "tsc",
     "start": "node dist/src/index.js",
     "dev": "tsx src/index.ts",

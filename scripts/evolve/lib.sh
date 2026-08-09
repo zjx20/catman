@@ -90,10 +90,18 @@ json_write() { # json_write <file> <json字符串>
 # 而 git 对读不到的 global 配置是静默当空的,例外就这么无声无息地丢了。
 git_trust_repo() { # git_trust_repo <仓库目录>...
   local cfg="${CATMAN_GIT_CONFIG:-/tmp/catman-gitconfig}" dir
-  : > "$cfg"
-  # 保留原有的 global 配置(用户名/邮箱等):我们是往上叠两条例外,不是替掉人家的配置。
   local prev="${GIT_CONFIG_GLOBAL:-${HOME:-}/.gitconfig}"
-  if [ -f "$prev" ]; then git config --file "$cfg" --add include.path "$prev"; fi
+  # **绝不能把这份配置 include 进它自己。** 第二次调用时 GIT_CONFIG_GLOBAL 已经指向
+  # cfg,若照旧 include 一次就成了循环,git 会以 "exceeded maximum include depth"
+  # 拒掉**该进程里的每一条 git 命令** —— 不是某一条失败,是全废。
+  # 这条路径不是假想:prepare 先调一次并导出 GIT_CONFIG_GLOBAL,随后 `npm test`
+  # 继承了它,测试里再调一次,于是整个测试进程的 git 全挂。
+  # 所以只有第一次(prev 还不是我们自己)才重建;之后只追加例外。
+  if [ "$prev" != "$cfg" ]; then
+    : > "$cfg"
+    # 保留原有的 global 配置(身份、insteadOf、代理等):我们是往上叠例外,不是替掉它。
+    if [ -f "$prev" ]; then git config --file "$cfg" --add include.path "$prev"; fi
+  fi
   for dir in "$@"; do
     git config --file "$cfg" --add safe.directory "$dir"
     git config --file "$cfg" --add safe.directory "$dir/.git"

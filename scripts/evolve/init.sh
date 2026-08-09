@@ -123,6 +123,7 @@ else
     -e "CATMAN_NPM_REGISTRY=${CATMAN_NPM_REGISTRY:-}" \
     -e "CATMAN_PREPARE_MEMORY=${CATMAN_PREPARE_MEMORY:-1500m}" \
     -e "CATMAN_MIN_DISK_MB=${CATMAN_MIN_DISK_MB:-5120}" \
+    -e "CATMAN_TEST_FLAGS=${CATMAN_TEST_FLAGS:-}" \
     -v "$HOST_DATA_DIR:/data" \
     -v "$DOCKER_SOCK:/var/run/docker.sock" \
     -w /data/src/catman \
