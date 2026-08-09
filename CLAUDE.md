@@ -583,6 +583,18 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(`skills.ts`,只�
   而人恰恰靠远端判断线上是什么)。推失败(多半是远端也有人提交了)**只记日志,绝不反过来
   判部署失败**;同理**绝不 `--force`**,快进失败正是它该失败的样子。没有可写密钥时先说一句
   「跳过」再返回 —— 否则每次部署都会甩一段 ssh 的 Permission denied,看着像部署出了问题。
+- **验脚本行为的用例必须自带干净环境**(`test/evolve-lib.test.ts` 的 `cleanEnv`):
+  测试跑在**制备容器**里,而那个容器的 shell 是 `. /data/deploy/bin/lib.sh` 起来的 ——
+  `load_blessed_env` 于是把**真机的** `/data/deploy/env`(宿主路径、镜像名、docker 属组)
+  整个 export 进环境,`npm test` 一路继承。而它的语义是"已有值不覆盖",于是用例摆好的
+  那份固化 env 永远赢不了真机那份:**开发机上全绿,制备容器里报「部署机制还没固化」
+  并打出真机的路径**。所以这类用例一律剔除 `CATMAN_*` / `DOCKER_GID` /
+  `GIT_CONFIG_GLOBAL` / `GIT_SSH_COMMAND` 再起子进程 —— 验的是脚本对给定输入的行为,
+  不是它碰巧继承到什么。往固化 env 里加字段时这条自动继续管用。
+- **别拿 inode 号验"文件被换掉了"**:inode 号会被**回收** —— unlink 之后紧接着在同一个
+  目录建文件,文件系统很可能把刚释放的号再分配回来。要验"正在读它的进程不受影响",
+  就开一个 fd、换完再从那个 fd 读(`bless` 那条用例)。比对 inode 号在开发容器里碰巧
+  能过、在真机上直接假红,而假红比没有测试更浪费人。
 - **固化环境由 lib.sh 自己读**(`load_blessed_env`):谁 source 了 lib.sh 谁就自动拿到
   `/data/deploy/env` 里的宿主路径、镜像名、docker.sock 属组,调用点不必记得 export。
   这是 agent 能直接跑 `prepare.sh` 的前提(它的进程环境里没有宿主路径,而制备要拿它去

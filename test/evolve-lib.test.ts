@@ -51,6 +51,28 @@ function withDir(fn: (dir: string) => void): void {
   }
 }
 
+/**
+ * 一份**不带任何 catman 环境痕迹**的 env。
+ *
+ * 测试跑在制备容器里,而那个容器的 shell 是 `. /data/deploy/bin/lib.sh` 起来的 ——
+ * `load_blessed_env` 于是把**真机的** `/data/deploy/env`(宿主路径、镜像名、
+ * docker 属组)整个 export 进了环境,`npm test` 一路继承下来。而 `load_blessed_env`
+ * 的语义是"已有值不覆盖",所以用例摆好的那份固化 env 永远赢不了真机那份 ——
+ * 症状是用例在开发机上全绿、在制备容器里报「部署机制还没固化」并打出真机的路径。
+ *
+ * 结论不是"少 export 一点",而是**这类用例必须自带干净环境**:它验的是脚本对
+ * 给定输入的行为,不是它碰巧继承到什么。将来往固化 env 里加字段时这条同样管用。
+ */
+function cleanEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith("CATMAN_")) continue;
+    if (k === "DOCKER_GID" || k === "GIT_CONFIG_GLOBAL" || k === "GIT_SSH_COMMAND") continue;
+    env[k] = v;
+  }
+  return { ...env, ...extra };
+}
+
 /** 造一个通过 release_verify 的 release。 */
 function makeRelease(releasesDir: string, sha: string): void {
   const dir = join(releasesDir, sha);
@@ -392,7 +414,9 @@ function inBlessedLib(libPath: string, script: string, extraEnv: Record<string, 
   return execFileSync("bash", ["-c", `set -euo pipefail; . "${libPath}"; ${script}`], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, GIT_CONFIG_GLOBAL: "", ...extraEnv },
+    // 必须走 cleanEnv:这组用例验的正是"固化 env 的值有没有落进来",而环境里可能
+    // 已经有真机那份的同名变量 —— 那样验的就成了继承,不是加载。
+    env: cleanEnv(extraEnv),
   }).trim();
 }
 
@@ -638,18 +662,17 @@ test("分级报告:算不出差异时只说一句就跳过,绝不让制备失败
 
 const EVOLVE_DIR = fileURLToPath(new URL("../scripts/evolve", import.meta.url));
 
+
 /** 在临时目录里跑一次 bless,返回固化目录。 */
 function blessTo(dataDir: string): string {
   execFileSync("bash", [join(EVOLVE_DIR, "bless.sh")], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
-    env: {
-      ...process.env,
+    env: cleanEnv({
       CATMAN_DATA_DIR: dataDir,
       CATMAN_HOST_DATA_DIR: dataDir,
       DOCKER_GID: "999",
-      GIT_CONFIG_GLOBAL: "",
-    },
+    }),
   });
   return join(dataDir, "deploy");
 }
@@ -681,7 +704,7 @@ test("固化链路:deployer-run 组装出的 docker 参数 —— 属组、镜�
     const deployDir = blessTo(dataDir);
     const out = execFileSync("bash", [join(deployDir, "bin", "deployer-run.sh"), "rollback"], {
       encoding: "utf8",
-      env: { ...process.env, PATH: `${fakeDocker(dir)}:${process.env["PATH"]}` },
+      env: cleanEnv({ PATH: `${fakeDocker(dir)}:${process.env["PATH"]}` }),
     });
     assert.match(out, /--user 10002:10002/);
     assert.match(out, /--group-add 999/, "漏了属组的症状是一句 permission denied,而那正是最需要它的时刻");
@@ -697,31 +720,49 @@ test("固化链路:命令行上显式给的 CATMAN_IMAGE 赢过固化 env", () =
     const deployDir = blessTo(dataDir);
     const out = execFileSync("bash", [join(deployDir, "bin", "deployer-run.sh"), "status"], {
       encoding: "utf8",
-      env: {
-        ...process.env,
+      env: cleanEnv({
         PATH: `${fakeDocker(dir)}:${process.env["PATH"]}`,
         CATMAN_IMAGE: "catman-env:test",
-      },
+      }),
     });
     assert.match(out, /catman-env:test/);
   });
 });
 
-test("bless 换文件必须换 inode —— 正在跑的 deployer 是边读边执行的", () => {
-  // 观察期长达 30 分钟,人往往正是在等它的时候顺手跑一次 bless。**原地**覆写(`cp` 的
-  // 语义:保留 inode、改写字节)会让那个正在执行的 bash 从文件中间读到新内容,
-  // 执行一段前言不搭后语的代码 —— 而它手里攥着「切换到一半的版本」。
-  // `install` 先 unlink 再新建,所以老 inode 活到那个进程读完。这条用例拦的是
-  // 「把 install 简化成 cp」那种改法(实测:改成 cp 之后它变红)。
+test("bless 不能原地覆写 —— 正在读那个文件的 deployer 必须继续读到旧内容", () => {
+  // 观察期长达 30 分钟,人往往正是在等它的时候顺手跑一次 bless。bash 是**边读边执行**的:
+  // `cp` 保留目标 inode、原地改写字节,那个正在执行的 bash 会从文件中间读到新内容,
+  // 于是执行一段前言不搭后语的代码 —— 而它手里攥着「切换到一半的版本」。
+  // `install` 先 unlink 再新建,老 inode 活到那个进程读完。
+  //
+  // **验的是语义,不是 inode 号。** 上一版比对 bless 前后的 inode 号,而 inode 号是会被
+  // **回收**的:unlink 之后紧接着在同一个目录建文件,文件系统很可能把刚释放的号再分配
+  // 回来 —— 那条用例在开发容器里碰巧没撞上,在真机上直接假红。这里改成开一个 fd 指着
+  // 旧文件,bless 之后从那个 fd 读:`install` 下读到旧内容,`cp` 下读到新内容。
   withDir((dir) => {
     const dataDir = join(dir, "data");
-    mkdirSync(dataDir, { recursive: true });
-    const deployDir = blessTo(dataDir);
-    const target = join(deployDir, "bin", "deployer.sh");
-    const inodeOf = (p: string) =>
-      execFileSync("stat", ["-c", "%i", p], { encoding: "utf8" }).trim();
-    const before = inodeOf(target);
-    blessTo(dataDir); // 再固化一次,模拟"deployer 正跑着,人又 bless 了"
-    assert.notEqual(inodeOf(target), before, "必须是新 inode —— cp 那种原地覆写会复用旧的");
+    const bin = join(dataDir, "deploy", "bin");
+    mkdirSync(bin, { recursive: true });
+    const target = join(bin, "deployer.sh");
+    writeFileSync(target, "旧内容\n");
+
+    // fd 3 在 bless 之前打开,bless 之后再读 —— 正是"正在跑的脚本"的处境。
+    const held = execFileSync(
+      "bash",
+      [
+        "-c",
+        `exec 3< "${target}"; bash "${join(EVOLVE_DIR, "bless.sh")}" >/dev/null 2>&1; cat <&3`,
+      ],
+      {
+        encoding: "utf8",
+        env: cleanEnv({
+          CATMAN_DATA_DIR: dataDir,
+          CATMAN_HOST_DATA_DIR: dataDir,
+          DOCKER_GID: "999",
+        }),
+      },
+    );
+    assert.equal(held.trim(), "旧内容", "已打开的 fd 必须还看得到旧字节");
+    assert.match(readFileSync(target, "utf8"), /deployer/, "而新读者拿到的是新版本");
   });
 });
