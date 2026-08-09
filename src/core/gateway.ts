@@ -581,8 +581,13 @@ export class Gateway {
     clearTimeout(batch.timer);
     const deadline = batch.firstAt + windowMs * AGGREGATION_MAX_MULTIPLIER;
     const wait = Math.max(0, Math.min(windowMs, deadline - now));
+    // **这个定时器不 unref**,与超时提醒(reminderTimer)和心跳刻意不同。
+    // 分界线是「它手里有没有欠用户的东西」:提醒与心跳只是定期看一眼,晚一轮无所谓,
+    // 不该拦着进程退出;而这个定时器攥着**已经从渠道收下、长轮询游标也推进了**的消息 ——
+    // unref 等于宣告「只剩这批消息没处理时可以直接退出」,那批消息就真丢了。
+    // 症状也很隐蔽:生产进程总有 dashboard 与长轮询占着事件循环,永远看不出来;
+    // 只有在没有别的句柄时(测试进程、以及未来任何精简的宿主)才会暴露。
     batch.timer = setTimeout(() => this.flush(userKey), wait);
-    batch.timer.unref?.();
     return batch.done;
   }
 

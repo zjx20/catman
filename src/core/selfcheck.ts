@@ -136,8 +136,11 @@ export async function runSelfCheck(opts: SelfCheckOptions = {}): Promise<SelfChe
 
     // ── 第二段:大脑。一次真实请求,带硬超时与轮数上限,跑飞不了。
     const abort = new AbortController();
+    // **不 unref**:这个定时器欠着一个动作 —— 中止探测并给出 network 分类的结论。
+    // unref 掉的话,一旦事件循环没有别的句柄,进程会在它触发前直接退出、什么都不打印,
+    // 而 deployer 把「没有可解析的结论」判成代码问题 —— 一次上游卡顿就此废掉一个好版本。
+    // finally 里会 clearTimeout,所以它最多把进程多留 timeoutMs,而那正是该活着的时候。
     const timer = setTimeout(() => abort.abort(), timeoutMs);
-    timer.unref?.();
     const model = process.env["CATMAN_SELFCHECK_MODEL"] || DEFAULT_PROBE_MODEL;
     try {
       const probe = opts.runProbe ?? defaultProbe;

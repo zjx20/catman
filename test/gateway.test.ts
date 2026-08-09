@@ -967,6 +967,21 @@ test("聚合:/切换会话 id + 问题连发时合成一个回合,直接落在�
   assert.equal(last.resume, "sess-1", "问题应落在切到的会话里");
 });
 
+test("聚合:窗口里的定时器必须维持事件循环 —— 否则只剩这批消息时进程会直接退出", async () => {
+  // 这个定时器攥着**已经从渠道收下、长轮询游标也推进了**的消息,unref 掉就等于宣告
+  // 「只剩这批没处理时可以直接退出」,那批消息真丢。生产进程总有 dashboard 与长轮询
+  // 占着事件循环,永远看不出来;只有没有别的句柄时才暴露 —— 曾经就是靠制备容器里
+  // node 22 的测试运行器抓出来的(它见事件循环跑空就把后面的用例全判 cancelled)。
+  // 所以这里不靠特定 node 版本的行为,直接问运行时:这个定时器算不算"活着的句柄"。
+  const before = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+  const { channel } = build(() => 1_000_000, { settings: { messageAggregationMs: AGG } });
+  const done = channel.receive(U1, "先说一句"); // 故意不 await:此刻这批还在窗口里
+  await new Promise((r) => setImmediate(r));
+  const during = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+  assert.ok(during > before, "聚合窗口开着的时候,必须有一个维持事件循环的定时器");
+  await done;
+});
+
 test("聚合:切换失败时同批的问题不处理 —— 那些话是冲着目标会话说的", async () => {
   const t = 1_000_000;
   const { channel, agent } = build(() => t, { settings: { messageAggregationMs: AGG } });
