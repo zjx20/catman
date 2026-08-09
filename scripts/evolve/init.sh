@@ -153,6 +153,26 @@ key_report "agent 拉代码" "$FETCH_KEY" 10001 "私有仓库下拉不到远端�
 key_report "deployer 推远端" "${CATMAN_GIT_SSH_KEY:-$DATA_DIR/ssh/id_ed25519}" 10002 \
   "上线后远端不会自动跟上(不影响部署本身)"
 
+# ── 引导过没有 ─────────────────────────────────────────────────────
+# 判据是 `current` 指针在不在:它是"这台机器已经能跑 catman 了"的唯一充要标志。
+#
+# **已经引导过就绝不碰指针与已验证清单。** 下面那两段是**引导**动作:把三个指针
+# 立到一个从未过门的 release 上、并把清单重写成只有它一条。在一台活着的机器上重跑,
+# 后果是绕过整套门禁(smoke / 健康门 / 观察期)换掉线上版本,**并且把全部回滚目标
+# 从清单里抹掉** —— 而抹掉回滚目标这件事,恰恰要等到真出事那天才被发现。
+#
+# 配置类的动作(git 身份、agent 的拉码密钥、属主、诊断)反过来是幂等的、也确实需要
+# 能重跑,所以它们在上面、无条件执行。这就是这个脚本"可以重跑"的准确含义:
+# **重跑修的是配置,不是版本。**
+if [ -L "$RELEASES_HOST/current" ] || [ -e "$RELEASES_HOST/current" ]; then
+  echo
+  echo "这台机器已经引导过(current → $(basename "$(readlink -f "$RELEASES_HOST/current")"))。"
+  echo "已完成上面的配置动作;**跳过制备与指针** —— 换版本请走部署流水线:"
+  echo "  <固化目录>/bin/prepare.sh HEAD   然后   <固化目录>/bin/deployer-run.sh deploy <sha>"
+  echo "(在这里立指针会绕过 smoke / 健康门 / 观察期,还会把已验证清单里的回滚目标抹掉。)"
+  exit 0
+fi
+
 SHA="$(git -C "$SRC_DIR_HOST" rev-parse "$REF")"
 echo "首个 release:$SHA"
 

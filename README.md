@@ -320,7 +320,16 @@ docker exec catman /data/deploy/bin/prepare.sh HEAD
 
 # 部署:排水 → 自检 → 切换 → 健康门 → 30 分钟观察期,不通过自动回滚
 data/deploy/bin/deployer-run.sh deploy <上一步输出的 sha>
+
+# 观察期可以调短(它是 `docker run -d`,命令本身立刻返回,不占着你的终端)。
+# 演练或迁移时人就在旁边看着,两分钟够用:
+CATMAN_BAKE_SECONDS=120 data/deploy/bin/deployer-run.sh deploy <sha>
 ```
+
+⚠️ **日常别调短观察期。** 它是这套流水线里**真正的门** —— 启动能过不代表真实负载能过,
+最常见的失败恰恰是"起来了,第一个真实回合把它打崩"。调到两分钟等于把判据退化成
+"起来了就算过"。观察期内 `current ≠ stable`,所以那段时间的任何崩溃(含断电重启)
+都会自然落回 stable;缩短它就是缩短这层保护。
 
 `deployer-run.sh` 起的是一个**独立的一次性容器**(它要停掉 catman 自己,跑在 catman 里
 会连自己一起被杀)。跑起来就返回,进度看 `docker logs -f catman-deployer`,结论写进

@@ -706,3 +706,22 @@ test("固化链路:命令行上显式给的 CATMAN_IMAGE 赢过固化 env", () =
     assert.match(out, /catman-env:test/);
   });
 });
+
+test("bless 换文件必须换 inode —— 正在跑的 deployer 是边读边执行的", () => {
+  // 观察期长达 30 分钟,人往往正是在等它的时候顺手跑一次 bless。**原地**覆写(`cp` 的
+  // 语义:保留 inode、改写字节)会让那个正在执行的 bash 从文件中间读到新内容,
+  // 执行一段前言不搭后语的代码 —— 而它手里攥着「切换到一半的版本」。
+  // `install` 先 unlink 再新建,所以老 inode 活到那个进程读完。这条用例拦的是
+  // 「把 install 简化成 cp」那种改法(实测:改成 cp 之后它变红)。
+  withDir((dir) => {
+    const dataDir = join(dir, "data");
+    mkdirSync(dataDir, { recursive: true });
+    const deployDir = blessTo(dataDir);
+    const target = join(deployDir, "bin", "deployer.sh");
+    const inodeOf = (p: string) =>
+      execFileSync("stat", ["-c", "%i", p], { encoding: "utf8" }).trim();
+    const before = inodeOf(target);
+    blessTo(dataDir); // 再固化一次,模拟"deployer 正跑着,人又 bless 了"
+    assert.notEqual(inodeOf(target), before, "必须是新 inode —— cp 那种原地覆写会复用旧的");
+  });
+});

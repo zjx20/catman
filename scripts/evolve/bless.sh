@@ -46,6 +46,13 @@ mkdir -p "$DEPLOY_DIR/bin"
 # prepare.sh 与 deployer.sh 一起固化,理由完全相同:**制备门就在 prepare.sh 里**。
 # 让 agent 跑 release 里那份的话,一次把 `npm test` 改没了的进化会让此后每一次制备
 # 都不再跑测试,而日志上看起来一切正常。能改门的人不能是被门管的人。
+#
+# ⚠️ **必须用 `install`(或别的先 unlink 再建的方式),不能改成 `cp`。** bash 是
+# **边读边执行**的:它按文件偏移量一段段读脚本。`cp` 保留目标 inode、原地覆写字节,
+# 于是一个正在跑的脚本会从中间读到新内容,执行一段前言不搭后语的代码 —— 而"正在跑的"
+# 最可能是一个处在 30 分钟观察期里的 deployer,人往往正是在等它的时候顺手跑一次 bless。
+# `install` 先 unlink 再新建(实测:目标 inode 变了),老 inode 一直活到那个进程读完。
+# 有单测钉着"换文件必须换 inode"。
 install -m 0755 "$HERE"/lib.sh "$HERE"/deployer.sh "$HERE"/deployer-run.sh "$HERE"/prepare.sh \
   "$DEPLOY_DIR/bin/"
 
