@@ -40,7 +40,26 @@ if [ "$#" -gt 0 ]; then
 fi
 
 LINK="${CATMAN_RELEASE_LINK:-/data/releases/current}"
-ENTRY="dist/src/index.js"
+# 跑哪个进程。**同一个镜像、同一份 release,三种角色靠这一个变量分开**:
+#   (默认)  主人格 —— releases/current,每周被自动进化
+#   courier 信使   —— releases/pinned,稳定面,持有全部微信连接
+#   rescue  守护人格 —— releases/pinned,机械看门狗 + 无 LLM 状态页 + 按需大脑
+#
+# 三种角色写成三个入口文件而不是三个镜像:测试环境即生产环境这条纪律要求它们
+# 用的是同一份被测过的字节。角色选错的后果很直观(起来的是别的进程),
+# 而拼错则会落到下面的 * 分支,当场退出并说清有哪几个 —— 不静默按默认跑。
+case "${CATMAN_ROLE:-primary}" in
+  primary) ENTRY="dist/src/index.js" ;;
+  courier) ENTRY="dist/src/courier/main.js" ;;
+  # 守护人格与主人格是**同一个入口**,差别全在配置(数据命名空间、端口、IPC secret)。
+  # 写两套装配的下场是它们慢慢走样,而守护人格恰恰是最不该在需要时才发现
+  # "它跟主人格不一样"的那个。
+  rescue)  ENTRY="dist/src/index.js" ;;
+  *)
+    echo "CATMAN_ROLE 只能是 primary / courier / rescue,拿到的是:${CATMAN_ROLE}" >&2
+    exit 1
+    ;;
+esac
 # 引导模式的重试间隔。60 秒:足够让日志保持可读,又不至于让人跑完 init 后干等太久。
 BOOTSTRAP_RETRY_SECONDS="${CATMAN_BOOTSTRAP_RETRY_SECONDS:-60}"
 

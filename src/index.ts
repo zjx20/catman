@@ -26,6 +26,7 @@ import { readVersion, versionLine, type VersionInfo } from "./core/version.js";
 import { runSelfCheck } from "./core/selfcheck.js";
 import { ScriptDeployControl } from "./core/deploy.js";
 import { formatDeployReport } from "./core/deploy-report.js";
+import { RescueRunner } from "./rescue/runner.js";
 
 async function main(): Promise<void> {
   // 第一件事:给所有 console 输出加时间戳。放在最前面,连启动期的日志也带上 ——
@@ -80,7 +81,10 @@ async function main(): Promise<void> {
     },
   );
 
-  const deploy = resolveDeployControl(config, version);
+  // 守护人格**不给**部署控制面:它跑 pinned release,不自进化;而 `/发布` `/回滚`
+  // 是全局动作,让两个人格都能发等于多了一条谁也说不清是谁按的路径。
+  // 它要动版本时走的是状态页上那个按钮(或看门狗自动),两者都经固化的 deployer。
+  const deploy = config.persona === "rescue" ? undefined : resolveDeployControl(config, version);
 
   // 有一条还没送出去的部署结果就在启动时打出来,**无条件**。
   // 它平时靠"下次有人开口时捎给他"送达,而"该收到的人"取决于:发起人是谁(从微信发起
@@ -181,11 +185,13 @@ async function main(): Promise<void> {
     return t;
   }
 
+  let rescueRef: RescueRunner | undefined;
   const shutdown = async () => {
     console.info("正在关闭 catman…");
     clearInterval(cleanupTimer);
     await gateway.stop();
     await dashboard.stop();
+    await rescueRef?.stop();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
@@ -196,6 +202,25 @@ async function main(): Promise<void> {
   // 与"起不来"。
   dashboard.start();
   await gateway.start();
+
+  // 守护人格额外挂上机械层:看门狗 + 无 LLM 状态页。
+  // 它们与大脑分开,因为磁盘满/内存尽/token 过期同样会废掉大脑 ——
+  // 而那正是最需要它们的时候(设计里的「失败域诚实条款」)。
+  let rescue: RescueRunner | undefined;
+  if (config.persona === "rescue") {
+    rescue = new RescueRunner({
+      dataDir: config.mainDataDir,
+      releasesDir: config.releasesDir,
+      deployDir: config.deployDir,
+      courierDir: config.courierDir,
+      primaryContainer: process.env["CATMAN_CONTAINER"] ?? "catman",
+      courierContainer: process.env["CATMAN_COURIER_CONTAINER"] ?? "catman-courier",
+      statusPort: config.dashboardPort + 1,
+      token: adminToken,
+    });
+    rescue.start();
+    rescueRef = rescue;
+  }
   bootOk = true;
   console.info(`catman 已启动,渠道=${channel.name},${versionLine(version)}`);
 }

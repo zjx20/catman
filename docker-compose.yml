@@ -40,6 +40,14 @@ services:
       # Claude 订阅认证:先在宿主用 `claude setup-token` 生成 1 年期 token
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}
       CATMAN_CHANNEL: wechat
+      # 三种角色同镜像、同一份 release,靠这个变量分开(见 docker/entrypoint.sh)。
+      CATMAN_ROLE: primary
+      # 人格与信使之间的 IPC 凭据。**两个人格必须各用一个**:共用会让它们的收件
+      # 队列串到一起,而这件事没有任何外部症状 —— 消息只是偶尔跑到另一个人格那儿。
+      # 信使读的是 CATMAN_IPC_SECRET_PRIMARY / _RESCUE,人格读的是 CATMAN_IPC_SECRET;
+      # **两侧必须对得上**,对不上的症状是人格一直拉取被拒(日志里有"信使拒绝了拉取")。
+      # 生成:openssl rand -hex 24。只能用可打印 ASCII —— 它要进 HTTP 请求头。
+      CATMAN_IPC_SECRET: ${CATMAN_IPC_SECRET_PRIMARY:?两个人格各要一个 IPC secret,见 README}
       # 排查用:打开后每条入站 iLink 消息打一行结构摘要(只有键名与标量,不含
       # base64 与媒体密钥)。用于确认「图 + 文字」这两条消息有没有可用的聚合键。
       CATMAN_ILINK_TRACE: ${CATMAN_ILINK_TRACE:-0}
@@ -126,3 +134,92 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "8787:8787" # dashboard(整站需 CATMAN_ADMIN_TOKEN;仍应只在内网暴露)
+    depends_on:
+      - catman-courier
+
+  # ── 信使:稳定面。全部微信连接都在它这儿,两个人格都在它身后 ──────────
+  #
+  # 它跑 **pinned** release(人工钦定),不随自我进化更新 —— 改它属 Tier 3。
+  # 它死了两个人格一起聋,所以 restart 用 always 而不是 unless-stopped。
+  catman-courier:
+    image: catman-env:1
+    container_name: catman-courier
+    restart: always
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    environment:
+      CATMAN_ROLE: courier
+      # **跑 pinned 而不是 current**:这是"稳定面"三个字的全部含义。
+      CATMAN_RELEASE_LINK: /data/releases/pinned
+      CATMAN_DATA_DIR: /data
+      TZ: ${TZ:-UTC}
+      CATMAN_ILINK_TRACE: ${CATMAN_ILINK_TRACE:-0}
+      # 两个人格各一个。信使按 secret 反查身份 —— 请求体里声称的身份一个字都不信。
+      CATMAN_IPC_SECRET_PRIMARY: ${CATMAN_IPC_SECRET_PRIMARY:?}
+      CATMAN_IPC_SECRET_RESCUE: ${CATMAN_IPC_SECRET_RESCUE:?}
+      CATMAN_RESCUE_STATUS_URL: ${CATMAN_RESCUE_STATUS_URL:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      http_proxy: ${HTTP_PROXY:-}
+      https_proxy: ${HTTPS_PROXY:-}
+      NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,::1,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.qq.com}"
+      no_proxy: "${NO_PROXY:-localhost,127.0.0.1,::1,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.qq.com}"
+    volumes:
+      - ./data:/data
+      - ./data/releases:/data/releases:ro
+    # 信使**不需要** docker.sock:它不部署、不看容器。少挂一个就少一条把宿主 root
+    # 交出去的路径,而它恰恰是那个直连外网、要解析陌生输入的进程。
+
+  # ── 守护人格:机械看门狗 + 无 LLM 状态页 + 按需唤醒的救援大脑 ─────────
+  #
+  # 同样跑 pinned。**独立的数据命名空间**(/data/rescue):它的会话、用户、偏好
+  # 与主人格完全分开,一行 env 拿到全套隔离。
+  catman-rescue:
+    image: catman-env:1
+    container_name: catman-rescue
+    restart: always
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    environment:
+      CATMAN_ROLE: rescue
+      CATMAN_PERSONA: rescue
+      CATMAN_RELEASE_LINK: /data/releases/pinned
+      CATMAN_CHANNEL: wechat
+      # 自己的可写命名空间;主 /data 只读,而部署报告/指针/信使队列都在那边。
+      CATMAN_DATA_DIR: /data/rescue
+      CATMAN_MAIN_DATA_DIR: /data
+      CATMAN_DASHBOARD_PORT: "8788"
+      CATMAN_IPC_SECRET: ${CATMAN_IPC_SECRET_RESCUE:?}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}
+      CLAUDE_CONFIG_DIR: /data/rescue/claude
+      CATMAN_ADMIN_TOKEN: ${CATMAN_ADMIN_TOKEN:-}
+      TZ: ${TZ:-UTC}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      http_proxy: ${HTTP_PROXY:-}
+      https_proxy: ${HTTPS_PROXY:-}
+      NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,::1,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.qq.com}"
+      no_proxy: "${NO_PROXY:-localhost,127.0.0.1,::1,host.docker.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.qq.com}"
+    volumes:
+      # 主 /data **只读** —— 每类状态只有一个写者,守护人格一个都不是。
+      - ./data:/data:ro
+      # 自己的可写命名空间(嵌套在只读挂载里,与 releases:ro 同一个手法)。
+      - ./data/rescue:/data/rescue
+      # ⚠️ IPC socket 必须**可写**:unix socket 的 connect() 需要对 socket 文件的
+      # 写权限。整个 /data 只读的话,守护人格连不上信使,而症状是
+      # "rescue 起来了但一条消息都收不到",日志里只有一句 EACCES。
+      - ./data/ipc:/data/ipc
+      # 它要 docker.sock:看门狗靠 `docker inspect` 观测,靠起一次性 deployer 动指针。
+      - ${DOCKER_SOCK_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-0}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8788:8788" # 无 LLM 状态页 + 第二个 dashboard(同一份令牌)
+    depends_on:
+      - catman-courier

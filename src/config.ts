@@ -114,10 +114,29 @@ export interface Config {
   ipcSocketPath: string;
   /** 本进程(人格)的 IPC secret。信使按它反查身份。 */
   ipcSecret: string | undefined;
+  /**
+   * 本进程是哪个人格。
+   *
+   * `rescue` 与 `primary` 跑的是**同一个入口**,差别全在配置:数据命名空间、端口、
+   * IPC secret,外加守护人格额外挂上的看门狗与状态页。写两套装配的下场是它们
+   * 慢慢走样,而守护人格恰恰是最不该在需要时才发现"它跟主人格不一样"的那个。
+   */
+  persona: "primary" | "rescue";
+  /**
+   * **主** /data 的位置。
+   *
+   * 守护人格的 `CATMAN_DATA_DIR` 指向它自己的命名空间(`/data/rescue`),
+   * 而它要读的部署报告、release 指针、信使队列都在主 /data 里 —— 两者必须分开表达,
+   * 否则它会去自己的小卷里找那些文件然后什么都读不到,而且**不报错**。
+   */
+  mainDataDir: string;
 }
 
 export function loadConfig(): Config {
   const dataDir = str("CATMAN_DATA_DIR", "/data");
+  // 主 /data 默认就是 dataDir;只有守护人格会把两者分开(它自己写 /data/rescue,
+  // 而部署报告、release 指针、信使队列都在主 /data 里,只读)。
+  const mainDataDir = str("CATMAN_MAIN_DATA_DIR", dataDir);
   const dashboardPort = num("CATMAN_DASHBOARD_PORT", 8787);
   return {
     dataDir,
@@ -143,12 +162,14 @@ export function loadConfig(): Config {
     maxImageBytes: num("CATMAN_MAX_IMAGE_BYTES", 3_500_000),
     maxImagesPerTurn: num("CATMAN_MAX_IMAGES_PER_TURN", 4),
     messageAggregationMs: num("CATMAN_MESSAGE_AGGREGATION_MS", 1500),
-    deployDir: str("CATMAN_DEPLOY_DIR", `${dataDir}/deploy`),
-    releasesDir: str("CATMAN_RELEASES_DIR", `${dataDir}/releases`),
+    deployDir: str("CATMAN_DEPLOY_DIR", `${mainDataDir}/deploy`),
+    releasesDir: str("CATMAN_RELEASES_DIR", `${mainDataDir}/releases`),
     srcDir: str("CATMAN_SRC_DIR", `${dataDir}/src/catman`),
     deploySeenPath: str("CATMAN_DEPLOY_SEEN_PATH", `${dataDir}/deploy-seen.json`),
-    courierDir: str("CATMAN_COURIER_DIR", `${dataDir}/courier`),
-    ipcSocketPath: str("CATMAN_IPC_SOCKET", `${dataDir}/ipc/courier.sock`),
+    courierDir: str("CATMAN_COURIER_DIR", `${mainDataDir}/courier`),
+    ipcSocketPath: str("CATMAN_IPC_SOCKET", `${mainDataDir}/ipc/courier.sock`),
     ipcSecret: process.env.CATMAN_IPC_SECRET || undefined,
+    persona: process.env.CATMAN_PERSONA === "rescue" ? "rescue" : "primary",
+    mainDataDir,
   };
 }

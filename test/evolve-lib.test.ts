@@ -9,6 +9,7 @@ import {
   readFileSync,
   symlinkSync,
   existsSync,
+  readlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -814,4 +815,39 @@ test("**demote 绝不写 stable** —— 指针单主,它只许 deployer 在观�
   // 反面对照:rollback 是**人**的判断,它该写 stable —— 少了这条,把两处都删掉也全绿。
   const rb = body.slice(body.indexOf("do_rollback() {"), body.indexOf("\ndo_demote() {"));
   assert.ok(rb.includes("pointer_set stable"), "rollback 反而必须写 stable");
+});
+
+test("bless 钦定 pinned,并把旧的存进 pinned-prev —— 钦定错了才有退路", () => {
+  // 钦定错误恰恰只会在"信使起不来"时才发现,而那时两个人格已经一起聋了。
+  withDir((dir) => {
+    const dataDir = join(dir, "data");
+    const rel = join(dataDir, "releases");
+    mkdirSync(rel, { recursive: true });
+    for (const sha of ["old1", "new2"]) mkdirSync(join(rel, sha), { recursive: true });
+    symlinkSync("old1", join(rel, "pinned"));
+    symlinkSync("new2", join(rel, "stable"));
+
+    execFileSync("bash", [join(EVOLVE_DIR, "bless.sh")], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: cleanEnv({ CATMAN_DATA_DIR: dataDir, CATMAN_HOST_DATA_DIR: dataDir, DOCKER_GID: "999" }),
+    });
+    assert.equal(readlinkSync(join(rel, "pinned")), "new2");
+    assert.equal(readlinkSync(join(rel, "pinned-prev")), "old1", "旧的必须留一份");
+  });
+});
+
+test("stable 还没立起来时 bless 不乱指 pinned,只报警", () => {
+  // 指到空气的话信使会进引导模式转一辈子,而人以为它起来了。
+  withDir((dir) => {
+    const dataDir = join(dir, "data");
+    mkdirSync(join(dataDir, "releases"), { recursive: true });
+    const out = execFileSync("bash", [join(EVOLVE_DIR, "bless.sh")], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: cleanEnv({ CATMAN_DATA_DIR: dataDir, CATMAN_HOST_DATA_DIR: dataDir, DOCKER_GID: "999" }),
+    });
+    assert.match(out, /没能钦定 pinned/);
+    assert.equal(existsSync(join(dataDir, "releases", "pinned")), false);
+  });
 });

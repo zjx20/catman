@@ -48,6 +48,29 @@ CATMAN_SELFCHECK=1 node dist/src/index.js
 
 改完务必跑 `npm run typecheck && npm test`(strict + noUncheckedIndexedAccess 全开)。
 
+## 进程拓扑(Phase 3 起)
+
+```
+catman-courier   pinned release · 稳定面 · restart:always
+  ├─ 全部 iLink 连接 + AccountStore(**唯一写者**)+ 扫码 + TOFU 准入
+  ├─ inbox:每人格一个持久化队列(at-least-once,人格落批后才 ack)
+  ├─ replyCtx 持久化 + 发送预算**唯一权威**(按 kind 预留)
+  ├─ 路由表 userKey → persona(+ TTL 自动回落)+ /救援 /主人格 /绑定
+  └─ IPC:unix socket 上的 HTTP(/data/ipc/courier.sock)
+
+catman           releases/current · 主人格 · 每周被自动进化
+  └─ BridgeChannel(name="wechat")⇄ IPC
+
+catman-rescue    pinned release · CATMAN_DATA_DIR=/data/rescue
+  ├─ BridgeChannel ⇄ IPC(persona=rescue)
+  ├─ 机械看门狗(决策纯函数;执行走固化的 deployer demote)
+  └─ 无 LLM 状态页 :8788
+```
+
+三种角色**同镜像、同一份 release**,靠 `CATMAN_ROLE` 分开(`docker/entrypoint.sh`)——
+写成三个镜像会破坏「测试环境即生产环境」。守护人格与主人格是**同一个入口**,
+差别全在配置;两套装配会慢慢走样,而它恰恰是最不该在需要时才发现"跟主人格不一样"的那个。
+
 ## 数据流
 
 ```
@@ -631,6 +654,51 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(`skills.ts`,只�
   两种都不报错,只是不干你让它干的事。调用方补 `--entrypoint` 不算修好:那要求每个
   调用点(含将来新增的)都记得写,而且会绕开 tini,子进程僵尸没人收。
   `test/entrypoint.test.ts` 把三条分流都跑起来验(纯 sh,不需要 docker)。
+
+## Phase 3 的不变量
+
+- **人格进程不能持有 `AccountStore`**:`accounts.json` 只能有一个写者(信使)。
+  人格里留一个实例就握着一份可能过时的快照,而那个类每次写都是**整份覆写** ——
+  症状是"扫了码过一会儿又掉了"、"改的备注名自己变回去了",**没有任何报错**。
+  `test/persona-isolation.test.ts` 从入口走**真实的模块图**断言到不了它,
+  并配一条反向用例(信使**必须**到得了 —— 少了它,把 accounts.ts 删光也全绿)。
+  dashboard 的账号面全部走 IPC 代理,超时与信使侧引用**同一个常量**。
+- **IPC secret 一条例外都没有**(`gateway.childEnv`,连 admin 回合也剔除):
+  拿到它就是拿到信使的整个控制面 —— 同容器同 uid,一句 `curl --unix-socket` 就能
+  冒充任意 userKey 发消息(顺带烧光**别人**那条来信的 10 条预算 = 把他打成永久静默)、
+  拉走并 ack 掉别人的消息、走 `/admin/*` 删账号(把 persona-isolation 那道墙整个绕过去)。
+  管理员令牌还有"admin 回合加回"那一档,这个没有。
+- **拉取与投递是两条循环**(`channels/bridge.ts`):`await handler()` 等的是**回合跑完**,
+  不是"消息进了批"。合成一条的话,长回合期间人格根本不再拉取,于是 ① `detach` 在它
+  唯一该起作用的场景(主人格正跑长回合时用户发 `/救援`)送不到;② 信使的"不可达"
+  误判波及**所有其他用户**,各吃一条保留额;③ `health().live` 在健康回合期间翻假。
+  用例里 handler 必须能"挂住",否则把回合时长这个变量整个消掉了。
+- **中止信号挂 `res` 不挂 `req`**(`ipc/server.ts`):`IncomingMessage` 的 `close` 在请求体
+  **读完**那一刻就触发(实测),而端点都要先读 body —— 挂 `req` 的话 signal 一进门
+  就是 aborted,长轮询退化成忙轮询把 CPU 打满,**而且没有任何报错**。
+- **同一个 `context_token` 不重置预算**(`reply-store.ts`):崩溃重放会让同一条来信被
+  `remember` 第二次,清零之后就会超发,而超发是 `ret=-2` 且永不恢复。
+- **投递失败必须有出口**(bridge):只 `break` 而不 ack/nack/退避的话,信使在队列非空时
+  立刻返回,两者相乘是每秒上万次的热循环;而**单 inbox** 意味着所有用户的后续消息
+  全堵在这一条后面。连续失败 3 次交回信使(复用"出队 + 亮红灯"),退避 400ms ——
+  比拉取那个 3 秒短,因为撞上限的总时长就是全体用户的堵塞时长。
+- **写盘失败不能静默吞掉**(`courier/core.ts`):磁盘满时消息没进队列、`dropped` 覆盖
+  不到、用户一个字收不到,而 `accept` 正常返回 → iLink 游标照常推进 → **永远不会重放**。
+  必须计数并让用户知道要重发。
+- **看门狗:锁在就只观测、绝不动 `stable`、每级只退一次**(`rescue/watchdog.ts`)。
+  决策是纯函数(不碰 docker、不看时钟),因为它是唯一在**没有人**的情况下换掉线上
+  版本的东西 —— 判错的看门狗比没有看门狗糟。锁的超时阈值**必须大于观察期上限**,
+  否则一次正常的 30 分钟观察期会被判成"deployer 死了",它就在部署成功的中途拨回去。
+  「干净地停着」单独成一条规则:deployer 死在 stop 与 start 之间时容器是**正常退出**的,
+  只看 crash-loop 永远发现不了。**看不见 ≠ 坏了**:`docker inspect` 取不到时什么都不做。
+- **`demote` 与 `rollback` 的区别是语义**:rollback 是人的判断,所以连 `stable` 一起拨;
+  demote 是机械判据(容器重启了几次),远弱于观察期,所以**只拨 `current`**。
+  让看门狗写 stable 等于允许一次误判永久改写「回退目标」这个概念本身。
+- **`pinned` 由 `bless.sh` 钦定,且先把旧的存进 `pinned-prev`**:钦定错误只会在
+  "信使起不来"时才发现,而那时两个人格已经一起聋了。
+- **IPC socket 必须在可写区**:守护人格把主 `/data` 整个只读挂载,而 unix socket 的
+  `connect()` 需要对 socket 文件的**写**权限 —— 放只读区的症状是"rescue 起来了但一条
+  消息都收不到",日志里只有一句 EACCES。所以 `/data/ipc` 单独 rw 挂给三个容器。
 
 ## 约定
 

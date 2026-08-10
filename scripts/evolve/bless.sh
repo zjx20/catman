@@ -82,6 +82,34 @@ else
   echo "⚠️  当前不是 root,跳过 chown。请确认 $DEPLOY_DIR 可被 uid 10002 写、被 10001 读。"
 fi
 
+# ── 钦定稳定面 ─────────────────────────────────────────────────────
+# 信使与守护人格跑的是 `pinned`,而**钦定它是显式的人工步骤**(设计 §18):
+# 它决定"出事时还活着的是哪份代码",不该由任何自动流程改写。
+#
+# bless 是那个人工步骤的自然落点 —— 人已经在这儿了,而且 bless 的语义本来就是
+# "我认可这一版的部署机制"。默认取当前 `stable`(存活最久的已验证版本)。
+#
+# **换 pinned 之前先把旧的存进 pinned-prev**:看门狗在信使 crash-loop 时要退到它。
+# 少了这一步,一次钦定错误就没有退路 —— 而钦定错误恰恰只会在信使起不来时才发现。
+PIN_TARGET="${CATMAN_PIN:-}"
+if [ -z "$PIN_TARGET" ]; then
+  PIN_TARGET="$(basename "$(readlink -f "$DATA_DIR/releases/stable" 2>/dev/null || echo "")" 2>/dev/null || true)"
+fi
+if [ -n "$PIN_TARGET" ] && [ -d "$DATA_DIR/releases/$PIN_TARGET" ]; then
+  OLD_PIN="$(basename "$(readlink -f "$DATA_DIR/releases/pinned" 2>/dev/null || echo "")" 2>/dev/null || true)"
+  if [ -n "$OLD_PIN" ] && [ "$OLD_PIN" != "$PIN_TARGET" ] && [ -d "$DATA_DIR/releases/$OLD_PIN" ]; then
+    ln -sfn "$OLD_PIN" "$DATA_DIR/releases/pinned-prev.tmp"
+    mv -T "$DATA_DIR/releases/pinned-prev.tmp" "$DATA_DIR/releases/pinned-prev"
+    echo "  上一份 pinned 存进 pinned-prev:$OLD_PIN"
+  fi
+  ln -sfn "$PIN_TARGET" "$DATA_DIR/releases/pinned.tmp"
+  mv -T "$DATA_DIR/releases/pinned.tmp" "$DATA_DIR/releases/pinned"
+  echo "  稳定面 pinned → $PIN_TARGET(信使与守护人格跑它)"
+else
+  echo "  ⚠️  没能钦定 pinned(stable 指针不可用)。信使与守护人格起不来 ——"
+  echo "      先完成一次部署让 stable 立起来,再重跑 bless;或用 CATMAN_PIN=<sha> 指定。"
+fi
+
 echo "已固化到 $DEPLOY_DIR"
 echo "  宿主 /data 路径:$HOST_DATA_DIR"
 echo "  docker.sock 属组:$DOCKER_GID"

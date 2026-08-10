@@ -102,3 +102,50 @@ test("悬空链接与链接不存在是同一个结果 —— 都是「没有可
     assert.match(out, /还没有可运行的 release/);
   });
 });
+
+/** 跑入口脚本并带上额外的 env(角色分流用)。 */
+function runWithEnv(link: string, env: Record<string, string>, args: string[] = []): {
+  status: number;
+  out: string;
+} {
+  try {
+    const out = execFileSync("sh", [ENTRY, ...args], {
+      encoding: "utf8",
+      env: { ...process.env, CATMAN_RELEASE_LINK: link, CATMAN_BOOTSTRAP_RETRY_SECONDS: "1", ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { status: 0, out };
+  } catch (err) {
+    const e = err as { status?: number; stdout?: string; stderr?: string };
+    return { status: e.status ?? 1, out: `${e.stdout ?? ""}${e.stderr ?? ""}` };
+  }
+}
+
+test("入口按 CATMAN_ROLE 选进程 —— 三种角色同镜像、同一份 release", () => {
+  // 写成三个镜像会破坏「测试环境即生产环境」:制备时测过的那份字节,
+  // 就该是三个进程都在跑的那份。
+  withDir((dir) => {
+    const rel = makeRelease(dir);
+    mkdirSync(join(rel, "dist", "src", "courier"), { recursive: true });
+    writeFileSync(join(rel, "dist", "src", "courier", "main.js"), 'console.log("COURIER-STARTED");\n');
+    const link = join(dir, "current");
+    symlinkSync(rel, link);
+
+    assert.match(runWithEnv(link, {}).out, /APP-STARTED/, "默认是主人格");
+    assert.match(runWithEnv(link, { CATMAN_ROLE: "courier" }).out, /COURIER-STARTED/);
+    // 守护人格与主人格同一个入口,差别全在配置 —— 两套装配会慢慢走样,
+    // 而它恰恰是最不该在需要时才发现"跟主人格不一样"的那个。
+    assert.match(runWithEnv(link, { CATMAN_ROLE: "rescue" }).out, /APP-STARTED/);
+  });
+});
+
+test("角色拼错必须当场退出并说清有哪几个 —— 静默按默认跑起来的后果是两个主人格", () => {
+  // 那意味着两个进程同时写同一份 /data,而人还以为守护人格起来了。
+  withDir((dir) => {
+    const link = join(dir, "current");
+    symlinkSync(makeRelease(dir), link);
+    const r = runWithEnv(link, { CATMAN_ROLE: "recue" });
+    assert.notEqual(r.status, 0);
+    assert.match(r.out, /primary \/ courier \/ rescue/);
+  });
+});
