@@ -134,7 +134,10 @@ export async function runSelfCheck(opts: SelfCheckOptions = {}): Promise<SelfChe
         srcDir: config.srcDir,
         deployBinDir: `${config.deployDir}/bin`,
         releasesDir: config.releasesDir,
+        deployDir: config.deployDir,
+        courierDir: config.courierDir,
       },
+      config.persona,
     );
     // 工作目录派生 + 长度闸门也走一遍:它会在真实部署里拦下路径过长的会话目录,
     // 自检里跑通它才谈得上"这份代码能服务一个用户"。

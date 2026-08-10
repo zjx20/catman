@@ -78,6 +78,23 @@ export class UserRegistry {
     this.users = readJsonFile<UserMap>(this.path, {});
   }
 
+  /**
+   * 共享人设文件不存在就写一份。**已存在的绝不覆盖。**
+   *
+   * 每用户的 CLAUDE.md 首行是 `@../CLAUDE.md`,共享那份缺席时这个 import 悬空。
+   * 主人格那边不会发生(人手写过),而守护人格的 workspace 是代码新建的、一直是空的 ——
+   * 真机上它因此连主人格那份人设都没有,只能靠 skill 正文里一句"你跑在 catman 里"
+   * 来猜自己是谁。
+   *
+   * 与 skill 那种「每次启动幂等覆盖」刻意相反:skill 的真相源是代码,这个是人。
+   * 启动时覆盖等于每次重启抹掉一次人设。
+   */
+  ensureSharedClaudeMd(body: string): void {
+    mkdirSync(this.workspaceRoot, { recursive: true });
+    const path = join(this.workspaceRoot, "CLAUDE.md");
+    if (!existsSync(path)) writeFileSync(path, body, "utf8");
+  }
+
   /** 某用户的工作目录(cwd)绝对路径。不保证目录已存在。 */
   workspaceDirOf(userKey: string): string {
     return join(this.workspaceRoot, userDirName(userKey));

@@ -1,4 +1,4 @@
-import type { Channel } from "../channels/types.js";
+import type { Channel, IncomingMessage } from "../channels/types.js";
 import type { Agent, AgentProgressEvent } from "./agent.js";
 import type { Decision, SessionManager, SessionRef } from "./session.js";
 import type { UserRegistry } from "./users.js";
@@ -16,11 +16,12 @@ import {
   type ParsedCommand,
 } from "./commands.js";
 import { SETTING_SCHEMA, USER_SETTING_KEYS } from "./settings.js";
-import { ADMIN_SKILLS, USER_SKILLS } from "./skills.js";
+import { skillsFor } from "./skills.js";
 import { readVersion, shortSha, versionLine, type VersionInfo } from "./version.js";
 import type { DeployControl } from "./deploy.js";
 import { formatDeployReport } from "./deploy-report.js";
 import type { SendKind } from "../ipc/protocol.js";
+import type { Persona } from "../config.js";
 
 /** 会话 id 的展示形式:开头 8 位足够在 HISTORY_LIMIT 条内无歧义,也好在手机上打。 */
 export function shortSessionId(sessionId: string): string {
@@ -90,6 +91,12 @@ export interface GatewayOptions {
   sessionExists?: (userKey: string, sessionId: string) => boolean;
   /** 版本戳。不传则运行时自己读(单测注入,免得依赖磁盘上有没有 VERSION)。 */
   version?: VersionInfo;
+  /**
+   * 本进程是哪个人格。目前只决定 admin 回合能看到哪套 skill ——
+   * 守护人格拿 `catman-rescue` 而不是 `catman-evolve`,理由见 skills.ts。
+   * 不传按主人格,与 stdin / dashboard 这类本地场景一致。
+   */
+  persona?: Persona;
   /**
    * 部署控制面。不传 = 这台机器没配自进化,两条部署指令会明说"没配",
    * 而不是假装成功 —— 本地开发与 stdin 调试就是这种情况。
@@ -477,6 +484,20 @@ export class Gateway {
    * 一个进程的生命周期内不会变(变了说明有人在动现役目录,那是 §6 只读挂载要拦的事)。
    */
   private readonly version: VersionInfo | undefined;
+  private readonly persona: Persona;
+  /**
+   * 信使说过"这些人早就收过使用指引了"的那些 userKey。
+   *
+   * 判定权在信使:它是唯一见过某个 userKey **全部**历史的进程,而人格有好几个、
+   * 各有各的 users.json。真机上的症状是首次 `/救援` 会收到守护人格那份一模一样的
+   * 整份欢迎语 —— 白烧一条发送预算(一个 context_token 只够发约 10 条),
+   * 而且看起来像"它把我当新人了"。
+   *
+   * 攒在这里而不是一路穿过 Segment/PendingBatch:标记是**单调**的(收过就永远收过),
+   * 与消息内容无关,也就不必跟着某一段话走。消费点在 prelude —— 必须等
+   * `ensureWorkspace()` 把用户注册进来之后才 mark 得动。
+   */
+  private readonly courierGreeted = new Set<string>();
   private readonly deploy: DeployControl | undefined;
 
   constructor(opts: GatewayOptions) {
@@ -493,6 +514,7 @@ export class Gateway {
     this.now = opts.now ?? Date.now;
     this.reminderIntervalMs = opts.reminderIntervalMs;
     this.version = opts.version ?? readVersion();
+    this.persona = opts.persona ?? "primary";
     this.deploy = opts.deploy;
     this.semaphore = new Semaphore(this.settings.effective().maxConcurrentTurns);
     this.settings.onChange(() => {
@@ -501,7 +523,7 @@ export class Gateway {
   }
 
   async start(): Promise<void> {
-    this.channel.onMessage((msg) => this.dispatch(msg.userKey, msg.text, msg.attachments ?? []));
+    this.channel.onMessage((msg) => this.onIncoming(msg));
     this.reminderTimer = setInterval(() => this.flushReminders(), this.reminderIntervalMs);
     // 允许进程在只剩此定时器时退出(容器里无所谓,测试友好)。
     this.reminderTimer.unref?.();
@@ -514,6 +536,21 @@ export class Gateway {
     // 丢掉就是真丢。能不能跑完交给关闭流程,总好过在这里静默吞掉。
     for (const userKey of [...this.pending.keys()]) this.flush(userKey);
     await this.channel.stop();
+  }
+
+  /**
+   * 渠道消息的**唯一**入口。
+   *
+   * 独立成一个方法而不是写在 `start()` 的闭包里:接线不止"把字段拆开传给 dispatch"
+   * 这一件事,而单测为了不起真实渠道,曾经自己抄了一份等价的接线 ——
+   * 于是这里每加一件事,那份抄件就悄悄少一件,**测的是一条生产里不存在的路径**。
+   * 收成一个方法之后两边共用同一份,想岔都岔不了。
+   */
+  onIncoming(msg: IncomingMessage): Promise<void> {
+    // 渠道知道他早收过指引就记一笔。只**抑制**不触发:缺席表示这个渠道没有这项知识
+    // (stdin / dashboard),那时退回人格自己的记录判断。见 courierGreeted 的说明。
+    if (msg.greeted) this.courierGreeted.add(msg.userKey);
+    return this.dispatch(msg.userKey, msg.text, msg.attachments ?? []);
   }
 
   /**
@@ -747,6 +784,11 @@ export class Gateway {
     }
 
     const cwd = this.users.ensureWorkspace(userKey);
+    // 信使说他早收过了就补记一笔。**必须在 ensureWorkspace 之后** ——
+    // markGreeted 对还没注册的用户是空操作,而首次 `/救援` 恰好就是"这个人格
+    // 第一次见到他"。补记而不只是跳过:信使不在场的路径(dashboard 聊天)
+    // 从此也不会再推,一次同步永久生效。
+    if (this.courierGreeted.delete(userKey)) this.users.markGreeted(userKey);
     // 上一次部署的结果先说 —— 用户此刻多半正要问"改好了没",而且失败的那种情况下
     // 他接下来说的话是基于"改动已生效"这个错误前提的。
     await this.announceDeployReport(userKey);
@@ -1308,7 +1350,7 @@ export class Gateway {
         resumeSessionId: decision.isNew ? undefined : decision.resumeSessionId,
         ...(prefs.model ? { model: prefs.model } : {}),
         env: this.childEnv(isAdmin, turn.token),
-        skills: [...(isAdmin ? ADMIN_SKILLS : USER_SKILLS)],
+        skills: skillsFor(this.persona, isAdmin),
         abortController: turn.ctx.abort,
         onProgress,
         logLabel: userKey,

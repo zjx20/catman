@@ -188,6 +188,21 @@ test("重复在投递完成之后到达:**必须补 ack** —— 不出队就把
   });
 });
 
+test("greeted 标记要一路透传到网关 —— 信使算了没人消费等于没算", async () => {
+  // 判定权在信使:它是唯一见过某个 userKey 全部历史的进程。bridge 把这个字段丢掉的话,
+  // 人格照旧问自己那份 users.json,于是用户每切一次人格就吃一整份欢迎语,
+  // 白烧一条发送预算(一个 context_token 只够发约 10 条)。
+  const c = new FakeCourier();
+  const dir = mkdtempSync(join(tmpdir(), "catman-bridge-greeted-"));
+  try {
+    c.rounds = [{ messages: [msg("g1", "你好")] }];
+    const got = await run(c, dir, 1);
+    assert.equal(got[0]!.greeted, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("控制帧先于消息应用 —— 后面那批不该落进一个刚被切走的会话", async () => {
   await withDir(async (dir) => {
     const c = new FakeCourier();

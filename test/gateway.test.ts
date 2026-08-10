@@ -72,6 +72,11 @@ class FakeChannel implements Channel {
   async receive(userKey: string, text: string, attachments?: readonly Attachment[]): Promise<void> {
     await this.handler!({ userKey, text, ...(attachments ? { attachments } : {}) });
   }
+
+  /** 注入一条**渠道说他早收过指引**的消息(bridge 就是这么带 greeted 的)。 */
+  async receiveGreeted(userKey: string, text: string): Promise<void> {
+    await this.handler!({ userKey, text, greeted: true });
+  }
 }
 
 /** 假 Agent:按调用序号返回递增的 session id;记录传给 SDK 的关键选项。 */
@@ -268,9 +273,11 @@ function build(now: () => number, opts: BuildOpts = {}) {
     ...(opts.sessionExists ? { sessionExists: opts.sessionExists } : {}),
     ...(opts.deploy ? { deploy: opts.deploy } : {}),
   });
-  // 只注册 handler,不启动真实定时器/渠道。走 dispatch 才能覆盖硬指令分流。
-  // 附件要一并转交 —— 与 Gateway.start() 里的接线保持一致,否则这里测不到透传。
-  channel.onMessage((m) => gw["dispatch"](m.userKey, m.text, m.attachments ?? []));
+  // 只注册 handler,不启动真实定时器/渠道 —— 但接线走 `onIncoming`,与
+  // `Gateway.start()` **同一个方法**。这里曾经自己抄了一份等价接线,
+  // 于是 start() 每加一件事(比如消费渠道给的 greeted 标记),测的就是一条
+  // 生产里不存在的路径:实现明明对了,用例却红。
+  channel.onMessage((m) => gw.onIncoming(m));
   return { channel, agent, sessions, users, prefs, settings, turns, gw, root };
 }
 
@@ -727,6 +734,32 @@ test("greeting:推送失败时不标记,下次重试", async () => {
   await channel.receive(U1, "再来一条");
   assert.ok(channel.sent.some((m) => m.text.startsWith("你好,我是 catman。")));
   assert.equal(users.needsGreeting(U1), false);
+});
+
+test("greeting:渠道说他早收过了就不再推 —— 判定权在信使", async () => {
+  // 信使是唯一见过某个 userKey 全部历史的进程,而人格有好几个、各有各的 users.json。
+  // 不接这个标记的话,用户每切一次人格就收到一整份一模一样的欢迎语,
+  // 白烧一条发送预算(一个 context_token 只够发约 10 条)。真机上首次 /救援 就是这样。
+  const t = 1_000_000;
+  const { channel, users } = build(() => t);
+  await channel.receiveGreeted(U1, "你好");
+  assert.equal(
+    channel.sent.filter((m) => m.text.startsWith("你好,我是 catman。")).length,
+    0,
+    "信使说过了就不该再推",
+  );
+  assert.ok(channel.sent.some((m) => m.text === "echo:你好"), "消息本身照常处理");
+  // 顺手把本地记录也补上:信使不在场的路径(dashboard 聊天)从此也不会再推。
+  assert.equal(users.needsGreeting(U1), false);
+});
+
+test("greeting:标记缺席只表示渠道不知道,不表示没收过", async () => {
+  // 它只能用来**抑制**推送,不能用来触发 —— stdin / dashboard 压根没有这项知识,
+  // 把缺席当成"没收过"是对的,当成"收过了"会让本地渠道永远收不到指引。
+  const t = 1_000_000;
+  const { channel } = build(() => t);
+  await channel.receive(U1, "你好");
+  assert.equal(channel.sent.filter((m) => m.text.startsWith("你好,我是 catman。")).length, 1);
 });
 
 // --- 硬指令 ---

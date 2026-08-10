@@ -32,6 +32,17 @@ export interface IncomingMessage {
    * 消息是否值得处理。
    */
   attachments?: readonly Attachment[];
+  /**
+   * 渠道知道这个用户**早就收过使用指引**了。
+   *
+   * 只有 bridge 会给:判定权在信使,它是唯一见过某个 userKey 全部历史的进程。
+   * 人格有好几个(主人格 + 守护人格)、各有各的 users.json,各自判断的结果是
+   * 用户每切一次人格就收到一整份一模一样的欢迎语 —— 白烧一条发送预算。
+   *
+   * 缺席**不表示"没收过"**,只表示这个渠道没有这项知识(stdin / dashboard 就是),
+   * 那时人格退回自己的记录判断。所以它只能用来**抑制**推送,不能用来触发。
+   */
+  greeted?: boolean;
 }
 
 export type MessageHandler = (msg: IncomingMessage) => Promise<void>;

@@ -3,9 +3,10 @@ import { randomBytes } from "node:crypto";
 import { loadConfig, type Config } from "./config.js";
 import { Agent } from "./core/agent.js";
 import { SessionManager } from "./core/session.js";
-import { FileStore } from "./core/file-store.js";
+import { FileStore, readJsonFile } from "./core/file-store.js";
 import { Gateway } from "./core/gateway.js";
 import { UserRegistry, listWorkspaceDirs } from "./core/users.js";
+import { adminBaseline, initialSharedClaudeMd } from "./core/persona.js";
 import { allowAll, type AdmissionPolicy } from "./core/admission.js";
 import { GlobalSettings } from "./core/settings.js";
 import { PrefsStore } from "./core/prefs.js";
@@ -80,7 +81,10 @@ async function main(): Promise<void> {
   mkdirSync(configDir, { recursive: true });
 
   // 配置三层由外到内装配:全局层要先建,每用户层拿它当默认值,会话层拿它算超时。
-  const settings = new GlobalSettings({ path: config.settingsPath, env: config });
+  const settings = new GlobalSettings({
+    path: config.settingsPath,
+    env: { ...config, adminUserKeys: resolveAdminBaseline(config) },
+  });
   const prefs = new PrefsStore({
     path: config.prefsPath,
     // 传函数不是快照:管理员改了全局默认要立刻跟随,不能等重启。
@@ -97,9 +101,13 @@ async function main(): Promise<void> {
     path: config.usersPath,
     workspaceRoot: config.workspaceDir,
   });
+  // 共享人设缺席时补一份占位:每用户 CLAUDE.md 首行的 `@../CLAUDE.md` 否则悬空。
+  // 主人格那边人手写过、不会被碰;守护人格的 workspace 是新建的,一直是空的。
+  users.ensureSharedClaudeMd(initialSharedClaudeMd(config.persona));
   const turns = new TurnTokens();
 
   // 接口说明做成 skill(按需加载,常态不占 token)。每次启动覆盖写,保证跟代码同步。
+  // 按人格生成不同的一套 —— 守护人格拿 catman-rescue 而不是 catman-evolve。
   writeSkills(
     configDir,
     { modelAllowlist: settings.effective().modelAllowlist },
@@ -107,7 +115,10 @@ async function main(): Promise<void> {
       srcDir: config.srcDir,
       deployBinDir: `${config.deployDir}/bin`,
       releasesDir: config.releasesDir,
+      deployDir: config.deployDir,
+      courierDir: config.courierDir,
     },
+    config.persona,
   );
 
   // 守护人格**不给**部署控制面:它跑 pinned release,不自进化;而 `/发布` `/回滚`
@@ -153,6 +164,7 @@ async function main(): Promise<void> {
     apiBase: config.apiBase,
     admission,
     version,
+    persona: config.persona,
     ...(deploy ? { deploy } : {}),
     // /切换会话 切换前确认目标的 JSONL 还在 —— 记录没了 resume 必然失败,
     // 提前给句人话并出清死引用,比让回合炸出原始报错友好得多。
@@ -342,6 +354,31 @@ function resolveDeployControl(
  * 不阻塞启动(本地开发友好),但也不会出现无鉴权的 dashboard:
  * 能打开它的人可以扫码接入,而接入者拥有宿主 root 级别的能力。
  */
+/**
+ * 管理员名单的 env 基线:读盘 + 说一句日志,判断本身在 `core/persona.ts` 里。
+ *
+ * **只当基线,不写盘。** 本进程 settings.json 若显式设过 `adminUserKeys`,
+ * 那份照旧赢 —— 与整套三层配置的优先级一致。
+ */
+function resolveAdminBaseline(config: Config): string[] {
+  const main =
+    config.persona === "rescue"
+      ? readJsonFile<unknown>(`${config.mainDataDir}/settings.json`, undefined)
+      : undefined;
+  const { keys, source } = adminBaseline(config.persona, config.adminUserKeys, main);
+  if (config.persona !== "rescue") return keys;
+  if (source === "inherited") {
+    console.info(`[rescue] 管理员名单继承自主 settings.json:${keys.length} 人`);
+  } else if (source === "empty") {
+    // 说出来。否则管理员切过来发现自己什么都干不了,而日志里一个字都没有。
+    console.warn(
+      "[rescue] 主 settings.json 里没有 adminUserKeys —— 切到守护人格的人会是普通用户," +
+        "看不到诊断用的 skill。可用 CATMAN_ADMIN_USER_KEYS 显式指定。",
+    );
+  }
+  return keys;
+}
+
 /**
  * 守护人格的访问令牌。**只读,绝不生成。**
  *

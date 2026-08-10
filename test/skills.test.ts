@@ -1,12 +1,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   ADMIN_SKILL,
   ADMIN_SKILLS,
   EVOLVE_SKILL,
+  RESCUE_SKILL,
   USER_SKILL,
   USER_SKILLS,
   evolveSkillBody,
+  rescueSkillBody,
+  skillsFor,
+  writeSkills,
 } from "../src/core/skills.js";
 import { COMMAND_TABLE, canonicalOf } from "../src/core/commands.js";
 
@@ -19,6 +26,8 @@ const PATHS = {
   srcDir: "/data/src/catman",
   deployBinDir: "/data/deploy/bin",
   releasesDir: "/data/releases",
+  deployDir: "/data/deploy",
+  courierDir: "/data/courier",
 };
 
 test("自进化 skill 只对管理员回合可见", () => {
@@ -68,6 +77,8 @@ test("路径全部来自参数 —— 换了 CATMAN_DEPLOY_DIR 之后 skill 不�
     srcDir: "/srv/code",
     deployBinDir: "/srv/deploy/bin",
     releasesDir: "/srv/rel",
+    deployDir: "/srv/deploy",
+    courierDir: "/srv/courier",
   });
   assert.ok(body.includes("/srv/code"));
   assert.ok(body.includes("/srv/deploy/bin/prepare.sh"));
@@ -79,4 +90,81 @@ test("帮助文案里的 /发布 与 skill 说的是同一条指令", () => {
   const publish = COMMAND_TABLE.find((c) => c.name === "publish");
   assert.ok(publish);
   assert.ok(evolveSkillBody(PATHS).includes(publish.canonical));
+});
+
+// --- 按人格分派 ---
+
+test("守护人格拿 catman-rescue,拿不到 catman-evolve", () => {
+  // 不是两者都给:它跑钉住的稳定版本,改了代码也上不了线,而人正在等它诊断。
+  // skill 的 description 常驻上下文 —— 摆一份"怎么改自己的代码"在那儿,
+  // 就是在邀请它去做一件注定白费的事。
+  const rescueAdmin = skillsFor("rescue", true);
+  assert.ok(rescueAdmin.includes(RESCUE_SKILL));
+  assert.equal(rescueAdmin.includes(EVOLVE_SKILL), false);
+
+  const primaryAdmin = skillsFor("primary", true);
+  assert.ok(primaryAdmin.includes(EVOLVE_SKILL));
+  assert.equal(primaryAdmin.includes(RESCUE_SKILL), false);
+});
+
+test("非管理员回合两个人格都只有 catman-settings", () => {
+  for (const p of ["primary", "rescue"] as const) {
+    assert.deepEqual(skillsFor(p, false), [USER_SKILL]);
+  }
+});
+
+test("skillsFor 列出的每个 skill,writeSkills 都真的写了文件", () => {
+  // 列一个磁盘上没有的 skill,SDK 那边只是安静地少一份说明 ——
+  // 而它恰好是最需要的那份(守护人格的诊断手册)。两处分支必须对齐。
+  for (const persona of ["primary", "rescue"] as const) {
+    const dir = mkdtempSync(join(tmpdir(), `catman-skills-${persona}-`));
+    try {
+      writeSkills(dir, { modelAllowlist: ["opus"] }, PATHS, persona);
+      for (const name of skillsFor(persona, true)) {
+        assert.ok(
+          existsSync(join(dir, "skills", name, "SKILL.md")),
+          `${persona} 的 ${name} 没被写出来`,
+        );
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("救援 skill 教的是诊断与退版本,不是改代码", () => {
+  const body = rescueSkillBody(PATHS);
+  assert.match(body, /你不改代码/);
+  assert.match(body, /demote/, "退版本走固化的 deployer");
+  assert.match(body, /绝不自己动.*符号链接/s, "换指针要先停容器,而它就跑在容器里");
+  // stable 是"回退目标"这个概念本身,机械判据不该改写它。
+  assert.match(body, /绝不动 `stable`|绝不动 stable/);
+});
+
+test("救援 skill 不教 /发布,那是主人格那边的事", () => {
+  // 部署确认口令由管理员在主人格那边亲手打。守护人格代劳等于把这把锁拆了,
+  // 而它恰好是判断"要不要换版本"的那一方。
+  const body = rescueSkillBody(PATHS);
+  assert.equal(body.includes(canonicalOf("publish")), false);
+});
+
+test("救援 skill 的路径全部来自参数", () => {
+  const body = rescueSkillBody({
+    srcDir: "/srv/code",
+    deployBinDir: "/srv/deploy/bin",
+    releasesDir: "/srv/rel",
+    deployDir: "/srv/deploy",
+    courierDir: "/srv/courier",
+  });
+  assert.ok(body.includes("/srv/deploy/report.json"), "部署报告");
+  assert.ok(body.includes("/srv/rel/current"), "指针");
+  assert.ok(body.includes("/srv/courier/inbox"), "信使队列");
+  assert.equal(body.includes("/data/"), false, "不该有写死的默认路径漏出来");
+});
+
+test("救援 skill 正文里也没有令牌字面量", () => {
+  const body = rescueSkillBody(PATHS);
+  for (const forbidden of ["sk-", "CLAUDE_CODE_OAUTH_TOKEN", "id_ed25519"]) {
+    assert.equal(body.includes(forbidden), false, `正文里不该出现 ${forbidden}`);
+  }
 });

@@ -378,8 +378,13 @@ export class GlobalSettings {
         return this.env.maxImagesPerTurn;
       case "messageAggregationMs":
         return this.env.messageAggregationMs;
+      case "adminUserKeys":
+        // 空数组当"没给" —— 否则守护人格从主 settings.json 继承来的名单会被一个
+        // 空基线盖掉。与别的项不同,这一项的默认值(floor)本身就是空数组,
+        // 所以"给了空的"与"没给"在行为上无从区分,当没给最省事也最不会出错。
+        return this.env.adminUserKeys.length ? this.env.adminUserKeys : undefined;
       default:
-        // maxReplyChars / adminUserKeys 没有 env 基线,直接用 floor。
+        // maxReplyChars 没有 env 基线,直接用 floor。
         return undefined;
     }
   }

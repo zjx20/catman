@@ -3,6 +3,15 @@
  * 时间相关的量以毫秒为单位,便于测试注入假时钟。
  */
 
+/**
+ * 本进程是哪个人格。
+ *
+ * 两者跑的是**同一个入口**,差别全在配置(数据命名空间、端口、IPC secret,外加
+ * 守护人格额外挂上的看门狗与状态页)。写两套装配的下场是它们慢慢走样,
+ * 而守护人格恰恰是最不该在需要时才发现"它跟主人格不一样"的那个。
+ */
+export type Persona = "primary" | "rescue";
+
 function num(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
@@ -114,14 +123,20 @@ export interface Config {
   ipcSocketPath: string;
   /** 本进程(人格)的 IPC secret。信使按它反查身份。 */
   ipcSecret: string | undefined;
+  /** 本进程是哪个人格(见 Persona)。 */
+  persona: Persona;
   /**
-   * 本进程是哪个人格。
+   * 管理员名单的 **env 基线**(`settings.json` 没覆盖时的默认值)。
    *
-   * `rescue` 与 `primary` 跑的是**同一个入口**,差别全在配置:数据命名空间、端口、
-   * IPC secret,外加守护人格额外挂上的看门狗与状态页。写两套装配的下场是它们
-   * 慢慢走样,而守护人格恰恰是最不该在需要时才发现"它跟主人格不一样"的那个。
+   * 存在的理由是守护人格:`isAdmin` 读的是**本进程数据目录**下的 settings.json,
+   * 而守护人格的是 `/data/rescue/settings.json` —— 一个全新的空文件。真机上的症状是
+   * 管理员一发 `/救援` 就被降级成普通用户:`catman-admin` 看不到、部署指令当不认识、
+   * 管理员令牌也拿不到,**而诊断与恢复恰好全是管理员的活**。
+   *
+   * 所以名单要能从进程外面给进来。守护人格由 index.ts 从主 settings.json 继承
+   * (主 /data 对它只读可读),别处则可用 `CATMAN_ADMIN_USER_KEYS` 显式指定。
    */
-  persona: "primary" | "rescue";
+  adminUserKeys: string[];
   /**
    * 守护人格的**无 LLM 状态页**端口。
    *
@@ -179,6 +194,7 @@ export function loadConfig(): Config {
     ipcSecret: process.env.CATMAN_IPC_SECRET || undefined,
     rescueStatusPort: num("CATMAN_RESCUE_STATUS_PORT", 8789),
     persona: process.env.CATMAN_PERSONA === "rescue" ? "rescue" : "primary",
+    adminUserKeys: list("CATMAN_ADMIN_USER_KEYS", []),
     mainDataDir,
   };
 }

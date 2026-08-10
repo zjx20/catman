@@ -126,7 +126,8 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 | `src/core/prefs.ts` | 每用户配置层,叠在全局默认之上 |
 | `src/core/commands.ts` | `COMMAND_TABLE`:硬指令的单一真相源(immediate = 只读/中断,其余进分拣队列) |
 | `src/core/turn-tokens.ts` | 回合级一次性令牌 + 在飞回合上下文(detached / abort / feed / done);每用户可有多个回合 |
-| `src/core/skills.ts` | 启动时生成两个 SKILL.md(接口说明按需加载,不占系统提示词) |
+| `src/core/skills.ts` | 启动时按人格生成三个 SKILL.md(接口说明按需加载,不占系统提示词) |
+| `src/core/persona.ts` | 人格自述(进 `systemPrompt.append`)、共享人设占位、管理员名单的跨命名空间继承 |
 | `src/core/agent.ts` | Agent SDK 封装;**必须**带 claude_code preset 三件套(见下);常开输入通道支持回合中途追加 |
 | `src/core/version.ts` | 版本戳:读 release 根目录的 VERSION;**读不到就返回 undefined,绝不编** |
 | `src/core/selfcheck.ts` | SELFCHECK 模式:自己开临时目录装配一遍 + 探一次大脑;失败分类(限流/网络/凭据/代码) |
@@ -160,6 +161,39 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 
 - **还原 Claude Code 行为靠三个非默认选项**(`agent.ts`):`systemPrompt:{type:"preset",preset:"claude_code"}`
   + `settingSources:["user","project","local"]` + `bypassPermissions`。少任何一个"脾气"就变了。
+- **人格身份走 `systemPrompt.append`,不走 skill 也不走 CLAUDE.md**(`persona.ts`)。
+  真机踩过:管理员发 `/救援` 切过去,守护人格张口就说"我现在跟你对话的就是主人格本身"——
+  它没说谎,三处身份来源当时全是人格无关的(preset 一模一样、skill 同一套、
+  而**人设 CLAUDE.md 在它的命名空间下压根不存在** —— 它的 workspace 是
+  `/data/rescue/workspace`,人手写的那份共享人设在主 `/data/workspace`,只读且不在同一棵树)。
+  三个候选载体各自的问题:**skill 正文按需加载**,模型可能压根不去读(与「图片走内联
+  不给路径」同一条理由);**CLAUDE.md** 住在数据卷里、用户能改能删,而"我是哪个人格"是
+  装配事实,改不掉才对;**消息前缀**会污染对话记录且 resume 之后就没了。
+  代价如实记:append 每回合都付钱,所以两段自述刻意短(单测钉着 <1200 字符),
+  细节交给按需加载的 `catman-rescue` skill。**每条禁令都对应一个它做得到但不该做的动作** ——
+  泛泛一句"你是守护人格"挡不住一个手上有 bypassPermissions 的 agent。
+- **skill 也要按人格分**(`skills.ts` 的 `skillsFor` / `writeSkills`):守护人格拿
+  `catman-rescue`,**拿不到** `catman-evolve`。它跑钉住的稳定版本,改了代码也上不了线,
+  而 skill 的 description 常驻上下文 —— 摆一份「怎么改自己的代码」在那儿,就是在邀请它
+  去做一件注定白费的事,而人正在等它诊断。两个分支必须对齐(列一个磁盘上没写的 skill,
+  SDK 那边只是安静地少一份说明,而它恰好是最需要的那份),有单测跑 `writeSkills` 再逐个查文件。
+- **管理员名单要跨命名空间继承**(`persona.ts` 的 `adminBaseline`):`isAdmin` 读的是
+  **本进程数据目录**下的 settings.json,而守护人格的是一个全新的空文件 —— 真机症状是管理员
+  一发 `/救援` 就被降级成普通用户(`catman-rescue` 看不到、部署指令当不认识、管理员令牌
+  也拿不到),**而诊断与恢复恰好全是管理员的活**。所以它从主 settings.json 继承一份当
+  **env 基线**(自己那份的显式值照旧赢),显式 `CATMAN_ADMIN_USER_KEYS` 又赢过继承 ——
+  后者是排查时唯一的旋钮。读不懂就当空、绝不抛:守护人格起不来比它少一个管理员糟得多。
+- **greeting 的判定权在信使,人格只消费**(`IncomingMessage.greeted` → `gateway.onIncoming`):
+  信使是唯一见过某个 userKey **全部**历史的进程,而人格有好几个、各有各的 `users.json`。
+  不接这个标记的话,用户每切一次人格就吃一整份一模一样的欢迎语 —— 白烧一条发送预算
+  (一个 context_token 只够发约 10 条),而且看起来像"它把我当新人了"。
+  **只能用来抑制,不能用来触发**:缺席表示这个渠道没有这项知识(stdin / dashboard),
+  那时退回人格自己的记录判断。消费点必须在 `ensureWorkspace()` **之后** ——
+  `markGreeted` 对还没注册的用户是空操作,而首次 `/救援` 恰好就是"这个人格第一次见到他"。
+- **渠道消息的接线是 `gateway.onIncoming` 一个方法,不写在 `start()` 的闭包里**:
+  单测为了不起真实渠道,曾经自己抄了一份等价接线 —— 于是 `start()` 每加一件事,
+  那份抄件就悄悄少一件,**测的是一条生产里不存在的路径**(greeted 那次实现明明对了、
+  用例却红)。收成一个方法之后两边共用同一份。
 - **bypassPermissions 不能以 root 运行**;镜像里用 uid 10001 的 catman 用户。
   镜像里还有 uid 10002 的 deployer:**`/data/releases` 属它所有,主容器只读挂载**
   (compose 里 `./data/releases:/data/releases:ro`)。助手文件系统全开,一句「帮我清清磁盘」
@@ -475,8 +509,10 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
  上开 evolve/<slug> 分支)  新 sha)                    健康门→30min→前移 stable→push)
 ```
 
-agent 那一侧的全部知识写在 `catman-evolve` skill 里(`skills.ts`,只对管理员回合可见),
-包括开工前要核对的三件事、分支纪律、固化的制备路径、汇报格式、以及"绝不自己起 deployer"。
+agent 那一侧的全部知识写在 `catman-evolve` skill 里(`skills.ts`,只对**主人格的**管理员
+回合可见),包括开工前要核对的三件事、分支纪律、固化的制备路径、汇报格式、以及
+"绝不自己起 deployer"。守护人格拿到的是另一份 `catman-rescue`(诊断与退版本),
+两者互斥 —— 见上面「skill 也要按人格分」那条。
 
 - **更新者不能是被更新者**:切换与回滚跑在独立的一次性容器里(`deployer-run.sh` 起,
   容器名固定 = 天然串行互斥)。它做的第一件事就是 `docker stop catman` —— 跑在 catman 里的

@@ -10,6 +10,7 @@ import {
   shortMs,
   shortNum,
 } from "./agent-trace.js";
+import { personaBriefing } from "./persona.js";
 
 /**
  * Agent SDK 封装。目标:尽量还原 Claude Code 的行为("脾气"),
@@ -197,7 +198,14 @@ export class Agent {
     const q = query({
       prompt: input,
       options: {
-        systemPrompt: { type: "preset", preset: "claude_code" },
+        // append 是**唯一**无条件在场的身份出口:skill 正文按需加载(模型可能压根
+        // 不去读)、CLAUDE.md 住在数据卷里(用户能改能删),而"我是哪个人格"是装配
+        // 事实。守护人格真机上正是因为缺这一段,张口就自称主人格。见 persona.ts。
+        systemPrompt: {
+          type: "preset",
+          preset: "claude_code",
+          append: personaBriefing(this.config.persona),
+        },
         settingSources: ["user", "project", "local"],
         permissionMode: "bypassPermissions",
         // 当前模型的 API 默认 display="omitted":thinking 块存在但文本为空。

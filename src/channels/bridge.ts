@@ -271,6 +271,10 @@ export class BridgeChannel implements Channel {
       userKey: m.userKey,
       msgId: m.msgId,
       text: m.text,
+      // 信封里的 `greeted` 一路传到网关 —— 信使算了却没人消费的话,
+      // 这个字段就只是协议里一句好看的空话(真机上正是如此:切到守护人格
+      // 的第一句话必吃一整份欢迎语)。
+      greeted: m.greeted,
       ...(attachments.length ? { attachments } : {}),
     });
     this.remember(m.msgId);

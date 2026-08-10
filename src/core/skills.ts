@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { canonicalOf } from "./commands.js";
 import { BUILTIN_ADMIN_USER_KEY } from "./identity.js";
 import { MIN_SHA_PREFIX } from "./releases.js";
+import type { Persona } from "../config.js";
 import { SETTING_SCHEMA, USER_SETTING_KEYS, type SettingContext, type SettingKey } from "./settings.js";
 
 /**
@@ -26,6 +27,7 @@ import { SETTING_SCHEMA, USER_SETTING_KEYS, type SettingContext, type SettingKey
 export const USER_SKILL = "catman-settings";
 export const ADMIN_SKILL = "catman-admin";
 export const EVOLVE_SKILL = "catman-evolve";
+export const RESCUE_SKILL = "catman-rescue";
 
 /** 普通回合可见的 skill。 */
 export const USER_SKILLS: readonly string[] = [USER_SKILL];
@@ -37,6 +39,13 @@ export const USER_SKILLS: readonly string[] = [USER_SKILL];
  * 连这份说明都不该出现 —— 它的 description 常驻上下文,列出来等于告诉每个人有这条路。
  */
 export const ADMIN_SKILLS: readonly string[] = [USER_SKILL, ADMIN_SKILL, EVOLVE_SKILL];
+/**
+ * 守护人格的 admin 回合可见的 skill。
+ *
+ * 与主人格的区别只有一处:`catman-evolve` 换成 `catman-rescue`。**不是两者都给** ——
+ * 它跑的是钉住的稳定版本,改了代码也上不了线,而人正在等它诊断。
+ */
+export const RESCUE_SKILLS: readonly string[] = [USER_SKILL, ADMIN_SKILL, RESCUE_SKILL];
 
 function settingRows(keys: readonly SettingKey[], ctx: SettingContext): string {
   const rows = keys.map((key) => {
@@ -206,17 +215,21 @@ curl -s -X DELETE -H "X-Catman-Token: $CATMAN_ADMIN_TOKEN" "$CATMAN_API_BASE/api
 `;
 }
 
-/** 自进化 skill 里那几个路径。由 config 传进来,免得正文写死后与部署布局脱节。 */
-export interface EvolvePaths {
+/** skill 正文里那几个路径。由 config 传进来,免得正文写死后与部署布局脱节。 */
+export interface SkillPaths {
   /** 源码工作区(agent 在这上面开分支)。 */
   srcDir: string;
-  /** bless 固化的部署脚本目录。制备脚本就在里面。 */
+  /** bless 固化的部署脚本目录。制备脚本与 deployer 入口都在里面。 */
   deployBinDir: string;
   /** release 目录(只读)。`current` 指针告诉 agent 线上跑的是哪个 sha。 */
   releasesDir: string;
+  /** 部署控制面目录。守护人格从这里读上一次部署的结果。 */
+  deployDir: string;
+  /** 信使的状态目录。守护人格数它的收件队列判断"消息是不是堵在人格这一侧"。 */
+  courierDir: string;
 }
 
-export function evolveSkillBody(paths: EvolvePaths): string {
+export function evolveSkillBody(paths: SkillPaths): string {
   const prepare = `${paths.deployBinDir}/prepare.sh`;
   const publish = canonicalOf("publish");
   return `${frontmatter(
@@ -322,19 +335,122 @@ git checkout main && git merge --ff-only evolve/<slug> && git branch -d evolve/<
 `;
 }
 
+export function rescueSkillBody(paths: SkillPaths): string {
+  const primary = canonicalOf("primaryPersona");
+  return `${frontmatter(
+    RESCUE_SKILL,
+    "诊断 catman 主人格的故障并在必要时把版本退回去:看部署报告、指针、容器状态、信使队列。" +
+      "有人切到守护人格找你时用它 —— 那说明主人格多半正卡着或刚上线的版本有问题。",
+  )}
+# 诊断与恢复
+
+你是守护人格。这份 skill 讲怎么查清主人格出了什么事,以及怎么把版本退回去。
+
+**你不改代码。** 你跑的是钉住的稳定版本,改了也不会上线;而且真出事时,人要的是
+"先恢复",不是"再来一次可能同样坏的改动"。改动留给主人格恢复之后再说。
+
+## 先看这四样
+
+\`\`\`bash
+cat ${paths.deployDir}/report.json            # ① 上一次部署的结果(成功?自动回滚了?)
+readlink ${paths.releasesDir}/current          # ② 线上跑的是哪个 sha
+readlink ${paths.releasesDir}/stable           # ③ 上一个熬过观察期的 sha
+docker inspect -f '{{.State.Status}} {{.RestartCount}}' catman   # ④ 主人格容器在不在
+\`\`\`
+
+**② 与 ③ 不一样 = 正处在观察期里**,那段时间的任何崩溃都会自然落回 stable,别急着动手。
+④ 的 \`RestartCount\` 在涨 = crash-loop,原因去 \`docker logs --tail 200 catman\` 里找。
+
+主 \`/data\` 对你是**只读**挂载,上面这些都读得到;想改就会 EACCES,那是刻意的。
+
+## 主人格还活着但答非所问
+
+先别退版本。让人给一句具体的复现(他刚说了什么、你猜他期待什么、实际收到什么),
+再去 \`docker logs\` 里找那一轮。**没有证据就退版本是最糟的处置** ——
+它把一个可能只是提示词问题的事故,变成一次真实的版本变更。
+
+## 消息卡在信使里
+
+\`\`\`bash
+wc -l ${paths.courierDir}/inbox/primary.jsonl   # 队列有多长
+\`\`\`
+
+队列在涨而主人格没在处理,说明它拉不动了(卡死或已经死了)。这是**该退版本**的信号之一。
+
+## 退版本
+
+\`\`\`bash
+${paths.deployBinDir}/deployer-run.sh demote --step 1 --why "<一句话说清为什么>"
+\`\`\`
+
+它起一个**一次性 deployer 容器**去换指针。三条纪律:
+
+1. **绝不自己动 \`${paths.releasesDir}\` 下的符号链接。** 「更新者不能是被更新者」——
+   换指针要先停容器,而你就跑在容器里。何况那个目录对你只读,你也写不动。
+2. **demote 只拨 \`current\`,绝不动 \`stable\`。** 它是机械判据,远弱于观察期;
+   让它改写"回退目标"这个概念本身,等于允许一次误判永久生效。
+3. **一次退一级,退完观察。** \`--step 2\` 是在第一级没救回来之后才用的。
+
+真要连 \`stable\` 一起拨(人已经判定那个版本坏了),那是 \`${canonicalOf("rollback")}\`,
+由**管理员在主人格那边**发 —— 不是你代劳。
+
+## 重启主人格
+
+\`\`\`bash
+docker restart catman
+\`\`\`
+
+**只在有理由相信是进程状态坏了(卡死、内存尽)时用。** 崩溃循环里重启没有意义,
+只是把同一个错误再跑一遍,而且会让 \`RestartCount\` 这个判据变浑。
+
+## 收尾
+
+弄完告诉他两件事:**出了什么事**、**现在跑的是哪个版本**。然后提醒他发
+\`${primary}\` 切回主人格 —— 忘了也不要紧,闲置一段时间会自动切回,但他会一直在跟你说话。
+`;
+}
+
 /**
  * 把 skill 写到 CLAUDE_CONFIG_DIR/skills/ 下。启动时调用一次。
  * 内容由 SETTING_SCHEMA、COMMAND_TABLE 与配置里的路径生成,所以那几处一改这里自动跟上。
+ *
+ * **按人格生成不同的一套。** 守护人格拿到的是 `catman-rescue` 而不是 `catman-evolve`:
+ * 它跑钉住的稳定版本,改了代码也上不了线;而 skill 的 description 常驻上下文,
+ * 摆一份"怎么改自己的代码"在那儿,就是在邀请它去做一件注定白费的事 ——
+ * 而人正在等它诊断。
  */
-export function writeSkills(configDir: string, ctx: SettingContext, paths: EvolvePaths): void {
-  const bodies: Array<[string, string]> = [
-    [USER_SKILL, userSkillBody(ctx)],
-    [ADMIN_SKILL, adminSkillBody(ctx)],
-    [EVOLVE_SKILL, evolveSkillBody(paths)],
-  ];
+export function writeSkills(
+  configDir: string,
+  ctx: SettingContext,
+  paths: SkillPaths,
+  persona: Persona = "primary",
+): void {
+  const bodies: Array<[string, string]> =
+    persona === "rescue"
+      ? [
+          [USER_SKILL, userSkillBody(ctx)],
+          [ADMIN_SKILL, adminSkillBody(ctx)],
+          [RESCUE_SKILL, rescueSkillBody(paths)],
+        ]
+      : [
+          [USER_SKILL, userSkillBody(ctx)],
+          [ADMIN_SKILL, adminSkillBody(ctx)],
+          [EVOLVE_SKILL, evolveSkillBody(paths)],
+        ];
   for (const [name, body] of bodies) {
     const dir = join(configDir, "skills", name);
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "SKILL.md"), body, "utf8");
   }
+}
+
+/**
+ * 这一回合该让哪些 skill 进上下文。
+ *
+ * 与 `writeSkills` 必须给出**一致**的人格分支 —— 列一个磁盘上没有的 skill,
+ * SDK 那边只是安静地少一份说明,而它恰好是最需要的那份。有单测钉住两者对齐。
+ */
+export function skillsFor(persona: Persona, isAdmin: boolean): string[] {
+  if (!isAdmin) return [...USER_SKILLS];
+  return persona === "rescue" ? [...RESCUE_SKILLS] : [...ADMIN_SKILLS];
 }
