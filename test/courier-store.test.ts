@@ -292,3 +292,32 @@ test("spool:开机扫除不碰新鲜的文件", () => {
     assert.ok(existsSync(join(spoolDir, ref.id)), "队列里可能还挂着这条引用");
   });
 });
+
+test("预算:同一个 token 再 remember 一次**不重置计数** —— 重放会导致超发", () => {
+  // 信使崩在"已入队、游标未落盘"之间时整批会重放,于是同一条来信的 context_token
+  // 会被 remember 第二次。清零之后我们以为还有满额,继续发 —— 而超发的后果是
+  // `ret=-2 prepare failed` 且永不恢复:连正文都发不出去,用户彻底静默。
+  withDir((dir) => {
+    const store = new ReplyStore(join(dir, "ctx.json"));
+    store.remember("u", "raw-u", "tok-1");
+    for (let i = 0; i < 4; i++) store.begin("u", "progress");
+    assert.equal(store.remainingProgress("u"), MAX_PROGRESS_PER_TOKEN - 4);
+
+    store.remember("u", "raw-u", "tok-1"); // 重放
+    assert.equal(
+      store.remainingProgress("u"),
+      MAX_PROGRESS_PER_TOKEN - 4,
+      "同一个 token 就是同一条来信,账不该被清掉",
+    );
+  });
+});
+
+test("预算:换了 token 才重置 —— 新来信本来就带新预算", () => {
+  withDir((dir) => {
+    const store = new ReplyStore(join(dir, "ctx.json"));
+    store.remember("u", "raw-u", "tok-1");
+    for (let i = 0; i < 4; i++) store.begin("u", "progress");
+    store.remember("u", "raw-u", "tok-2");
+    assert.equal(store.remainingProgress("u"), MAX_PROGRESS_PER_TOKEN);
+  });
+});

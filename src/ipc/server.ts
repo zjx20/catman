@@ -133,6 +133,9 @@ function readWaitMs(body: unknown): number {
   return Math.min(Math.max(0, Math.floor(v)), 60_000);
 }
 
+/** 中止之后留给在飞响应写完的时间。够短以免拖住关闭,够长以免把正常结果掐断。 */
+const GRACE_MS = 50;
+
 /** 请求体上限。IPC 只传文本与引用,**附件字节不走这里**,所以可以定得很小。 */
 const MAX_BODY_BYTES = 1_000_000;
 
@@ -174,21 +177,36 @@ export class IpcServer {
   }
 
   async stop(): Promise<void> {
-    // 先中止在飞的长轮询:它们最长会挂 25 秒,不收掉的话 close() 的回调永远不触发,
-    // 进程卡在优雅关闭里出不去 —— dashboard 的 SSE 是同一个坑,已实测复现过。
+    // ① 先中止在飞的长轮询:它们最长会挂 25 秒,不收掉的话 close() 的回调永远不触发,
+    //    进程卡在优雅关闭里出不去 —— dashboard 的 SSE 是同一个坑,已实测复现过。
     for (const c of this.inFlight) c.abort();
     this.inFlight.clear();
-    await new Promise<void>((resolve) => {
-      if (!this.server) return resolve();
-      this.server.close(() => resolve());
-    });
+    // ② 给被中止的那些一小段时间把响应写完 —— 人格那边拿到一个正常的空结果,
+    //    比拿到一个被掐断的连接干净(后者会让它打一行"拉取失败"然后退避)。
+    await new Promise((r) => setTimeout(r, GRACE_MS));
+    const server = this.server;
+    if (server) {
+      // ③ **必须显式关连接**。客户端用的是 keep-alive 的 agent,响应写完之后 socket
+      //    仍然活着;`close()` 只是不再接新连接,于是它会一直等到 keep-alive 超时
+      //    (默认 5 秒)才回调 —— 实测这一步让 stop() 从毫秒变成 4 秒。
+      //    对**信使**来说这是致命的:它跑 pinned release、要被人工 bless 重启,
+      //    每次都白等几秒还算小事,真正的问题是这类"等待"会随连接数线性增长。
+      server.closeAllConnections?.();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
     rmSync(this.opts.socketPath, { force: true });
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const abort = new AbortController();
     this.inFlight.add(abort);
-    req.on("close", () => abort.abort());
+    // ⚠️ **必须挂在 `res` 上,不能挂 `req`。**
+    // `IncomingMessage` 的 `close` 在请求体**读完**的那一刻就触发(实测:读完 body
+    // 之后立即为已触发),而我们下面要先 `await readJsonBody(req)` —— 于是 signal
+    // 一进 `api.pull` 就已经 aborted,长轮询当场返回空,bridge 以最高速度重拉,
+    // 在软路由上把 CPU 打满。而这件事**没有任何报错**,只表现为"机器很烫"。
+    // `ServerResponse` 的 `close` 才是"对端走了或响应写完了",正是我们要的。
+    res.on("close", () => abort.abort());
     try {
       const url = new URL(req.url ?? "/", "http://localhost");
       const body = await readJsonBody(req);

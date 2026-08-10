@@ -106,6 +106,18 @@ export class ReplyStore {
    * 又发了一条,序号退回 #1 —— 那是对的,新来信带来新预算。
    */
   remember(userKey: string, toUserId: string, contextToken: string): void {
+    // **同一个 token 不重置计数。** 计数的语义是"针对**这条来信**回了几条",而同一个
+    // context_token 就是同一条来信 —— 重放(信使崩在"已入队、游标未落盘"之间时整批
+    // 会重放)会让 remember 被同一个 token 调第二次,清零之后我们以为还有满额,
+    // 于是超发,而超发是 `ret=-2` 且永不恢复。往保守一侧倒:只更新收件人,不动账。
+    const existing = this.ctxs.get(userKey);
+    if (existing && existing.contextToken === contextToken) {
+      if (existing.toUserId !== toUserId) {
+        this.ctxs.set(userKey, { ...existing, toUserId });
+        this.flush();
+      }
+      return;
+    }
     this.ctxs.set(userKey, {
       toUserId,
       contextToken,

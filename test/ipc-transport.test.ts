@@ -24,9 +24,12 @@ class FakeCourier implements CourierApi {
   next: PullResponse = { schema: IPC_SCHEMA, controls: [], messages: [] };
   /** true 时 pull 一直挂着直到 signal 触发 —— 模拟真实的长轮询。 */
   hang = false;
+  /** 进入 pull 那一刻 signal 是不是已经 aborted。**这是个陷阱的探针**,见用例。 */
+  abortedOnEntry: boolean | undefined;
 
   async pull(persona: PersonaId, _waitMs: number, signal: AbortSignal): Promise<PullResponse> {
     this.pulls.push(persona);
+    this.abortedOnEntry = signal.aborted;
     if (!this.hang) return this.next;
     await new Promise<void>((resolve) => {
       if (signal.aborted) return resolve();
@@ -202,5 +205,16 @@ test("/admin/* 透传给信使,并带上由 secret 推出的身份", async () =>
     const r = (await client.admin("GET", "/accounts")) as Record<string, unknown>;
     assert.equal(r["persona"], "primary");
     assert.equal(r["path"], "/accounts");
+  });
+});
+
+test("长轮询的 signal **进门时不能已经 aborted** —— 否则它退化成忙轮询", async () => {
+  // 踩过的坑:中止挂在 `req` 上,而 IncomingMessage 的 `close` 在请求体**读完**的
+  // 那一刻就触发(实测确认),早于 api.pull 被调用。于是每次拉取立即返回空,
+  // bridge 以最高速度重拉,在软路由上把 CPU 打满 —— 而这件事**没有任何报错**,
+  // 只表现为"机器很烫"。中止必须挂在 `res` 上。
+  await withServer(async (client, api) => {
+    await client.pull(0);
+    assert.equal(api.abortedOnEntry, false, "signal 一进门就 aborted 了 —— 长轮询是假的");
   });
 });

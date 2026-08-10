@@ -276,3 +276,35 @@ test("处理来信时任何一步抛错都只跳过这一条,绝不掀翻循环"
     assert.equal(h.inboxes.get("primary")!.depth(), 0);
   });
 });
+
+test("没有消息时 pull 真的挂住 waitMs —— 否则 bridge 会以最高速度空转", async () => {
+  // 与 ipc-transport 里那条"signal 进门时不能已经 aborted"是同一件事的两半:
+  // 那条验信号,这条验**行为**。只验信号的话,别处再加一个提前返回同样测不出来。
+  await withHarness(async (h) => {
+    const started = Date.now();
+    const r = await h.core.pull("primary", 200, NO_SIGNAL);
+    const elapsed = Date.now() - started;
+    assert.deepEqual(r.messages, []);
+    assert.ok(elapsed >= 150, `只挂了 ${elapsed}ms —— 长轮询没生效`);
+  });
+});
+
+test("有消息时立刻返回,不必等满 waitMs", async () => {
+  await withHarness(async (h) => {
+    await h.core.accept({ msgId: "m1", userKey: USER, text: "喂" });
+    const started = Date.now();
+    await h.core.pull("primary", 5000, NO_SIGNAL);
+    assert.ok(Date.now() - started < 200, "有货就该马上给");
+  });
+});
+
+test("挂着的时候来了新消息要**立刻唤醒**,而不是等超时", async () => {
+  await withHarness(async (h) => {
+    const started = Date.now();
+    const pulling = h.core.pull("primary", 5000, NO_SIGNAL);
+    setTimeout(() => void h.core.accept({ msgId: "m1", userKey: USER, text: "喂" }), 50);
+    const r = await pulling;
+    assert.equal(r.messages.length, 1);
+    assert.ok(Date.now() - started < 1000, "唤醒没生效,白等了一整个 waitMs");
+  });
+});
