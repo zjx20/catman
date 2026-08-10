@@ -13,6 +13,7 @@ import {
   MAX_FEEDS_PER_TURN,
   FEED_ACK_TEXT,
   TURN_ERROR_PREFIX,
+  helpText,
 } from "../src/core/gateway.js";
 import { canonicalOf } from "../src/core/commands.js";
 import { SessionManager, InMemoryStore } from "../src/core/session.js";
@@ -742,6 +743,28 @@ test("greeting:指引里列全了硬指令,它是唯一的发现入口", async (
   for (const cmd of ["/帮助", "/状态", "/新会话", "/取消", "/继续", "/切换会话"]) {
     assert.ok(g.includes(cmd), `指引里缺了 ${cmd}`);
   }
+});
+
+test("指引:每个列表块前面都空一行 —— 紧贴上一段的话渲染完会糊成一坨", () => {
+  // 这是它以前难看的真因:靠缩进两格分行,而 markdown 会把连续的行并成一段,
+  // 十几条指令连成一大坨,看不出哪里是一条的开头。
+  const lines = helpText(["sonnet", "opus"], true).split("\n");
+  lines.forEach((line, i) => {
+    if (!line.startsWith("- ")) return;
+    const prev = lines[i - 1] ?? "";
+    assert.ok(
+      prev === "" || prev.startsWith("- "),
+      `第 ${i + 1} 行是列表项,但上一行既不是空行也不是列表项:${JSON.stringify(prev)}`,
+    );
+  });
+});
+
+test("指引:带参指令的占位名包在反引号里 —— 裸的 <会话id> 会被当成 HTML 标签吃掉", () => {
+  // 吃掉之后用户看到的是一条没有参数的 /切换会话,而它恰恰是最需要说清参数的那条。
+  const help = helpText(["sonnet"], false);
+  const line = help.split("\n").find((l) => l.includes(canonicalOf("switchSession")));
+  assert.ok(line, "指引里没有 /切换会话");
+  assert.match(line, /`\/切换会话 <会话id>`/, "占位名没被反引号保护");
 });
 
 test("greeting:推送失败时不标记,下次重试", async () => {

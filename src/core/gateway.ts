@@ -265,29 +265,42 @@ function humanDuration(ms: number): string {
 /**
  * 使用指引。**由 COMMAND_TABLE 与 SETTING_SCHEMA 生成** ——
  * 加指令或加配置项时这里自动跟上,不会出现"文档说有、实际没有"。
+ *
+ * ## 正文是 markdown,而且列表前后的空行不能省
+ *
+ * 这份文案的读者是聊天客户端的 markdown 渲染器。**列表块前面必须空一行** ——
+ * 紧贴着上一段写的话,渲染器会把整个清单并进那一段,十几条指令连成一大坨,
+ * 看不出哪里是一条的开头。这正是它以前的样子(缩进两格靠肉眼分行,渲染完全糊掉)。
+ *
+ * 同理,靠行尾断句、指望渲染器保留换行的写法一律不要:markdown 会把连续的行
+ * 合成一段。要分行就分段,要并列就用列表。
  */
 export function helpText(modelAllowlist: string[], isAdmin = false): string {
   const cmds = commandHelpLines(isAdmin)
-    .map((l) => `  ${l}`)
+    .map((l) => `- ${l}`)
     .join("\n");
   const settings = USER_SETTING_KEYS.map((key) => {
     const def = SETTING_SCHEMA[key];
-    return `  ${def.label} — ${def.hint({ modelAllowlist })}`;
+    return `- **${def.label}** — ${def.hint({ modelAllowlist })}`;
   }).join("\n");
   return [
     "跟我说话就行,平常怎么聊都可以。",
     "",
-    "下面这些是硬指令,不经过大脑、后台直接答,所以我卡住的时候它们照样管用。",
-    "必须以 / 开头,而且整条消息只有指令本身:",
+    "**硬指令** —— 不经过大脑、后台直接答,所以我卡住的时候它们照样管用。" +
+      "必须以 `/` 开头,而且整条消息只有指令本身:",
+    "",
     cmds,
     "",
-    "另外你可以直接跟我说「换成 sonnet」「别刷进度了」「超时改成一天」,",
-    "我会去改你自己的设置。能改的有:",
+    "**你的设置** —— 直接跟我说「换成 sonnet」「别刷进度了」「超时改成一天」,我就去改:",
+    "",
     settings,
     "",
-    `想接着聊被超时中断的话题,发 ${canonicalOf("continue")};`,
-    `上下文太长把我卡住了,发 ${canonicalOf("newSession")} 重新开始;`,
-    `想切回之前的某段对话,发 ${canonicalOf("switchSession")} 加上会话 id(只发指令则列出最近的对话)。`,
+    "**几种常见情况**:",
+    "",
+    `- 想接着聊被超时中断的话题 → \`${canonicalOf("continue")}\``,
+    `- 上下文太长把我卡住了 → \`${canonicalOf("newSession")}\` 重新开始`,
+    `- 想切回之前的某段对话 → \`${canonicalOf("switchSession")} <会话id>\`` +
+      "(只发指令则列出最近的对话)",
   ].join("\n");
 }
 

@@ -249,7 +249,11 @@ export function parseCommand(text: string): ParsedCommand | undefined {
 }
 
 /**
- * 帮助文案里的指令清单,每行形如 `/帮助（/help）— 看这份使用指引`。
+ * 帮助文案里的指令清单,每行形如 `` `/帮助`(`/help`)— 看这份使用指引 ``。
+ *
+ * **指令一律包在反引号里**,理由不止是好看:带参那条的占位名是 `<会话id>`,
+ * 裸着出现在 markdown 里会被当成 HTML 标签整个吃掉 —— 用户看到的是一条
+ * 没有参数的 `/切换会话`,而这恰恰是最需要说清参数的那条。
  *
  * `isAdmin` 决定要不要列出 adminOnly 的那几条。默认不列 —— 漏传的后果应当是
  * "少显示几条"而不是"把管理员指令告诉所有人"。
@@ -257,8 +261,8 @@ export function parseCommand(text: string): ParsedCommand | undefined {
 export function commandHelpLines(isAdmin = false): string[] {
   return COMMAND_TABLE.filter((c) => !c.hidden && (isAdmin || !c.adminOnly)).map((c) => {
     const arg = c.takesArg && c.argHint ? ` <${c.argHint}>` : "";
-    const alt = c.aliases.length ? `(${c.aliases.join(" ")})` : "";
-    return `${c.canonical}${arg}${alt} — ${c.desc}`;
+    const alt = c.aliases.length ? `(${c.aliases.map((a) => `\`${a}\``).join(" ")})` : "";
+    return `\`${c.canonical}${arg}\`${alt} — ${c.desc}`;
   });
 }
 
