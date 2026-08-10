@@ -301,23 +301,16 @@ ${prepare} HEAD
 setsid nohup ${prepare} HEAD > /tmp/prepare.log 2>&1 < /dev/null &
 \`\`\`
 
-### 上一次被杀掉之后:先清残骸
+### 满屏 \`Permission denied\` 是残骸,不是你
 
-制备的第一步是 \`rm -rf <releases>/<sha>.tmp\`。**被中途杀掉的运行留下的那个 \`.tmp\`
-删不掉**:lockfile 没变时它是 \`cp -al\` 硬链接复用来的 node_modules,目录权限连同
-555 一起复制了过来,deployer 是属主也照样写不进去 —— 于是新的制备在第一行就 \`set -e\` 退出,
-满屏 \`rm: cannot remove ...: Permission denied\`。看到这个就是撞上了它,跟你改的代码无关。
+被杀掉的运行会留下 \`<releases>/<sha>.tmp\`,而它删不掉:lockfile 没变时那棵
+node_modules 是 \`cp -al\` 复用来的,555 的目录权限一起复制了过来,连建它的人自己
+都写不进去。制备的第一步正是删这个目录,于是新的制备在第一行就 \`set -e\` 退出,
+满屏 \`rm: cannot remove ...: Permission denied\`。
 
-清理办法是起一个跟制备同属主的一次性容器,先给**目录**加写权限再删:
-
-\`\`\`bash
-docker run --rm --user 10002:10002 -v "$CATMAN_HOST_DATA_DIR:/data" "$CATMAN_IMAGE" \\
-  bash -c "find <releases>/<sha>.tmp -type d -exec chmod u+w {} + && rm -rf <releases>/<sha>.tmp"
-\`\`\`
-
-\`-type d\` 不能省。\`.tmp\` 里的**文件**跟已验证 release 逐个共享 inode,\`chmod\` 会穿透过去
-改到那边的字节(同「复用之后对那棵树零写操作」);目录是 \`cp -al\` 新建的,只归这个 \`.tmp\`,
-改它安全。
+\`prepare.sh\` 现在自己清(\`lib.sh\` 的 \`rm_release_tmp\`)。**还是看到这个报错的话,
+说明固化的那份脚本比仓库里的旧** —— 那是 Tier 3,要人重新跑一次 bless;在那之前
+先请管理员清一次,不要自己去改固化目录里的脚本。
 
 制备成功后把分支落回 main 并删掉它:
 

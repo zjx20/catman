@@ -10,6 +10,8 @@ import {
   symlinkSync,
   existsSync,
   readlinkSync,
+  chmodSync,
+  statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -342,6 +344,68 @@ test("GC:名字不像 release 的一概不碰 —— 宁可漏删,不可错删",
     inLib(dir, `history_push ${a}; pointer_set current ${a}; release_gc`);
     assert.ok(existsSync(join(dir, `${a.slice(0, 39)}.tmp`)), "制备中途的 .tmp 不该被动");
     assert.ok(existsSync(join(dir, "某个手工放进来的目录")), "不认识的目录不该被动");
+  });
+});
+
+/**
+ * 制备残骸的清理。GC 明确不碰 `<sha>.tmp`(上一个用例),所以清它的责任全在
+ * `rm_release_tmp` 身上 —— 而它清不掉的后果不是占磁盘,是**下一次制备跑不起来**:
+ * prepare 的第一行就是删这个目录,删不掉就 `set -e` 当场退出。
+ */
+function makeStaleTmp(dir: string, releaseSha: string, work: string): string {
+  // 照着真机复现:release 里一棵 node_modules,`cp -al` 出 .tmp(于是文件逐个共享
+  // inode),再把 .tmp 的目录压成 555 —— 制备被杀掉时盘上就是这个样子。
+  const pkg = join(dir, releaseSha, "node_modules", "some-pkg");
+  mkdirSync(pkg, { recursive: true });
+  writeFileSync(join(pkg, "index.js"), "module.exports = 1;\n");
+  chmodSync(join(pkg, "index.js"), 0o444);
+  execFileSync("cp", ["-al", join(dir, releaseSha, "node_modules"), join(work, "node_modules")]);
+  for (const d of ["node_modules/some-pkg", "node_modules", "."]) {
+    chmodSync(join(work, d), 0o555);
+  }
+  return join(pkg, "index.js");
+}
+
+test("清残骸:cp -al 留下的只读目录也要删得掉 —— 否则下一次制备第一行就死", () => {
+  withDir((dir) => {
+    const a = SHA("a");
+    const work = join(dir, `${SHA("b")}.tmp`);
+    mkdirSync(work, { recursive: true });
+    makeStaleTmp(dir, a, work);
+
+    // 先确认这个场景真的复现了:不 chmod 直接删是删不动的。
+    // root 除外 —— 它无视权限位,复现不出来。制备容器里跑的是 10002,不走这个分支。
+    if (process.getuid?.() !== 0) {
+      assert.throws(() => rmSync(work, { recursive: true }), "场景没复现,这个用例就没在验东西");
+    }
+
+    inLib(dir, `rm_release_tmp "${work}"`);
+    assert.ok(!existsSync(work), "残骸没清掉,下一次同 sha 的制备会一直失败");
+  });
+});
+
+test("清残骸:只 chmod 目录 —— 文件与已验证 release 共享 inode,改它就是改到 stable 上", () => {
+  withDir((dir) => {
+    const a = SHA("a");
+    const work = join(dir, `${SHA("b")}.tmp`);
+    mkdirSync(work, { recursive: true });
+    const shared = makeStaleTmp(dir, a, work);
+
+    inLib(dir, `rm_release_tmp "${work}"`);
+
+    // 这一条钉的是 `find -type d`。改成 `chmod -R u+w` 的话这里会变成 0o644 ——
+    // 一个 444 的文件在已验证 release 里被写成可写,而没有任何日志会提到它。
+    assert.equal(statSync(shared).mode & 0o777, 0o444, "chmod 穿透硬链接改到 release 上了");
+    assert.equal(readFileSync(shared, "utf8"), "module.exports = 1;\n", "release 的字节被动过");
+  });
+});
+
+test("清残骸:没有残骸时是空操作 —— 它在 set -e 下每次制备都要跑一遍", () => {
+  withDir((dir) => {
+    // 绝大多数制备都走这条路(上一次好好地跑完了,盘上没有 .tmp)。这里返回非零的话
+    // **每一次**制备都在第一行就退出 —— 比清不掉残骸严重得多。
+    assert.equal(inLib(dir, `rm_release_tmp "${join(dir, "不存在.tmp")}"; echo 活着`), "活着");
+    assert.equal(inLib(dir, `rm_release_tmp ""; echo 活着`), "活着", "路径为空也不该炸");
   });
 });
 

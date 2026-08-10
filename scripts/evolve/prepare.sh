@@ -117,7 +117,8 @@ docker run --rm \
     git_trust_repo "$SRC_DIR"
 
     WORK="$RELEASES_DIR/$SHA.tmp"
-    rm -rf "$WORK"
+    # 不是 `rm -rf` —— 上一次被中途杀掉留下的 $WORK 删不掉,见 lib.sh 里那段说明。
+    rm_release_tmp "$WORK"
     # clone 而不是 git worktree:worktree 的 .git 只是一个指向共享仓库的指针,
     # 清理时 rm -rf 会留下元数据残骸,导致**同一个 sha 无法再次 worktree add** ——
     # 那恰好死在"回滚之后想重新制备旧版本"这条事故恢复路径上。clone 出来的

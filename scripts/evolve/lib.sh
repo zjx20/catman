@@ -442,6 +442,32 @@ release_gc() {
   rm -f "$keep_file"
 }
 
+# ── 制备残骸 ───────────────────────────────────────────────────────
+# 删掉一个 `<sha>.tmp`。看着是 `rm -rf` 的同义词,不是:
+#
+# 制备被中途杀掉时(会话结束、Ctrl-C、OOM)`$WORK` 留在盘上,而**建它的人自己都删不掉**
+# —— lockfile 未变时 node_modules 是 `cp -al` 复用来的,连同 555 的目录权限一起复制了
+# 过来,rm 进不去那些目录。于是下一次同 sha 的制备在 `rm -rf "$WORK"` 这**第一行**就
+# `set -e` 退出,满屏 `Permission denied`。那条报错跟这次改的代码毫无关系,却让制备
+# 再也跑不动,只能人工进来清一次。真机上连着撞了两次,第二次才看明白。
+#
+# ⚠️ **只 chmod 目录,不能用 `chmod -R`。** `$WORK` 里的**文件**与已验证 release 逐个
+# 共享 inode(见 prepare.sh 头上的纪律 ③),chmod 会穿透过去改到 stable 的字节上 ——
+# 为了删掉一坨垃圾而动了逃生门,买卖做反了。目录是 `cp -al` 新建的,只归这个 `$WORK`,
+# 改它安全。有单测钉着这一条。
+rm_release_tmp() { # rm_release_tmp <目录>
+  local work="${1:-}"
+  [ -n "$work" ] || return 0
+  # 写成 if 而不是 `[ -d … ] && …`:目录不存在时那种写法整条 AND 列表返回 1,
+  # 在调用方的 `set -e` 下是不是当场退出取决于它出现在什么位置 —— 而"没有残骸要清"
+  # 恰恰是最常走的那条路,不能让它去赌。
+  if [ -d "$work" ]; then
+    # chmod 失败不致命:真接不下去的话让 rm 去报错,那句话比这里能说的更具体。
+    find "$work" -type d -exec chmod u+w {} + 2>/dev/null || true
+  fi
+  rm -rf "$work"
+}
+
 # ── release 校验 ───────────────────────────────────────────────────
 release_verify() { # release_verify <sha>
   # ⚠️ 分两句写。`local a="$1" b="…$a"` 在 `set -u` 下会炸:local 先把两个名字都
