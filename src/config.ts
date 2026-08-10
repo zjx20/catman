@@ -123,6 +123,14 @@ export interface Config {
    */
   persona: "primary" | "rescue";
   /**
+   * 守护人格的**无 LLM 状态页**端口。
+   *
+   * 与 dashboard 分开一个端口而不是共用:两者的可用前提不同 —— dashboard 要装配
+   * 起来(会话、agent、skill),状态页只读文件。磁盘满或 token 过期时前者可能起不来,
+   * 而后者恰恰是那时唯一还能用的东西。共用一个 server 就把它们绑成同生共死了。
+   */
+  rescueStatusPort: number;
+  /**
    * **主** /data 的位置。
    *
    * 守护人格的 `CATMAN_DATA_DIR` 指向它自己的命名空间(`/data/rescue`),
@@ -169,6 +177,7 @@ export function loadConfig(): Config {
     courierDir: str("CATMAN_COURIER_DIR", `${mainDataDir}/courier`),
     ipcSocketPath: str("CATMAN_IPC_SOCKET", `${mainDataDir}/ipc/courier.sock`),
     ipcSecret: process.env.CATMAN_IPC_SECRET || undefined,
+    rescueStatusPort: num("CATMAN_RESCUE_STATUS_PORT", 8789),
     persona: process.env.CATMAN_PERSONA === "rescue" ? "rescue" : "primary",
     mainDataDir,
   };

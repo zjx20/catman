@@ -215,7 +215,7 @@ async function main(): Promise<void> {
       courierDir: config.courierDir,
       primaryContainer: process.env["CATMAN_CONTAINER"] ?? "catman",
       courierContainer: process.env["CATMAN_COURIER_CONTAINER"] ?? "catman-courier",
-      statusPort: config.dashboardPort + 1,
+      statusPort: config.rescueStatusPort,
       token: adminToken,
     });
     rescue.start();

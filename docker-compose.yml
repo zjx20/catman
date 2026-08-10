@@ -193,6 +193,10 @@ services:
       CATMAN_DATA_DIR: /data/rescue
       CATMAN_MAIN_DATA_DIR: /data
       CATMAN_DASHBOARD_PORT: "8788"
+      # 状态页单独一个端口 —— 它与 dashboard 的可用前提不同:dashboard 要装配起来
+      # (会话、agent、skill),状态页只读文件。磁盘满或 token 过期时前者可能起不来,
+      # 而后者恰恰是那时唯一还能用的东西。
+      CATMAN_RESCUE_STATUS_PORT: "8789"
       CATMAN_IPC_SECRET: ${CATMAN_IPC_SECRET_RESCUE:?}
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}
       CLAUDE_CONFIG_DIR: /data/rescue/claude
@@ -220,6 +224,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8788:8788" # 无 LLM 状态页 + 第二个 dashboard(同一份令牌)
+      - "8788:8788" # 守护人格的 dashboard(同一份令牌)
+      - "8789:8789" # **无 LLM 状态页** —— 大脑起不来时唯一还能用的控制面
     depends_on:
       - catman-courier
