@@ -5,6 +5,7 @@
 #   deployer.sh deploy <sha> [--requested-by <userKey>]
 #   deployer.sh rollback [--requested-by <userKey>]
 #   deployer.sh demote [--step N] [--why <一句话>]
+#   deployer.sh courier-fallback [--why <一句话>]
 #   deployer.sh status
 #
 # ## 它为什么必须与 catman 分开
@@ -221,7 +222,7 @@ pick_rollback_target() {
 # shell 层的单测直接跑起来验 —— 曾经有一版把 current/stable/pinned 三个指针当成
 # release 目录删掉,把它们指向的内容全部掏空。
 
-# ── 三种模式 ───────────────────────────────────────────────────────
+# ── 四种模式 ───────────────────────────────────────────────────────
 
 do_deploy() {
   local sha="$1"
@@ -342,6 +343,85 @@ do_demote() {
   fi
 }
 
+# ── courier-fallback:信使自己崩了,把稳定面退回上一份 ───────────────
+#
+# 这是整套脚本里**唯一会自动改写稳定面**的动作,所以它比 demote 更保守。
+#
+# ## 它修的是哪一种故障
+#
+# `pinned` 是人钦定的,而钦定的依据是那份 release 当过 `stable` —— 但观察期只跑过
+# **主人格**。信使的代码路径(iLink 连接、accounts.json、收件队列)在那 30 分钟里
+# 一次都没被执行过。所以一份"过了门"的 release 完全可能有一个起不来的信使,
+# 而后果是**微信整个聋掉**:两个人格都在它身后,连报警都发不出去。
+# `pinned-prev` 就是为这一种故障留的,由 bless 在钦定新 pinned 时顺手存下。
+#
+# ## 三条比 demote 更严的纪律
+#
+# **① 只动 `pinned`。** `current` / `stable` / `pinned-prev` 一个都不碰 ——
+# 主人格跑的是 current,信使崩了不是它的错,把它一起换掉是无谓地扩大故障面。
+#
+# **② 目标必须先过内容校验。** 退到一个字节已经损坏的 release 上,结果是
+# 两份都起不来,而人还以为退过了。
+#
+# **③ 不重启守护人格。** 它跑的也是 pinned,但**换链接不影响已经跑起来的进程**
+# (符号链接在启动时就解析完了)。而重启它等于杀掉正在执行这次兜底的那个决策者 ——
+# 何况它此刻是唯一还活着的观测点。下次它自己重启时自然就在新 pinned 上。
+do_courier_fallback() {
+  lock_acquire "courier-fallback"
+  trap 'lock_release' EXIT
+
+  local cur prev
+  cur="$(pointer_sha pinned)"
+  prev="$(pointer_sha pinned-prev)"
+
+  if [ -z "$prev" ]; then
+    # 首次 bless 之后 pinned-prev 还不存在(它在**第二次**钦定时才产生)。
+    report aborted "${cur:-unknown}" "信使起不来,但没有 pinned-prev 可退 —— 需要人:检查信使日志与 .env"
+    die "没有 pinned-prev"
+  fi
+  if [ "$prev" = "$cur" ]; then
+    report aborted "${cur:-unknown}" "信使起不来,而 pinned-prev 与 pinned 是同一份 —— 退了也没用,需要人"
+    die "pinned-prev 与 pinned 相同"
+  fi
+  if ! release_verify "$prev"; then
+    report aborted "${cur:-unknown}" "信使起不来,而 pinned-prev($prev)内容校验不过 —— 需要人"
+    die "pinned-prev 校验不通过"
+  fi
+
+  log "信使兜底:pinned $cur → $prev(${DEMOTE_WHY:-信使 crash-loop})"
+  local base; base="$(container_restarts "$CATMAN_COURIER_CONTAINER")"
+  container_stop "$CATMAN_COURIER_CONTAINER"
+  pointer_set pinned "$prev"
+  container_start "$CATMAN_COURIER_CONTAINER"
+
+  # 信使没有 HTTP 健康端点(它只有 IPC),所以判据只能是"起来了并且不再重启"。
+  # 比主人格那道健康门弱得多 —— 如实写进报告,别让人以为它被验过了。
+  local i ok=0
+  for i in $(seq 1 "${CATMAN_COURIER_SETTLE:-60}"); do
+    sleep 1
+    if container_running "$CATMAN_COURIER_CONTAINER" &&
+       [ "$(container_restarts "$CATMAN_COURIER_CONTAINER")" = "$base" ]; then
+      ok=$((ok + 1))
+    else
+      ok=0
+    fi
+    [ "$ok" -ge 15 ] && break
+  done
+
+  if [ "$ok" -ge 15 ]; then
+    report rolled-back "${cur:-unknown}" \
+      "信使起不来,稳定面已退回上一份(pinned $cur → $prev);主人格未动。判据只是「连续 15 秒没再重启」,不是健康门 —— 请自己确认微信通了" \
+      "$prev"
+  else
+    # **pinned 不再往回拨。** 退过还崩多半是环境问题(磁盘、.env、凭据),
+    # 而反复换指针只会让人更难判断现在跑的到底是哪一份。
+    report rolled-back "${cur:-unknown}" \
+      "信使退到 $prev 之后仍起不来 —— 多半不是版本问题,需要人:看磁盘、.env 与信使日志" \
+      "$prev"
+    die "退回之后信使仍起不来"
+  fi
+}
+
 do_status() {
   echo "current: $(pointer_sha current)"
   echo "stable:  $(pointer_sha stable)"
@@ -355,6 +435,7 @@ case "$MODE" in
   deploy) do_deploy "$TARGET_SHA" ;;
   rollback) do_rollback ;;
   demote) do_demote ;;
+  courier-fallback) do_courier_fallback ;;
   status) do_status ;;
-  *) die "用法:deployer.sh {deploy <sha>|rollback|demote [--step N] [--why ...]|status} [--requested-by <userKey>]" ;;
+  *) die "用法:deployer.sh {deploy <sha>|rollback|demote [--step N] [--why ...]|courier-fallback [--why ...]|status} [--requested-by <userKey>]" ;;
 esac

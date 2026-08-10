@@ -10,7 +10,7 @@
  * 所以决策与执行分开:这里只根据一组**观测**给出一个**动作**,不碰 docker、不碰
  * 文件系统、不看时钟(时刻由调用方注入)。于是每一条规则都能用表驱动的用例逐条钉死。
  *
- * ## 三条不能动的纪律
+ * ## 四条不能动的纪律
  *
  * ① **锁在就只观测。** deployer 正在部署时,容器本来就会被停、被换、被重启 ——
  *    看门狗把那些当故障就会与它对着干(双头决策互踩是评审确认的死法)。
@@ -19,6 +19,9 @@
  *    结束后前移 —— 指针单主。看门狗写 stable 等于把"回退目标"这个概念本身毁掉。
  * ③ **每一级只退一次。** 退到上一级还崩,再退下一级;而不是对同一级反复重试。
  *    反复重试在日志上看起来像"一直在恢复",实际是一直没恢复。
+ * ④ **换 `pinned` 比换 `current` 更谨慎。** 前者是稳定面 —— 信使和守护人格都跑它,
+ *    换错了连"还有谁活着"这个前提都没了。所以它额外要求:有 pinned-prev 可退、
+ *    没退过、而且**主人格是好的**(两个一起崩说明是环境问题,换版本没用)。
  */
 
 /** 看门狗看到的一切。全部由调用方从 docker / 文件系统读出来。 */
@@ -38,6 +41,15 @@ export interface WatchdogObservation {
   readonly remainingHistory: number;
   /** 本轮之前已经自动退过几级。**每一级只退一次**靠它。 */
   readonly demotedSteps: number;
+  /**
+   * `pinned-prev` 存在,而且与 `pinned` 不是同一个 release。
+   *
+   * 它由 `bless.sh` 在**第二次**钦定 pinned 时才产生 —— 首次部署之后是空的,
+   * 那时切过去就是切到空气。所以这不是"顺手校验一下",而是决策的前提。
+   */
+  readonly hasPinnedPrev: boolean;
+  /** 本轮之前已经把信使退过一次了。**只退一次**靠它,理由同 demotedSteps。 */
+  readonly courierFellBack: boolean;
 }
 
 export interface ContainerState {
@@ -92,11 +104,39 @@ export function decide(
     return { kind: "none", why: "部署锁还活着,deployer 正在干活,只观测" };
   }
 
-  // ② 信使优先:它死了两个人格一起聋。
+  // ② 信使优先:它死了两个人格一起聋,连报警都发不出去。
+  //
+  // 但换 `pinned` 是整套系统里**唯一会自动改写稳定面**的动作,所以它比 demote 更保守:
+  // 下面三道闸每一道都对应一种"退了也没用、退了还更糟"的真实处境。
   if (isCrashLooping(obs.courier, th)) {
+    if (!obs.hasPinnedPrev) {
+      return {
+        kind: "alert",
+        why: `信使重启了 ${obs.courier.restarts} 次,但没有可退的 pinned-prev —— 需要人`,
+      };
+    }
+    if (obs.courierFellBack) {
+      // 退过一次还崩,多半根本不是版本问题。反复换指针只会让人更难判断
+      // 现在跑的到底是哪一份 —— 而那时他正需要这个信息。
+      return {
+        kind: "alert",
+        why: `信使退到 pinned-prev 之后仍在重启(${obs.courier.restarts} 次)—— 不是版本问题,需要人`,
+      };
+    }
+    // **主人格也病着就不动手。** 磁盘满、内存尽、docker 出问题这类环境故障会让
+    // 两个容器一起崩,而换 pinned 一点用没有 —— 换完仍然崩,却把稳定面悄悄挪走了,
+    // 于是正在排查的人看到的代码跟他以为的不是同一份。
+    // 反过来「信使崩、主人格好」是个很强的信号:问题就出在信使自己那份代码上,
+    // 而它恰恰是观察期从来没有跑过的那部分(30 分钟的 bake 只跑主人格)。
+    if (isCrashLooping(obs.primary, th) || !obs.primary.running) {
+      return {
+        kind: "alert",
+        why: `信使与主人格一起不正常 —— 多半是环境问题(磁盘/内存/docker),换版本没用,需要人`,
+      };
+    }
     return {
       kind: "courier-fallback",
-      why: `信使重启了 ${obs.courier.restarts} 次 —— 稳定面自己崩了,切到 pinned-prev`,
+      why: `信使重启了 ${obs.courier.restarts} 次而主人格正常 —— 稳定面自己崩了,切到 pinned-prev`,
     };
   }
 

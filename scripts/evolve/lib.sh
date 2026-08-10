@@ -57,6 +57,8 @@ REPORT_FILE="$DEPLOY_DIR/report.json"
 NPM_CACHE_DIR="${CATMAN_NPM_CACHE_DIR:-/data/npm-cache}"
 
 CATMAN_CONTAINER="${CATMAN_CONTAINER:-catman}"
+# 信使容器。它跑 `pinned`,而 pinned 坏掉时**微信整个聋掉** —— 两个人格都在它身后。
+CATMAN_COURIER_CONTAINER="${CATMAN_COURIER_CONTAINER:-catman-courier}"
 CATMAN_IMAGE="${CATMAN_IMAGE:-catman-env:1}"
 # 健康检查走**宿主上映射出来的端口**,不走容器网络:deployer 是 `docker run` 起的
 # 一次性容器,不在 compose 网络里;而共享 catman 的 netns(--network container:catman)
@@ -359,31 +361,37 @@ health_background() {
 
 # ── 容器 ───────────────────────────────────────────────────────────
 
-container_running() {
-  [ "$(docker inspect -f '{{.State.Running}}' "$CATMAN_CONTAINER" 2>/dev/null || echo false)" = "true" ]
+# 下面四个都接一个可选的容器名,**默认仍是主人格** —— 既有调用点一个字都不用改。
+# 需要名字的是信使兜底(切 pinned 之后要重启的是 catman-courier,不是 catman)。
+
+container_running() { # container_running [容器名]
+  local c="${1:-$CATMAN_CONTAINER}"
+  [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null || echo false)" = "true" ]
 }
 
 # 停容器并**确认它真的退出了**。不确认的话,后面换链接、写状态文件的动作会与
 # 一个还在跑的进程并发 —— 尤其 crash-loop 的容器会被 restart 策略一次次拉起来,
 # 每次都可能再写一遍状态文件。
-container_stop() {
-  log "停止 $CATMAN_CONTAINER"
-  docker stop -t "${CATMAN_STOP_TIMEOUT:-60}" "$CATMAN_CONTAINER" >/dev/null 2>&1 || true
+container_stop() { # container_stop [容器名]
+  local c="${1:-$CATMAN_CONTAINER}"
+  log "停止 $c"
+  docker stop -t "${CATMAN_STOP_TIMEOUT:-60}" "$c" >/dev/null 2>&1 || true
   local i
   for i in $(seq 1 30); do
-    container_running || { log "已停止"; return 0; }
+    container_running "$c" || { log "已停止"; return 0; }
     sleep 1
   done
-  die "$CATMAN_CONTAINER 停不下来"
+  die "$c 停不下来"
 }
 
-container_start() {
-  log "启动 $CATMAN_CONTAINER"
-  docker start "$CATMAN_CONTAINER" >/dev/null
+container_start() { # container_start [容器名]
+  local c="${1:-$CATMAN_CONTAINER}"
+  log "启动 $c"
+  docker start "$c" >/dev/null
 }
 
-container_restarts() {
-  docker inspect -f '{{.RestartCount}}' "$CATMAN_CONTAINER" 2>/dev/null || echo 0
+container_restarts() { # container_restarts [容器名]
+  docker inspect -f '{{.RestartCount}}' "${1:-$CATMAN_CONTAINER}" 2>/dev/null || echo 0
 }
 
 # ── release 校验 ───────────────────────────────────────────────────

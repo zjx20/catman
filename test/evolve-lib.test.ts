@@ -802,19 +802,64 @@ test("降级目标:没有那么多级时返回空,由调用方报警而不是乱
   });
 });
 
+/**
+ * 从 deployer.sh 里切出一个函数体。
+ *
+ * 边界靠"下一个顶格的 `do_xxx() {`"而不是某个写死的函数名 —— 后者会在中间插入
+ * 一个新模式时静默地把两个函数并成一段,于是"这个函数里没有 pointer_set stable"
+ * 这类断言就变成了在另一个函数上求值,照样全绿。
+ */
+function deployerFn(name: string): string {
+  const body = readFileSync(join(EVOLVE_DIR, "deployer.sh"), "utf8");
+  const start = body.indexOf(`${name}() {`);
+  assert.ok(start > 0, `deployer.sh 里没有 ${name}`);
+  const rest = body.slice(start + name.length);
+  const next = rest.search(/\ndo_[a-z_]+\(\) \{/);
+  return next < 0 ? rest : rest.slice(0, next);
+}
+
 test("**demote 绝不写 stable** —— 指针单主,它只许 deployer 在观察期后前移", () => {
   // 看门狗的判据(容器重启了几次)远弱于观察期。让它写 stable,等于允许一次误判
   // 永久改写「回退目标」这个概念本身 —— 下一次真出事时,它会把 current 拨到
   // 那个被误判抬上去的版本上。
-  const body = readFileSync(join(EVOLVE_DIR, "deployer.sh"), "utf8");
-  const start = body.indexOf("do_demote() {");
-  const end = body.indexOf("\ndo_status() {");
-  assert.ok(start > 0 && end > start);
-  const fn = body.slice(start, end);
+  const fn = deployerFn("do_demote");
   assert.equal(fn.includes("pointer_set stable"), false, "do_demote 里出现了 pointer_set stable");
   // 反面对照:rollback 是**人**的判断,它该写 stable —— 少了这条,把两处都删掉也全绿。
-  const rb = body.slice(body.indexOf("do_rollback() {"), body.indexOf("\ndo_demote() {"));
-  assert.ok(rb.includes("pointer_set stable"), "rollback 反而必须写 stable");
+  assert.ok(deployerFn("do_rollback").includes("pointer_set stable"), "rollback 反而必须写 stable");
+});
+
+test("**courier-fallback 只动 pinned** —— current / stable / pinned-prev 一个都不碰", () => {
+  // 它是整套脚本里唯一会自动改写**稳定面**的动作。多碰一个指针的后果:
+  //   - 动 current  → 把主人格一起换掉,而信使崩了不是它的错,无谓扩大故障面;
+  //   - 动 stable   → 一次机械误判永久改写「回退目标」这个概念本身(与 demote 同罪);
+  //   - 动 pinned-prev → 把"我们是从哪儿退过来的"这条唯一记录抹掉。
+  const fn = deployerFn("do_courier_fallback");
+  for (const p of ["current", "stable", "pinned-prev"]) {
+    assert.equal(
+      fn.includes(`pointer_set ${p}`),
+      false,
+      `do_courier_fallback 里出现了 pointer_set ${p}`,
+    );
+  }
+  // 正面:它必须确实换 pinned,否则上面几条断言在一个空函数上也全绿。
+  assert.ok(fn.includes("pointer_set pinned "), "它得真的换 pinned");
+  // 重启的必须是**信使**。写成默认的 $CATMAN_CONTAINER 就变成"换了信使的代码、
+  // 重启了主人格" —— 两边都没救到,而日志上看起来一切照做了。
+  assert.ok(fn.includes("$CATMAN_COURIER_CONTAINER"), "要重启的是信使容器");
+  assert.equal(
+    /container_(stop|start|restarts)\s*$|container_(stop|start)\n/.test(fn),
+    false,
+    "不能用不带容器名的默认形式",
+  );
+});
+
+test("courier-fallback 换指针之前先验目标的内容清单", () => {
+  // 退到一个字节已经损坏的 release 上,结果是两份都起不来,而人还以为退过了。
+  const fn = deployerFn("do_courier_fallback");
+  const verify = fn.indexOf("release_verify");
+  const set = fn.indexOf("pointer_set pinned ");
+  assert.ok(verify > 0, "缺少 release_verify");
+  assert.ok(verify < set, "校验必须排在换指针之前");
 });
 
 test("bless 钦定 pinned,并把旧的存进 pinned-prev —— 钦定错了才有退路", () => {

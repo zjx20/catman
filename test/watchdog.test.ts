@@ -27,6 +27,8 @@ function obs(over: Partial<WatchdogObservation> = {}): WatchdogObservation {
     currentIsStable: true,
     remainingHistory: 2,
     demotedSteps: 0,
+    hasPinnedPrev: true,
+    courierFellBack: false,
     ...over,
   };
 }
@@ -57,8 +59,44 @@ test("锁的超时阈值必须**大于观察期上限** —— 否则会在部�
 });
 
 test("信使崩了优先处理 —— 它死了两个人格一起聋", () => {
-  const a = decide(obs({ courier: CRASHING, primary: CRASHING }), NOW);
+  // 顺序有意义:主人格崩了至少还有守护人格能接;信使崩了连报警都发不出去。
+  const a = decide(obs({ courier: CRASHING }), NOW);
   assert.equal(a.kind, "courier-fallback");
+});
+
+// --- 换 pinned 的三道闸(它是唯一会自动改写**稳定面**的动作) ---
+
+test("信使与主人格一起崩:只报警 —— 那是环境问题,换版本没用", () => {
+  // 磁盘满 / 内存尽 / docker 出问题会让两个容器一起崩。这时候换 pinned 换完仍然崩,
+  // 却把稳定面悄悄挪走了 —— 正在排查的人看到的代码跟他以为的不是同一份。
+  const a = decide(obs({ courier: CRASHING, primary: CRASHING }), NOW);
+  assert.equal(a.kind, "alert");
+  assert.match(a.why, /环境问题/);
+});
+
+test("主人格只是停着(没在 crash-loop)也算不正常,不动稳定面", () => {
+  const a = decide(obs({ courier: CRASHING, primary: { ...OK, running: false } }), NOW);
+  assert.equal(a.kind, "alert");
+});
+
+test("没有 pinned-prev 就只报警 —— 切过去是切到空气", () => {
+  // 它由 bless 在**第二次**钦定 pinned 时才产生,首次部署之后是空的。
+  const a = decide(obs({ courier: CRASHING, hasPinnedPrev: false }), NOW);
+  assert.equal(a.kind, "alert");
+  assert.match(a.why, /pinned-prev/);
+});
+
+test("**信使只退一次**:退过还崩就交给人", () => {
+  // 反复换指针只会让人更难判断现在跑的到底是哪一份,而那时他正需要这个信息。
+  const a = decide(obs({ courier: CRASHING, courierFellBack: true }), NOW);
+  assert.equal(a.kind, "alert");
+  assert.match(a.why, /不是版本问题/);
+});
+
+test("部署锁还活着时,信使这条路径同样只观测", () => {
+  // 三道闸都过了也不行 —— 锁那条规则排在最前面,它防的是双头决策互踩。
+  const a = decide(obs({ courier: CRASHING, lockHeartbeatAt: NOW - 60_000 }), NOW);
+  assert.equal(a.kind, "none");
 });
 
 test("主人格 crash-loop 就往回退一级", () => {

@@ -54,6 +54,10 @@ export class RescueRunner {
   private demotedSteps = 0;
   /** 上次看到的 current,用来判断"人插手过了"。 */
   private lastSeenCurrent?: string;
+  /** 本轮之前已经把信使退过一次。见 tick 里的说明,与 demotedSteps 同一个理由。 */
+  private courierFellBack = false;
+  /** 上次看到的 pinned,用来判断"人重新 bless 过了"。 */
+  private lastSeenPinned?: string;
 
   constructor(private readonly opts: RunnerOptions) {
     this.now = opts.now ?? (() => Date.now());
@@ -91,6 +95,17 @@ export class RescueRunner {
         if (this.lastSeenCurrent !== undefined) this.demotedSteps = 0;
         this.lastSeenCurrent = current;
       }
+      // pinned 变了有两种可能,必须分开:人重新 bless 了(拿新代码来救),
+      // 或者就是上面那次兜底自己换的。**只有前一种该解闩** —— 否则人换了一份
+      // 好代码上去,它再崩时看门狗会以为"退过了、没用"然后袖手旁观。
+      //
+      // 判据就是 `pinned-prev`:bless 换 pinned 之前会先把旧的存进去,所以人干的
+      // 那次之后两者不同;而我们自己那次是把 pinned 挪到 pinned-prev 身上,两者相等。
+      const pinned = pointerSha(this.opts.releasesDir, "pinned");
+      if (pinned && pinned !== this.lastSeenPinned) {
+        if (this.lastSeenPinned !== undefined && this.hasPinnedPrev()) this.courierFellBack = false;
+        this.lastSeenPinned = pinned;
+      }
 
       const obs = {
         primary: this.inspect(this.opts.primaryContainer),
@@ -99,6 +114,8 @@ export class RescueRunner {
         currentIsStable: !!current && current === pointerSha(this.opts.releasesDir, "stable"),
         remainingHistory: Math.max(0, this.history().length - 1),
         demotedSteps: this.demotedSteps,
+        hasPinnedPrev: this.hasPinnedPrev(),
+        courierFellBack: this.courierFellBack,
       };
       const action = decide(obs, this.now(), DEFAULT_THRESHOLDS);
       if (action.kind !== "none") {
@@ -109,10 +126,12 @@ export class RescueRunner {
         this.demotedSteps = action.step;
         this.runDeployer(["demote", "--step", String(action.step), "--why", action.why]);
       }
-      // courier-fallback 目前只报警:切 pinned-prev 要求那个指针存在,而钦定 pinned
-      // 是显式的人工步骤(设计 §18)。没有它时自动切会切到空气 —— 宁可报警。
       if (action.kind === "courier-fallback") {
-        console.error("[rescue] 信使自己在 crash-loop —— 需要人:检查 pinned/pinned-prev 与信使日志");
+        // 决策那边已经过了三道闸(有 pinned-prev、没退过、主人格是好的),
+        // 这里只负责执行**一次**。门闩记在进程里,与 demotedSteps 同一个理由:
+        // 它描述的是"本轮故障处理进行到哪一步",而不是一个该持久化的事实。
+        this.courierFellBack = true;
+        this.runDeployer(["courier-fallback", "--why", action.why]);
       }
     } catch (err) {
       console.error("[rescue] 巡检失败(下一轮继续):", err);
@@ -140,6 +159,18 @@ export class RescueRunner {
       // 一个把"我瞎了"当成"它死了"的看门狗,会在 dockerd 抖动时把版本一路退到底。
       return { running: true, restarts: 0, since: this.now() };
     }
+  }
+
+  /**
+   * 有没有一份**不同于当前 pinned** 的 pinned-prev 可退。
+   *
+   * 两个条件缺一不可。`bless.sh` 在**第二次**钦定时才产生 pinned-prev,所以首次
+   * 部署之后它不存在 —— 那时"切过去"就是切到空气。而一次兜底之后两者会相等,
+   * 再退一次是空动作,却会让日志上看起来像是又救了一回。
+   */
+  private hasPinnedPrev(): boolean {
+    const prev = pointerSha(this.opts.releasesDir, "pinned-prev");
+    return !!prev && prev !== pointerSha(this.opts.releasesDir, "pinned");
   }
 
   private lockState(): { lockHeartbeatAt?: number } {
