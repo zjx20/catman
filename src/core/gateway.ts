@@ -98,6 +98,12 @@ export interface GatewayOptions {
    */
   persona?: Persona;
   /**
+   * OAuth token 到期告警(core/token-alert.ts)。只发给管理员 —— 换发要人在宿主
+   * 跑 setup-token,普通用户拿这条消息什么都做不了,只会吓一跳。
+   * 不传 = 这台机器不做此项播报(stdin 调试就不必)。
+   */
+  tokenAlert?: { pending(): string | undefined; markAnnounced(): void };
+  /**
    * 部署控制面。不传 = 这台机器没配自进化,两条部署指令会明说"没配",
    * 而不是假装成功 —— 本地开发与 stdin 调试就是这种情况。
    */
@@ -483,6 +489,7 @@ export class Gateway {
    */
   private readonly version: VersionInfo | undefined;
   private readonly persona: Persona;
+  private readonly tokenAlert: GatewayOptions["tokenAlert"];
   /**
    * 信使说过"这些人早就收过使用指引了"的那些 userKey。
    *
@@ -513,6 +520,7 @@ export class Gateway {
     this.reminderIntervalMs = opts.reminderIntervalMs;
     this.version = opts.version ?? readVersion();
     this.persona = opts.persona ?? "primary";
+    this.tokenAlert = opts.tokenAlert;
     this.deploy = opts.deploy;
     this.semaphore = new Semaphore(this.settings.effective().maxConcurrentTurns);
     this.settings.onChange(() => {
@@ -790,6 +798,15 @@ export class Gateway {
     // 上一次部署的结果先说 —— 用户此刻多半正要问"改好了没",而且失败的那种情况下
     // 他接下来说的话是基于"改动已生效"这个错误前提的。
     await this.announceDeployReport(userKey);
+    // token 快到期也在这时说 —— 只对管理员(换发要人在宿主跑 setup-token,普通用户
+    // 拿这条什么都做不了)。发送成功才落账,与部署结果播报同一条纪律:
+    // 先标记等于把这条告警永久吞掉,而它恰恰是"整个系统会一起静默死掉"的预告。
+    if (this.tokenAlert && this.settings.isAdmin(userKey)) {
+      const alert = this.tokenAlert.pending();
+      if (alert && (await this.trySend(userKey, alert, "token 到期告警", "reminder"))) {
+        this.tokenAlert.markAnnounced();
+      }
+    }
     let justGreeted = false;
     if (this.users.needsGreeting(userKey)) {
       const allowlist = this.settings.effective().modelAllowlist;

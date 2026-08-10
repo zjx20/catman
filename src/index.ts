@@ -7,6 +7,7 @@ import { FileStore, readJsonFile } from "./core/file-store.js";
 import { Gateway } from "./core/gateway.js";
 import { UserRegistry, listWorkspaceDirs } from "./core/users.js";
 import { adminBaseline, initialSharedClaudeMd } from "./core/persona.js";
+import { TokenAlerter, readTokenExpiry } from "./core/token-alert.js";
 import { allowAll, type AdmissionPolicy } from "./core/admission.js";
 import { GlobalSettings } from "./core/settings.js";
 import { PrefsStore } from "./core/prefs.js";
@@ -165,6 +166,12 @@ async function main(): Promise<void> {
     admission,
     version,
     persona: config.persona,
+    // token 到期告警的微信出口。过期时刻从凭据文件读(env 长效 token 没有这份信息,
+    // 那时它安静地什么都不报 —— 绝不编)。记账落在本进程自己的可写区。
+    tokenAlert: new TokenAlerter({
+      expiry: () => readTokenExpiry(configDir),
+      seenPath: `${config.dataDir}/token-alert-seen.json`,
+    }),
     ...(deploy ? { deploy } : {}),
     // /切换会话 切换前确认目标的 JSONL 还在 —— 记录没了 resume 必然失败,
     // 提前给句人话并出清死引用,比让回合炸出原始报错友好得多。

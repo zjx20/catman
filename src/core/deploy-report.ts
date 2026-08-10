@@ -89,6 +89,43 @@ export function parseDeployReport(v: unknown): DeployReport | undefined {
   };
 }
 
+// ── 点火报告(每周冷启动演练的结果)────────────────────────────────
+//
+// 同一族契约:deployer 的 drill 模式写 `/data/deploy/ignition.json`,守护人格读它
+// 上状态页。**与部署报告分开两个文件** —— report.json 是"上一次部署的结果",
+// catman 靠它向用户播报;drill 把它覆写掉,用户就再也收不到那条(可能是失败)的结果。
+//
+// 点火存在的理由(§13):守护人格自己也会锈 —— 活进程握着已删 inode 照常运行,
+// pinned 的字节在磁盘上坏没坏、SELFCHECK 还过不过,只有**从磁盘冷启动**才测得出来。
+// 每周由看门狗触发一次,结果红绿摆在状态页上。
+
+export interface IgnitionReport {
+  readonly schema: number;
+  /** 结束时刻(ISO 8601)。看门狗按它排下一次。 */
+  readonly ranAt: string;
+  readonly ok: boolean;
+  /** 失败时:第一个没过的检查项。 */
+  readonly failed?: string;
+  readonly detail: string;
+}
+
+/** 防御式解析。与 parseDeployReport 同一条纪律:读不懂当没有,绝不抛。 */
+export function parseIgnitionReport(v: unknown): IgnitionReport | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const r = v as Record<string, unknown>;
+  const ranAt = r["ranAt"];
+  if (typeof ranAt !== "string" || !ranAt || !Number.isFinite(Date.parse(ranAt))) return undefined;
+  if (typeof r["ok"] !== "boolean") return undefined;
+  const failed = r["failed"];
+  return {
+    schema: typeof r["schema"] === "number" ? r["schema"] : 1,
+    ranAt,
+    ok: r["ok"],
+    ...(typeof failed === "string" && failed ? { failed } : {}),
+    detail: typeof r["detail"] === "string" ? r["detail"] : "",
+  };
+}
+
 /** 播报给用户的那段话。三种结局说三句不同的话 —— 用户该做的事完全不同。 */
 export function formatDeployReport(r: DeployReport): string {
   const head =

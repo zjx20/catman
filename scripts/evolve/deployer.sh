@@ -6,6 +6,8 @@
 #   deployer.sh rollback [--requested-by <userKey>]
 #   deployer.sh demote [--step N] [--why <一句话>]
 #   deployer.sh courier-fallback [--why <一句话>]
+#   deployer.sh gc [--why <一句话>]
+#   deployer.sh drill
 #   deployer.sh status
 #
 # ## 它为什么必须与 catman 分开
@@ -222,7 +224,7 @@ pick_rollback_target() {
 # shell 层的单测直接跑起来验 —— 曾经有一版把 current/stable/pinned 三个指针当成
 # release 目录删掉,把它们指向的内容全部掏空。
 
-# ── 四种模式 ───────────────────────────────────────────────────────
+# ── 七种模式 ───────────────────────────────────────────────────────
 
 do_deploy() {
   local sha="$1"
@@ -422,6 +424,99 @@ do_courier_fallback() {
   fi
 }
 
+# ── gc:磁盘红色水位时看门狗要求清一次超保留期的 release ─────────────
+#
+# 动作只有 release_gc 一个 —— 它有双重闸门(保留集 = 已验证清单 ∪ 全部指针的
+# realpath;目录名必须是 40 位 hex),清不掉任何被指着的东西。**不写部署报告**:
+# report.json 是"上一次部署的结果",catman 靠它向用户播报,清理覆写它会把一条
+# (可能是失败的)部署结果永久顶掉。
+do_gc() {
+  lock_acquire "gc"
+  trap 'lock_release' EXIT
+  log "磁盘清理(${DEMOTE_WHY:-看门狗触发}):release GC"
+  release_gc
+  log "磁盘清理完成"
+}
+
+# ── drill:每周冷启动点火 ───────────────────────────────────────────
+#
+# 守护人格自己也会锈:活进程握着已删 inode 照常运行,pinned 的字节在磁盘上坏没坏、
+# SELFCHECK 还过不过、部署机制还转不转,只有**从磁盘冷启动**才测得出来 ——
+# 而那正是断电重启那天要走的路。每周由看门狗触发,结果写 ignition.json 上状态页。
+#
+# 四项检查按"断电重启那天的依赖顺序"排:字节完整 → 冷启动能过自检 →
+# 主人格活着且版本对 → 回滚机制的每个环节还能动。
+#
+# **结果写 ignition.json,绝不写 report.json** —— 后者是部署结果的播报通道,
+# 覆写它等于把一条(可能是失败的)部署结果永久顶掉。两份文件、两个消费者。
+do_drill() {
+  lock_acquire "drill"
+  trap 'lock_release' EXIT
+
+  ignition_report() { # ignition_report <ok> <failed> <detail>
+    node -e '
+      const [file, ok, failed, detail] = process.argv.slice(1);
+      const fs = require("fs"), path = require("path");
+      const r = {
+        schema: 1,
+        ranAt: new Date().toISOString(),
+        ok: ok === "true",
+        ...(failed ? { failed } : {}),
+        detail,
+      };
+      const tmp = file + ".tmp";
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(tmp, JSON.stringify(r, null, 2));
+      fs.renameSync(tmp, file);
+    ' "$DEPLOY_DIR/ignition.json" "$@"
+    log "点火报告已写入:$1 ${2:-}"
+  }
+
+  local pin
+  pin="$(pointer_sha pinned)"
+  if [ -z "$pin" ]; then
+    ignition_report false pinned "没有 pinned 指针 —— 稳定面没被钦定过"
+    die "点火失败:没有 pinned"
+  fi
+
+  # ① 字节完整:清单重验。热补丁、硬链接污染、误删都在这里现形。
+  if ! release_verify "$pin"; then
+    ignition_report false verify "pinned($pin)内容清单校验不过 —— 字节被改过或缺文件"
+    die "点火失败:pinned 校验不过"
+  fi
+
+  # ② 冷启动自检:从磁盘起一次性容器跑 SELFCHECK(smoke 对限流/网络自带退避分类,
+  #    不会把一次上游抖动记成点火失败)。
+  if ! smoke "$pin"; then
+    ignition_report false smoke "pinned($pin)冷启动自检不过:${SMOKE_DETAIL:-见 deployer 日志}"
+    die "点火失败:smoke 不过"
+  fi
+
+  # ③ 主人格健康且版本与 current 一致 —— 顺带把 /health 契约的解析走一遍
+  #    (pinned 侧的 deployer 读 current 侧的接口,这正是要防漂移的那条缝)。
+  local cur
+  cur="$(pointer_sha current)"
+  if ! health_ok "$cur"; then
+    ignition_report false health "主人格 /health 不健康或 sha 与 current($cur)不符"
+    die "点火失败:health 不过"
+  fi
+
+  # ④ 回滚机制的关节:已验证清单解析得出、目标还在,指针机构能动(dry-run flip:
+  #    在真名字之外立一个临时指针再拆掉 —— pointer_set 的清残留让它可从任意断点重跑)。
+  if [ -z "$(history_shas | head -1)" ]; then
+    ignition_report false history "verified-history 解析不出任何 sha —— 回滚没有目标"
+    die "点火失败:history 空"
+  fi
+  rm -f "$RELEASES_DIR/drill-scratch" "$RELEASES_DIR/drill-scratch.tmp"
+  if ! pointer_set drill-scratch "$pin"; then
+    ignition_report false flip "指针机构 dry-run 失败 —— 真回滚那天它也动不了"
+    die "点火失败:dry-run flip 失败"
+  fi
+  rm -f "$RELEASES_DIR/drill-scratch"
+
+  ignition_report true "" "pinned=$pin 冷启动自检通过;主人格健康(current=$cur);history 可解析;指针机构可动"
+}
+
 do_status() {
   echo "current: $(pointer_sha current)"
   echo "stable:  $(pointer_sha stable)"
@@ -436,6 +531,8 @@ case "$MODE" in
   rollback) do_rollback ;;
   demote) do_demote ;;
   courier-fallback) do_courier_fallback ;;
+  gc) do_gc ;;
+  drill) do_drill ;;
   status) do_status ;;
-  *) die "用法:deployer.sh {deploy <sha>|rollback|demote [--step N] [--why ...]|courier-fallback [--why ...]|status} [--requested-by <userKey>]" ;;
+  *) die "用法:deployer.sh {deploy <sha>|rollback|demote [--step N] [--why ...]|courier-fallback [--why ...]|gc [--why ...]|drill|status} [--requested-by <userKey>]" ;;
 esac

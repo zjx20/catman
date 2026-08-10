@@ -2,7 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   DEFAULT_THRESHOLDS,
+  IGNITION_INTERVAL_MS,
   decide,
+  shouldIgnite,
   type ContainerState,
   type WatchdogObservation,
 } from "../src/rescue/watchdog.js";
@@ -29,6 +31,7 @@ function obs(over: Partial<WatchdogObservation> = {}): WatchdogObservation {
     demotedSteps: 0,
     hasPinnedPrev: true,
     courierFellBack: false,
+    diskGcRan: false,
     ...over,
   };
 }
@@ -133,6 +136,64 @@ test("「干净地停着」单独成一条 —— 那是全灭里最安静的一
 test("刚停下来还没到阈值时不动手 —— 正常重启也会短暂地停着", () => {
   const justStopped: ContainerState = { running: false, restarts: 0, since: NOW - 1000 };
   assert.equal(decide(obs({ primary: justStopped }), NOW).kind, "none");
+});
+
+// --- 磁盘红色水位 ---
+
+test("磁盘红线以下触发一次 GC —— 排在容器规则前面", () => {
+  // 磁盘满是"两个容器一起崩"最常见的环境原因,清理可能直接治好;
+  // 这时候去退版本一点用没有。
+  const a = decide(obs({ diskFreeMb: 500, courier: CRASHING }), NOW);
+  assert.equal(a.kind, "disk-gc");
+});
+
+test("磁盘清过一次仍红就只报警 —— 清无可清,反复清是空转", () => {
+  const a = decide(obs({ diskFreeMb: 500, diskGcRan: true }), NOW);
+  assert.equal(a.kind, "alert");
+  assert.match(a.why, /不是旧 release/);
+});
+
+test("读不到磁盘余量就当没这条规则 —— 看不见 ≠ 满了", () => {
+  assert.equal(decide(obs({}), NOW).kind, "none");
+});
+
+test("磁盘规则同样让位于部署锁 —— GC 与部署抢锁没意义,等下一轮", () => {
+  const a = decide(obs({ diskFreeMb: 500, lockHeartbeatAt: NOW - 60_000 }), NOW);
+  assert.equal(a.kind, "none");
+});
+
+// --- 每周点火排程 ---
+
+test("从没点过火(读不到 ignition.json)→ 该点", () => {
+  assert.equal(
+    shouldIgnite({ lastRanAt: undefined, kickedAt: undefined, lockHeartbeatAt: undefined, now: NOW, lockStaleMs: 45 * 60_000 }),
+    true,
+  );
+});
+
+test("上次点火不满一周 → 不点;满了 → 点", () => {
+  const base = { kickedAt: undefined, lockHeartbeatAt: undefined, now: NOW, lockStaleMs: 45 * 60_000 };
+  assert.equal(shouldIgnite({ ...base, lastRanAt: NOW - IGNITION_INTERVAL_MS + 60_000 }), false);
+  assert.equal(shouldIgnite({ ...base, lastRanAt: NOW - IGNITION_INTERVAL_MS - 60_000 }), true);
+});
+
+test("部署锁活着不点 —— drill 会占锁,与真部署互斥", () => {
+  assert.equal(
+    shouldIgnite({ lastRanAt: undefined, kickedAt: undefined, lockHeartbeatAt: NOW - 60_000, now: NOW, lockStaleMs: 45 * 60_000 }),
+    false,
+  );
+});
+
+test("刚踢过不重踢 —— drill 跑几分钟,tick 每 30 秒一轮,不冷却会起一串容器", () => {
+  // ignition.json 只在 drill 结束时更新,期间 lastRanAt 一直是旧值。
+  const base = { lastRanAt: undefined, lockHeartbeatAt: undefined, lockStaleMs: 45 * 60_000 };
+  assert.equal(shouldIgnite({ ...base, kickedAt: NOW - 60_000, now: NOW }), false, "一分钟前踢过");
+  // 冷却过了还没有新报告 —— 说明那次踢没成(deployer 没起来),要能重试,
+  // 否则点火从此永远停摆。
+  assert.equal(
+    shouldIgnite({ ...base, kickedAt: NOW - IGNITION_INTERVAL_MS / 24 - 1, now: NOW }),
+    true,
+  );
 });
 
 test("决策不产出任何「动 stable」的动作 —— 指针单主", () => {

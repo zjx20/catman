@@ -37,6 +37,17 @@ export interface StatusView {
   readonly lost: number;
   /** 上次部署结果的一句话。 */
   readonly lastDeploy?: string;
+  /** 主 /data 所在文件系统的可用 MB。读不到就缺席(不显示比显示错的强)。 */
+  readonly diskFreeMb?: number;
+  /**
+   * OAuth token 到期的一句话(tokenStatusLine 产出)。token 过期是三大死法之一,
+   * 而换发必须人在宿主跑 setup-token —— 这一行是无 LLM 侧唯一的倒计时出口。
+   */
+  readonly tokenLine?: string;
+  /** token 那行要不要红。 */
+  readonly tokenOk?: boolean;
+  /** 上次冷启动点火的结果。缺席 = 从没点过火(也要显眼 —— 那说明例行演练没在跑)。 */
+  readonly ignition?: { readonly ranAt: string; readonly ok: boolean; readonly detail: string };
   /** 日志尾巴。 */
   readonly logTail: readonly string[];
 }
@@ -84,12 +95,30 @@ export function renderStatus(v: StatusView): string {
       )}</b> —— ${escapeHtml(v.lastAction.action.why)}</p>`
     : "<p>看门狗还没做过任何动作。</p>";
 
+  // 机械防线三行:磁盘 / token / 点火。它们对应的三种死法(磁盘满、token 过期、
+  // 守护人格自己锈了)恰恰都是"大脑也一起废"的那种 —— 只能摆在无 LLM 的这一页上。
+  const machineRows = [
+    v.diskFreeMb !== undefined
+      ? `<tr><td>磁盘</td><td>${badge(v.diskFreeMb >= 2048, `剩 ${v.diskFreeMb}MB`)}</td></tr>`
+      : "",
+    v.tokenLine !== undefined
+      ? `<tr><td>订阅凭据</td><td>${badge(v.tokenOk ?? true, v.tokenLine)}</td></tr>`
+      : "",
+    v.ignition
+      ? `<tr><td>每周点火</td><td>${badge(
+          v.ignition.ok,
+          `${v.ignition.ranAt} ${v.ignition.ok ? "通过" : "失败"}:${v.ignition.detail}`,
+        )}</td></tr>`
+      : `<tr><td>每周点火</td><td>${badge(false, "还没跑过 —— 冷启动这条路没被验过")}</td></tr>`,
+  ].join("");
+
   return `<h1>catman 守护人格</h1>
 ${alarms}
 <p>这一页**不需要大脑**:只读文件、只调固化的部署脚本。磁盘满或 token 过期时,
 救援大脑同样起不来,而这一页还在。</p>
 ${action}
 ${v.lastDeploy ? `<p>上次部署:${escapeHtml(v.lastDeploy)}</p>` : ""}
+<h2>机械防线</h2><table>${machineRows}</table>
 <h2>容器</h2><table>${containers}</table>
 <h2>版本指针</h2><table>${pointers}</table>
 <h2>信使队列</h2><table>${depths}</table>

@@ -63,3 +63,26 @@ test("看门狗的决策与理由都要露出来 —— 没有 why 就查不出�
 test("页面写明「退回上一级」不动 stable —— 那是指针单主的用户可见面", () => {
   assert.match(renderStatus(view()), /只动 current.*绝不动 stable/);
 });
+
+test("机械防线三行:磁盘 / 订阅凭据 / 每周点火 —— 三种「大脑也一起废」的死法", () => {
+  const html = renderStatus(
+    view({
+      diskFreeMb: 900,
+      tokenLine: "还有约 2 天到期",
+      tokenOk: false,
+      ignition: { ranAt: "2026-08-10T00:00:00Z", ok: false, detail: "smoke:自检没过" },
+    }),
+  );
+  assert.match(html, /900MB/);
+  assert.match(html, /2 天到期/);
+  assert.match(html, /smoke:自检没过/);
+  // 红线以下的磁盘、快到期的 token、失败的点火都要红(class="bad")。
+  const bad = html.match(/class="bad"/g) ?? [];
+  assert.ok(bad.length >= 3, `该有至少 3 处红,实际 ${bad.length}`);
+});
+
+test("从没点过火也要显眼 —— 例行演练没在跑本身就是异常", () => {
+  // 缺席不等于没事:冷启动这条路一次都没被验过,断电那天走的就是它。
+  const html = renderStatus(view({}));
+  assert.match(html, /还没跑过/);
+});

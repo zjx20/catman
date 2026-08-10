@@ -50,6 +50,13 @@ export interface WatchdogObservation {
   readonly hasPinnedPrev: boolean;
   /** 本轮之前已经把信使退过一次了。**只退一次**靠它,理由同 demotedSteps。 */
   readonly courierFellBack: boolean;
+  /**
+   * 主 /data 所在文件系统的可用空间(MB)。**读不到 = undefined = 什么都不做** ——
+   * 看不见 ≠ 满了,与 docker inspect 那条同一个纪律。
+   */
+  readonly diskFreeMb?: number;
+  /** 本轮之前已经触发过一次磁盘清理。**只清一次**:清完还红说明清无可清,要人。 */
+  readonly diskGcRan: boolean;
 }
 
 export interface ContainerState {
@@ -68,7 +75,9 @@ export type WatchdogAction =
   /** 把 current 往回拨一级。step 从 1 开始。 */
   | { readonly kind: "demote"; readonly step: number; readonly why: string }
   /** 把信使切到 pinned-prev。 */
-  | { readonly kind: "courier-fallback"; readonly why: string };
+  | { readonly kind: "courier-fallback"; readonly why: string }
+  /** 磁盘红色水位:起固化的 deployer 跑一次 release GC。 */
+  | { readonly kind: "disk-gc"; readonly why: string };
 
 export interface WatchdogThresholds {
   /** 多少次重启算 crash-loop。 */
@@ -77,6 +86,11 @@ export interface WatchdogThresholds {
   lockStaleMs: number;
   /** "干净地停着"多久算异常。 */
   cleanStoppedMs: number;
+  /**
+   * 磁盘红色水位(MB)。**比制备门(5GB)低**:制备门是"别开始一件要几百 MB 的事",
+   * 这条是"再不清理连回滚都要做不了了" —— 两个阈值答的是不同的问题。
+   */
+  diskRedMb: number;
 }
 
 export const DEFAULT_THRESHOLDS: WatchdogThresholds = {
@@ -85,6 +99,7 @@ export const DEFAULT_THRESHOLDS: WatchdogThresholds = {
   // "deployer 死了",于是看门狗在部署**成功的中途**把版本拨回去。
   lockStaleMs: 45 * 60_000,
   cleanStoppedMs: 5 * 60_000,
+  diskRedMb: 2048,
 };
 
 /**
@@ -104,7 +119,25 @@ export function decide(
     return { kind: "none", why: "部署锁还活着,deployer 正在干活,只观测" };
   }
 
-  // ② 信使优先:它死了两个人格一起聋,连报警都发不出去。
+  // ② 磁盘红色水位排在容器规则前面:磁盘满是"两个容器一起崩"最常见的环境原因,
+  //    这时候退版本一点用没有(见下面 courier 那条的第三道闸),而清理可能直接治好。
+  //    动作只是起固化的 deployer 跑一次 release GC —— 它有双重闸门(保留集 +
+  //    sha 目录名),清不掉指针指着的东西。**只清一次**:清完还红说明清无可清
+  //    (占磁盘的是别的东西),反复清只是空转,要人来看。
+  if (obs.diskFreeMb !== undefined && obs.diskFreeMb < th.diskRedMb) {
+    if (obs.diskGcRan) {
+      return {
+        kind: "alert",
+        why: `磁盘只剩 ${obs.diskFreeMb}MB,GC 清过一次仍在红线下 —— 占空间的不是旧 release,需要人`,
+      };
+    }
+    return {
+      kind: "disk-gc",
+      why: `磁盘只剩 ${obs.diskFreeMb}MB(红线 ${th.diskRedMb}MB),清理超保留期的 release`,
+    };
+  }
+
+  // ③ 信使优先:它死了两个人格一起聋,连报警都发不出去。
   //
   // 但换 `pinned` 是整套系统里**唯一会自动改写稳定面**的动作,所以它比 demote 更保守:
   // 下面三道闸每一道都对应一种"退了也没用、退了还更糟"的真实处境。
@@ -143,7 +176,7 @@ export function decide(
   const primaryBad = classifyPrimary(obs.primary, now, th);
   if (!primaryBad) return { kind: "none", why: "主人格看起来正常" };
 
-  // ③ 已经在 stable 上还崩 —— 说明问题不在"刚换的那个版本"。
+  // ④ 已经在 stable 上还崩 —— 说明问题不在"刚换的那个版本"。
   //    这时候再退是往更老的已验证版本上退,只在还有余量时做。
   if (obs.currentIsStable && obs.remainingHistory <= obs.demotedSteps) {
     return {
@@ -181,4 +214,44 @@ function classifyPrimary(c: ContainerState, now: number, th: WatchdogThresholds)
     return `主人格干净地停着已经 ${Math.round((now - c.since) / 60_000)} 分钟,没人拉它`;
   }
   return "";
+}
+
+// ── 每周冷启动点火的排程 ────────────────────────────────────────────
+
+/** 点火间隔。7 天:与设计 §13「每周冷启动点火」一致。 */
+export const IGNITION_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * 现在该不该点一次火(deployer 的 drill 模式:从磁盘冷启动 pinned 跑 SELFCHECK、
+ * 按契约探 /health、验 verified-history、dry-run flip)。
+ *
+ * 为什么不能在活进程里测:活进程握着已删 inode 照常运行,pinned 的字节在磁盘上
+ * 坏没坏,只有从磁盘重新起一遍才知道 —— 而那正是断电重启那天要走的路。
+ *
+ * 三个条件,纯函数逐条钉:
+ * - **锁在就不点。** drill 会占部署锁,与真部署互斥;赶上部署窗口就等下一轮,
+ *   反正一周的量级差几十分钟无所谓。
+ * - **上次结果太新就不点。** `lastRanAt` 来自 ignition.json(读不到 = undefined =
+ *   从没点过 → 该点)。
+ * - **刚踢过就不重踢。** drill 要跑几分钟,而 tick 每 30 秒一轮;`kickedAt` 是
+ *   进程内的"我已经起过容器了"标记,防止把同一次点火起成一串容器
+ *   (容器名互斥会让后面的全部失败,日志刷一排误导人的红)。
+ */
+export function shouldIgnite(obs: {
+  readonly lastRanAt: number | undefined;
+  readonly kickedAt: number | undefined;
+  readonly lockHeartbeatAt: number | undefined;
+  readonly now: number;
+  readonly lockStaleMs: number;
+  readonly intervalMs?: number;
+}): boolean {
+  const interval = obs.intervalMs ?? IGNITION_INTERVAL_MS;
+  if (obs.lockHeartbeatAt !== undefined && obs.now - obs.lockHeartbeatAt < obs.lockStaleMs) {
+    return false;
+  }
+  // 重踢冷却取间隔的 1/24(默认 7 小时):远大于一次 drill 的时长,又保证
+  // "踢了但 deployer 压根没起来"不会让点火从此永远停摆。
+  if (obs.kickedAt !== undefined && obs.now - obs.kickedAt < interval / 24) return false;
+  if (obs.lastRanAt !== undefined && obs.now - obs.lastRanAt < interval) return false;
+  return true;
 }

@@ -1,13 +1,24 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import { readFileSync } from "node:fs";
+import { readFileSync, statfsSync } from "node:fs";
 import { join } from "node:path";
 import { readJsonFile } from "../core/file-store.js";
-import { parseDeployReport, formatDeployReport } from "../core/deploy-report.js";
+import {
+  parseDeployReport,
+  formatDeployReport,
+  parseIgnitionReport,
+} from "../core/deploy-report.js";
 import { parseVerifiedHistory } from "../core/deploy.js";
 import { listPreparedReleases, pointerSha } from "../core/releases.js";
+import { readTokenExpiry, tokenStatus, tokenStatusLine } from "../core/token-alert.js";
 import { renderStatus, type StatusView } from "./status.js";
-import { DEFAULT_THRESHOLDS, decide, type ContainerState, type WatchdogAction } from "./watchdog.js";
+import {
+  DEFAULT_THRESHOLDS,
+  decide,
+  shouldIgnite,
+  type ContainerState,
+  type WatchdogAction,
+} from "./watchdog.js";
 
 /**
  * 守护人格的机械层:看门狗循环 + 无 LLM 状态页。
@@ -43,6 +54,8 @@ export interface RunnerOptions {
   runDeployer?: (args: readonly string[]) => void;
   /** 读容器状态。单测注入。 */
   inspect?: (name: string) => ContainerState;
+  /** 主 /data 所在文件系统的可用 MB。单测注入;读不到返回 undefined。 */
+  diskFree?: () => number | undefined;
 }
 
 export class RescueRunner {
@@ -58,6 +71,10 @@ export class RescueRunner {
   private courierFellBack = false;
   /** 上次看到的 pinned,用来判断"人重新 bless 过了"。 */
   private lastSeenPinned?: string;
+  /** 本轮之前已经清过一次磁盘。清完还红是"清无可清",不反复清。 */
+  private diskGcRan = false;
+  /** 上次踢起点火容器的时刻(进程内)。防止把同一次点火起成一串容器。 */
+  private ignitionKickedAt?: number;
 
   constructor(private readonly opts: RunnerOptions) {
     this.now = opts.now ?? (() => Date.now());
@@ -107,15 +124,19 @@ export class RescueRunner {
         this.lastSeenPinned = pinned;
       }
 
+      const lock = this.lockState();
+      const disk = this.diskFree();
       const obs = {
         primary: this.inspect(this.opts.primaryContainer),
         courier: this.inspect(this.opts.courierContainer),
-        ...this.lockState(),
+        ...lock,
         currentIsStable: !!current && current === pointerSha(this.opts.releasesDir, "stable"),
         remainingHistory: Math.max(0, this.history().length - 1),
         demotedSteps: this.demotedSteps,
         hasPinnedPrev: this.hasPinnedPrev(),
         courierFellBack: this.courierFellBack,
+        ...(disk !== undefined ? { diskFreeMb: disk } : {}),
+        diskGcRan: this.diskGcRan,
       };
       const action = decide(obs, this.now(), DEFAULT_THRESHOLDS);
       if (action.kind !== "none") {
@@ -132,6 +153,26 @@ export class RescueRunner {
         // 它描述的是"本轮故障处理进行到哪一步",而不是一个该持久化的事实。
         this.courierFellBack = true;
         this.runDeployer(["courier-fallback", "--why", action.why]);
+      }
+      if (action.kind === "disk-gc") {
+        this.diskGcRan = true;
+        this.runDeployer(["gc", "--why", action.why]);
+      }
+
+      // 每周冷启动点火:与故障处理无关的例行动作,不走 decide(它答的是"出了什么事"),
+      // 但同样受部署锁约束 —— drill 会占锁,与真部署互斥。
+      if (
+        shouldIgnite({
+          lastRanAt: this.ignitionRanAt(),
+          kickedAt: this.ignitionKickedAt,
+          lockHeartbeatAt: lock.lockHeartbeatAt,
+          now: this.now(),
+          lockStaleMs: DEFAULT_THRESHOLDS.lockStaleMs,
+        })
+      ) {
+        this.ignitionKickedAt = this.now();
+        console.info("[rescue] 每周点火:起 deployer drill(冷启动自检 + 契约探测 + dry-run flip)");
+        this.runDeployer(["drill"]);
       }
     } catch (err) {
       console.error("[rescue] 巡检失败(下一轮继续):", err);
@@ -159,6 +200,27 @@ export class RescueRunner {
       // 一个把"我瞎了"当成"它死了"的看门狗,会在 dockerd 抖动时把版本一路退到底。
       return { running: true, restarts: 0, since: this.now() };
     }
+  }
+
+  /** 主 /data 所在文件系统还剩多少 MB。读不到 → undefined(看不见 ≠ 满了)。 */
+  private diskFree(): number | undefined {
+    if (this.opts.diskFree) return this.opts.diskFree();
+    try {
+      const s = statfsSync(this.opts.dataDir);
+      return Math.floor((s.bavail * s.bsize) / (1024 * 1024));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** 上次点火完成的时刻(ms)。读 ignition.json,读不懂 → undefined(= 从没点过)。 */
+  private ignitionRanAt(): number | undefined {
+    const r = parseIgnitionReport(
+      readJsonFile<unknown>(join(this.opts.deployDir, "ignition.json"), undefined),
+    );
+    if (!r) return undefined;
+    const t = Date.parse(r.ranAt);
+    return Number.isFinite(t) ? t : undefined;
   }
 
   /**
@@ -209,6 +271,13 @@ export class RescueRunner {
     const report = parseDeployReport(
       readJsonFile<unknown>(join(this.opts.deployDir, "report.json"), undefined),
     );
+    const ignition = parseIgnitionReport(
+      readJsonFile<unknown>(join(this.opts.deployDir, "ignition.json"), undefined),
+    );
+    const disk = this.diskFree();
+    // 凭据在**主** /data 的 CLAUDE_CONFIG_DIR 下(两个人格共用同一份 token,
+    // §18 已定决策);守护人格自己的 /data/rescue/claude 里没有这份信息。
+    const token = tokenStatus(readTokenExpiry(join(this.opts.dataDir, "claude")), this.now());
     return {
       containers: [
         { name: this.opts.primaryContainer, ...pick(this.inspect(this.opts.primaryContainer)) },
@@ -225,6 +294,18 @@ export class RescueRunner {
       losses,
       lost: 0,
       ...(report ? { lastDeploy: formatDeployReport(report) } : {}),
+      ...(disk !== undefined ? { diskFreeMb: disk } : {}),
+      tokenLine: tokenStatusLine(token),
+      tokenOk: token.kind === "ok" || token.kind === "unknown",
+      ...(ignition
+        ? {
+            ignition: {
+              ranAt: ignition.ranAt,
+              ok: ignition.ok,
+              detail: ignition.ok ? ignition.detail : `${ignition.failed ?? "?"}:${ignition.detail}`,
+            },
+          }
+        : {}),
       logTail: [`已制备的 release:${listPreparedReleases(this.opts.releasesDir).length} 个`],
     };
   }

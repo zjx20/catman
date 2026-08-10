@@ -862,6 +862,57 @@ test("courier-fallback 换指针之前先验目标的内容清单", () => {
   assert.ok(verify < set, "校验必须排在换指针之前");
 });
 
+test("gc 模式只清理,不碰任何指针、不写部署报告", () => {
+  // report.json 是"上一次部署的结果",catman 靠它向用户播报 —— 清理覆写它,
+  // 会把一条(可能是失败的)部署结果永久顶掉。
+  const fn = deployerFn("do_gc");
+  assert.ok(fn.includes("release_gc"), "得真的清理");
+  assert.equal(fn.includes("pointer_set"), false, "GC 不该动指针");
+  assert.equal(/\breport /.test(fn), false, "GC 不该写部署报告");
+  assert.ok(fn.includes("lock_acquire"), "要抢部署锁 —— 与部署互斥");
+});
+
+test("drill 的结果写 ignition.json,绝不写 report.json", () => {
+  // 两份文件、两个消费者:report.json 归部署播报,ignition.json 归状态页。
+  const fn = deployerFn("do_drill");
+  assert.ok(fn.includes("ignition.json"));
+  assert.equal(/\breport /.test(fn.replace(/ignition_report/g, "IR")), false,
+    "drill 里不该调部署报告的 report()");
+});
+
+test("drill 覆盖冷启动那天的每个关节:字节 → 自检 → 健康 → 回滚机构", () => {
+  // 少一项就是一类"断电那天才发现"的故障。顺序也有意义:按依赖排,
+  // 前面挂了后面的结论没有意义。
+  const fn = deployerFn("do_drill");
+  const order = ["release_verify", "smoke ", "health_ok", "history_shas", "pointer_set drill-scratch"];
+  let at = -1;
+  for (const step of order) {
+    const i = fn.indexOf(step);
+    assert.ok(i > at, `${step} 缺失或顺序不对`);
+    at = i;
+  }
+});
+
+test("drill 的 dry-run flip 用完就拆,而且开头先清残留 —— 可从任意断点重跑", () => {
+  const fn = deployerFn("do_drill");
+  // 清残留在 pointer_set 之前(上次 drill 可能死在中间)。
+  const cleanup = fn.indexOf('rm -f "$RELEASES_DIR/drill-scratch"');
+  const set = fn.indexOf("pointer_set drill-scratch");
+  assert.ok(cleanup > 0 && cleanup < set, "开头要清残留");
+  // 成功路径的收尾也要拆掉临时指针。
+  assert.ok(fn.lastIndexOf('rm -f "$RELEASES_DIR/drill-scratch"') > set, "用完要拆");
+});
+
+test("drill 每一种失败都写清 failed 是哪个检查 —— 状态页红灯要能指路", () => {
+  const fn = deployerFn("do_drill");
+  for (const check of ["pinned", "verify", "smoke", "health", "history", "flip"]) {
+    assert.ok(
+      fn.includes(`ignition_report false ${check}`),
+      `失败分类里缺 ${check}`,
+    );
+  }
+});
+
 /**
  * 造一个**跑得动稳定面**的 release:两个角色的入口文件都在。
  *

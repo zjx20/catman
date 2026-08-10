@@ -177,6 +177,8 @@ interface BuildOpts {
   sessionExists?: (userKey: string, sessionId: string) => boolean;
   /** 部署控制面。不传 = 这台机器没配自进化(本地开发就是这样)。 */
   deploy?: DeployControl;
+  /** token 到期告警。不传 = 不播(stdin 调试就是这样)。 */
+  tokenAlert?: { pending(): string | undefined; markAnnounced(): void };
 }
 
 /** 可编排的假部署控制面:记录发布与回滚请求,报告、清单、候选由用例摆好。 */
@@ -271,6 +273,7 @@ function build(now: () => number, opts: BuildOpts = {}) {
     ...(opts.admission ? { admission: opts.admission } : {}),
     ...(opts.sessionExists ? { sessionExists: opts.sessionExists } : {}),
     ...(opts.deploy ? { deploy: opts.deploy } : {}),
+    ...(opts.tokenAlert ? { tokenAlert: opts.tokenAlert } : {}),
   });
   // 只注册 handler,不启动真实定时器/渠道 —— 但接线走 `onIncoming`,与
   // `Gateway.start()` **同一个方法**。这里曾经自己抄了一份等价接线,
@@ -777,6 +780,49 @@ test("greeting:标记缺席只表示渠道不知道,不表示没收过", async (
   const { channel } = build(() => t);
   await channel.receive(U1, "你好");
   assert.equal(channel.sent.filter((m) => m.text.startsWith("你好,我是 catman。")).length, 1);
+});
+
+// --- token 到期告警 ---
+
+test("token 告警只发给管理员,发送成功才落账", async () => {
+  // 换发要人在宿主跑 setup-token —— 普通用户拿这条消息什么都做不了,只会吓一跳。
+  // 发送成功才 markAnnounced,与部署结果播报同一条纪律:先标记等于把告警永久吞掉。
+  const t = 1_000_000;
+  let marked = 0;
+  const tokenAlert = {
+    pending: () => "【订阅凭据】还有约 5 天到期",
+    markAnnounced: () => {
+      marked += 1;
+    },
+  };
+  const { channel, settings } = build(() => t, { tokenAlert });
+  settings.set({ adminUserKeys: [U1] });
+
+  await channel.receive(U2, "你好"); // 非管理员
+  assert.equal(channel.sent.filter((m) => m.text.includes("订阅凭据")).length, 0);
+  assert.equal(marked, 0);
+
+  await channel.receive(U1, "你好"); // 管理员
+  assert.equal(
+    channel.sent.filter((m) => m.userKey === U1 && m.text.includes("订阅凭据")).length,
+    1,
+  );
+  assert.equal(marked, 1);
+});
+
+test("token 告警发送失败不落账 —— 留给下次重试", async () => {
+  const t = 1_000_000;
+  let marked = 0;
+  const tokenAlert = {
+    pending: () => "【订阅凭据】快到期了",
+    markAnnounced: () => {
+      marked += 1;
+    },
+  };
+  const { channel, settings } = build(() => t, { tokenAlert, failSend: true });
+  settings.set({ adminUserKeys: [U1] });
+  await channel.receive(U1, "你好");
+  assert.equal(marked, 0, "发送失败不该标记已播报");
 });
 
 // --- 硬指令 ---
