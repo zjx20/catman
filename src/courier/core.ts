@@ -49,6 +49,14 @@ const FALLBACK_COOLDOWN_MS = 5 * 60_000;
 /** 一次拉取最多返回几条。够一个聚合批用,又不至于让人格一口吃下太多。 */
 const PULL_BATCH = 20;
 
+/**
+ * 没能收下一条消息时对用户说的话。
+ *
+ * 必须说,而且必须说清"没收下" —— 沉默在他那边与"正在想"完全同形,他会一直等。
+ * 让他知道要重发,是这条路上唯一还剩的补救。
+ */
+const UNDELIVERABLE_TEXT = "这条消息我没能收下(多半是我这边磁盘或存储出了问题),麻烦你再发一次。";
+
 export interface CourierSend {
   (userKey: string, text: string, kind: SendKind): Promise<void>;
 }
@@ -88,6 +96,8 @@ export class CourierCore implements CourierApi {
   private readonly lastFallback = new Map<string, number>();
   /** 每人格投递失败(NACK)的累计条数。非零 = 契约漂移的红灯。 */
   private readonly nacked = new Map<PersonaId, number>();
+  /** 压根没能收下的条数(写盘失败等)。与 inbox 的 dropped 是两回事。 */
+  private lost = 0;
 
   constructor(private readonly opts: CourierCoreOptions) {
     this.now = opts.now ?? (() => Date.now());
@@ -136,6 +146,8 @@ export class CourierCore implements CourierApi {
       const box = this.opts.inboxes.get(persona);
       if (!box) {
         console.error(`[courier] 没有 ${persona} 的收件队列,消息丢弃:${msg.userKey}`);
+        this.noteLost(persona, refs);
+        await this.reply(msg.userKey, UNDELIVERABLE_TEXT, "fallback");
         return;
       }
       box.push(
@@ -154,8 +166,27 @@ export class CourierCore implements CourierApi {
       // ③ 目标人格不可达就自己说句话。消息**仍留在队列里**等它起来。
       await this.maybeFallback(persona, msg.userKey);
     } catch (err) {
-      console.error(`[courier] 处理来信失败(已跳过这一条):${msg.userKey} ${String(err)}`);
+      // **不能只是记一行日志就算了。** 走到这里最常见的原因是写盘失败(磁盘满、
+      // 只读挂载、EACCES),而那时:消息没进队列、`dropped` 计数覆盖不到这条路、
+      // 用户一个字都收不到,而 `accept` 正常返回 → iLink 游标照常推进 →
+      // **这条消息永远不会被重放**。用户侧就是"发了没反应",也就是整套设计最想
+      // 消灭的那个症状,发生在最该说话的那个进程上。
+      //
+      // 所以:计数(状态页看得见)+ 给用户一句实话。告诉他之后他会重发,
+      // 而重发是这条路上唯一还剩的补救。
+      this.lost += 1;
+      console.error(
+        `[courier] 处理来信失败(累计 ${this.lost} 条没能收下):${msg.userKey} ${String(err)}`,
+      );
+      await this.reply(msg.userKey, UNDELIVERABLE_TEXT, "fallback");
     }
+  }
+
+  /** 没能入队的那些附件也要清掉,否则它们成了永远没人引用的孤儿。 */
+  private noteLost(persona: PersonaId, refs: readonly AttachmentRef[]): void {
+    this.lost += 1;
+    void persona;
+    this.opts.spool.drop(refs.map((r) => r.id));
   }
 
   /**
@@ -311,6 +342,11 @@ export class CourierCore implements CourierApi {
       out[p] = { dropped: box.droppedCount(), nacked: this.nacked.get(p) ?? 0 };
     }
     return out;
+  }
+
+  /** 压根没收下的条数(写盘失败等)。与队列里的 dropped 分开报 —— 处置不同。 */
+  lostCount(): number {
+    return this.lost;
   }
 
   // ── 内部 ────────────────────────────────────────────────────────

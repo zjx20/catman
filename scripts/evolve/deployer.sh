@@ -4,6 +4,7 @@
 # 用法:
 #   deployer.sh deploy <sha> [--requested-by <userKey>]
 #   deployer.sh rollback [--requested-by <userKey>]
+#   deployer.sh demote [--step N] [--why <一句话>]
 #   deployer.sh status
 #
 # ## 它为什么必须与 catman 分开
@@ -35,9 +36,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="${1:-}"; shift || true
 REQUESTED_BY=""
 TARGET_SHA=""
+DEMOTE_STEP=1
+DEMOTE_WHY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --requested-by) REQUESTED_BY="${2:-}"; shift 2 ;;
+    --step) DEMOTE_STEP="${2:-1}"; shift 2 ;;
+    --why) DEMOTE_WHY="${2:-}"; shift 2 ;;
     -*) die "未知参数 $1" ;;
     *) TARGET_SHA="$1"; shift ;;
   esac
@@ -296,6 +301,47 @@ do_rollback() {
   fi
 }
 
+# ── demote:看门狗要求把 current 往回拨 ─────────────────────────────
+#
+# 与 rollback 的区别是**语义**,不是实现细节:
+#
+#   rollback  人主动要求退回上一个已验证版本。它会把 stable 一并拨回去 ——
+#             因为那是人的判断:"刚上线那个是坏的"。
+#   demote    机械看门狗在**没有人**的情况下判定主人格起不来。它只拨 current,
+#             **绝不动 stable**。
+#
+# 为什么这条界线不能模糊:`stable` 是"最后一个被证明能跑的版本",而看门狗的判据
+# (容器重启了几次)远弱于观察期。让它写 stable,等于允许一次误判永久改写
+# "回退目标"这个概念本身 —— 而下一次真出事时,它会把 current 拨到那个被误判抬上去的
+# 版本上。指针单主的具体含义就在这里:stable 只许 deployer 在观察期结束后前移。
+#
+# 每一级只退一次由调用方(看门狗)用 --step 表达,这里只负责按级数选目标。
+do_demote() {
+  local step="${DEMOTE_STEP:-1}"
+  lock_acquire "demote"
+  trap 'lock_release' EXIT
+
+  local cur; cur="$(pointer_sha current)"
+  local target; target="$(pick_demote_target "$step" || true)"
+
+  if [ -z "$target" ]; then
+    report aborted "${cur:-unknown}" "看门狗要求退到第 $step 级,但没有那么多可用的已验证版本 —— 需要人来处理"
+    die "没有第 $step 级可退"
+  fi
+
+  log "看门狗降级:$cur → $target(第 $step 级;${DEMOTE_WHY:-无说明})"
+  local bg; bg="$(health_background)"
+  # 不排水:走到这一步说明主人格已经起不来了,没有"在处理的消息"可等。
+  revert_to "$target"
+  if await_health "$target"; then
+    report rolled-back "${cur:-unknown}" "看门狗自动降级(第 $step 级):${DEMOTE_WHY:-主人格起不来}" "$target" "$bg"
+  else
+    # **stable 一个字都不动**,哪怕退完还是不健康。见上面的说明。
+    report rolled-back "${cur:-unknown}" "看门狗降级后仍不健康(第 $step 级),需要人来看:${DEMOTE_WHY:-}" "$target" "$bg"
+    die "降级后仍不健康"
+  fi
+}
+
 do_status() {
   echo "current: $(pointer_sha current)"
   echo "stable:  $(pointer_sha stable)"
@@ -308,6 +354,7 @@ do_status() {
 case "$MODE" in
   deploy) do_deploy "$TARGET_SHA" ;;
   rollback) do_rollback ;;
+  demote) do_demote ;;
   status) do_status ;;
-  *) die "用法:deployer.sh {deploy <sha>|rollback|status} [--requested-by <userKey>]" ;;
+  *) die "用法:deployer.sh {deploy <sha>|rollback|demote [--step N] [--why ...]|status} [--requested-by <userKey>]" ;;
 esac

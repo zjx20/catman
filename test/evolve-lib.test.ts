@@ -766,3 +766,52 @@ test("bless 不能原地覆写 —— 正在读那个文件的 deployer 必须�
     assert.match(readFileSync(target, "utf8"), /deployer/, "而新读者拿到的是新版本");
   });
 });
+
+// ── 看门狗降级 ────────────────────────────────────────────────────
+
+test("降级目标:第 N 级 = 清单里第 N 个「不是 current 且校验得过」的 release", () => {
+  withDir((dir) => {
+    for (const sha of ["aaa111", "bbb222", "ccc333"]) makeRelease(dir, sha);
+    inLib(dir, `pointer_set current aaa111`);
+    inLib(dir, `history_push ccc333; history_push bbb222; history_push aaa111`);
+    // 清单(新→旧)= aaa111, bbb222, ccc333;current 是 aaa111,所以跳过它。
+    assert.equal(inLib(dir, `pick_demote_target 1`), "bbb222");
+    assert.equal(inLib(dir, `pick_demote_target 2`), "ccc333");
+  });
+});
+
+test("降级目标:校验不过的跳过但**不占级数**", () => {
+  // 占了级数的话,"第 2 级"会指向一个比预期更旧的版本 —— 而看门狗每级只退一次,
+  // 那一格就被永久跳过去了。
+  withDir((dir) => {
+    for (const sha of ["aaa111", "bbb222", "ccc333"]) makeRelease(dir, sha);
+    writeFileSync(join(dir, "bbb222", "dist", "src", "index.js"), "// 被改过\n");
+    inLib(dir, `pointer_set current aaa111`);
+    inLib(dir, `history_push ccc333; history_push bbb222; history_push aaa111`);
+    assert.equal(inLib(dir, `pick_demote_target 1`), "ccc333", "坏的那个不该占掉第 1 级");
+  });
+});
+
+test("降级目标:没有那么多级时返回空,由调用方报警而不是乱选", () => {
+  withDir((dir) => {
+    makeRelease(dir, "aaa111");
+    inLib(dir, `pointer_set current aaa111`);
+    inLib(dir, `history_push aaa111`);
+    assert.equal(inLib(dir, `pick_demote_target 1 || true`), "");
+  });
+});
+
+test("**demote 绝不写 stable** —— 指针单主,它只许 deployer 在观察期后前移", () => {
+  // 看门狗的判据(容器重启了几次)远弱于观察期。让它写 stable,等于允许一次误判
+  // 永久改写「回退目标」这个概念本身 —— 下一次真出事时,它会把 current 拨到
+  // 那个被误判抬上去的版本上。
+  const body = readFileSync(join(EVOLVE_DIR, "deployer.sh"), "utf8");
+  const start = body.indexOf("do_demote() {");
+  const end = body.indexOf("\ndo_status() {");
+  assert.ok(start > 0 && end > start);
+  const fn = body.slice(start, end);
+  assert.equal(fn.includes("pointer_set stable"), false, "do_demote 里出现了 pointer_set stable");
+  // 反面对照:rollback 是**人**的判断,它该写 stable —— 少了这条,把两处都删掉也全绿。
+  const rb = body.slice(body.indexOf("do_rollback() {"), body.indexOf("\ndo_demote() {"));
+  assert.ok(rb.includes("pointer_set stable"), "rollback 反而必须写 stable");
+});

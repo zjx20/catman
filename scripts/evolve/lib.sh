@@ -463,6 +463,27 @@ release_verify() { # release_verify <sha>
   return 0
 }
 
+# ── 看门狗降级的目标选择 ───────────────────────────────────────────
+# 放在 lib.sh 而不是 deployer.sh:它要能**不依赖 docker**被跑起来验。
+# 与 release_gc 同一个理由 —— 会改变"出事时退到哪儿"的代码,必须有直接的用例。
+#
+# 第 N 级 = 已验证清单里第 N 个「不是 current 且校验得过」的 release。
+# 校验不过的**跳过但不占级数**:它本来就不能作为目标,占了级数会让"第 2 级"
+# 指向一个比预期更旧的版本,而看门狗每级只退一次 —— 那一格就永久跳过去了。
+pick_demote_target() { # pick_demote_target <级数> → sha(找不到则空)
+  local step="${1:-1}"
+  local cur; cur="$(pointer_sha current)"
+  local n=0 sha
+  while read -r sha; do
+    [ -n "$sha" ] || continue
+    [ "$sha" = "$cur" ] && continue
+    release_verify "$sha" >/dev/null 2>&1 || continue
+    n=$((n + 1))
+    if [ "$n" -ge "$step" ]; then echo "$sha"; return 0; fi
+  done < <(history_shas)
+  return 1
+}
+
 # ── 变更分级(Tier) ───────────────────────────────────────────────
 # 一次改动里有没有"光靠流水线上不了线"的东西。分级本身不拦任何事 —— 它拦不住,
 # 也不该拦:Tier 3 的东西**改了也不会自动生效**(部署脚本走 bless 固化副本、

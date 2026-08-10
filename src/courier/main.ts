@@ -61,7 +61,15 @@ async function main(): Promise<void> {
   const spool = new Spool({ dir: join(dir, "spool") });
   const routing = new RoutingTable({ path: join(dir, "routes.json") });
   const inboxes = new Map<PersonaId, Inbox>(
-    PERSONA_IDS.map((p) => [p, new Inbox({ path: join(dir, "inbox", `${p}.jsonl`) })]),
+    PERSONA_IDS.map((p) => [
+      p,
+      new Inbox({
+        path: join(dir, "inbox", `${p}.jsonl`),
+        // 溢出淘汰信封的同时清掉它引用的图片字节 —— 信封几百字节,图片好几 MB,
+        // 只淘汰信封腾不出磁盘。
+        onEvict: (env) => spool.drop(env.attachmentRefs.map((r) => r.id)),
+      }),
+    ]),
   );
 
   const channel = new WechatILinkChannel(
@@ -125,7 +133,11 @@ async function main(): Promise<void> {
 
   // 路由的 TTL 扫描。**unref**:它是纯观测型的,晚一轮甚至不跑都无所谓,
   // 不该拦着进程退出(与 gateway.reminderTimer 同一条分界线)。
-  const sweep = setInterval(() => void core.sweepRoutes(), 5 * 60_000);
+  const sweep = setInterval(() => {
+    void core.sweepRoutes();
+    // spool 也在这里扫:只在构造函数里扫一次的话,一个跑几周的稳定面等于从不清扫。
+    spool.sweep();
+  }, 5 * 60_000);
   sweep.unref?.();
 
   console.info(`catman-courier 已启动,IPC=${config.ipcSocketPath}`);

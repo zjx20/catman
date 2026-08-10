@@ -45,6 +45,14 @@ export interface InboxOptions {
   /** JSONL 路径,如 /data/courier/inbox/primary.jsonl。 */
   path: string;
   maxBytes?: number;
+  /**
+   * 一条消息因为溢出被丢弃。
+   *
+   * **必须有人接**:信封只有几百字节,真正占地方的是它引用的那些图片字节。
+   * 不在这里把 spool 里的文件一起删掉的话,淘汰再多信封也腾不出磁盘 ——
+   * 而"人格挂了几小时、用户一直发图"这个场景下,先炸的正是磁盘不是队列。
+   */
+  onEvict?: (env: InboundEnvelope) => void;
 }
 
 export class Inbox {
@@ -138,6 +146,7 @@ export class Inbox {
       const oldest = this.queue.shift()!;
       this.bytes -= JSON.stringify({ t: "m", ...oldest }).length;
       this.dropped += 1;
+      this.opts.onEvict?.(oldest);
       appendFileSync(this.opts.path, `${JSON.stringify({ t: "a", id: oldest.msgId })}\n`, "utf8");
       console.warn(
         `[courier] inbox ${this.opts.path} 超过 ${this.maxBytes} 字节,丢弃最旧的一条` +

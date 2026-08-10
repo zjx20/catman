@@ -29,16 +29,33 @@ const ORPHAN_TTL_MS = 24 * 60 * 60 * 1000;
 export interface SpoolOptions {
   dir: string;
   now?: () => number;
+  /**
+   * 目录总字节上限。超了就从最旧的开始删。
+   *
+   * **这道闸不能省。** inbox 的 8MB 上限管的是几百字节的信封,管不到真正占地方的
+   * 图片字节;而磁盘满会让 dockerd 全面异常,那时连回滚都做不了 —— 整套自进化
+   * 的最后一道防线跟着一起没。
+   *
+   * 代价说清楚:被删掉的图片如果还挂在队列里,人格读它会 ENOENT。那条路径已经
+   * 有兜底(跳过这一张、文字与其余图片照常投递),所以退化是"少看一张图",
+   * 而不是"消息丢了"。这个取舍是刻意的:磁盘满的代价大得多。
+   */
+  maxTotalBytes?: number;
 }
+
+/** spool 目录的默认总量上限。 */
+const DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
 
 export class Spool {
   private readonly now: () => number;
+  private readonly maxTotalBytes: number;
   private seq = 0;
 
   constructor(private readonly opts: SpoolOptions) {
     this.now = opts.now ?? (() => Date.now());
+    this.maxTotalBytes = opts.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
     mkdirSync(opts.dir, { recursive: true });
-    this.sweepOrphans();
+    this.sweep();
   }
 
   /**
@@ -51,6 +68,7 @@ export class Spool {
     const id = `${(this.seq += 1).toString(36)}-${rand()}.bin`;
     // 0600:图片是用户的私人内容,而 /data 在几个容器之间共享。
     writeFileSync(join(this.opts.dir, id), bytes, { mode: 0o600 });
+    this.enforceCap();
     return { id, mediaType, bytes: bytes.length };
   }
 
@@ -80,6 +98,53 @@ export class Spool {
   private pathOf(id: string): string | undefined {
     if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) return undefined;
     return join(this.opts.dir, id);
+  }
+
+  /**
+   * 扫除超龄孤儿 + 执行总量上限。
+   *
+   * **公开且要被周期性调用**:只在构造函数里扫一次的话,一个跑几周的稳定面等于
+   * 从不清扫 —— 而它恰恰是最不该把磁盘吃光的那个进程。
+   */
+  sweep(): void {
+    this.sweepOrphans();
+    this.enforceCap();
+  }
+
+  /** 总量超限就从最旧的开始删。见 maxTotalBytes 的说明(退化成"少看一张图")。 */
+  private enforceCap(): void {
+    let entries: Array<{ path: string; mtime: number; size: number }>;
+    try {
+      entries = readdirSync(this.opts.dir).flatMap((name) => {
+        const path = join(this.opts.dir, name);
+        try {
+          const st = statSync(path);
+          return st.isFile() ? [{ path, mtime: st.mtimeMs, size: st.size }] : [];
+        } catch {
+          return [];
+        }
+      });
+    } catch {
+      return;
+    }
+    let total = entries.reduce((n, e) => n + e.size, 0);
+    if (total <= this.maxTotalBytes) return;
+    entries.sort((a, b) => a.mtime - b.mtime);
+    let removed = 0;
+    for (const e of entries) {
+      if (total <= this.maxTotalBytes) break;
+      try {
+        rmSync(e.path, { force: true });
+        total -= e.size;
+        removed += 1;
+      } catch {
+        // 删不掉就跳过:少腾一点空间好过让整个流程挂掉。
+      }
+    }
+    console.warn(
+      `[courier] spool 超过 ${this.maxTotalBytes} 字节,删掉最旧的 ${removed} 个附件` +
+        "(还挂在队列里的那些会退化成「少看一张图」)",
+    );
   }
 
   private sweepOrphans(): void {

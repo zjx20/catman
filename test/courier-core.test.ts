@@ -308,3 +308,31 @@ test("挂着的时候来了新消息要**立刻唤醒**,而不是等超时", asy
     assert.ok(Date.now() - started < 1000, "唤醒没生效,白等了一整个 waitMs");
   });
 });
+
+test("写盘失败不能静默吞掉 —— 计数,并且**告诉用户重发**", async () => {
+  // 磁盘满时:消息没进队列、dropped 覆盖不到这条路、用户一个字收不到,
+  // 而 accept 正常返回 → iLink 游标照常推进 → 这条消息永远不会被重放。
+  // 用户侧就是"发了没反应",也就是整套设计最想消灭的那个症状。
+  await withHarness(async (h) => {
+    h.inboxes.delete("primary"); // 模拟"这条消息落不了地"
+    await h.core.accept({ msgId: "m1", userKey: USER, text: "喂" });
+    assert.equal(h.core.lostCount(), 1, "必须计数");
+    assert.match(h.sent.at(-1)!.text, /再发一次/, "必须让他知道要重发");
+  });
+});
+
+test("没收下的那条,它的附件也要清掉 —— 否则成了永远没人引用的孤儿", async () => {
+  await withHarness(async (h) => {
+    h.inboxes.delete("primary");
+    await h.core.accept({
+      msgId: "m1",
+      userKey: USER,
+      text: "看图",
+      attachments: [{ kind: "image", mediaType: "image/png", data: "AQID", bytes: 3 }],
+    });
+    const spool = new Spool({ dir: join(h.dir, "spool") });
+    const { readdirSync } = await import("node:fs");
+    assert.deepEqual(readdirSync(join(h.dir, "spool")), [], "spool 该是空的");
+    void spool;
+  });
+});

@@ -321,3 +321,49 @@ test("预算:换了 token 才重置 —— 新来信本来就带新预算", () =
     assert.equal(store.remainingProgress("u"), MAX_PROGRESS_PER_TOKEN);
   });
 });
+
+test("spool:总量超限时从最旧的开始删 —— 磁盘满会让 dockerd 全面异常,那时连回滚都做不了", () => {
+  // 代价是刻意选的:被删掉的图片若还挂在队列里,人格读它会 ENOENT,而那条路径
+  // 已经有兜底(跳过这一张、文字与其余图片照常投递)。退化成"少看一张图",
+  // 比磁盘满小得多。
+  withDir((dir) => {
+    const spoolDir = join(dir, "spool");
+    const spool = new Spool({ dir: spoolDir, maxTotalBytes: 300 });
+    const ids: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      ids.push(spool.put(new Uint8Array(100), "image/png", () => `f${i}`).id);
+    }
+    const alive = ids.filter((id) => spool.get(id));
+    assert.ok(alive.length <= 3, `上限没生效,还剩 ${alive.length} 个`);
+    assert.ok(spool.get(ids.at(-1)!), "最新的那个必须还在 —— 它多半正被引用");
+  });
+});
+
+test("spool:sweep 可以被周期性调用,不只是开机那一次", () => {
+  // 只在构造函数里扫的话,一个跑几周的稳定面等于从不清扫 ——
+  // 而它恰恰是最不该把磁盘吃光的那个进程。
+  withDir((dir) => {
+    const spoolDir = join(dir, "spool");
+    const spool = new Spool({ dir: spoolDir, maxTotalBytes: 150 });
+    const a = spool.put(new Uint8Array(100), "image/png", () => "a");
+    const b = spool.put(new Uint8Array(100), "image/png", () => "b");
+    void b;
+    spool.sweep();
+    assert.equal(spool.get(a.id), undefined, "扫过之后最旧的该没了");
+  });
+});
+
+test("inbox:溢出淘汰时把被丢的信封交出去 —— 否则它引用的图片字节永远没人清", () => {
+  withDir((dir) => {
+    const evicted: string[] = [];
+    const box = new Inbox({
+      path: join(dir, "p.jsonl"),
+      maxBytes: 400,
+      onEvict: (env) => evicted.push(env.msgId),
+    });
+    for (let i = 0; i < 20; i++) box.push(msg(`m${i}`, "x".repeat(50)));
+    assert.ok(evicted.length > 0);
+    assert.equal(evicted[0], "m0", "先丢最旧的");
+    assert.equal(evicted.length, box.droppedCount(), "回调次数要与计数一致");
+  });
+});
