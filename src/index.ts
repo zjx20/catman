@@ -42,6 +42,35 @@ async function main(): Promise<void> {
 
   const config = loadConfig();
 
+  // ── 守护人格:机械层**先于装配**起来 ──────────────────────────────
+  //
+  // 顺序就是这条不变量本身。它存在的理由是「失败域诚实条款」:磁盘满 / 内存尽 /
+  // token 过期这三样同样会废掉大脑 —— 而那正是最需要看门狗与状态页的时候。
+  // 放在装配之后的话,一次 `mkdirSync` 或 `writeSkills` 写盘失败就会让整个进程退出,
+  // **状态页从来没起过** —— 于是"大脑起不来时它还在"这句话只是一句注释,不是事实。
+  // (这正是评审在 IPC secret 那条上抓到的同一类错误:注释描述了一个不存在的东西。)
+  //
+  // 所以:它自带 try/catch,起不来只记一行,绝不拖垮别的;而下面的装配若失败,
+  // 守护人格**不退出** —— 见文件末尾 main().catch 的分流。
+  let rescueRef: RescueRunner | undefined;
+  if (config.persona === "rescue") {
+    try {
+      rescueRef = new RescueRunner({
+        dataDir: config.mainDataDir,
+        releasesDir: config.releasesDir,
+        deployDir: config.deployDir,
+        courierDir: config.courierDir,
+        primaryContainer: process.env["CATMAN_CONTAINER"] ?? "catman",
+        courierContainer: process.env["CATMAN_COURIER_CONTAINER"] ?? "catman-courier",
+        statusPort: config.rescueStatusPort,
+        token: rescueToken(config),
+      });
+      rescueRef.start();
+    } catch (err) {
+      console.error("[rescue] 机械层起不来(这很严重,它本该是最后一道):", err);
+    }
+  }
+
   // 让 Agent SDK 把会话 JSONL 存到数据卷里(而非镜像内的 HOME)。
   if (!process.env.CLAUDE_CONFIG_DIR) {
     process.env.CLAUDE_CONFIG_DIR = `${config.dataDir}/claude`;
@@ -185,7 +214,6 @@ async function main(): Promise<void> {
     return t;
   }
 
-  let rescueRef: RescueRunner | undefined;
   const shutdown = async () => {
     console.info("正在关闭 catman…");
     clearInterval(cleanupTimer);
@@ -203,24 +231,6 @@ async function main(): Promise<void> {
   dashboard.start();
   await gateway.start();
 
-  // 守护人格额外挂上机械层:看门狗 + 无 LLM 状态页。
-  // 它们与大脑分开,因为磁盘满/内存尽/token 过期同样会废掉大脑 ——
-  // 而那正是最需要它们的时候(设计里的「失败域诚实条款」)。
-  let rescue: RescueRunner | undefined;
-  if (config.persona === "rescue") {
-    rescue = new RescueRunner({
-      dataDir: config.mainDataDir,
-      releasesDir: config.releasesDir,
-      deployDir: config.deployDir,
-      courierDir: config.courierDir,
-      primaryContainer: process.env["CATMAN_CONTAINER"] ?? "catman",
-      courierContainer: process.env["CATMAN_COURIER_CONTAINER"] ?? "catman-courier",
-      statusPort: config.rescueStatusPort,
-      token: adminToken,
-    });
-    rescue.start();
-    rescueRef = rescue;
-  }
   bootOk = true;
   console.info(`catman 已启动,渠道=${channel.name},${versionLine(version)}`);
 }
@@ -332,6 +342,29 @@ function resolveDeployControl(
  * 不阻塞启动(本地开发友好),但也不会出现无鉴权的 dashboard:
  * 能打开它的人可以扫码接入,而接入者拥有宿主 root 级别的能力。
  */
+/**
+ * 守护人格的访问令牌。**只读,绝不生成。**
+ *
+ * 两个站点两份令牌意味着出事时人要先想起来是哪一份,而那时他正着急。所以它读的是
+ * 主 dashboard 那一份(`CATMAN_ADMIN_TOKEN`,或主 /data 下那个文件)。
+ * 读不到就给一个当场生成的随机值 —— 那等于**没人进得来**,但比"无鉴权"好:
+ * 能打开这一页的人可以重启容器、回退版本。同时打一行日志说清是这种状态。
+ */
+function rescueToken(config: Config): string {
+  if (config.adminToken) return config.adminToken;
+  try {
+    const existing = readFileSync(`${config.mainDataDir}/dashboard-token`, "utf8").trim();
+    if (existing) return existing;
+  } catch {
+    // 读不到 —— 落到下面那句。
+  }
+  console.error(
+    "[rescue] 取不到主 dashboard 的令牌,状态页将无人可进。" +
+      "在 .env 里设 CATMAN_ADMIN_TOKEN,或确认主 /data 已只读挂载进来。",
+  );
+  return randomBytes(16).toString("hex");
+}
+
 function resolveAdminToken(config: Config): string {
   if (config.adminToken) return config.adminToken;
 
@@ -353,5 +386,12 @@ function resolveAdminToken(config: Config): string {
 
 main().catch((err) => {
   console.error("catman 启动失败:", err);
+  // 守护人格的机械层(看门狗 + 状态页)在装配**之前**就起来了,而它恰恰是为
+  // "大脑起不来"这种处境准备的 —— 这里退出等于把最后一道防线跟着一起关掉。
+  // 所以它只报错、继续跑;主人格与信使照旧退出(让 restart 策略去重试)。
+  if (process.env["CATMAN_PERSONA"] === "rescue") {
+    console.error("[rescue] 大脑那半没起来,机械层继续跑 —— 去状态页看看,它还在。");
+    return;
+  }
   process.exit(1);
 });
