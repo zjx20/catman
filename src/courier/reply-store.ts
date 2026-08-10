@@ -121,6 +121,12 @@ export class ReplyStore {
     return this.ctxs.get(userKey);
   }
 
+  /** 发给谁、用哪个 token。渠道只需要这两样,不该看到计数。 */
+  target(userKey: string): { toUserId: string; contextToken: string } | undefined {
+    const c = this.ctxs.get(userKey);
+    return c ? { toUserId: c.toUserId, contextToken: c.contextToken } : undefined;
+  }
+
   /** 还能发几条进度。没有上下文时是 0(压根发不出去)。 */
   remainingProgress(userKey: string): number {
     const c = this.ctxs.get(userKey);

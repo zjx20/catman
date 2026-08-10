@@ -1,9 +1,22 @@
 import type { Channel, ChannelHealth, MessageHandler } from "./types.js";
 import type { AccountStore } from "../core/accounts.js";
 import { parseUserKey } from "../core/identity.js";
-import { ILinkConnection } from "./ilink-connection.js";
+import { ILinkConnection, type ReplyContexts } from "./ilink-connection.js";
 import type { AttachmentLimits } from "../core/attachments.js";
 import { WECHAT_CHANNEL } from "./ilink-protocol.js";
+import type { SendKind } from "../ipc/protocol.js";
+
+/**
+ * 长轮询游标的落盘。**每个账号一份。**
+ *
+ * 默认实现什么都不做(等价于旧行为:游标只在内存里),信使会注入真正的那个。
+ * 不落盘的代价见 ConnectionHooks.onCursor 的说明 —— 毒消息会让进程重启后
+ * 重放同一条、再崩,无限循环。
+ */
+export interface CursorStore {
+  get(accountId: string): string | undefined;
+  set(accountId: string, updatesBuf: string): void;
+}
 
 /**
  * 微信 iLink 渠道:管理若干个 ILinkConnection,每个账号一条独立的长轮询。
@@ -26,6 +39,8 @@ export class WechatILinkChannel implements Channel {
   constructor(
     private readonly accounts: AccountStore,
     private readonly limits: () => AttachmentLimits,
+    private readonly replies: ReplyContexts,
+    private readonly cursors: CursorStore = { get: () => undefined, set: () => {} },
   ) {
     this.accounts.onConnectionSetChanged(() => {
       // 账号增删或凭据替换后立刻对齐连接。start() 之前的变更留给 start() 统一处理。
@@ -55,14 +70,21 @@ export class WechatILinkChannel implements Channel {
   }
 
   /** 按 userKey 中的 accountId 路由到对应连接。 */
-  async send(userKey: string, text: string): Promise<void> {
+  async send(userKey: string, text: string, kind: SendKind = "body"): Promise<void> {
     const parts = parseUserKey(userKey);
     if (!parts) throw new Error(`非法 userKey: ${userKey}`);
     const conn = this.connections.get(parts.accountId);
     if (!conn) {
       throw new Error(`账号 ${parts.accountId} 无活动连接,无法发送`);
     }
-    await conn.send(userKey, text);
+    await conn.send(userKey, text, kind);
+  }
+
+  /** 各连接累计跳过的毒消息条数。非零说明有来信我们处理不了,状态页要显眼。 */
+  poisonedCount(): number {
+    let n = 0;
+    for (const c of this.connections.values()) n += c.poisonedCount;
+    return n;
   }
 
   /** 当前活动连接数(dashboard/日志用)。 */
@@ -110,17 +132,23 @@ export class WechatILinkChannel implements Channel {
       if (this.connections.has(id)) continue;
       const conn = new ILinkConnection(
         account,
-        (userKey, text, attachments) => {
-          void this.handler?.({
-            userKey,
-            text,
-            ...(attachments.length ? { attachments } : {}),
+        // **同步 await**:投递顺序严格等于收到顺序。「图 + 文字」那 120ms 的一对
+        // 靠它保持先后 —— 并发投递会让它们颠倒着进队列。
+        async (msg) => {
+          await this.handler?.({
+            msgId: msg.msgId,
+            userKey: msg.userKey,
+            text: msg.text,
+            ...(msg.attachments.length ? { attachments: msg.attachments } : {}),
           });
         },
         this.limits,
+        this.replies,
         {
           canonicalUserId: (raw) => this.accounts.canonicalUserId(id, raw),
           onExpired: () => this.accounts.markExpired(id),
+          onCursor: (buf) => this.cursors.set(id, buf),
+          ...(this.cursors.get(id) ? { initialCursor: this.cursors.get(id)! } : {}),
         },
       );
       this.connections.set(id, conn);

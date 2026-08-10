@@ -10,6 +10,7 @@ import {
 import type { AttachmentLimits } from "../src/core/attachments.js";
 import type { Account } from "../src/core/accounts.js";
 import type { Attachment } from "../src/core/attachments.js";
+import { FakeReplies } from "./helpers/replies.js";
 
 /**
  * iLink 图片入站:item_list 里 type=2 的条目要被下载、解密、还原成附件。
@@ -50,14 +51,16 @@ function setup(hooks?: ConnectionHooks) {
   const got: Received[] = [];
   const conn = new ILinkConnection(
     ACCOUNT,
-    (userKey, text, attachments) => {
-      got.push({ userKey, text, attachments });
+    (msg) => {
+      got.push({ userKey: msg.userKey, text: msg.text, attachments: msg.attachments });
     },
     () => LIMITS,
+    new FakeReplies(),
     hooks ?? {},
   );
   return { conn, got };
 }
+
 
 function imageItem(media: Record<string, unknown>, aeskeyHex?: string) {
   return {

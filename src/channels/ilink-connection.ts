@@ -16,6 +16,7 @@ import {
   type Attachment,
   type AttachmentLimits,
 } from "../core/attachments.js";
+import type { SendKind } from "../ipc/protocol.js";
 
 /**
  * 单个 iLink 账号的连接:一份 bot_token = 一条 getupdates 长轮询 + 一份回复上下文缓存。
@@ -80,27 +81,37 @@ interface GetUpdatesResp {
   longpolling_timeout_ms?: number;
 }
 
-/** 每用户缓存最近一次入站消息的回复上下文,供 send() 使用。 */
-interface ReplyContext {
-  toUserId: string;
-  contextToken: string;
-  /** 该 token 入缓存的时刻。用来算「拿它发信时它已经多老了」。 */
-  cachedAt: number;
-  /** 用这个 token 尝试发了几条。 */
-  attempts: number;
-  /**
-   * 其中成功几条。**必须与 attempts 分开记**:合成一个计数的话,失败不推进序号,
-   * 「第 4 次尝试但只成功过 1 条」这种"从第 2 条起就一直坏"的形态就看不出来了。
-   */
-  sent: number;
+/**
+ * 回复上下文与发送预算的持有者。
+ *
+ * **不再由连接自己持有**:预算必须有唯一权威(信使的 `ReplyStore`),否则两个人格
+ * 各按 10 条算就必然超发,而超发的后果是 `ret=-2` 且永不恢复。连接只负责"拿到 token
+ * 就交出去"和"发之前问一句还能不能发"。
+ *
+ * 唯一的实现是信使的 `courier/reply-store.ts`。人格侧不再持有 iLink 连接
+ * (它走 bridge),所以不存在第二份记账。
+ */
+export interface ReplyContexts {
+  /** 新来信:换一份上下文,计数归零。 */
+  remember(userKey: string, toUserId: string, contextToken: string): void;
+  /** 申请发一条。allowed=false 时连接不发,并把 reason 抛给调用方。 */
+  begin(userKey: string, kind: SendKind): { allowed: boolean; reason?: string };
+  /** 记一次结果(只影响诊断计数)。 */
+  settle(userKey: string, ok: boolean): void;
+  /** 发给谁、用哪个 token。 */
+  target(userKey: string): { toUserId: string; contextToken: string } | undefined;
+  /** 诊断三量:第几次尝试、之前成功几条、这份上下文多老了。 */
+  diag(userKey: string): { attempt: number; okBefore: number; ageMs: number };
 }
 
 /** 收到一条用户消息。userKey 已由连接拼好(含本账号的 accountId)。 */
-export type ConnectionMessageHandler = (
-  userKey: string,
-  text: string,
-  attachments: readonly Attachment[],
-) => void;
+export type ConnectionMessageHandler = (msg: {
+  /** 协议派生的稳定标识。**重放时必须与上一次相同** —— 去重全靠它。 */
+  readonly msgId: string;
+  readonly userKey: string;
+  readonly text: string;
+  readonly attachments: readonly Attachment[];
+}) => void | Promise<void>;
 
 /** 连接向上回报的事件。都由 wechat-ilink.ts 接到 AccountStore 上。 */
 export interface ConnectionHooks {
@@ -112,6 +123,15 @@ export interface ConnectionHooks {
   canonicalUserId?: (rawUserId: string) => string;
   /** 凭据失效(errcode=-14)。落盘后账号页会提示"需要重新扫码"。 */
   onExpired?: () => void;
+  /**
+   * 长轮询游标推进了。**在这一批消息被成功消费之后**调用,由调用方落盘。
+   *
+   * 不落盘的后果有两个,都很难查:重启会重放整批(用户收到重复回答),而**毒消息**
+   * ——某条来信触发崩溃 —— 会让进程重启后重放同一条、再崩,无限循环,微信全聋。
+   */
+  onCursor?: (updatesBuf: string) => void;
+  /** 恢复上次落盘的游标。不给则从空开始(等价于旧行为)。 */
+  initialCursor?: string;
 }
 
 /** 出错退避时长。 */
@@ -187,12 +207,13 @@ export class ILinkConnection {
 
   private readonly account: Account;
   private readonly onMessage: ConnectionMessageHandler;
-  private readonly replyCtx = new Map<string, ReplyContext>();
   private readonly clientId = `catman-${randomBytes(8).toString("hex")}`;
   private readonly abort = new AbortController();
 
-  private updatesBuf = "";
+  private updatesBuf: string;
   private running = false;
+  /** 被跳过的毒消息累计条数。非零就该在状态页与日志里显眼。 */
+  private poisoned = 0;
   /** 服务端上次报的长轮询时长,只为「变了才打日志」而存。 */
   private serverPollTimeoutMs?: number;
   /** 轮询循环的 promise,stop() 时等它退出。 */
@@ -208,15 +229,22 @@ export class ILinkConnection {
     account: Account,
     onMessage: ConnectionMessageHandler,
     private readonly limits: () => AttachmentLimits,
+    private readonly replies: ReplyContexts,
     private readonly hooks: ConnectionHooks = {},
   ) {
     this.account = account;
     this.accountId = account.accountId;
     this.onMessage = onMessage;
+    this.updatesBuf = hooks.initialCursor ?? "";
   }
 
   get isExpired(): boolean {
     return this.expired;
+  }
+
+  /** 被跳过的毒消息条数。供 /health 与状态页 —— 静默跳过等于没有隔离。 */
+  get poisonedCount(): number {
+    return this.poisoned;
   }
 
   /**
@@ -247,32 +275,36 @@ export class ILinkConnection {
    * 发送文本。使用该用户最近入站消息缓存的 context_token。
    * 无缓存(如主动提醒且用户从未发过消息)时抛错,由网关判定推送失败并降级。
    */
-  async send(userKey: string, text: string): Promise<void> {
-    const ctx = this.replyCtx.get(userKey);
-    if (!ctx) {
+  async send(userKey: string, text: string, kind: SendKind = "body"): Promise<void> {
+    const target = this.replies.target(userKey);
+    if (!target) {
       throw new Error(`无 ${userKey} 的 context_token,iLink 无法主动推送`);
+    }
+    // **预算在发之前问**,而权威不在这里 —— 见 ReplyContexts 的说明。
+    const permit = this.replies.begin(userKey, kind);
+    if (!permit.allowed) {
+      throw new Error(permit.reason ?? "发送预算不允许");
     }
     const msg: WeixinMessage = {
       from_user_id: "",
-      to_user_id: ctx.toUserId,
+      to_user_id: target.toUserId,
       client_id: `${this.clientId}-${randomBytes(4).toString("hex")}`,
       message_type: 2, // BOT
       message_state: 2, // FINISH
-      context_token: ctx.contextToken,
+      context_token: target.contextToken,
       item_list: [{ type: 1, text_item: { text } }],
     };
     // 诊断量在**发之前**取:失败路径要抛错,取晚了就得在两个分支各算一遍。
-    // attempts 就地自增(而非等结果),这样并发进来的发送拿到的是不同的序号 ——
+    // begin() 已经就地自增过 attempts,所以并发进来的发送拿到的是不同的序号 ——
     // 硬指令与在飞回合是会同时发消息的。
-    const attempt = (ctx.attempts += 1);
-    const okBefore = ctx.sent;
-    const ageMs = Date.now() - ctx.cachedAt;
+    const { attempt, okBefore, ageMs } = this.replies.diag(userKey);
 
     const resp = await this.post<{ ret?: number; errmsg?: string }>("ilink/bot/sendmessage", {
       msg,
       base_info: baseInfo(),
     });
     if (resp.ret !== undefined && resp.ret !== 0) {
+      this.replies.settle(userKey, false);
       // 失败**无条件**打:上层的 trySend 会把回执/进度的失败吞掉,只在这里
       // 还能看到全貌。带上三个判别量,见 formatSendDiag 的说明。
       console.warn(
@@ -287,7 +319,7 @@ export class ILinkConnection {
       );
       throw new Error(`sendmessage 失败 ret=${resp.ret} ${resp.errmsg ?? ""}`);
     }
-    ctx.sent += 1;
+    this.replies.settle(userKey, true);
     // 成功的量大(回执 + 每条进度 + 每段正文),跟入站 TRACE 同一个开关。
     // 但失败行自带 okBefore,所以不开 TRACE 也判得出"第几条开始坏的"。
     if (TRACE) {
@@ -338,11 +370,31 @@ export class ILinkConnection {
           await this.sleep(BACKOFF_MS); // 出错退避
           continue;
         }
-        if (resp.get_updates_buf) this.updatesBuf = resp.get_updates_buf;
-        // 逐条 await:dispatch 现在可能要下载图片。代价是下载期间暂停拉取,
+        // 逐条 await:dispatch 可能要下载图片。代价是下载期间暂停拉取,
         // 好处是投递顺序严格等于收到顺序 —— 长轮询有 get_updates_buf 游标兜底,
         // 暂停不会丢消息;而乱序会让「先发图、后发问题」的两条消息颠倒着进队列。
-        for (const m of resp.msgs ?? []) await this.dispatch(m);
+        //
+        // **单条消息是一个故障域**:解析/下载/入队任何一步抛错,只记录这一条并继续,
+        // 绝不让它掀翻主循环。否则一条毒消息就能让整个渠道停摆 —— 而重启之后
+        // 游标还没推进,它会被重放、再崩,无限循环,微信全聋。
+        for (const m of resp.msgs ?? []) {
+          try {
+            await this.dispatch(m);
+          } catch (err) {
+            this.poisoned += 1;
+            console.error(
+              `[ilink:${this.accountId}] 消息处理失败,已跳过(累计 ${this.poisoned} 条):` +
+                `${String(err)} — ${formatTrace(m)}`,
+            );
+          }
+        }
+        // 游标**在这一批消费完之后**才推进并落盘。放在消费之前的话,崩溃会丢掉
+        // 整批;放在之后而不落盘,则重启会重放整批。两者都要避免,所以是这个顺序 +
+        // 这个回调。重放本身由协议派生的稳定 msgId 兜底(见 dispatch),不会变成重复回答。
+        if (resp.get_updates_buf && resp.get_updates_buf !== this.updatesBuf) {
+          this.updatesBuf = resp.get_updates_buf;
+          this.hooks.onCursor?.(this.updatesBuf);
+        }
       } catch (err) {
         if (!this.running) break; // stop() 触发的 abort,正常退出
         // 带上已等时长:AbortError 贴着 LONG_POLL_TIMEOUT_MS 就是客户端超时太短
@@ -382,20 +434,29 @@ export class ILinkConnection {
     // 每条新来信都换一份上下文,发送计数也跟着归零 —— 计数的语义是「针对**这条来信**
     // 回了几条」。所以读日志时留意:用户在回合进行中又发了一条,会看到序号退回 #1。
     if (m.context_token) {
-      this.replyCtx.set(userKey, {
-        toUserId: m.from_user_id,
-        contextToken: m.context_token,
-        cachedAt: Date.now(),
-        attempts: 0,
-        sent: 0,
-      });
+      this.replies.remember(userKey, m.from_user_id, m.context_token);
     }
 
     const attachments = await this.collectImages(userKey, m.item_list ?? []);
 
     // 文字与图片同时为空才算无内容。只发一张图是完全正常的用法。
     if (!text && !attachments.length) return;
-    this.onMessage(userKey, text, attachments);
+    await this.onMessage({ msgId: this.msgIdOf(m), userKey, text, attachments });
+  }
+
+  /**
+   * 消息的稳定标识。**必须由协议派生,不能用自增计数器。**
+   *
+   * 它是重放去重的唯一依据:进程崩在"消息已入队、游标还没落盘"之间时,整批会被重放,
+   * 而计数器生成的 id 每次都不同 —— 于是同一条话在用户那边被回答两次。
+   *
+   * `message_id` 缺失时退回到"内容 + 时刻"的指纹:比计数器稳,但不完美(同一毫秒内
+   * 同一个人发两条一模一样的话会撞)。如实说明,不假装它总是可靠。
+   */
+  private msgIdOf(m: WeixinMessage): string {
+    if (m.message_id !== undefined) return `${this.accountId}-${m.message_id}`;
+    const items = (m.item_list ?? []).length;
+    return `${this.accountId}-f${m.create_time_ms ?? 0}-${m.from_user_id ?? ""}-${items}`;
   }
 
   /**

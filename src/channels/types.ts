@@ -1,4 +1,5 @@
 import type { Attachment } from "../core/attachments.js";
+import type { SendKind } from "../ipc/protocol.js";
 
 /**
  * 聊天渠道抽象。网关只依赖这个接口,微信(iLink)、钉钉、stdin 测试通道
@@ -13,6 +14,14 @@ import type { Attachment } from "../core/attachments.js";
 export interface IncomingMessage {
   /** 全局唯一用户键 `<channel>:<accountId>:<userId>`。 */
   userKey: string;
+  /**
+   * 渠道给的**稳定**消息标识,用于跨重启去重。
+   *
+   * 可选:stdin 与 dashboard 这类渠道没有"同一条消息会被重放"的概念。有它的渠道
+   * (iLink、bridge)必须保证**重放时与上一次相同** —— 用自增计数器生成的话,
+   * 一次崩溃重放就会让同一句话被回答两次。
+   */
+  msgId?: string;
   /** 用户发来的文本。只发了图片时为空串。 */
   text: string;
   /**
@@ -50,11 +59,15 @@ export interface Channel {
 
   /**
    * 主动向用户发送文本。实现方负责必要的分段。
+   *
+   * `kind` 是**发送预算按类别预留**的依据(见 courier/reply-store.ts):一个 iLink
+   * context_token 只够发约 10 条,进度必须让位给正文、提醒与部署结果播报。
+   * 没有预算概念的渠道(stdin / dashboard)忽略它即可。
    * 支持撤回的渠道应返回可传给 recall() 的消息 id;其余渠道返回 void 即可。
    * 注意:某些渠道(如微信 iLink)可能不支持"用户未先发消息时"的主动推送,
    * 这种情况下应 reject 或返回失败,由上层决定降级策略。
    */
-  send(userKey: string, text: string): Promise<string | void>;
+  send(userKey: string, text: string, kind?: SendKind): Promise<string | void>;
 
   /**
    * 可选:撤回本渠道之前 send() 返回过 id 的消息。

@@ -5,18 +5,18 @@ import { Agent } from "./core/agent.js";
 import { SessionManager } from "./core/session.js";
 import { FileStore } from "./core/file-store.js";
 import { Gateway } from "./core/gateway.js";
-import { AccountStore } from "./core/accounts.js";
 import { UserRegistry, listWorkspaceDirs } from "./core/users.js";
-import { allowAll, accountAdmission, type AdmissionPolicy } from "./core/admission.js";
+import { allowAll, type AdmissionPolicy } from "./core/admission.js";
 import { GlobalSettings } from "./core/settings.js";
 import { PrefsStore } from "./core/prefs.js";
 import { TurnTokens } from "./core/turn-tokens.js";
 import { writeSkills } from "./core/skills.js";
 import { StdinChannel } from "./channels/stdin.js";
-import { WechatILinkChannel } from "./channels/wechat-ilink.js";
+import { BridgeChannel } from "./channels/bridge.js";
+import { IpcClient } from "./ipc/client.js";
+import { IpcAccountsProxy } from "./dashboard/accounts-proxy.js";
 import { DashboardChannel } from "./channels/dashboard.js";
 import { CompositeChannel, compositeAdmission } from "./channels/composite.js";
-import { ILinkLogin } from "./channels/ilink-login.js";
 import type { Channel } from "./channels/types.js";
 import type { AttachmentLimits } from "./core/attachments.js";
 import { Dashboard } from "./dashboard/server.js";
@@ -63,7 +63,6 @@ async function main(): Promise<void> {
     timeoutMs: config.sessionTimeoutMs,
     timeoutMsFor: (userKey) => prefs.effective(userKey).sessionTimeoutMs,
   });
-  const accounts = new AccountStore(config.accountsPath);
   const users = new UserRegistry({
     path: config.usersPath,
     workspaceRoot: config.workspaceDir,
@@ -97,10 +96,19 @@ async function main(): Promise<void> {
   // 聊天记录落盘:网页没有本地记录,不存的话重启后页面空白、而助手那边的会话还在。
   const chat = new DashboardChannel({ path: config.chatLogPath });
   // 闭包读 settings:改了上限立刻生效,与 maxConcurrentTurns 那套一致。
-  const { channel, admission } = createChannel(accounts, chat, () => {
-    const s = settings.effective();
-    return { maxImageBytes: s.maxImageBytes, maxImagesPerTurn: s.maxImagesPerTurn };
-  });
+  // gateway 要在 createChannel 之后建,而 bridge 的 onDetach 要指向 gateway ——
+  // 用一个后填的引用打破这个环。detach 帧在 gateway 装好之前不可能到达
+  // (bridge 要等 start() 才开始拉取),所以这里的 undefined 窗口是安全的。
+  let gatewayRef: Gateway | undefined;
+  const { channel, admission, ipcClient: bridgeClient } = createChannel(
+    config,
+    chat,
+    () => {
+      const s = settings.effective();
+      return { maxImageBytes: s.maxImageBytes, maxImagesPerTurn: s.maxImagesPerTurn };
+    },
+    (userKey) => gatewayRef?.detachUser(userKey),
+  );
   const gateway = new Gateway({
     channel,
     agent,
@@ -120,6 +128,7 @@ async function main(): Promise<void> {
     // 提醒轮询:取超时时长的 1/10,但不短于 1 分钟。
     reminderIntervalMs: Math.max(60_000, Math.floor(config.sessionTimeoutMs / 10)),
   });
+  gatewayRef = gateway;
 
   const adminToken = resolveAdminToken(config);
   // 渠道起来之前一律报 bootOk=false:部署的健康门等的就是这个翻转,
@@ -132,8 +141,7 @@ async function main(): Promise<void> {
     port: config.dashboardPort,
     adminToken,
     users,
-    accounts,
-    login: new ILinkLogin(accounts),
+    ...(bridgeClient ? { accounts: new IpcAccountsProxy(bridgeClient) } : {}),
     chat,
     selfApi: { turns, prefs, users, sessions, settings, configDir },
     adminApi: { settings, prefs, users },
@@ -216,33 +224,57 @@ async function selfCheckMain(): Promise<void> {
  * 复合渠道对未登记的 channel 前缀一律拒绝 —— 漏配应当表现为不工作,而不是没防护。
  */
 function createChannel(
-  accounts: AccountStore,
+  config: Config,
   chat: DashboardChannel,
   /** 图片闸门。取函数而非值 —— 管理员改了上限,下一张图就按新值走,不必重启。 */
   limits: () => AttachmentLimits,
+  /** 收到 detach 控制帧:把这个用户的在飞回合转后台。 */
+  onDetach: (userKey: string) => void,
 ): {
   channel: Channel;
   admission: AdmissionPolicy;
+  /** 有信使时给出,dashboard 的账号页靠它代理过去。 */
+  ipcClient?: IpcClient;
 } {
   const kind = process.env.CATMAN_CHANNEL ?? "stdin";
   const byChannel: Record<string, AdmissionPolicy> = { dashboard: allowAll };
   let primary: Channel;
+  let ipcClient: IpcClient | undefined;
   switch (kind) {
     case "stdin":
       // 本地测试通道,消息只可能来自跑这个进程的人。
       primary = new StdinChannel(limits);
       byChannel["stdin"] = allowAll;
       break;
-    case "wechat":
-      primary = new WechatILinkChannel(accounts, limits);
-      byChannel["wechat"] = accountAdmission(accounts);
+    case "wechat": {
+      // 微信连接**不在这个进程里** —— 它归信使(见 src/courier/)。这里只有一根管子。
+      //
+      // 准入随之也搬走了:信使在消息跨 IPC **之前**就判过,未获准的一步都不往前走。
+      // 所以这里放行 —— 不是"没有准入",而是"准入在更前面"。写死成 allowAll 而不是
+      // 留个 accountAdmission 的影子,是因为后者要 import accounts.ts,
+      // 而人格进程**一行都不能 import 它**(见下面 assertNoAccountStore 的说明)。
+      const secret = config.ipcSecret;
+      if (!secret) {
+        throw new Error(
+          "CATMAN_CHANNEL=wechat 需要 CATMAN_IPC_SECRET —— 微信连接在信使进程里,人格靠它认身份",
+        );
+      }
+      ipcClient = new IpcClient({ socketPath: config.ipcSocketPath, secret });
+      primary = new BridgeChannel({
+        client: ipcClient,
+        spoolDir: `${config.courierDir}/spool`,
+        onDetach,
+      });
+      byChannel["wechat"] = allowAll;
       break;
+    }
     default:
       throw new Error(`未知渠道 CATMAN_CHANNEL=${kind}`);
   }
   return {
     channel: new CompositeChannel([primary, chat]),
     admission: compositeAdmission(byChannel),
+    ...(ipcClient ? { ipcClient } : {}),
   };
 }
 

@@ -10,6 +10,7 @@ import { BUILTIN_ADMIN_USER_KEY, makeUserKey } from "../src/core/identity.js";
 import { StdinChannel } from "../src/channels/stdin.js";
 import { WechatILinkChannel } from "../src/channels/wechat-ilink.js";
 import { WECHAT_CHANNEL } from "../src/channels/ilink-protocol.js";
+import { FakeReplies } from "./helpers/replies.js";
 import { AccountStore } from "../src/core/accounts.js";
 import type { Channel, MessageHandler } from "../src/channels/types.js";
 
@@ -321,7 +322,7 @@ test("每个渠道产出的 userKey 都能被 CompositeChannel 路由回自己",
     list: () => [],
     onConnectionSetChanged: () => {},
   } as unknown as AccountStore;
-  const wechat = new WechatILinkChannel(accounts, limits);
+  const wechat = new WechatILinkChannel(accounts, limits, new FakeReplies());
 
   const composite = new CompositeChannel([stdin, wechat]);
 
@@ -374,10 +375,11 @@ test("凭据被替换后重建连接;凭据没变则不动它", async (t) => {
     });
   });
 
-  const ch = new WechatILinkChannel(store, () => ({
-    maxImageBytes: 1_000_000,
-    maxImagesPerTurn: 4,
-  }));
+  const ch = new WechatILinkChannel(
+    store,
+    () => ({ maxImageBytes: 1_000_000, maxImagesPerTurn: 4 }),
+    new FakeReplies(),
+  );
   await ch.start();
   const before = ch["connections"].get("a1");
   assert.ok(before, "启动后该有一条连接");

@@ -97,7 +97,7 @@ test("secret 不对时一律 401,而且信使一个动作都不做", async () =>
     async (client, api) => {
       await client.ack(["m-1"]);
       assert.deepEqual(api.acks, [], "越权的 ack 绝不能出队别人的消息");
-      const r = await client.send("wechat:a:u", "body", "喂");
+      const r = await client.send("wechat:a:u", "喂", "body");
       assert.equal(r.ok, false);
       assert.equal(r.remainingProgress, 0, "认证失败时额度必须按 0 报,免得人格照着发");
     },
@@ -128,7 +128,7 @@ test("send 的信封由信使解析 —— 读不懂要给可读的失败,不能
 
 test("正常 send 把信封原样交给信使,并把剩余额度带回来", async () => {
   await withServer(async (client, api) => {
-    const r = await client.send("wechat:a:u", "progress", "在跑了");
+    const r = await client.send("wechat:a:u", "在跑了", "progress");
     assert.equal(r.ok, true);
     assert.equal(r.remainingProgress, 4);
     assert.deepEqual(api.sends[0]?.out, {

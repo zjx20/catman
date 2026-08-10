@@ -20,6 +20,7 @@ import { ADMIN_SKILLS, USER_SKILLS } from "./skills.js";
 import { readVersion, shortSha, versionLine, type VersionInfo } from "./version.js";
 import type { DeployControl } from "./deploy.js";
 import { formatDeployReport } from "./deploy-report.js";
+import type { SendKind } from "../ipc/protocol.js";
 
 /** 会话 id 的展示形式:开头 8 位足够在 HISTORY_LIMIT 条内无歧义,也好在手机上打。 */
 export function shortSessionId(sessionId: string): string {
@@ -991,7 +992,7 @@ export class Gateway {
       ? report.requestedBy === userKey
       : this.settings.isAdmin(userKey);
     if (!forHim) return;
-    if (await this.trySend(userKey, formatDeployReport(report), "部署结果")) {
+    if (await this.trySend(userKey, formatDeployReport(report), "部署结果", "announce")) {
       this.deploy?.markReportAnnounced(report.id);
     }
   }
@@ -1022,6 +1023,22 @@ export class Gateway {
     if (!fg) return false;
     fg.detached = true;
     return true;
+  }
+
+  /**
+   * 外部(信使的 `detach` 控制帧)要求把这个用户的在飞回合转后台。
+   *
+   * 触发的是 `/救援` 与路由 TTL 回落:那个用户已经不归本人格了,他手里这一轮
+   * 得跑完 —— 但**进度不再推**(他正在跟另一个人格说话)、正文带【后台对话】前缀、
+   * 产出走 `archiveTurn` 而不是 `record`(顶掉他刚切过去的会话是最糟的)。
+   * 这三件事全都由既有的 detached 语义承担,所以这里只是把那个开关暴露出来。
+   *
+   * 幂等:没有在飞回合时什么也不做 —— 控制帧可能重复送达(at-least-once)。
+   */
+  detachUser(userKey: string): void {
+    if (this.detachForeground(userKey)) {
+      console.info(`[gateway] ${userKey} 已被切到别的人格,他的在飞回合转后台`);
+    }
   }
 
   /**
@@ -1274,7 +1291,7 @@ export class Gateway {
       const text = throttle.offer(this.now(), ev);
       if (text === undefined) return;
       progress = progress.then(async () => {
-        await this.trySend(userKey, text, "进度");
+        await this.trySend(userKey, text, "进度", "progress");
       });
     };
 
@@ -1434,7 +1451,7 @@ export class Gateway {
    */
   private async trySendAck(userKey: string, text: string): Promise<string | undefined> {
     try {
-      const id = await this.channel.send(userKey, text);
+      const id = await this.channel.send(userKey, text, "ack");
       return typeof id === "string" ? id : undefined;
     } catch (err) {
       // 同 trySend:静默降级,但不静默消失。回执是一个回合里**第一条**外发消息,
@@ -1454,6 +1471,7 @@ export class Gateway {
         userKey,
         reminderText(shortSessionId(current.sessionId)),
         "超时提醒",
+        "reminder",
       );
       if (!ok) {
         // 渠道无法主动推送:降级为下次用户发消息时由会话规则处理,无需额外动作。
@@ -1475,9 +1493,14 @@ export class Gateway {
    * 排查发送问题时,看不见的失败比失败本身更难办:日志里只剩最后一步正文报错,
    * 会让人以为前面都成功了。`what` 用来分辨是哪一类发送坏掉的。
    */
-  private async trySend(userKey: string, text: string, what = "消息"): Promise<boolean> {
+  private async trySend(
+    userKey: string,
+    text: string,
+    what = "消息",
+    kind: SendKind = "body",
+  ): Promise<boolean> {
     try {
-      await this.channel.send(userKey, text);
+      await this.channel.send(userKey, text, kind);
       return true;
     } catch (err) {
       console.warn(`[gateway] 给 ${userKey} 发${what}失败:${String(err)}`);

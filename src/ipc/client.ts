@@ -19,6 +19,20 @@ import { IPC_SECRET_HEADER } from "./server.js";
  * 而那时人格不该跟着崩。所有方法在网络层失败时抛错,由 bridge 决定退避重试。
  */
 
+/**
+ * 人格需要信使做的那几件事。
+ *
+ * bridge 依赖这个**接口**而不是 `IpcClient` 这个类:后者有私有成员,TypeScript 的
+ * 结构化类型因此认不出任何假实现 —— 于是渠道层的时序用例就只能去起一个真 socket,
+ * 而那会把"验时序"变成"验 IO"。
+ */
+export interface CourierLink {
+  pull(waitMs: number): Promise<ParsedPull | undefined>;
+  ack(msgIds: readonly string[]): Promise<void>;
+  nack(msgIds: readonly string[], reason: string): Promise<void>;
+  send(userKey: string, text: string, kind: SendKind): Promise<SendResult>;
+}
+
 export interface IpcClientOptions {
   socketPath: string;
   /** 本人格的 secret。信使按它反查身份 —— 请求体里不带任何身份声明。 */
@@ -27,7 +41,7 @@ export interface IpcClientOptions {
   timeoutMs?: number;
 }
 
-export class IpcClient {
+export class IpcClient implements CourierLink {
   constructor(private readonly opts: IpcClientOptions) {}
 
   /**
@@ -52,7 +66,7 @@ export class IpcClient {
     await this.post("/nack", { schema: IPC_SCHEMA, msgIds, reason });
   }
 
-  async send(userKey: string, kind: SendKind, text: string): Promise<SendResult> {
+  async send(userKey: string, text: string, kind: SendKind): Promise<SendResult> {
     const body = await this.post("/send", { schema: IPC_SCHEMA, userKey, kind, text });
     const parsed = parseSendResult(body);
     // 读不懂信使的回复时按"没发出去、也没有额度"处理:**宁可少发,不可超发**。

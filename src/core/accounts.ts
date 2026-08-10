@@ -144,6 +144,35 @@ export class AccountStore {
   }
 
   /**
+   * **应急**:强制把该账号的主人改成 userId,不管它之前绑给谁。
+   *
+   * 这是 `/绑定 <口令>` 那个逃生阀的落点,存在的理由是一种很具体的处境:
+   * 重新扫码之后 `pendingRebind` 的认领没成功(比如那条来信在别的路径上被丢了),
+   * 于是主人的新标识对不上 `boundUserId`,他被自己的助手挡在门外 —— 而修复它
+   * 本来只能回内网开 dashboard,可"人不在电脑前"恰恰是整个项目的立项动机。
+   *
+   * 它**故意**绕开 `bind()` 那条"已绑定就不覆盖"的 TOFU 纪律:那条纪律防的是
+   * "任何一条来信都能悄悄改写主人",而这里的前提是带外口令 —— 改写是**显式**的,
+   * 与 `unbind()` 同属"人明确说了要换人"这一类。
+   *
+   * 局限如实说:它改的是 `boundUserId`。如果坏掉的是 `userIdAliases`(来信被映射成了
+   * 一个错的标识),这一步救不回来 —— 那时只能解绑重来。
+   */
+  forceBind(accountId: string, userId: string): { changed: boolean; previous?: string } {
+    const a = this.accounts[accountId];
+    if (!a) return { changed: false };
+    const previous = a.boundUserId;
+    if (previous === userId) return { changed: false, ...(previous ? { previous } : {}) };
+    a.boundUserId = userId;
+    // 待认领标记清掉:它的使命(把新标识接到老 userKey 上)已经被这次强制绑定取代了,
+    // 留着会让下一条来信再改一次主人。
+    delete a.pendingRebind;
+    this.persist();
+    console.warn(`[accounts] 账号 ${accountId} 被应急口令强制绑定到 ${userId}(原 ${previous ?? "未绑定"})`);
+    return { changed: true, ...(previous ? { previous } : {}) };
+  }
+
+  /**
    * 改备注名。传空串等于恢复默认名。返回 false 表示账号不存在。
    * 只是给人看的标签,不影响连接与准入,所以不触发 emit()。
    */

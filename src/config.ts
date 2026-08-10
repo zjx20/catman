@@ -99,6 +99,21 @@ export interface Config {
   srcDir: string;
   /** 部署结果"已播报"的标记。catman 自己写,所以必须在可写区,不能放 deployDir。 */
   deploySeenPath: string;
+  /**
+   * 信使的状态目录(收件队列、回复上下文、路由表、附件 spool、游标)。
+   * **写者只有信使**;人格对它只读(只读 spool 里的附件字节)。
+   */
+  courierDir: string;
+  /**
+   * IPC 的 unix socket。
+   *
+   * 单独一个目录而不是放在 courierDir 里:守护人格把主 `/data` 整个**只读**挂载,
+   * 而 unix socket 的 `connect()` 需要对 socket 文件的**写**权限 —— 放在只读区的
+   * 症状是"rescue 起来了但一条消息都收不到",而日志上只有一句 EACCES。
+   */
+  ipcSocketPath: string;
+  /** 本进程(人格)的 IPC secret。信使按它反查身份。 */
+  ipcSecret: string | undefined;
 }
 
 export function loadConfig(): Config {
@@ -132,5 +147,8 @@ export function loadConfig(): Config {
     releasesDir: str("CATMAN_RELEASES_DIR", `${dataDir}/releases`),
     srcDir: str("CATMAN_SRC_DIR", `${dataDir}/src/catman`),
     deploySeenPath: str("CATMAN_DEPLOY_SEEN_PATH", `${dataDir}/deploy-seen.json`),
+    courierDir: str("CATMAN_COURIER_DIR", `${dataDir}/courier`),
+    ipcSocketPath: str("CATMAN_IPC_SOCKET", `${dataDir}/ipc/courier.sock`),
+    ipcSecret: process.env.CATMAN_IPC_SECRET || undefined,
   };
 }

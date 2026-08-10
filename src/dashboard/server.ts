@@ -6,8 +6,29 @@ import {
   type ProjectScope,
 } from "../core/transcript.js";
 import { listWorkspaceDirs, type UserRegistry } from "../core/users.js";
-import type { AccountStore } from "../core/accounts.js";
-import type { ILinkLogin } from "../channels/ilink-login.js";
+import type { PublicAccount } from "../core/accounts.js";
+import type { LoginPollResult, LoginSession, LoginTarget } from "../channels/ilink-login.js";
+
+/**
+ * dashboard 眼里的账号控制面。
+ *
+ * **全是异步的**,因为真正的 `AccountStore` 不在这个进程里 —— 它归信使,而
+ * `accounts.json` 只能有一个写者:人格进程里只要还留着一个实例,它握着的陈旧快照
+ * 迟早会整份覆写信使刚写的东西,表现是"扫了码过一会儿又掉了"且没有任何报错
+ * (评审列为 fatal)。所以这里只有接口,实现是一个走 IPC 的代理。
+ *
+ * 类型从 `core/accounts.ts` 里 **`import type`** 过来:类型在编译后不留任何痕迹,
+ * 与"人格不能持有 AccountStore 实例"那条不变量不冲突(有单测按值导入来判定)。
+ */
+export interface AccountsGateway {
+  list(): Promise<PublicAccount[]>;
+  exists(accountId: string): Promise<boolean>;
+  rename(accountId: string, displayName: string): Promise<boolean>;
+  unbind(accountId: string): Promise<boolean>;
+  remove(accountId: string): Promise<boolean>;
+  loginStart(target: LoginTarget): Promise<LoginSession>;
+  loginPoll(loginId: string): Promise<LoginPollResult>;
+}
 import type { DashboardChannel } from "../channels/dashboard.js";
 import { renderPage, type UserRow } from "./ui.js";
 import { DashboardAuth, urlWithoutToken } from "./auth.js";
@@ -59,8 +80,8 @@ export interface DashboardOptions {
   port: number;
   adminToken: string;
   users: UserRegistry;
-  accounts: AccountStore;
-  login: ILinkLogin;
+  /** 不配 = 这台机器没有信使(本地 stdin 调试),账号页会明说而不是报错。 */
+  accounts?: AccountsGateway;
   /** 管理员聊天渠道。 */
   chat: DashboardChannel;
   selfApi: SelfApiDeps;
@@ -129,6 +150,28 @@ export class Dashboard {
       createdAt: rec.createdAt,
       lastSeenAt: rec.lastSeenAt,
     }));
+  }
+
+  /**
+   * 账号控制面。没配就抛 —— 由 handle 的 catch 变成一个说人话的 500,
+   * 而不是让页面渲染出一个空列表让人以为"账号都没了"。
+   */
+  private accounts(): AccountsGateway {
+    if (!this.opts.accounts) {
+      throw new Error("这台机器没有信使进程,账号管理不可用(本地 stdin 调试就是这种情况)");
+    }
+    return this.opts.accounts;
+  }
+
+  /** 账号页在没有信使时照常渲染,只是列表为空 —— 页面本身还有别的信息。 */
+  private async accountsOrEmpty(): Promise<PublicAccount[]> {
+    if (!this.opts.accounts) return [];
+    try {
+      return await this.opts.accounts.list();
+    } catch (err) {
+      console.warn(`[dashboard] 取账号列表失败:${String(err)}`);
+      return [];
+    }
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -240,7 +283,7 @@ export class Dashboard {
         return html(
           res,
           renderPage("accounts", {
-            accounts: this.opts.accounts.listPublic(),
+            accounts: await this.accountsOrEmpty(),
             token: this.opts.adminToken,
           }),
         );
@@ -338,10 +381,10 @@ export class Dashboard {
         isObject(body) && typeof body["rebindAccountId"] === "string" ? body["rebindAccountId"] : "";
       // 先验一次账号存在:扫完才发现目标没了,那三分钟就白等了。
       // 真正的判定仍在 poll() 里(账号可能在扫码期间被删),这里只是提前失败。
-      if (rebind && !this.opts.accounts.get(rebind)) {
+      if (rebind && !(await this.accounts().exists(rebind))) {
         return jsonError(res, 404, "账号不存在");
       }
-      const session = await this.opts.login.start(
+      const session = await this.accounts().loginStart(
         rebind ? { rebindAccountId: rebind } : { displayName: name },
       );
       return json(res, session);
@@ -353,30 +396,30 @@ export class Dashboard {
       if (!isObject(body) || typeof body["displayName"] !== "string") {
         return jsonError(res, 400, "需要 { displayName: string }(空串恢复默认名)");
       }
-      const ok = this.opts.accounts.rename(decodeURIComponent(rename[1]), body["displayName"]);
+      const ok = await this.accounts().rename(decodeURIComponent(rename[1]), body["displayName"]);
       return ok ? json(res, { ok }) : jsonError(res, 404, "账号不存在");
     }
 
     const loginPoll = path.match(/^\/api\/accounts\/login\/([^/]+)$/);
     if (loginPoll?.[1] && req.method === "POST") {
-      const result = await this.opts.login.poll(decodeURIComponent(loginPoll[1]));
+      const result = await this.accounts().loginPoll(decodeURIComponent(loginPoll[1]));
       return json(res, result);
     }
 
     const unbind = path.match(/^\/api\/accounts\/([^/]+)\/unbind$/);
     if (unbind?.[1] && req.method === "POST") {
-      const ok = this.opts.accounts.unbind(decodeURIComponent(unbind[1]));
+      const ok = await this.accounts().unbind(decodeURIComponent(unbind[1]));
       return ok ? json(res, { ok }) : jsonError(res, 404, "账号不存在");
     }
 
     const remove = path.match(/^\/api\/accounts\/([^/]+)$/);
     if (remove?.[1] && req.method === "DELETE") {
-      const ok = this.opts.accounts.remove(decodeURIComponent(remove[1]));
+      const ok = await this.accounts().remove(decodeURIComponent(remove[1]));
       return ok ? json(res, { ok }) : jsonError(res, 404, "账号不存在");
     }
 
     if (path === "/api/accounts" && req.method === "GET") {
-      return json(res, this.opts.accounts.listPublic());
+      return json(res, await this.accounts().list());
     }
 
     return jsonError(res, 404, "未知的账号接口");
