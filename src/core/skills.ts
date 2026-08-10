@@ -291,6 +291,34 @@ ${prepare} HEAD
 上面那份是 bless 固化的,不随你的改动变 —— 制备门(那句全量测试)就在这个脚本里,
 跑仓库里那份等于让被考的人自己出卷子。
 
+### 让它跑完:脱离会话
+
+制备要跑好几分钟(全量测试就占一多半)。你的回合结束时会话会被拆掉,**挂在回合上的
+后台命令跟着一起死** —— 表现为日志停在某条测试中间,既没有失败也没有 sha。所以要让它
+脱离会话跑,再去等结果:
+
+\`\`\`bash
+setsid nohup ${prepare} HEAD > /tmp/prepare.log 2>&1 < /dev/null &
+\`\`\`
+
+### 上一次被杀掉之后:先清残骸
+
+制备的第一步是 \`rm -rf <releases>/<sha>.tmp\`。**被中途杀掉的运行留下的那个 \`.tmp\`
+删不掉**:lockfile 没变时它是 \`cp -al\` 硬链接复用来的 node_modules,目录权限连同
+555 一起复制了过来,deployer 是属主也照样写不进去 —— 于是新的制备在第一行就 \`set -e\` 退出,
+满屏 \`rm: cannot remove ...: Permission denied\`。看到这个就是撞上了它,跟你改的代码无关。
+
+清理办法是起一个跟制备同属主的一次性容器,先给**目录**加写权限再删:
+
+\`\`\`bash
+docker run --rm --user 10002:10002 -v "$CATMAN_HOST_DATA_DIR:/data" "$CATMAN_IMAGE" \\
+  bash -c "find <releases>/<sha>.tmp -type d -exec chmod u+w {} + && rm -rf <releases>/<sha>.tmp"
+\`\`\`
+
+\`-type d\` 不能省。\`.tmp\` 里的**文件**跟已验证 release 逐个共享 inode,\`chmod\` 会穿透过去
+改到那边的字节(同「复用之后对那棵树零写操作」);目录是 \`cp -al\` 新建的,只归这个 \`.tmp\`,
+改它安全。
+
 制备成功后把分支落回 main 并删掉它:
 
 \`\`\`bash
