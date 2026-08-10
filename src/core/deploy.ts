@@ -230,16 +230,76 @@ function listCandidates(candidates: readonly PublishCandidate[]): string {
 }
 
 /**
- * 起脚本。**detached + unref + 忽略 stdio**:这个脚本会停掉 catman 自己,
- * 它必须在父进程死后继续跑完。等的只是"起没起来",不是"跑完没有"。
+ * spawn 之后再多等这么久,只为看它会不会当场死掉。
+ *
+ * 正常路径是脚本 `exec docker run -d`,一秒上下就返回 0,所以这个窗口几乎从不走满。
  */
-async function defaultSpawnRunner(runnerPath: string, args: readonly string[]): Promise<void> {
+const SPAWN_GRACE_MS = 3_000;
+
+/**
+ * 起脚本。**detached + unref**:这个脚本会停掉 catman 自己,
+ * 它必须在父进程死后继续跑完。等的只是"起没起来",不是"跑完没有"。
+ *
+ * ⚠️ **"spawn 成功"不等于"起来了"。** 这里曾经只等 `spawn` 事件、并且把 stdio 全部
+ * 丢进 `ignore`,于是脚本在头几行 exit 1 的那一类失败**彻底不可见**:catman 已经
+ * 回过一句"已提交部署",而错误既没进日志也没进报告 —— 用户看到的是"发布了,然后
+ * 什么都没发生"。真机上撞过:固化 env 里的宿主路径在容器内是条断了的软链,
+ * `deployer-run.sh` 的第一道检查当场失败,连着两次 `/发布` 都石沉大海。
+ *
+ * 所以窗口内非零退出要带着 stderr 抛出去 —— 网关那边本来就有"起不来就当场告诉人"
+ * 的分支(见 `handleDeployRequest`),缺的只是让它拿到这个错。
+ */
+export async function defaultSpawnRunner(
+  runnerPath: string,
+  args: readonly string[],
+): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    const child = spawn(runnerPath, [...args], { detached: true, stdio: "ignore" });
-    child.once("error", reject);
-    child.once("spawn", () => {
+    const child = spawn(runnerPath, [...args], {
+      detached: true,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      // 只留够说明问题的量。这条路径上的输出是给人看的一两句话,不是日志流。
+      if (stderr.length < 4_000) stderr += chunk.toString();
+    });
+
+    let timer: ReturnType<typeof setTimeout>;
+
+    // 放手:不再等这个孩子,但**绝不 destroy 它的 stderr** —— 管道断了之后它下一次
+    // 写日志就会吃到 EPIPE,而那个进程正是要去换版本的那个。上面的 data 回调一直在
+    // 排水(只是不再往字符串里堆),所以缓冲区也不会堵。
+    const letGo = (): void => {
+      clearTimeout(timer);
       child.unref();
+    };
+    // 窗口一到就放手:脚本还活着说明它已经越过了那些当场就会失败的检查,
+    // 而它接下来要做的第一件事就是停掉 catman —— 再等下去毫无意义。
+    timer = setTimeout(() => {
+      letGo();
       resolve();
+    }, SPAWN_GRACE_MS);
+    timer.unref?.();
+
+    child.once("error", (err) => {
+      letGo();
+      reject(err);
+    });
+    // 听 `close` 而不是 `exit`:`exit` 在进程死掉那一刻就来,stderr 可能还有没读完的
+    // 字节 —— 而那几行恰恰是要给人看的原因。`close` 等所有 stdio 都收完才来。
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        letGo();
+        resolve();
+        return;
+      }
+      // 末几行才是原因,前面多半是无关的噪音。
+      const tail = stderr.trim().split("\n").slice(-3).join(" / ");
+      const how = signal ? `被信号 ${signal} 杀掉` : `退出码 ${code}`;
+      child.stderr?.destroy();
+      child.unref();
+      reject(new Error(`${runnerPath} ${how}${tail ? `:${tail}` : "(没有任何输出)"}`));
     });
   });
 }

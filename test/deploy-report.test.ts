@@ -10,7 +10,11 @@ import {
   parseDeployReport,
   type DeployReport,
 } from "../src/core/deploy-report.js";
-import { parseVerifiedHistory, ScriptDeployControl } from "../src/core/deploy.js";
+import {
+  parseVerifiedHistory,
+  ScriptDeployControl,
+  defaultSpawnRunner,
+} from "../src/core/deploy.js";
 
 const GOOD = {
   schema: DEPLOY_REPORT_SCHEMA,
@@ -358,4 +362,61 @@ test("/发布:判「已经是当前版本」看的是版本戳,不是 current �
     assert.match(msg, /已提交部署/, "跑的还是别的版本,这次部署必须放行");
     assert.deepEqual(spawned(), [["deploy", SHA_A, "--requested-by", "wechat:a:u"]]);
   }, SHA_B); // 进程实际跑的是另一份
+});
+
+/**
+ * 起 deployer 这一下。
+ *
+ * 这几条钉的是一个真机上花了两小时才查出来的故障:`/发布` 回了"已提交部署",
+ * 而 deployer 在第一道检查上就 exit 1 —— 错误全丢进 `stdio: "ignore"`,
+ * 容器没起、报告没变、日志一片安静,看上去就是"发布了,然后什么都没发生"。
+ * "spawn 成功"从来不等于"起来了"。
+ */
+function withScript(body: string, fn: (path: string) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "catman-spawn-"));
+  const path = join(dir, "runner.sh");
+  writeFileSync(path, `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
+  return fn(path).finally(() => rmSync(dir, { recursive: true, force: true }));
+}
+
+test("起 deployer:脚本当场 exit 1 必须抛出去,而不是当成起来了", async () => {
+  await withScript('echo "部署机制还没固化" >&2\nexit 1', async (path) => {
+    await assert.rejects(
+      () => defaultSpawnRunner(path, ["deploy", "abc1234"]),
+      /退出码 1/,
+      "非零退出被当成了成功 —— 用户会收到一句假的「已提交部署」",
+    );
+  });
+});
+
+test("起 deployer:失败时把 stderr 带上,否则人只知道「没起来」查不出为什么", async () => {
+  await withScript('echo "宿主路径在容器内解不开" >&2\nexit 1', async (path) => {
+    await assert.rejects(() => defaultSpawnRunner(path, []), /宿主路径在容器内解不开/);
+  });
+});
+
+test("起 deployer:一句话都没有的失败也要说清是「没有任何输出」", async () => {
+  // 空错误信息比错误信息本身更误导 —— 人会以为是自己没看见。
+  await withScript("exit 3", async (path) => {
+    await assert.rejects(() => defaultSpawnRunner(path, []), /退出码 3.*没有任何输出/s);
+  });
+});
+
+test("起 deployer:正常起来了就放手,不等它跑完", async () => {
+  // deployer 的第一件事是停掉 catman 自己,等它跑完等的是自己的死。
+  // 真实脚本 `exec docker run -d` 会秒回 0,这里同构。
+  await withScript("exit 0", async (path) => {
+    await defaultSpawnRunner(path, ["deploy", "abc1234"]);
+  });
+});
+
+test("起 deployer:脚本一直跑着也不能卡住调用方", async () => {
+  // 窗口内没死就认为它越过了那些当场失败的检查。卡住的后果是整个网关停在这里。
+  await withScript("sleep 30", async (path) => {
+    await defaultSpawnRunner(path, []);
+  });
+});
+
+test("起 deployer:脚本根本不存在时抛 spawn 错误", async () => {
+  await assert.rejects(() => defaultSpawnRunner("/nonexistent/deployer-run.sh", []));
 });
