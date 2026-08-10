@@ -35,8 +35,21 @@ class FakeCourier implements CourierLink {
   sent: Array<{ userKey: string; text: string; kind: SendKind }> = [];
   sendResult: SendResult = { schema: IPC_SCHEMA, ok: true, remainingProgress: 3 };
   private i = 0;
+  /** 从第几轮起挂住,直到 release() —— 用来精确摆出"重复在什么时候到达"。 */
+  holdFrom = Number.POSITIVE_INFINITY;
+  private gate?: () => void;
+  release(): void {
+    this.gate?.();
+    this.gate = undefined;
+    this.holdFrom = Number.POSITIVE_INFINITY;
+  }
 
   async pull(): Promise<ParsedPull | undefined> {
+    if (this.i >= this.holdFrom) {
+      await new Promise<void>((res) => {
+        this.gate = res;
+      });
+    }
     const r = this.rounds[this.i];
     this.i += 1;
     if (!r) {
@@ -143,15 +156,35 @@ test("同步逐条投递 —— 「图 + 文字」那 120ms 的一对靠它保�
   });
 });
 
-test("重复投递被认出来直接跳过 —— 否则用户会看到同一句话被回答两次", async () => {
-  // at-least-once 的正常代价:信使崩在"已入队、游标未落盘"之间时整批会重放。
+test("重复在原件还排队时到达:直接忽略,不重复投也不重复 ack", async () => {
   await withDir(async (dir) => {
     const c = new FakeCourier();
     c.rounds = [{ messages: [msg("m1", "喂")] }, { messages: [msg("m1", "喂")] }];
     const got = await run(c, dir, 1);
     assert.equal(got.length, 1);
-    // 重复的那条仍然要 ack —— 不 ack 的话它会一直卡在信使队列头上。
-    assert.equal(c.acked.flat().filter((x) => x === "m1").length, 2);
+    assert.equal(c.acked.flat().filter((x) => x === "m1").length, 1);
+  });
+});
+
+test("重复在投递完成之后到达:**必须补 ack** —— 不出队就把整条队列钉死", async () => {
+  // 信使还把它送来,说明上次的 ack 没生效(信使重启、网络抖动)。它是队头,
+  // 不出队的话所有人的后续消息都堵在它后面,而且没有任何一轮会再动它。
+  await withDir(async (dir) => {
+    const c = new FakeCourier();
+    c.rounds = [{ messages: [msg("m1", "喂")] }, { messages: [msg("m1", "喂")] }];
+    c.holdFrom = 1; // 第二轮挂住,等第一条投完再放行
+    const got: unknown[] = [];
+    const bridge = new BridgeChannel({ client: c, spoolDir: dir });
+    bridge.onMessage(async (m) => {
+      got.push(m);
+    });
+    await bridge.start();
+    while (!c.acked.flat().includes("m1")) await new Promise((r) => setTimeout(r, 10));
+    c.release();
+    await new Promise((r) => setTimeout(r, 120));
+    await bridge.stop();
+    assert.equal(got.length, 1, "不能再投一次");
+    assert.equal(c.acked.flat().filter((x) => x === "m1").length, 2, "必须补 ack");
   });
 });
 
@@ -238,5 +271,77 @@ test("没拉取成功过就不算 live —— 「已启动」不等于「收得�
     await b.start();
     assert.equal(b.health()[0]!.started, true);
     await b.stop();
+  });
+});
+
+test("长回合期间照样拉取:控制帧不被投递挡住 —— detach 唯一该起作用的场景就是长回合", async () => {
+  // 耦合版在这里必然失败:handler 等的是回合跑完,而 detach 要送到的正是那个回合。
+  // 期间那一轮的正文照发,且没有出处前缀 —— 而 labelIfDetached 存在的理由就是它。
+  await withDir(async (dir) => {
+    const c = new FakeCourier();
+    c.rounds = [
+      { messages: [msg("m1", "跑个长的")] },
+      { controls: [{ schema: IPC_SCHEMA, type: "detach", userKey: "wechat:a:u1" }] },
+    ];
+    let releaseTurn: (() => void) | undefined;
+    const detached: string[] = [];
+    const bridge = new BridgeChannel({
+      client: c,
+      spoolDir: dir,
+      onDetach: (u) => detached.push(u),
+    });
+    bridge.onMessage(
+      () =>
+        new Promise<void>((res) => {
+          releaseTurn = res; // 模拟一个一直没跑完的回合
+        }),
+    );
+    await bridge.start();
+    await new Promise((r) => setTimeout(r, 400));
+    assert.deepEqual(detached, ["wechat:a:u1"], "回合还没跑完,detach 就该已经应用了");
+    releaseTurn?.();
+    await bridge.stop();
+  });
+});
+
+test("长回合期间 live 不该翻假 —— 它替换掉的 iLink 渠道没有这个耦合", async () => {
+  await withDir(async (dir) => {
+    const c = new FakeCourier();
+    c.rounds = [{ messages: [msg("m1", "跑个长的")] }];
+    let releaseTurn: (() => void) | undefined;
+    const bridge = new BridgeChannel({ client: c, spoolDir: dir });
+    bridge.onMessage(
+      () =>
+        new Promise<void>((res) => {
+          releaseTurn = res;
+        }),
+    );
+    await bridge.start();
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(bridge.health()[0]!.live, true, "拉取一直在继续,渠道当然是通的");
+    releaseTurn?.();
+    await bridge.stop();
+  });
+});
+
+test("投递一直失败时要退避并最终交回信使 —— 否则是每秒上万次的热循环", async () => {
+  // 实测过:原先只 break,不 ack 不 nack 不退避,而信使在队列非空时立刻返回,
+  // 两者相乘就是两万次/秒 —— 软路由上 CPU 打满、日志把轮转刷穿,
+  // 而且单 inbox 意味着所有用户的后续消息全堵在这一条后面。
+  await withDir(async (dir) => {
+    const c = new FakeCourier();
+    c.rounds = [{ messages: [msg("m1", "毒")] }];
+    let tries = 0;
+    const bridge = new BridgeChannel({ client: c, spoolDir: dir });
+    bridge.onMessage(async () => {
+      tries += 1;
+      throw new Error("投不下去");
+    });
+    await bridge.start();
+    await new Promise((r) => setTimeout(r, 1600));
+    await bridge.stop();
+    assert.ok(tries <= 6, `1.6 秒内试了 ${tries} 次 —— 没有退避`);
+    assert.deepEqual(c.nacked.at(-1)?.ids, ["m1"], "撞上限之后要交回信使,给它让位");
+    assert.equal(bridge.poisonedCount, 1);
   });
 });

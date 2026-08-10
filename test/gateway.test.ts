@@ -1155,6 +1155,29 @@ test("管理员令牌只注入 admin 回合的子进程", async () => {
   }
 });
 
+test("IPC secret 一条例外都没有 —— 连管理员回合也拿不到", async () => {
+  // 拿到它 = 拿到信使的整个控制面(同容器同 uid,socket 就在 /data/ipc 下):
+  // 冒充任意 userKey 发消息并烧光他的预算、拉走并 ack 掉别人的消息、
+  // 走 /admin/* 删账号 —— 最后这条会把 persona-isolation 那道墙整个绕过去。
+  const t = 1_000_000;
+  process.env.CATMAN_IPC_SECRET = "ipc-secret-value";
+  process.env.CATMAN_ADMIN_TOKEN = "secret-token";
+  try {
+    const { channel, agent } = build(() => t);
+    await channel.receive(U1, "普通用户");
+    await channel.receive(BUILTIN_ADMIN_USER_KEY, "管理员");
+    assert.equal(agent.calls[0]!.env?.["CATMAN_IPC_SECRET"], undefined);
+    assert.equal(
+      agent.calls[1]!.env?.["CATMAN_IPC_SECRET"],
+      undefined,
+      "管理员令牌有「admin 回合加回」那一档,IPC secret 没有 —— 回合一次都不需要它",
+    );
+  } finally {
+    delete process.env.CATMAN_IPC_SECRET;
+    delete process.env.CATMAN_ADMIN_TOKEN;
+  }
+});
+
 test("admin skill 只对 admin 回合可见", async () => {
   const t = 1_000_000;
   const { channel, agent } = build(() => t);

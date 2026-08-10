@@ -26,6 +26,18 @@ import { IPC_SECRET_HEADER } from "./server.js";
  * 结构化类型因此认不出任何假实现 —— 于是渠道层的时序用例就只能去起一个真 socket,
  * 而那会把"验时序"变成"验 IO"。
  */
+/** 一次 IPC 往返的原始结果。状态码要一路带上来 —— 见 pull 里的说明。 */
+interface HttpReply {
+  readonly status: number;
+  readonly body: unknown;
+}
+
+/** 从错误响应体里挖一句人话。挖不到就说不知道,别编。 */
+function reasonOf(body: unknown): string {
+  const r = body && typeof body === "object" ? (body as { reason?: unknown }).reason : undefined;
+  return typeof r === "string" && r ? r : "信使没有给出原因";
+}
+
 export interface CourierLink {
   pull(waitMs: number): Promise<ParsedPull | undefined>;
   ack(msgIds: readonly string[]): Promise<void>;
@@ -50,14 +62,23 @@ export class IpcClient implements CourierLink {
    * (默认 15 秒超时撞上 30 秒长轮询,每次都被中断)。
    */
   async pull(waitMs: number): Promise<ParsedPull | undefined> {
-    const body = await this.post("/pull", { schema: IPC_SCHEMA, waitMs }, waitMs + 10_000);
-    return parsePull(body);
+    const r = await this.post("/pull", { schema: IPC_SCHEMA, waitMs }, waitMs + 10_000);
+    // **状态码必须看**。401 的响应体是 `{ok:false,reason}` —— 它没有 messages 键,
+    // 而 parsePull 对缺席的键一律按空数组处理,于是「认证失败」与「队列是空的」
+    // 在人格这边**完全同形**:它会以最快速度反复重拉一个永远拒绝它的信使,
+    // 而 health() 还照报 live。触发条件是纯配置漂移(两侧的 env 变量名不同名),
+    // 所以这道判定不能省。
+    if (r.status >= 400) throw new Error(`信使拒绝了拉取(${r.status}):${reasonOf(r.body)}`);
+    return parsePull(r.body);
   }
 
   /** 确认这些消息已经落进本进程的队列。**此时信使才出队。** */
   async ack(msgIds: readonly string[]): Promise<void> {
     if (!msgIds.length) return;
-    await this.post("/ack", { schema: IPC_SCHEMA, msgIds });
+    const r = await this.post("/ack", { schema: IPC_SCHEMA, msgIds });
+    // ack 静默失败最坏:消息没出队,人格却以为处理完了 —— 下一轮再拿到同一批,
+    // 而它们已经在 seen 里,于是被当成重复直接跳过。那等于**真丢**。
+    if (r.status >= 400) throw new Error(`信使拒绝了 ack(${r.status}):${reasonOf(r.body)}`);
   }
 
   /** 读不懂这些消息。信使据此亮红灯 —— 契约漂移必须看得见。 */
@@ -67,18 +88,20 @@ export class IpcClient implements CourierLink {
   }
 
   async send(userKey: string, text: string, kind: SendKind): Promise<SendResult> {
-    const body = await this.post("/send", { schema: IPC_SCHEMA, userKey, kind, text });
-    const parsed = parseSendResult(body);
+    // send 与上面几个不同:它的 4xx 响应体**本身就是**一份有意义的 SendResult
+    // (ok:false + reason),所以这里看体不看码。
+    const r = await this.post("/send", { schema: IPC_SCHEMA, userKey, kind, text });
+    const parsed = parseSendResult(r.body);
     // 读不懂信使的回复时按"没发出去、也没有额度"处理:**宁可少发,不可超发**。
     return parsed ?? { schema: IPC_SCHEMA, ok: false, remainingProgress: 0, reason: "信使的回复读不懂" };
   }
 
   /** 代理 dashboard 的账号管理等控制面。 */
   async admin(method: string, path: string, body?: unknown, timeoutMs?: number): Promise<unknown> {
-    return await this.send_(method, `/admin${path}`, body, timeoutMs);
+    return (await this.send_(method, `/admin${path}`, body, timeoutMs)).body;
   }
 
-  private post(path: string, body: unknown, timeoutMs?: number): Promise<unknown> {
+  private post(path: string, body: unknown, timeoutMs?: number): Promise<HttpReply> {
     return this.send_("POST", path, body, timeoutMs);
   }
 
@@ -87,9 +110,26 @@ export class IpcClient implements CourierLink {
     path: string,
     body: unknown,
     timeoutMs = this.opts.timeoutMs ?? 15_000,
-  ): Promise<unknown> {
+  ): Promise<HttpReply> {
     const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
     return new Promise((resolve, reject) => {
+      // ⚠️ **墙钟兜底,与 socket 的 timeout 是两回事。**
+      // `timeout` 是 socket 的**空闲**超时:对端在写了一半响应之后销毁 socket 时,
+      // 定时器随 socket 一起消失,而 'end' 永远不来 —— 于是这个 promise 既不 resolve
+      // 也不 reject,bridge 的 `await client.pull(...)` 就永久停在那一次 await 上,
+      // 拉取循环再没有下一轮,只能人工重启人格。实测复现过(响应被截断时 20 秒仍未 settle)。
+      // 信使是会被 SIGKILL 的(OOM、人工 bless 重启),所以这条路不是假想。
+      let settled = false;
+      const finish = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        fn();
+      };
+      const deadline = setTimeout(() => {
+        req.destroy();
+        finish(() => reject(new Error(`IPC 无响应超时(${timeoutMs}ms) ${method} ${path}`)));
+      }, timeoutMs + 1000);
       const req = request(
         {
           socketPath: this.opts.socketPath,
@@ -104,21 +144,26 @@ export class IpcClient implements CourierLink {
         },
         (res) => {
           const chunks: Buffer[] = [];
+          const status = res.statusCode ?? 0;
           res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("error", (e) => finish(() => reject(e)));
+          res.on("aborted", () =>
+            finish(() => reject(new Error(`信使在写响应途中断开 ${method} ${path}`))),
+          );
           res.on("end", () => {
             const text = Buffer.concat(chunks).toString("utf8");
-            // 状态码不参与判定:信使用 body 里的 ok/reason 说话,而 4xx 的 body
-            // 同样有意义(比如 send 的 ok=false + reason)。只有解析不了才算失败。
-            try {
-              resolve(text ? JSON.parse(text) : undefined);
-            } catch {
-              reject(new Error(`信使返回的不是 JSON(${res.statusCode}):${text.slice(0, 200)}`));
-            }
+            finish(() => {
+              try {
+                resolve({ status, body: text ? JSON.parse(text) : undefined });
+              } catch {
+                reject(new Error(`信使返回的不是 JSON(${status}):${text.slice(0, 200)}`));
+              }
+            });
           });
         },
       );
       req.on("timeout", () => req.destroy(new Error(`IPC 超时(${timeoutMs}ms) ${method} ${path}`)));
-      req.on("error", reject);
+      req.on("error", (e) => finish(() => reject(e)));
       if (payload) req.write(payload);
       req.end();
     });

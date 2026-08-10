@@ -98,7 +98,9 @@ test("身份由 secret 推出 —— 人格不必也不能声明自己是谁", a
 test("secret 不对时一律 401,而且信使一个动作都不做", async () => {
   await withServer(
     async (client, api) => {
-      await client.ack(["m-1"]);
+      // ack 必须**抛**而不是静默成功:静默的话人格以为处理完了,下一轮再拿到同一批
+      // 时它们已经在 seen 里、被当成重复跳过 —— 那等于真丢。
+      await assert.rejects(() => client.ack(["m-1"]), /401|拒绝/);
       assert.deepEqual(api.acks, [], "越权的 ack 绝不能出队别人的消息");
       const r = await client.send("wechat:a:u", "喂", "body");
       assert.equal(r.ok, false);
