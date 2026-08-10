@@ -96,6 +96,29 @@ if [ -z "$PIN_TARGET" ]; then
   PIN_TARGET="$(basename "$(readlink -f "$DATA_DIR/releases/stable" 2>/dev/null || echo "")" 2>/dev/null || true)"
 fi
 if [ -n "$PIN_TARGET" ] && [ -d "$DATA_DIR/releases/$PIN_TARGET" ]; then
+  # **钦定之前先确认这份 release 跑得动稳定面的每一个角色。**
+  #
+  # 只查"目录存在"不够:一个早于当前拓扑的 release 目录完好、内容齐全,却没有
+  # `dist/src/courier/main.js` —— 于是信使**永远起不来**,而且要等到重启它那一刻
+  # 才发现。真机上发生过一次:bless 默认取 `stable`,而手工迁移过的机器上 stable
+  # 还停在旧拓扑(迁移时是人工切的 current,deployer 没参与,stable 从没被推进过)。
+  # 守护人格更糟 —— 它的入口在旧 release 里**存在**,于是安安静静地跑起了旧代码。
+  #
+  # 判据与 `docker/entrypoint.sh` 完全一致(它按 CATMAN_ROLE 选入口文件,文件不在
+  # 就进引导模式)。加角色时两处都要改,有单测比对这两份清单。
+  MISSING=""
+  for e in dist/src/index.js dist/src/courier/main.js; do
+    [ -f "$DATA_DIR/releases/$PIN_TARGET/$e" ] || MISSING="$MISSING $e"
+  done
+  if [ -n "$MISSING" ]; then
+    echo "  ❌ 拒绝把 pinned 指向 $PIN_TARGET:这份 release 里没有$MISSING"
+    echo "     稳定面(信使 + 守护人格)跑的就是它,缺入口文件等于起不来。"
+    echo "     **pinned 一个字没动**,现在还是:$(readlink "$DATA_DIR/releases/pinned" 2>/dev/null || echo '(没有)')"
+    echo "     多半是这个 sha 早于当前进程拓扑。用 CATMAN_PIN=<新 sha> 显式指定,"
+    echo "     或先完成一次正常部署让 stable 推进上来。"
+    exit 1
+  fi
+
   OLD_PIN="$(basename "$(readlink -f "$DATA_DIR/releases/pinned" 2>/dev/null || echo "")" 2>/dev/null || true)"
   if [ -n "$OLD_PIN" ] && [ "$OLD_PIN" != "$PIN_TARGET" ] && [ -d "$DATA_DIR/releases/$OLD_PIN" ]; then
     ln -sfn "$OLD_PIN" "$DATA_DIR/releases/pinned-prev.tmp"

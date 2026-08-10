@@ -763,6 +763,15 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(`skills.ts`,只�
   兜底之后两者相等 —— 不分开的话,人换了一份好代码上去它再崩时看门狗会袖手旁观。
 - **`pinned` 由 `bless.sh` 钦定,且先把旧的存进 `pinned-prev`**:钦定错误只会在
   "信使起不来"时才发现,而那时两个人格已经一起聋了。
+- **钦定之前必须确认目标跑得动稳定面的每一个角色**(`bless.sh` 查
+  `dist/src/index.js` 与 `dist/src/courier/main.js`,判据与 `entrypoint.sh` 一致)。
+  只查"目录存在"不够,真机上栽过:bless 不带 `CATMAN_PIN` 时默认取 `stable`,而**手工
+  迁移过的机器上 stable 还停在旧拓扑** —— 迁移时是人工切的 `current`,deployer 没参与,
+  stable 从没被推进过。那个 release 目录完好、内容齐全,只是没有 `courier/main.js`,
+  于是信使进引导模式转一辈子;**守护人格更糟**,它的入口在旧 release 里存在,
+  安安静静地跑起了旧代码。所以缺文件就**拒绝并非零退出,一个指针都不动** ——
+  报成功会让人以为稳定面已经换过了。加角色时 `entrypoint.sh` 与 `bless.sh` 两处都要改,
+  有单测从 entrypoint 解析出角色清单跟 bless 对账。
 - **IPC socket 必须在可写区**:守护人格把主 `/data` 整个只读挂载,而 unix socket 的
   `connect()` 需要对 socket 文件的**写**权限 —— 放只读区的症状是"rescue 起来了但一条
   消息都收不到",日志里只有一句 EACCES。所以 `/data/ipc` 单独 rw 挂给三个容器。

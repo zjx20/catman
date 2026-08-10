@@ -862,13 +862,26 @@ test("courier-fallback 换指针之前先验目标的内容清单", () => {
   assert.ok(verify < set, "校验必须排在换指针之前");
 });
 
+/**
+ * 造一个**跑得动稳定面**的 release:两个角色的入口文件都在。
+ *
+ * 光 `mkdir` 出一个空目录是不够的 —— bless 钦定之前会查入口文件,而那正是真机上
+ * 出过事的地方(见下面那条用例)。
+ */
+function makeRunnableRelease(releasesDir: string, sha: string): void {
+  const d = join(releasesDir, sha, "dist", "src");
+  mkdirSync(join(d, "courier"), { recursive: true });
+  writeFileSync(join(d, "index.js"), "", "utf8");
+  writeFileSync(join(d, "courier", "main.js"), "", "utf8");
+}
+
 test("bless 钦定 pinned,并把旧的存进 pinned-prev —— 钦定错了才有退路", () => {
   // 钦定错误恰恰只会在"信使起不来"时才发现,而那时两个人格已经一起聋了。
   withDir((dir) => {
     const dataDir = join(dir, "data");
     const rel = join(dataDir, "releases");
     mkdirSync(rel, { recursive: true });
-    for (const sha of ["old1", "new2"]) mkdirSync(join(rel, sha), { recursive: true });
+    for (const sha of ["old1", "new2"]) makeRunnableRelease(rel, sha);
     symlinkSync("old1", join(rel, "pinned"));
     symlinkSync("new2", join(rel, "stable"));
 
@@ -880,6 +893,61 @@ test("bless 钦定 pinned,并把旧的存进 pinned-prev —— 钦定错了才�
     assert.equal(readlinkSync(join(rel, "pinned")), "new2");
     assert.equal(readlinkSync(join(rel, "pinned-prev")), "old1", "旧的必须留一份");
   });
+});
+
+test("**目标跑不动稳定面就拒绝钦定**,而且一个指针都不动", () => {
+  // 真机上发生过:bless 默认取 stable,而手工迁移过的机器上 stable 还停在旧拓扑
+  // (迁移时是人工切的 current,deployer 没参与,stable 从没被推进过)。
+  // 那个 release 目录完好、内容齐全,只是没有 dist/src/courier/main.js ——
+  // 于是信使进引导模式转一辈子,而守护人格更糟:它的入口在旧 release 里**存在**,
+  // 安安静静地跑起了旧代码。只查"目录存在"抓不到这两种。
+  withDir((dir) => {
+    const dataDir = join(dir, "data");
+    const rel = join(dataDir, "releases");
+    mkdirSync(rel, { recursive: true });
+    makeRunnableRelease(rel, "good1");
+    // 旧拓扑的 release:只有主人格的入口。
+    mkdirSync(join(rel, "old2", "dist", "src"), { recursive: true });
+    writeFileSync(join(rel, "old2", "dist", "src", "index.js"), "", "utf8");
+    symlinkSync("good1", join(rel, "pinned"));
+    symlinkSync("old2", join(rel, "stable"));
+
+    let out = "";
+    let failed = false;
+    try {
+      execFileSync("bash", [join(EVOLVE_DIR, "bless.sh")], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: cleanEnv({ CATMAN_DATA_DIR: dataDir, CATMAN_HOST_DATA_DIR: dataDir, DOCKER_GID: "999" }),
+      });
+    } catch (err) {
+      failed = true;
+      const e = err as { stdout?: string; stderr?: string };
+      out = `${e.stdout ?? ""}${e.stderr ?? ""}`;
+    }
+    assert.ok(failed, "拒绝钦定必须以非零退出 —— 报成功会让人以为稳定面已经换过了");
+    assert.match(out, /拒绝把 pinned 指向/);
+    assert.match(out, /courier\/main\.js/, "要说清缺的是哪个文件");
+    assert.equal(readlinkSync(join(rel, "pinned")), "good1", "pinned 必须原封不动");
+    assert.equal(
+      existsSync(join(rel, "pinned-prev")),
+      false,
+      "连 pinned-prev 都不该写 —— 拒绝就是什么都没发生",
+    );
+  });
+});
+
+test("bless 的入口清单必须覆盖 entrypoint 认识的每一个角色", () => {
+  // 两份清单分处 bash 与 sh、无法共享,所以让它们在这里对账:加了新角色而漏改
+  // bless,后果是 pinned 可以被指到一个跑不动那个角色的 release 上 ——
+  // 而这类错误的发现时机是"重启那个容器的时候",往往已经是出事之后。
+  const entry = readFileSync(join(EVOLVE_DIR, "..", "..", "docker", "entrypoint.sh"), "utf8");
+  const bless = readFileSync(join(EVOLVE_DIR, "bless.sh"), "utf8");
+  const entries = [...entry.matchAll(/ENTRY="([^"]+)"/g)].map((m) => m[1]!);
+  assert.ok(entries.length >= 2, "没从 entrypoint.sh 里解析出入口文件,正则该更新了");
+  for (const e of new Set(entries)) {
+    assert.ok(bless.includes(e), `bless.sh 的钦定前检查里缺 ${e}`);
+  }
 });
 
 test("stable 还没立起来时 bless 不乱指 pinned,只报警", () => {
