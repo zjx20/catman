@@ -150,35 +150,21 @@ export function formatProgress(ev: AgentProgressEvent, skipped = 0): string {
 export const PROGRESS_INTERVALS_MS = [5_000, 15_000, 30_000, 60_000];
 
 /**
- * 一个 `context_token` 总共能发多少条。
+ * 进度的总量上限**不在这里** —— 它由渠道现问(`Channel.progressBudget`)。
  *
- * 真机实测:第 11 条起 `sendmessage` 返回 `ret=-2 prepare failed`,且**永不恢复** ——
- * 不是限流(限流会放行),是这个 token 作废。详见 README「一个 context_token 的发送预算」。
- * 这里取实测值本身、不偷偷留余量:余量在 RESERVED_SENDS 里显式列支,
- * 免得两处各自"稍微保守一点",最后谁也说不清实际还剩多少。
- */
-const SEND_BUDGET = 10;
-
-/**
- * 预留给非进度用途的条数,进度不许碰:
+ * 曾经这里有一份自己的账:`SEND_BUDGET(10) − 回执 1 − 预留 2`。而信使上线之后
+ * 预算的权威搬到了 `courier/reply-store.ts`(它按 kind 预留 3 条:正文 / 空闲提醒 /
+ * 部署结果播报),**旧的那份却没删** —— 两份账于是各算各的,7 对 6。
+ * 后果不是超发(信使会拒),而是**每个长回合都多发一条注定被拒的进度**,
+ * 并且「进度就报到这儿」那句提示**永远不会触发**:信使在第 6 条就拒了,
+ * 网关要到第 7 条才提示。用户看到的是进度毫无征兆地停住 —— 正是那句提示要防的事。
  *
- *   1 条**正文** —— 回复超过 `maxReplyChars` 会分段,后面几段仍可能超预算失败,
- *     但用户至少拿到开头,比彻底静默强得多。
- *   1 条**会话空闲提醒** —— 它和正文共用同一个 `context_token`:提醒的前提就是
- *     用户没再发消息,而 `replyCtx` 只在收到新消息时更新,所以那时用的还是这一份。
- *     预留不保证它一定发得出去(iLink 本就不支持主动推送),但进度把额度吃光的话,
- *     它**一定**发不出去。
- */
-const RESERVED_SENDS = 2;
-
-/**
- * 一个回合里最多推几条进度 = 预算 − 回执 1 条 − 预留 2 条。
+ * 更根本的是:预算必须**只有一个权威**,那是信使存在的理由之一(守护人格可能也在往
+ * 同一个 `context_token` 发东西)。两处常量碰巧相等不叫单一权威,叫还没出事。
  *
- * 光有间隔阶梯不够:阶梯只是把间隔拉长,总条数仍随回合时长无限增长 ——
- * 稳定在 60 秒一条之后,一个十分钟的回合照样能发十几条,又撞回预算,
- * 而那时被挤掉的正好是最不能丢的那几条。所以还要一个绝对上限。
+ * 所以这里一条也不记:上限从渠道现问,渠道说不上来(stdin / dashboard 没有发送预算
+ * 这个概念)就**不设总量上限** —— 那时唯一的节流是下面的间隔阶梯,而那是对的。
  */
-export const MAX_PROGRESS_PER_TURN = SEND_BUDGET - 1 - RESERVED_SENDS;
 
 /** 额度用尽时附在最后一条进度后面的交代。 */
 const PROGRESS_CAP_NOTICE = "(进度就报到这儿,接下来直接等答案)";
@@ -206,10 +192,15 @@ export class ProgressThrottle {
   /** 上次放行之后被丢掉几条。 */
   private skipped = 0;
 
+  /**
+   * @param remaining 该用户**还能收几条进度**,由渠道现问。返回 `undefined` 表示
+   *   这个渠道没有发送预算的概念(stdin / dashboard),那时不设总量上限。
+   *   传函数而不是值:预算是信使那边的实时状态,守护人格可能也在花同一份。
+   */
   constructor(
     startedAt: number,
     private readonly intervals: readonly number[] = PROGRESS_INTERVALS_MS,
-    private readonly maxSends: number = MAX_PROGRESS_PER_TURN,
+    private readonly remaining: () => number | undefined = () => undefined,
   ) {
     this.nextAllowedAt = startedAt + (intervals[0] ?? 0);
   }
@@ -219,8 +210,12 @@ export class ProgressThrottle {
    * 时刻在**决定放行时**推进而不是发送完成后 —— 否则一次慢发送期间会漏过好几条。
    */
   offer(now: number, ev: AgentProgressEvent): string | undefined {
+    // 渠道给的是**上一次发送响应**里的余量,所以可能落后一条。间隔阶梯保证两次放行
+    // 至少隔 5 秒,而一次 IPC 往返是毫秒级,实际追得上;真追不上也只是多发一条,
+    // 由信使当场拒掉 —— 权威在它那里,这里的数只用来把话说清楚。
+    const left = this.remaining();
     // 额度用尽就彻底不发了,连计数都不必再攒 —— 后面没有任何一条会被放出去。
-    if (this.sent >= this.maxSends) return undefined;
+    if (left !== undefined && left <= 0) return undefined;
     if (now < this.nextAllowedAt) {
       this.skipped += 1;
       return undefined;
@@ -232,16 +227,19 @@ export class ProgressThrottle {
     this.nextAllowedAt = now + (this.intervals[Math.min(this.sent, this.intervals.length - 1)] ?? 0);
     // 最后一条要说清楚后面没了。否则用户看到的是进度突然断掉,与"卡死了"无从分辨 ——
     // 长回合下这段静默可能长达好几分钟,正是最容易让人以为出事的时候。
-    return this.sent === this.maxSends ? `${text}\n${PROGRESS_CAP_NOTICE}` : text;
+    return left === 1 ? `${text}\n${PROGRESS_CAP_NOTICE}` : text;
   }
 
   /**
    * 追加输入之后重新开闸(条数与间隔阶梯都从头开始)。
    *
    * 依据是**发送预算确实回来了**:iLink 的 replyCtx 在收到新消息时换成新的
-   * `context_token`,而 maxSends 防的正是一个 token 被进度耗光。同时用户刚补完话,
-   * 正是最想知道"接住了没"的时刻 —— 不重置的话,被追加过的长回合后半段完全静默,
-   * 与卡死无从分辨。阶梯一并重来,所以重置不会变成刷屏:下一条仍要等满第一档。
+   * `context_token`,信使那边的计数随之归零。同时用户刚补完话,正是最想知道
+   * "接住了没"的时刻 —— 不重置的话,被追加过的长回合后半段完全静默,与卡死无从分辨。
+   * 阶梯一并重来,所以重置不会变成刷屏:下一条仍要等满第一档。
+   *
+   * 余量本身不在这里重置 —— 它由渠道现问,而渠道要等下一次发送的响应才知道
+   * 新预算。落后一条,与 offer 里那条说明同源。
    */
   reset(now: number): void {
     this.sent = 0;
@@ -1314,7 +1312,10 @@ export class Gateway {
 
     // 进度消息串行链:保证按事件产生顺序逐条发送,最终回复排在链尾之后。
     // 节流从**回合开始**起算,而不是从第一个事件 —— 用户等待的是前者。
-    const throttle = new ProgressThrottle(this.now());
+    // 上限从渠道现问 —— 网关自己不记发送预算的账,见 PROGRESS_CAP_NOTICE 上面那段。
+    const throttle = new ProgressThrottle(this.now(), PROGRESS_INTERVALS_MS, () =>
+      this.channel.progressBudget?.(userKey),
+    );
     let progress: Promise<void> = Promise.resolve();
     // **回调无条件挂上**,progressEnabled 只决定要不要推给用户。
     // 关掉进度推送的用户同样需要 /状态 答得出"现在在干什么" —— 把观测和

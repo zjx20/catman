@@ -69,6 +69,20 @@ export interface Channel {
   onMessage(handler: MessageHandler): void;
 
   /**
+   * 这个用户**还能收几条进度**。
+   *
+   * 发送预算的权威在信使(`courier/reply-store.ts`),不在人格 —— 守护人格可能也在往
+   * 同一个 `context_token` 发东西,两边各按自己的常量算就必然对不上。所以网关的
+   * 进度节流器不再自带上限,改成每次现问渠道。
+   *
+   * **没有发送预算这个概念的渠道不要实现它**(stdin / dashboard):返回
+   * `undefined` 表示"不设总量上限",那时唯一的节流是间隔阶梯,而那是对的。
+   * 实现的渠道给的是**上一次发送响应**里的余量,所以允许落后一条 ——
+   * 它只用来把"进度到此为止"这句话说在正确的时刻,真正的闸门在信使那边。
+   */
+  progressBudget?(userKey: string): number | undefined;
+
+  /**
    * 主动向用户发送文本。实现方负责必要的分段。
    *
    * `kind` 是**发送预算按类别预留**的依据(见 courier/reply-store.ts):一个 iLink

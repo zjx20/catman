@@ -261,6 +261,50 @@ test("附件按引用读回来;读不到只跳过那一张,文字照常投递", 
   });
 });
 
+test("进度余量转述信使的账,自己不记 —— 发之前问不出数就是不设上限", async () => {
+  // 预算的权威只能有一个:守护人格可能也在往同一个 context_token 发东西,
+  // 两边各按自己的常量算就必然对不上(真机上正是 7 对 6)。
+  const c = new FakeCourier();
+  const dir = mkdtempSync(join(tmpdir(), "catman-bridge-budget-"));
+  try {
+    const bridge = new BridgeChannel({ client: c, spoolDir: dir });
+    assert.equal(bridge.progressBudget("wechat:a:u1"), undefined, "一次没发过时不该编一个数");
+
+    c.sendResult = { schema: IPC_SCHEMA, ok: true, remainingProgress: 3 };
+    await bridge.send("wechat:a:u1", "第一条", "progress");
+    assert.equal(bridge.progressBudget("wechat:a:u1"), 3);
+
+    c.sendResult = { schema: IPC_SCHEMA, ok: true, remainingProgress: 0 };
+    await bridge.send("wechat:a:u1", "最后一条", "progress");
+    assert.equal(bridge.progressBudget("wechat:a:u1"), 0, "耗尽由成功那次带回来");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("被拒的响应里那个余量不作数 —— 它说的是「这条不该发」,不是「你没额度了」", async () => {
+  // 「信封读不懂」「路由已经切走」两种拒绝都硬填 0。把它当预算记下,
+  // 会让节流器从此闭嘴 —— 连那个用户切回来之后也不再有进度。
+  const c = new FakeCourier();
+  const dir = mkdtempSync(join(tmpdir(), "catman-bridge-budget2-"));
+  try {
+    const bridge = new BridgeChannel({ client: c, spoolDir: dir });
+    c.sendResult = { schema: IPC_SCHEMA, ok: true, remainingProgress: 4 };
+    await bridge.send("wechat:a:u1", "一条", "progress");
+
+    c.sendResult = {
+      schema: IPC_SCHEMA,
+      ok: false,
+      remainingProgress: 0,
+      reason: "这个用户已经切到别的人格了",
+    };
+    await assert.rejects(() => bridge.send("wechat:a:u1", "又一条", "progress"));
+    assert.equal(bridge.progressBudget("wechat:a:u1"), 4, "被拒不该把余量抹成 0");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("send 把 kind 原样交给信使 —— 预算是按它算的", async () => {
   await withDir(async (dir) => {
     const c = new FakeCourier();

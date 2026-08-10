@@ -10,7 +10,6 @@ import {
   ACK_TEXT,
   formatProgress,
   ProgressThrottle,
-  MAX_PROGRESS_PER_TURN,
   MAX_FEEDS_PER_TURN,
   FEED_ACK_TEXT,
   TURN_ERROR_PREFIX,
@@ -539,21 +538,39 @@ test("进度节流:同一间隔内只发最新那条,丢掉的条数如实交代
   assert.ok(next && !next.includes("步"), `不该重复计数:${next}`);
 });
 
-test("进度节流:总条数封顶,给正文与超时提醒留出额度", () => {
+test("进度节流:总条数封顶用的是**渠道现报**的余量,不是自己的常量", () => {
   // 阶梯只拉长间隔,不限制总数 —— 一个十分钟的回合照样能发十几条,
   // 撞满预算后被挤掉的正好是正文和超时提醒(两者共用同一个 context_token)。
+  // 而这个上限必须来自信使:它才是预算的权威(守护人格可能也在花同一份)。
   const t0 = 1_000_000;
-  const th = new ProgressThrottle(t0);
+  let left = 4; // 假装信使说还剩 4 条
+  const th = new ProgressThrottle(t0, undefined, () => left);
   const texts: string[] = [];
   // 跨度 30 分钟,远超阶梯能自然产生的条数。
   for (let ms = 0; ms <= 1_800_000; ms += 1_000) {
     const out = th.offer(t0 + ms, toolEv(ms));
-    if (out) texts.push(out);
+    if (out) {
+      texts.push(out);
+      left -= 1; // 发出去一条,信使那边的余量跟着减
+    }
   }
-  assert.equal(texts.length, MAX_PROGRESS_PER_TURN, "封顶后不该再放行");
+  assert.equal(texts.length, 4, "封顶后不该再放行");
   // 最后一条要交代"后面没了" —— 否则长回合里那段几分钟的静默与卡死无从分辨。
   assert.ok(texts.at(-1)!.includes("进度就报到这儿"), `缺少收尾交代:${texts.at(-1)}`);
   assert.ok(!texts.at(-2)!.includes("进度就报到这儿"), "只有最后一条该带交代");
+});
+
+test("进度节流:渠道说不上来余量就不设总量上限 —— stdin / dashboard 没有发送预算", () => {
+  // 给它们套一个凭空来的上限,等于把 iLink 的协议限制强加到根本没有这个限制的渠道上,
+  // 而本地调试恰恰最需要看见进度。唯一的节流是间隔阶梯,那是对的。
+  const t0 = 1_000_000;
+  const th = new ProgressThrottle(t0);
+  let sent = 0;
+  for (let ms = 0; ms <= 1_800_000; ms += 1_000) {
+    if (th.offer(t0 + ms, toolEv(ms))) sent += 1;
+  }
+  // 30 分钟 / 最后一档 60 秒 ≈ 30 条,远多于任何常量上限。
+  assert.ok(sent > 20, `不该被封顶,实际只发了 ${sent} 条`);
 });
 
 test("进度节流:一个 83 秒的回合只发 3 条进度", () => {
