@@ -108,6 +108,8 @@ export interface Config {
   srcDir: string;
   /** 部署结果"已播报"的标记。catman 自己写,所以必须在可写区,不能放 deployDir。 */
   deploySeenPath: string;
+  /** 部署里程碑"已播报"的标记。同上,catman 自己写。 */
+  deployProgressSeenPath: string;
   /**
    * 信使的状态目录(收件队列、回复上下文、路由表、附件 spool、游标)。
    * **写者只有信使**;人格对它只读(只读 spool 里的附件字节)。
@@ -189,6 +191,13 @@ export function loadConfig(): Config {
     releasesDir: str("CATMAN_RELEASES_DIR", `${mainDataDir}/releases`),
     srcDir: str("CATMAN_SRC_DIR", `${dataDir}/src/catman`),
     deploySeenPath: str("CATMAN_DEPLOY_SEEN_PATH", `${dataDir}/deploy-seen.json`),
+    // 里程碑的已播报标记。**与部署结果的那份分开两个文件**:结果只有一条、里程碑
+    // 是一串,合在一起就得在同一份 JSON 里同时维护两种形状,而写它的是两条独立的
+    // 路径 —— 分开之后各写各的,谁也不会覆盖谁。
+    deployProgressSeenPath: str(
+      "CATMAN_DEPLOY_PROGRESS_SEEN_PATH",
+      `${dataDir}/deploy-progress-seen.json`,
+    ),
     courierDir: str("CATMAN_COURIER_DIR", `${mainDataDir}/courier`),
     ipcSocketPath: str("CATMAN_IPC_SOCKET", `${mainDataDir}/ipc/courier.sock`),
     ipcSecret: process.env.CATMAN_IPC_SECRET || undefined,

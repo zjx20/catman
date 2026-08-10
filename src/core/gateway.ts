@@ -20,6 +20,7 @@ import { skillsFor } from "./skills.js";
 import { readVersion, shortSha, versionLine, type VersionInfo } from "./version.js";
 import type { DeployControl } from "./deploy.js";
 import { formatDeployReport } from "./deploy-report.js";
+import { formatDeployProgress } from "./deploy-progress.js";
 import type { SendKind } from "../ipc/protocol.js";
 import type { Persona } from "../config.js";
 
@@ -63,6 +64,28 @@ export const TURN_ERROR_PREFIX = "⚠️ 这一轮没能跑成,以下是 Claude 
 
 /** 进度消息里思考/工具参数摘要的截断长度。 */
 const PROGRESS_MAX_CHARS = 200;
+
+/**
+ * 部署进展多久去看一眼。
+ *
+ * 这是个纯本地的动作(读两个小文件),15 秒的开销可以忽略;而它决定了用户在
+ * "切换成功"那一刻要等多久才收到消息 —— 部署的整条链以分钟计,15 秒足够贴身。
+ */
+export const DEPLOY_NEWS_INTERVAL_MS = 15_000;
+
+/**
+ * 一条主动播报最多试几次、两次之间至少隔多久。
+ *
+ * **上限不是为了省事,是为了不把发送预算烧光。** 一个 context_token 只够发约 10 条
+ * (见 courier/reply-store.ts 那笔账),而失败的尝试照样计数。15 秒一轮无限重试的话,
+ * 两分半就能把额度耗尽 —— 那时连正文都发不出去,用户彻底静默,而起因只是一条
+ * 本来可以晚点再说的进度。
+ *
+ * 放弃的只是**主动**这条路:用户下次开口时仍然会补播(那时他有一份崭新的上下文,
+ * 发送几乎不会失败),所以"放弃"从不等于"这条消息丢了"。
+ */
+const NEWS_MAX_ATTEMPTS = 3;
+const NEWS_RETRY_MS = 60_000;
 
 export interface GatewayOptions {
   channel: Channel;
@@ -108,6 +131,11 @@ export interface GatewayOptions {
    * 而不是假装成功 —— 本地开发与 stdin 调试就是这种情况。
    */
   deploy?: DeployControl;
+  /**
+   * 部署进展主动播报的轮询间隔(ms)。不传用 `DEPLOY_NEWS_INTERVAL_MS`。
+   * 单测传一个大到不会自己触发的值,然后手工调 `flushDeployNews()`。
+   */
+  deployNewsIntervalMs?: number;
   /**
    * 时钟。目前只喂给进度节流 —— 它是纯计算,可以用假时钟驱动。
    *
@@ -474,9 +502,18 @@ export class Gateway {
   private readonly sessionExists: ((userKey: string, sessionId: string) => boolean) | undefined;
   private readonly now: () => number;
   private readonly reminderIntervalMs: number;
+  private readonly deployNewsIntervalMs: number;
   private readonly semaphore: Semaphore;
 
   private reminderTimer?: NodeJS.Timeout;
+  private deployNewsTimer?: NodeJS.Timeout;
+  /**
+   * 主动播报的串行链。定时器与用户开口这两条路径都会去播同一批消息 ——
+   * 不串起来的话它们会同时读到"还没播过"然后各发一遍,用户收到两条一模一样的。
+   */
+  private newsChain: Promise<void> = Promise.resolve();
+  /** 每条播报的主动重试记账(只在内存里:重启后重来一遍是对的,进程换了上下文也换了)。 */
+  private readonly newsAttempts = new Map<string, { n: number; last: number }>();
   /** 每用户一条处理链,保证串行。 */
   private readonly queues = new Map<string, Promise<void>>();
   /** 每用户至多一批待聚合的消息。 */
@@ -531,6 +568,7 @@ export class Gateway {
     this.sessionExists = opts.sessionExists;
     this.now = opts.now ?? Date.now;
     this.reminderIntervalMs = opts.reminderIntervalMs;
+    this.deployNewsIntervalMs = opts.deployNewsIntervalMs ?? DEPLOY_NEWS_INTERVAL_MS;
     this.version = opts.version ?? readVersion();
     this.persona = opts.persona ?? "primary";
     this.tokenAlert = opts.tokenAlert;
@@ -546,11 +584,24 @@ export class Gateway {
     this.reminderTimer = setInterval(() => this.flushReminders(), this.reminderIntervalMs);
     // 允许进程在只剩此定时器时退出(容器里无所谓,测试友好)。
     this.reminderTimer.unref?.();
+    // 部署进展主动播报。**没有部署控制面就不起这个定时器** —— 守护人格与本地开发
+    // 压根没有可播的东西,起一个空转的轮询只会让日志和心智负担变复杂。
+    if (this.deploy) {
+      this.deployNewsTimer = setInterval(() => {
+        void this.flushDeployNews();
+      }, this.deployNewsIntervalMs);
+      this.deployNewsTimer.unref?.();
+    }
     await this.channel.start();
+    // 起来就先看一眼:上一次部署的结果正是在**这个进程启动之前**写下的,
+    // 等一个轮询周期没有任何理由。**放在 channel.start() 之后** —— 渠道还没起来时
+    // 发送要么抛要么石沉大海,而这一条恰恰是最不该丢的。
+    if (this.deploy) void this.flushDeployNews();
   }
 
   async stop(): Promise<void> {
     if (this.reminderTimer) clearInterval(this.reminderTimer);
+    if (this.deployNewsTimer) clearInterval(this.deployNewsTimer);
     // 攒着的消息立刻入队,不等窗口走完:消息已经从渠道收下了(长轮询游标也推进了),
     // 丢掉就是真丢。能不能跑完交给关闭流程,总好过在这里静默吞掉。
     for (const userKey of [...this.pending.keys()]) this.flush(userKey);
@@ -808,9 +859,12 @@ export class Gateway {
     // 第一次见到他"。补记而不只是跳过:信使不在场的路径(dashboard 聊天)
     // 从此也不会再推,一次同步永久生效。
     if (this.courierGreeted.delete(userKey)) this.users.markGreeted(userKey);
-    // 上一次部署的结果先说 —— 用户此刻多半正要问"改好了没",而且失败的那种情况下
+    // 部署的进展先说 —— 用户此刻多半正要问"改好了没",而且失败的那种情况下
     // 他接下来说的话是基于"改动已生效"这个错误前提的。
-    await this.announceDeployReport(userKey);
+    //
+    // 定时器平时已经主动播过了,这里是**兜底**:主动推送要用他上一条来信的
+    // context_token,那份东西会耗尽也会失效;而他现在开口了,手上就有一份崭新的。
+    await this.flushDeployNews(userKey);
     // token 快到期也在这时说 —— 只对管理员(换发要人在宿主跑 setup-token,普通用户
     // 拿这条什么都做不了)。发送成功才落账,与部署结果播报同一条纪律:
     // 先标记等于把这条告警永久吞掉,而它恰恰是"整个系统会一起静默死掉"的预告。
@@ -1044,27 +1098,98 @@ export class Gateway {
   }
 
   /**
-   * 把上一次部署的结果告诉发起人。
+   * 把部署的进展(里程碑 + 最终结果)告诉该收到的人。
    *
-   * 这是那个空档的唯一出口:用户说完「发布」那个回合就结束了(提交部署后立即收尾,
-   * 否则会与排水互锁),而结果几十分钟后才出来 —— 那时没有任何在飞回合能说话,
-   * iLink 也不支持主动推送。所以只能等他下次开口时补上。
+   * ## 为什么必须主动推
    *
-   * **发送成功才标记已读**:iLink 的发送本就可能失败(context_token 预算耗尽),
-   * 先标记的话这条结果就被永久吞掉了 —— 而"升级失败已回滚"恰恰是最不能丢的一条。
+   * 用户说完「发布」那个回合就结束了(提交部署后立即收尾,否则会与排水互锁),
+   * 而整条链要走三十多分钟 —— 那期间没有任何在飞回合能说话。这里原先的做法是
+   * "等他下次开口时捎给他",于是真机上的体验是:等多久都等不到,直到自己先开口。
+   * 而"先开口"恰恰是他想避免的事:他就是在等结果。
+   *
+   * 主动推送**是能做的**:信使把每个用户的回复上下文落了盘(courier/reply-store.ts),
+   * 会话空闲提醒早就靠它送达了。所以这里按同一条路走,只是多了预算上的克制。
+   *
+   * ## 三条纪律
+   *
+   * ① **发送成功才标记已播**:发送本就可能失败(预算耗尽/上下文失效),先标记
+   *    等于把这条进展永久吞掉,而"升级失败已回滚"是最不能丢的一条。
+   * ② **失败要收手**:见 NEWS_MAX_ATTEMPTS —— 重试烧的是同一份发送预算。
+   * ③ **串行**:定时器与用户开口两条路径共用这一个方法,靠 newsChain 排队,
+   *    否则两边会同时判定"还没播过"然后各发一遍。
+   *
+   * @param prefer 正在开口的那个用户。他手上有一份崭新的回复上下文,所以发给他的
+   *   那几条**不受重试上限约束** —— 上限防的是对着一个发不出去的上下文空烧预算。
    */
-  private async announceDeployReport(userKey: string): Promise<void> {
-    const report = this.deploy?.pendingReport();
+  flushDeployNews(prefer?: string): Promise<void> {
+    this.newsChain = this.newsChain
+      .then(() => this.doFlushDeployNews(prefer))
+      .catch((err) => {
+        // 播报失败不该拖垮调用方(它可能是 prelude,后面还有正事要做)。
+        console.warn(`[deploy] 播报部署进展时出错:${String(err)}`);
+      });
+    return this.newsChain;
+  }
+
+  private async doFlushDeployNews(prefer?: string): Promise<void> {
+    const deploy = this.deploy;
+    if (!deploy) return;
+
+    // 里程碑按发生顺序播:先"切到新版本"再"转稳定",倒过来读是另一个故事。
+    for (const p of deploy.pendingProgress()) {
+      const to = this.newsRecipient(p.requestedBy);
+      if (!to) {
+        // 没有任何人收得到(没有发起人、管理员名单也是空的)。标记已播免得每 15 秒
+        // 重算一次,内容照旧留在日志里 —— 它是这条路径上唯一不依赖配置的出口。
+        console.warn(`[deploy] 没有可播报的对象,只记日志:${formatDeployProgress(p)}`);
+        deploy.markProgressAnnounced(p.id);
+        continue;
+      }
+      if (!this.mayPushNews(p.id, to === prefer)) continue;
+      if (await this.trySend(to, formatDeployProgress(p), "部署进度", "announce")) {
+        deploy.markProgressAnnounced(p.id);
+        this.newsAttempts.delete(p.id);
+      }
+    }
+
+    const report = deploy.pendingReport();
     if (!report) return;
     // 有发起人就只告诉他:别人没等这个结果,收到一句"升级完成"只会莫名其妙。
-    // 没有发起人(比如看门狗自动回退)则告诉任一管理员 —— 那种情况更要有人知道。
-    const forHim = report.requestedBy
-      ? report.requestedBy === userKey
-      : this.settings.isAdmin(userKey);
-    if (!forHim) return;
-    if (await this.trySend(userKey, formatDeployReport(report), "部署结果", "announce")) {
-      this.deploy?.markReportAnnounced(report.id);
+    // 没有发起人(比如看门狗自动回退)则告诉管理员 —— 那种情况更要有人知道。
+    const to = this.newsRecipient(report.requestedBy);
+    if (!to) {
+      console.warn(`[deploy] 没有可播报的对象,只记日志:${formatDeployReport(report)}`);
+      return;
     }
+    if (!this.mayPushNews(report.id, to === prefer)) return;
+    if (await this.trySend(to, formatDeployReport(report), "部署结果", "announce")) {
+      deploy.markReportAnnounced(report.id);
+      this.newsAttempts.delete(report.id);
+    }
+  }
+
+  /**
+   * 这条播报该发给谁。发起人优先(他才是在等的那个);没有发起人时发给第一位管理员 ——
+   * 那种情况(看门狗自动降级)更要有人知道。一个都没有时返回 undefined,由调用方记日志。
+   */
+  private newsRecipient(requestedBy?: string): string | undefined {
+    if (requestedBy) return requestedBy;
+    return this.settings.effective().adminUserKeys[0];
+  }
+
+  /** 这条播报现在能不能再试一次。见 NEWS_MAX_ATTEMPTS 的说明。 */
+  private mayPushNews(id: string, unlimited: boolean): boolean {
+    if (unlimited) return true;
+    const now = this.now();
+    const a = this.newsAttempts.get(id);
+    if (!a) {
+      this.newsAttempts.set(id, { n: 1, last: now });
+      return true;
+    }
+    if (a.n >= NEWS_MAX_ATTEMPTS || now - a.last < NEWS_RETRY_MS) return false;
+    a.n += 1;
+    a.last = now;
+    return true;
   }
 
   /**

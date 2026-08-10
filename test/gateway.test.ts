@@ -30,6 +30,7 @@ import type { Attachment } from "../src/core/attachments.js";
 import type { Agent, AgentProgressEvent, AgentReply, AgentRunOptions } from "../src/core/agent.js";
 import type { DeployControl, PublishCandidate, VerifiedRelease } from "../src/core/deploy.js";
 import type { DeployReport } from "../src/core/deploy-report.js";
+import type { DeployProgress } from "../src/core/deploy-progress.js";
 
 const TIMEOUT = 60 * 60 * 1000;
 
@@ -43,8 +44,10 @@ class FakeChannel implements Channel {
   handler?: MessageHandler;
   sent: Array<{ userKey: string; text: string }> = [];
   recalled: string[] = [];
-  /** 设为 true 时 send 抛错,模拟渠道不支持主动推送。 */
+  /** 设为 true 时 send 抛错,模拟主动推送发不出去(预算耗尽 / 上下文失效)。 */
   failSend = false;
+  /** 试过几次发送(**含失败的**)。失败的尝试照样烧 iLink 的发送预算,所以要单独数。 */
+  attempted = 0;
   /** 仅"支持撤回"的实例才有 recall 方法(网关按方法是否存在判断能力)。 */
   recall?: (userKey: string, messageId: string) => Promise<void>;
 
@@ -60,6 +63,7 @@ class FakeChannel implements Channel {
     this.handler = h;
   }
   async send(userKey: string, text: string): Promise<string | void> {
+    this.attempted += 1;
     if (this.failSend) throw new Error("push not supported");
     this.sent.push({ userKey, text });
     // 支持撤回的渠道返回消息 id
@@ -191,6 +195,8 @@ class FakeDeploy implements DeployControl {
   candidates: PublishCandidate[] = [];
   report?: DeployReport;
   announced: string[] = [];
+  progress: DeployProgress[] = [];
+  progressAnnounced: string[] = [];
   history: VerifiedRelease[] = [];
 
   async requestDeploy(shaPrefix: string, requestedBy: string): Promise<string> {
@@ -211,6 +217,12 @@ class FakeDeploy implements DeployControl {
   }
   markReportAnnounced(id: string): void {
     this.announced.push(id);
+  }
+  pendingProgress(): readonly DeployProgress[] {
+    return this.progress.filter((p) => !this.progressAnnounced.includes(p.id));
+  }
+  markProgressAnnounced(id: string): void {
+    this.progressAnnounced.push(id);
   }
   lastReport(): DeployReport | undefined {
     return this.report;
@@ -2171,20 +2183,74 @@ test("/升级状态 列出待发布的候选 —— 那是 /发布 后面那几�
   assert.equal(text.includes("eeeeeee"), false, "正在跑的那个不是候选");
 });
 
-test("部署结果在发起人下次开口时播报一次,之后不再重复", async () => {
+/** 一条里程碑。用例只改要点的那几个字段。 */
+function progressOf(over: Partial<DeployProgress> = {}): DeployProgress {
+  return {
+    schema: 1,
+    id: "run1-switched",
+    stage: "switched",
+    sha: "a".repeat(40),
+    at: new Date(1_000_000).toISOString(),
+    detail: "接下来是观察期。",
+    ok: true,
+    requestedBy: U1,
+    ...over,
+  };
+}
+
+// 这一组守的是同一件事:**用户不必先开口才知道结果**。
+// 真机上的症状是"发布之后无论等多久都等不到结果",而他等的恰恰就是这个 ——
+// 让他先说话才肯告诉他,等于让他自己去问一件他已经在等的事。
+test("部署结果不等用户开口就主动推给发起人,且只推一次", async () => {
   const t = 1_000_000;
   const deploy = new FakeDeploy();
   deploy.report = REPORT; // requestedBy = U1
-  const { channel } = build(() => t, { deploy, settings: { adminUserKeys: [U1] } });
+  const { channel, gw } = build(() => t, { deploy, settings: { adminUserKeys: [U1] } });
 
-  await channel.receive(U1, "改好了吗");
+  await gw.flushDeployNews(); // 定时器就是这么调的
   const first = channel.sent.filter((m) => m.text.includes("已自动回滚"));
-  assert.equal(first.length, 1, "该播报一次");
+  assert.equal(first.length, 1, "没人开口也该播出去");
+  assert.equal(first[0]!.userKey, U1, "发给发起人");
   assert.deepEqual(deploy.announced, ["d-1"]);
 
-  await channel.receive(U1, "再说一句");
-  const again = channel.sent.filter((m) => m.text.includes("已自动回滚"));
-  assert.equal(again.length, 1, "播报过就不再重复");
+  await gw.flushDeployNews();
+  await channel.receive(U1, "改好了吗");
+  assert.equal(
+    channel.sent.filter((m) => m.text.includes("已自动回滚")).length,
+    1,
+    "播报过就不再重复,定时器与用户开口两条路径都不会让它重来",
+  );
+});
+
+test("三个里程碑按发生顺序主动播给发起人", async () => {
+  const t = 1_000_000;
+  const deploy = new FakeDeploy();
+  deploy.progress = [
+    progressOf({ id: "run1-switched", stage: "switched" }),
+    progressOf({ id: "run1-stable", stage: "stable" }),
+    progressOf({ id: "run1-pushed", stage: "pushed" }),
+  ];
+  const { channel, gw } = build(() => t, { deploy, settings: { adminUserKeys: [U1] } });
+
+  await gw.flushDeployNews();
+  const texts = channel.sent.filter((m) => m.userKey === U1).map((m) => m.text);
+  assert.equal(texts.length, 3);
+  assert.match(texts[0]!, /已切到/);
+  assert.match(texts[1]!, /观察期通过/);
+  assert.match(texts[2]!, /已推送到远端/);
+  assert.deepEqual(deploy.progressAnnounced, ["run1-switched", "run1-stable", "run1-pushed"]);
+
+  await gw.flushDeployNews();
+  assert.equal(channel.sent.length, 3, "播过的不再重播");
+});
+
+test("推远端失败的里程碑照样播 —— 「本地上线了但远端没有」下次开工会踩到", async () => {
+  const deploy = new FakeDeploy();
+  deploy.progress = [progressOf({ id: "run1-pushed", stage: "pushed", ok: false })];
+  const { channel, gw } = build(() => 1_000_000, { deploy, settings: { adminUserKeys: [U1] } });
+
+  await gw.flushDeployNews();
+  assert.match(channel.sent.at(-1)!.text, /没能推上远端/);
 });
 
 test("部署结果只发给发起人 —— 别人收到一句「升级完成」只会莫名其妙", async () => {
@@ -2195,44 +2261,78 @@ test("部署结果只发给发起人 —— 别人收到一句「升级完成」
 
   await channel.receive(U2, "你好");
   assert.equal(
-    channel.sent.filter((m) => m.text.includes("已自动回滚")).length,
+    channel.sent.filter((m) => m.userKey === U2 && m.text.includes("已自动回滚")).length,
     0,
     "U2 不是发起人,不该收到",
   );
-  assert.deepEqual(deploy.announced, [], "也不该被标记成已播报");
-
-  await channel.receive(U1, "你好");
-  assert.equal(channel.sent.filter((m) => m.text.includes("已自动回滚")).length, 1);
+  assert.equal(
+    channel.sent.filter((m) => m.userKey === U1 && m.text.includes("已自动回滚")).length,
+    1,
+    "收件人由报告决定,与此刻谁在说话无关",
+  );
 });
 
-test("没有发起人的报告(比如看门狗自动回退)发给任一管理员,但不发给普通用户", async () => {
+test("没有发起人的报告(比如看门狗自动回退)发给管理员,不发给普通用户", async () => {
   const t = 1_000_000;
   const deploy = new FakeDeploy();
   const { requestedBy: _drop, ...noOwner } = REPORT;
   deploy.report = noOwner as DeployReport;
-  const { channel } = build(() => t, { deploy, settings: { adminUserKeys: [U2] } });
+  const { channel, gw } = build(() => t, { deploy, settings: { adminUserKeys: [U2] } });
 
-  await channel.receive(U1, "你好"); // 普通用户
-  assert.equal(channel.sent.filter((m) => m.text.includes("已自动回滚")).length, 0);
-  await channel.receive(U2, "你好"); // 管理员
-  assert.equal(channel.sent.filter((m) => m.text.includes("已自动回滚")).length, 1);
+  await gw.flushDeployNews();
+  const sent = channel.sent.filter((m) => m.text.includes("已自动回滚"));
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]!.userKey, U2, "没有发起人时归管理员 —— 那种情况更要有人知道");
+});
+
+test("一个管理员都没有时只记日志,并标记已播免得每轮重算", async () => {
+  const deploy = new FakeDeploy();
+  deploy.progress = [progressOf({ requestedBy: undefined })];
+  const { channel, gw } = build(() => 1_000_000, { deploy, settings: { adminUserKeys: [] } });
+
+  await gw.flushDeployNews();
+  assert.equal(channel.sent.length, 0);
+  assert.deepEqual(deploy.progressAnnounced, ["run1-switched"]);
 });
 
 test("播报发送失败时不标记已读 —— 否则这条结果就被永久吞掉了", async () => {
   const t = 1_000_000;
   const deploy = new FakeDeploy();
   deploy.report = REPORT;
-  const { channel } = build(() => t, {
+  const { channel, gw } = build(() => t, {
     deploy,
     failSend: true, // 模拟 iLink 发送失败(context_token 预算耗尽是常态)
     settings: { adminUserKeys: [U1] },
   });
 
-  await channel.receive(U1, "你好");
+  await gw.flushDeployNews();
   assert.deepEqual(deploy.announced, [], "发送失败就不该记成已播报");
   // 下次发得出去时还得能播 —— 「升级失败已回滚」是最不能丢的一条。
   channel.failSend = false;
   await channel.receive(U1, "再来一次");
+  assert.equal(channel.sent.filter((m) => m.text.includes("已自动回滚")).length, 1);
+});
+
+test("主动重试有上限 —— 失败的发送烧的是同一份预算,烧光了连正文都发不出去", async () => {
+  let t = 1_000_000;
+  const deploy = new FakeDeploy();
+  deploy.report = REPORT;
+  const { channel, gw } = build(() => t, {
+    deploy,
+    failSend: true,
+    settings: { adminUserKeys: [U1] },
+  });
+
+  // 三次之后收手(每次之间要过够退避间隔,否则连这三次都攒不满)。
+  for (let i = 0; i < 6; i += 1) {
+    await gw.flushDeployNews();
+    t += 61_000;
+  }
+  assert.equal(channel.attempted, 3, "试满三次就不再主动试");
+
+  // 但用户开口时照样试 —— 他手上是一份崭新的回复上下文,发送几乎不会失败。
+  channel.failSend = false;
+  await channel.receive(U1, "怎么样了");
   assert.equal(channel.sent.filter((m) => m.text.includes("已自动回滚")).length, 1);
 });
 

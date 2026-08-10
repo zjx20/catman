@@ -56,6 +56,17 @@ HEALTH_TIMEOUT="${CATMAN_HEALTH_TIMEOUT:-300}"   # 5 分钟
 BAKE_SECONDS="${CATMAN_BAKE_SECONDS:-1800}"      # 30 分钟观察期
 SMOKE_RETRY_WINDOW="${CATMAN_SMOKE_RETRY_WINDOW:-1800}" # 限流/网络类失败的退避总时长
 
+# 本次运行的标识。里程碑的 id 由它加阶段名拼成,catman 靠 id 去重 ——
+# **必须在这里算一次然后固定住**:每条里程碑各算各的时间戳,重启后就认不出
+# "这条我播过了",于是同一条进度会被反复播出去。
+RUN_ID="$(node -e 'process.stdout.write(Date.now().toString(36))')"
+
+# 一条里程碑。失败不写(那归 report),细节见 lib.sh 的 progress_write。
+milestone() { # milestone <stage> <sha> <detail> [ok]
+  local stage="$1" sha="$2" detail="$3" ok="${4:-1}"
+  progress_write "$RUN_ID-$stage" "$stage" "$sha" "$detail" "$ok" "$REQUESTED_BY"
+}
+
 report() { # report <outcome> <sha> <detail> [revertedTo] [interruptedBg]
   local outcome="$1" sha="$2" detail="$3" reverted="${4:-}" bg="${5:-0}"
   node -e '
@@ -260,6 +271,10 @@ do_deploy() {
     exit 1
   fi
 
+  # 健康门过了 = 新版本真的起来了,而且 /health 报的 sha 就是它。这是整条链上
+  # 第一个**用户看得见**的事实(他刚经历了几分钟失联),而离最终结果还有半小时。
+  milestone switched "$sha" "接下来是 ${BAKE_SECONDS}s 观察期,这期间崩了会自动退回 ${prev:0:7}。"
+
   if ! bake "$sha"; then
     log "观察期没过,回滚到 $prev"
     revert_to "$prev"
@@ -271,9 +286,11 @@ do_deploy() {
   # 到这里才前移 stable —— 观察期是真正的门。
   pointer_set stable "$sha"
   history_push "$sha"
+  milestone stable "$sha" "从现在起它是回滚回得去的那个版本。"
   release_gc
   # 推远端**放在这里**:此刻这个提交才真的"上线过并且活下来了"。失败不阻塞。
   push_upstream "$sha"
+  milestone pushed "$sha" "$PUSH_DETAIL" "$PUSH_OK"
   local note="已上线并通过 ${BAKE_SECONDS}s 观察期。"
   [ "$drained_ok" = "1" ] || note="$note(切换时还有消息在处理,可能有丢失)"
   report deployed "$sha" "$note" "" "$bg"

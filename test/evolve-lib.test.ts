@@ -430,6 +430,61 @@ test("JSON:读坏文件返回空串而不是崩", () => {
   });
 });
 
+// ── 里程碑 ─────────────────────────────────────────────────────────
+// 它是"发布之后别让人对着黑箱干等"的落点。三条里程碑之间隔着几十分钟,而写它们的
+// 是一个随时可能连同容器一起消失的一次性进程 —— 所以这里验的是**追加**语义本身:
+// 覆盖、丢行、或者被修剪掉最新的那条,症状都是"中间那步没消息",与从没写过一模一样。
+test("里程碑:一行一条,追加不覆盖 —— 中间那条丢了就等于没播", () => {
+  withDir((dir) => {
+    const file = join(dir, "progress.jsonl");
+    inLib(
+      dir,
+      `export CATMAN_DEPLOY_PROGRESS_FILE="${file}"; ` +
+        `progress_write run1-switched switched abc123 "起来了" 1 "wechat:a:u1" >/dev/null; ` +
+        `progress_write run1-stable stable abc123 "转稳定了" 1 "wechat:a:u1" >/dev/null`,
+    );
+    const lines = readFileSync(file, "utf8").trim().split("\n");
+    assert.equal(lines.length, 2, "第二条不能把第一条冲掉");
+    const first = JSON.parse(lines[0]!);
+    assert.equal(first.stage, "switched");
+    assert.equal(first.sha, "abc123");
+    assert.equal(first.ok, true);
+    assert.equal(first.requestedBy, "wechat:a:u1");
+    assert.match(first.at, /^\d{4}-\d{2}-\d{2}T/, "时间戳要能被 Date.parse 读懂");
+    assert.equal(JSON.parse(lines[1]!).stage, "stable");
+  });
+});
+
+test("里程碑:推远端失败写 ok=false —— 「本地上线了但远端没有」下次开工会踩到", () => {
+  withDir((dir) => {
+    const file = join(dir, "progress.jsonl");
+    inLib(
+      dir,
+      `export CATMAN_DEPLOY_PROGRESS_FILE="${file}"; ` +
+        `progress_write run1-pushed pushed abc123 "推 main 失败:非快进" 0 "" >/dev/null`,
+    );
+    const rec = JSON.parse(readFileSync(file, "utf8").trim());
+    assert.equal(rec.ok, false);
+    assert.equal("requestedBy" in rec, false, "没有发起人时不写这个字段");
+  });
+});
+
+test("里程碑:修剪只砍最老的几条 —— 砍掉最新的等于把刚发生的事丢了", () => {
+  withDir((dir) => {
+    const file = join(dir, "progress.jsonl");
+    inLib(
+      dir,
+      `export CATMAN_DEPLOY_PROGRESS_FILE="${file}"; export CATMAN_DEPLOY_PROGRESS_KEEP=3; ` +
+        `for i in 1 2 3 4 5; do progress_write "run$i" switched abc123 "第 $i 条" 1 "" >/dev/null; done`,
+    );
+    const ids = readFileSync(file, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l).id);
+    assert.deepEqual(ids, ["run3", "run4", "run5"]);
+  });
+});
+
 test("锁:被占着时拒绝第二次获取", () => {
   withDir((dir) => {
     assert.throws(() => inLib(dir, `lock_acquire first; lock_acquire second`));
@@ -881,6 +936,39 @@ function deployerFn(name: string): string {
   const next = rest.search(/\ndo_[a-z_]+\(\) \{/);
   return next < 0 ? rest : rest.slice(0, next);
 }
+
+test("三条里程碑各在它该在的位置上 —— 早一步就是在报一件还没发生的事", () => {
+  const fn = deployerFn("do_deploy");
+  const health = fn.indexOf("await_health");
+  const switched = fn.indexOf("milestone switched");
+  const bake = fn.indexOf("bake ");
+  const stableSet = fn.indexOf("pointer_set stable");
+  const stableMs = fn.indexOf("milestone stable");
+  const push = fn.indexOf("push_upstream");
+  const pushMs = fn.indexOf("milestone pushed");
+
+  for (const [what, i] of [
+    ["switched", switched],
+    ["stable", stableMs],
+    ["pushed", pushMs],
+  ] as const) {
+    assert.ok(i > 0, `do_deploy 里没有 milestone ${what}`);
+  }
+  // 切换那条必须在健康门**之后**、观察期之前:门没过就播"已切到新版本",而下一步
+  // 恰恰是回滚 —— 用户收到的是一条与结局相反的消息。
+  assert.ok(health < switched && switched < bake, "switched 要夹在健康门与观察期之间");
+  // 转稳定那条必须在指针真的前移之后 —— 它说的就是"从现在起回滚回得去这个版本"。
+  assert.ok(stableSet < stableMs, "stable 要在 pointer_set stable 之后");
+  assert.ok(push < pushMs, "pushed 要在 push_upstream 之后(它播的是那次推送的结果)");
+});
+
+test("失败的路径不写里程碑 —— 失败的结局归报告,里程碑只记站住了的事实", () => {
+  // 两者混在一起的话,用户会先收到一条"已切到 xxx",再收到一条"已回滚",
+  // 而中间那条本就不该发出去:切换成功但整件事失败了,他要的是结论。
+  for (const name of ["do_rollback", "do_demote", "do_courier_fallback", "do_drill"]) {
+    assert.equal(deployerFn(name).includes("milestone "), false, `${name} 里不该有 milestone`);
+  }
+});
 
 test("**demote 绝不写 stable** —— 指针单主,它只许 deployer 在观察期后前移", () => {
   // 看门狗的判据(容器重启了几次)远弱于观察期。让它写 stable,等于允许一次误判

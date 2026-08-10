@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { readJsonFile } from "./file-store.js";
 import { DeployReports, type DeployReport } from "./deploy-report.js";
+import { DeployProgressLog, type DeployProgress } from "./deploy-progress.js";
 import {
   listPreparedReleases,
   resolveShaPrefix,
@@ -30,6 +31,16 @@ import { shortSha } from "./version.js";
 
 /** verified-history.json 的契约版本。 */
 export const VERIFIED_HISTORY_SCHEMA = 1;
+
+/**
+ * 超过这个岁数的里程碑不再补播。
+ *
+ * 进度文件是追加的,所以里面永远躺着上几次部署的记录。回退到一个还没播过这些
+ * 里程碑的旧版本时,它会把几天前的"已切到 xxx"当新消息播出来 —— 用户那边看起来
+ * 就是"我什么都没干,它说它部署了"。一天足够覆盖任何一次正常部署(30 分钟观察期
+ * 加上人不在场的那几小时),又短到不会翻旧账。
+ */
+const PROGRESS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 /** 一个通过了观察期的 release。回滚就是在这张单子上往回走。 */
 export interface VerifiedRelease {
@@ -80,6 +91,14 @@ export interface DeployControl {
   /** 待播报的报告(尚未标记已读)。 */
   pendingReport(): DeployReport | undefined;
   markReportAnnounced(id: string): void;
+  /**
+   * 待播报的里程碑(切换成功 / 转稳定 / 推远端),旧→新。
+   *
+   * 与报告分开:报告是结局、只有一条且写在最后,里程碑是过程中那几个已经站住的事实。
+   * 用户要的是"别让我对着三十分钟的黑箱等",光有结局给不了这个。
+   */
+  pendingProgress(): readonly DeployProgress[];
+  markProgressAnnounced(id: string): void;
   /** 最近一次报告,不论播报过没有。供 `/升级状态`。 */
   lastReport(): DeployReport | undefined;
   /** 可回退的版本,新→旧。 */
@@ -99,6 +118,14 @@ export interface ScriptDeployControlOptions {
   reportPath: string;
   /** 已播报标记,catman 自己写(必须在 catman 可写区)。 */
   seenPath: string;
+  /**
+   * deployer 追加的里程碑(如 /data/deploy/progress.jsonl)与它的已播报标记。
+   *
+   * **两个都可选**:里程碑由 deployer 写,而 deployer 属 Tier 3 —— 这台机器上固化的
+   * 那份可能还不会写它。缺席时就是"没有里程碑可播",报告照旧,不影响任何既有行为。
+   */
+  progressPath?: string | undefined;
+  progressSeenPath?: string | undefined;
   /** release 目录(只读)。`/发布` 的候选就是从这里枚举的。 */
   releasesDir: string;
   /** deployer 写的已验证版本清单(如 /data/releases/verified-history.json)。 */
@@ -127,9 +154,14 @@ export interface ScriptDeployControlOptions {
  */
 export class ScriptDeployControl implements DeployControl {
   private readonly reports: DeployReports;
+  private readonly progress: DeployProgressLog | undefined;
 
   constructor(private readonly opts: ScriptDeployControlOptions) {
     this.reports = new DeployReports(opts.reportPath, opts.seenPath);
+    this.progress =
+      opts.progressPath && opts.progressSeenPath
+        ? new DeployProgressLog(opts.progressPath, opts.progressSeenPath)
+        : undefined;
   }
 
   publishable(): readonly PublishCandidate[] {
@@ -179,8 +211,8 @@ export class ScriptDeployControl implements DeployControl {
     ]);
     return (
       `已提交部署 ${shortSha(target.sha)}${target.branch ? `(${target.branch})` : ""}。\n` +
-      "接下来是自检 → 切换 → 30 分钟观察期,期间我会被停掉换版本、失联几分钟。\n" +
-      "任何一步没过都会自动退回原来的版本。换完之后你发条消息,我把结果告诉你。"
+      "接下来是自检 → 切换 → 30 分钟观察期 → 转稳定 → 推远端,期间我会被停掉换版本、失联几分钟。\n" +
+      "任何一步没过都会自动退回原来的版本。**每过一关我都主动发消息告诉你**,不用一直等着问。"
     );
   }
 
@@ -198,7 +230,7 @@ export class ScriptDeployControl implements DeployControl {
     await spawnRunner(this.opts.runnerPath, ["rollback", "--requested-by", requestedBy]);
     return (
       `已请求回滚到 ${shortSha(target.sha)}(${target.verifiedAt || "时间未知"})。\n` +
-      "我这就要被停掉换版本了,这段时间会失联几分钟;换完之后你发条消息,我会把结果告诉你。"
+      "我这就要被停掉换版本了,这段时间会失联几分钟;换完之后我主动把结果发给你。"
     );
   }
 
@@ -208,6 +240,14 @@ export class ScriptDeployControl implements DeployControl {
 
   markReportAnnounced(id: string): void {
     this.reports.markAnnounced(id);
+  }
+
+  pendingProgress(): readonly DeployProgress[] {
+    return this.progress?.pending(PROGRESS_MAX_AGE_MS) ?? [];
+  }
+
+  markProgressAnnounced(id: string): void {
+    this.progress?.markAnnounced(id);
   }
 
   lastReport(): DeployReport | undefined {

@@ -100,6 +100,55 @@ json_write() { # json_write <file> <json字符串>
   ' "$file" "$payload"
 }
 
+# ── 里程碑:一行一条,追加不覆盖 ───────────────────────────────────
+# 契约与读取端见 src/core/deploy-progress.ts。这里只讲写法上的两个决定:
+#
+# ① **追加而不是覆盖**。三条里程碑之间隔着几十分钟(观察期),而 catman 每 15 秒
+#    才去看一眼 —— 覆盖式的单文件会让它错过中间那条,而那条恰恰是"切换成功了"。
+# ② **不写失败**。失败的结局归 report.json:它要说清"你要的改动没上线"。
+#    里程碑只记已经站住、不会再撤销的事实。唯一的例外是推远端失败(ok=false):
+#    那件事不影响本次上线,但下次开工会踩到(远端没有这个提交)。
+#
+# 文件只保留最近若干行:它是追加的,不修剪的话几年后是一份没人读得动的流水账,
+# 而读者(catman)每 15 秒整份读一遍。
+progress_write() { # progress_write <id> <stage> <sha> <detail> [ok] [requestedBy]
+  local id="$1" stage="$2" sha="$3" detail="$4" ok="${5:-1}" by="${6:-}"
+  # 路径**在调用时**取而不是 source 时定住:上面那些 XXX_FILE 都是在 source 时算的,
+  # 于是"先 source 再改环境变量"这种用法(单测就是这么跑的)会静默写到真实的
+  # /data/deploy 去。这个函数每次部署只调三回,现算的开销可以忽略。
+  local file="${CATMAN_DEPLOY_PROGRESS_FILE:-$DEPLOY_DIR/progress.jsonl}"
+  local keep="${CATMAN_DEPLOY_PROGRESS_KEEP:-100}"
+  node -e '
+    const fs = require("fs"), path = require("path");
+    const [file, keepRaw, id, stage, sha, detail, ok, requestedBy] = process.argv.slice(1);
+    const line = JSON.stringify({
+      schema: 1,
+      id, stage, sha,
+      at: new Date().toISOString(),
+      detail,
+      ok: ok !== "0",
+      ...(requestedBy ? { requestedBy } : {}),
+    });
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    // 先追加再修剪:反过来的话,修剪与追加之间进程被杀掉就把这一条弄丢了,
+    // 而这个脚本正是那个"随时可能连同容器一起消失"的一次性进程。
+    fs.appendFileSync(file, line + "\n");
+    // 修剪写成 if 而不是提前 return:`node -e` 的代码在 node 22 里走 TS 解析器,
+    // **顶层 return 直接是语法错**(报的还是一句看不出所以然的 Invalid token)。
+    let lines = [];
+    try {
+      lines = fs.readFileSync(file, "utf8").split("\n").filter((l) => l.trim());
+    } catch { lines = []; }
+    const keep = Number(keepRaw);
+    if (lines.length > keep) {
+      const tmp = file + ".tmp";
+      fs.writeFileSync(tmp, lines.slice(-keep).join("\n") + "\n");
+      fs.renameSync(tmp, file);
+    }
+  ' "$file" "$keep" "$id" "$stage" "$sha" "$detail" "$ok" "$by"
+  log "里程碑:$stage $sha"
+}
+
 # ── git:接受属主不同的仓库 ─────────────────────────────────────────
 # `/data/src/catman` 归 catman(10001)所有 —— agent 在上面开分支干活;而制备跑在
 # deployer(10002)下。属主一不同,git 就以 "detected dubious ownership" 拒绝打开它,
@@ -615,15 +664,27 @@ tier_report() { # tier_report <base-ref> <head-ref>
 # **失败只记日志,绝不反过来判部署失败** —— 版本已经在跑了,远端没跟上是另一件事,
 # 而且多半是"有人在 GitHub 上也提交了",要人来合。同理**绝不 --force**:
 # 这把密钥能改写远端历史是最不该发生的事,而快进失败正是它该失败的样子。
+#
+# 结果**也要说给人听**:调用方读 `PUSH_OK` / `PUSH_DETAIL` 写一条里程碑。
+# "本地上线了但远端没有"是个下次开工才会踩到的事实(再从远端拉一次就把它拉丢了),
+# 只躺在 deployer 的容器日志里等于没人知道。
+PUSH_OK=0
+PUSH_DETAIL=""
 push_upstream() { # push_upstream <sha>
   local sha="$1"
   local dir="$RELEASES_DIR/$sha"
   local url branch out
+  PUSH_OK=0
+  PUSH_DETAIL=""
   git_trust_repo "$SRC_DIR"
   url="$(git -C "$SRC_DIR" remote get-url origin 2>/dev/null || true)"
   case "$url" in
-    "") log "push:源码仓库没有 origin,跳过"; return 0 ;;
-    /* | ./* | ../*) log "push:origin 是本地路径($url),跳过"; return 0 ;;
+    "")
+      PUSH_DETAIL="源码仓库没有 origin,这次上线不会记录到远端。"
+      log "push:源码仓库没有 origin,跳过"; return 0 ;;
+    /* | ./* | ../*)
+      PUSH_DETAIL="origin 是本地路径,这次上线不会记录到远端。"
+      log "push:origin 是本地路径($url),跳过"; return 0 ;;
   esac
   branch="$(json_get "$dir/VERSION" 'd.branch')"
   # detached 制备(prepare 传的是裸 sha)时 branch 是 "HEAD" 或空,那就推主线:
@@ -634,6 +695,7 @@ push_upstream() { # push_upstream <sha>
   case "$url" in
     *ssh://* | *@*:*)
       if [ -z "$(push_key_path)" ]; then
+        PUSH_DETAIL="deployer 侧没有可写密钥,这次上线不会记录到远端。"
         log "push:没有可读的可写密钥(deployer 侧),跳过 —— 远端不会记录这次上线"
         return 0
       fi
@@ -641,8 +703,12 @@ push_upstream() { # push_upstream <sha>
   esac
   git_ssh_env
   if out="$(git -C "$dir" push "$url" "$sha:refs/heads/$branch" 2>&1)"; then
+    PUSH_OK=1
+    PUSH_DETAIL="分支 $branch 已指向这个提交。"
     log "push:${sha:0:7} → $branch"
   else
+    # 只留末尾一段:git 的失败输出前面多半是无关的提示,原因在最后。
+    PUSH_DETAIL="推 $branch 失败:$(echo "$out" | tr '\n' ' ' | tail -c 200)"
     log "push 失败(不影响本次部署,版本已经在跑了):$(echo "$out" | tr '\n' ' ')"
   fi
   return 0
