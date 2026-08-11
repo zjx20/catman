@@ -38,20 +38,23 @@ DOCKER_GID="${DOCKER_GID:-$(stat -c '%g' "$DOCKER_SOCK" 2>/dev/null || echo 0)}"
 # 跑的必须是**固化过的**那份 deployer,不是当前 release 里的那份。理由见 bless.sh:
 # 门禁和逃生门是同一把锁,不能让一次改坏了部署逻辑的进化把它们一起毁掉。
 DEPLOYER_IN_CONTAINER="$DEPLOY_DIR/bin/deployer.sh"
-# ⚠️ 检查**容器内**看得见的那份,不要拿宿主路径去 `-f`。
+# ⚠️ 「固化了没有」要看**两个视角**,任何一边证实存在就够 —— 它们指的是同一个文件
+# (deployer 容器将要执行的那份),只是这个脚本可能跑在两种地方,各自只看得见一边:
 #
-# 这个脚本跑在 catman 容器里,而宿主路径在这里通常根本解不开:真机上
-# `/opt/services/catman/data` 是一条指向 `/mnt/usb/catman_data` 的软链,容器挂了
-# `/opt/services` 却没挂 `/mnt/usb` —— 链接断在容器内,判断为假,于是**每一次
-# `/发布` 都在这一行 exit 1**。而 catman 起它时用的是 `stdio: "ignore"`,这句话
-# 谁也看不见:用户收到"已提交部署",容器没起、报告没变、日志一片安静。
+# **容器内**(catman 的 /发布、rescue 的 demote)看 `$DEPLOY_DIR`:宿主路径在容器里
+# 通常根本解不开 —— 真机上 `/opt/services/catman/data` 是一条指向
+# `/mnt/usb/catman_data` 的软链,容器挂了 `/opt/services` 却没挂 `/mnt/usb`,
+# 链接断在容器内,只认宿主路径就会**每一次 `/发布` 都在这里 exit 1**。而 catman
+# 起它时用的是 `stdio: "ignore"`,这句话谁也看不见:用户收到"已提交部署",
+# 容器没起、报告没变、日志一片安静。(以前没暴露,是因为部署都由人在宿主上发起。)
 #
-# 以前没暴露,是因为部署都由人在宿主上手动发起 —— 那边 `/mnt/usb` 真实存在。
-# 第一次由容器里的 `/发布` 发起就撞上了。
+# **宿主上**(init.sh 指引的首次部署、人工救援)看 `$CATMAN_HOST_DATA_DIR`:宿主没有
+# `/data`,只认容器内路径就会让固化副本对着自己报「还没固化」,首次部署当场卡死。
+# 开发机上的测试与宿主是同一种处境,test/evolve-lib.test.ts 的「固化链路」用例钉着这条。
 #
-# 宿主路径对不对这件事**在容器内本来就验不了**,别假装能验:它错了的话
-# `docker run -v` 会挂上一个空目录,deployer 立刻失败并写进部署报告,那是看得见的。
-[ -f "$DEPLOYER_IN_CONTAINER" ] || {
+# 两边都没有才是真没固化。误放行的代价有兜底:宿主路径错了的话 `docker run -v`
+# 挂上的是空目录,deployer 立刻失败并写进部署报告,那是看得见的。
+[ -f "$DEPLOYER_IN_CONTAINER" ] || [ -f "${HOST_DATA_DIR%/}/deploy/bin/deployer.sh" ] || {
   echo "部署机制还没固化 —— 先在宿主上跑一次:" >&2
   echo "  CATMAN_HOST_DATA_DIR=$HOST_DATA_DIR scripts/evolve/bless.sh" >&2
   exit 1
