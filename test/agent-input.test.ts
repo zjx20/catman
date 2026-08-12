@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { InputChannel, buildUserMessage, joinReplyTexts } from "../src/core/agent.js";
+import { InputChannel, ProgressFan, buildUserMessage, joinReplyTexts } from "../src/core/agent.js";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
 /**
@@ -88,4 +88,51 @@ test("失败回合的空正文不能说成「没有返回内容」", () => {
   assert.match(joinReplyTexts([], true), /回合失败/);
   assert.equal(joinReplyTexts([], false), "(助手没有返回内容)");
   assert.match(joinReplyTexts(["   "], true), /回合失败/, "只有空白也算没给详情");
+});
+
+// ── 内容块 → 进度事件 ────────────────────────────────────────────
+// 助手中途说的话也推给用户(大多数时候它埋头调工具,偶尔开口那几句最能看出它在
+// 怎么干活)。难点只有一个:**最终答复也是一个 text 块**,原样透出去用户会收到
+// 两遍同一句话 —— 一遍当进度、一遍当正文。
+
+test("中途说的话推出去,最后那句留给正文 —— 不能同一句话收两遍", () => {
+  const fan = new ProgressFan();
+  // 一条消息里:先说一句,再调工具。那句话后面有动静,所以它是"中途说的"。
+  const first = fan.take([
+    { type: "text", text: "先看看日志" },
+    { type: "tool_use", name: "Bash", input: { command: "tail log" } },
+  ]);
+  assert.deepEqual(
+    first.map((e) => e.kind),
+    ["text", "tool"],
+    "顺序要保住:先说的先出去",
+  );
+
+  // 最后一条消息只有一个 text —— 那就是答复,一个事件都不该出来。
+  assert.deepEqual(fan.take([{ type: "text", text: "查完了,是磁盘满了" }]), []);
+});
+
+test("跨消息也算数:上一条消息末尾那句话,由下一条消息放它出去", () => {
+  // 真实形态就是这样 —— 助手说一句、停下来调工具是两条 assistant 消息。
+  const fan = new ProgressFan();
+  assert.deepEqual(fan.take([{ type: "text", text: "我先查一下" }]), [], "还不知道它是不是答复");
+  const next = fan.take([{ type: "tool_use", name: "Read", input: {} }]);
+  assert.deepEqual(next[0], { kind: "text", text: "我先查一下" }, "下一条消息一来它就确定了");
+  assert.equal(next[1]?.kind, "tool");
+});
+
+test("连着说两句:前一句放出去,后一句继续攒着", () => {
+  const fan = new ProgressFan();
+  fan.take([{ type: "text", text: "第一句" }]);
+  const out = fan.take([{ type: "text", text: "第二句" }]);
+  assert.deepEqual(out, [{ kind: "text", text: "第一句" }]);
+});
+
+test("空白的块一概不出事件 —— 空的 💭 / 💬 是纯噪音", () => {
+  const fan = new ProgressFan();
+  assert.deepEqual(fan.take([{ type: "text", text: "   " }, { type: "thinking", thinking: "" }]), []);
+  // 攒着的那个也不该被空块顶出来。
+  assert.deepEqual(fan.take([{ type: "tool_use", name: "Bash", input: {} }]), [
+    { kind: "tool", name: "Bash", input: {} },
+  ]);
 });

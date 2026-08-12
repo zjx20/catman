@@ -170,10 +170,12 @@ export function formatProgress(ev: AgentProgressEvent, skipped = 0): string {
   const body =
     ev.kind === "thinking"
       ? `💭 ${truncate(ev.text.trim(), PROGRESS_MAX_CHARS)}`
-      : (() => {
-          const summary = truncate(summarizeToolInput(ev.input), PROGRESS_MAX_CHARS);
-          return summary ? `🔧 ${ev.name}: ${summary}` : `🔧 ${ev.name}`;
-        })();
+      : ev.kind === "text"
+        ? `💬 ${truncate(ev.text.trim(), PROGRESS_MAX_CHARS)}`
+        : (() => {
+            const summary = truncate(summarizeToolInput(ev.input), PROGRESS_MAX_CHARS);
+            return summary ? `🔧 ${ev.name}: ${summary}` : `🔧 ${ev.name}`;
+          })();
   return skipped ? `${body}(+${skipped} 步)` : body;
 }
 

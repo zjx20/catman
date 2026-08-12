@@ -30,7 +30,66 @@ export interface AgentReply {
 /** 一次回合中的中间过程事件,供上层向用户透出进度。 */
 export type AgentProgressEvent =
   | { kind: "thinking"; text: string }
+  /**
+   * 助手**中途**说的话(不是最终答复)。
+   *
+   * "中途"这个限定是硬的:最终答复本身也是一个 text 块,原样透出去的话用户会
+   * 收到两遍同一句话 —— 一遍当进度、一遍当正文。所以 text 块**延后一拍**发:
+   * 只有当后面还有别的动作(又一个 text、思考、或工具调用)时,前一个 text 才
+   * 确定不是答复,这时才把它交出去。回合结束时手上那个一律丢掉。
+   */
+  | { kind: "text"; text: string }
   | { kind: "tool"; name: string; input: unknown };
+
+/** SDK 内容块里我们认得的那几样。只声明用得上的字段,免得跟着 SDK 的类型走。 */
+export interface ContentBlockLike {
+  readonly type: string;
+  readonly thinking?: string;
+  readonly text?: string;
+  readonly name?: string;
+  readonly input?: unknown;
+}
+
+/**
+ * 内容块 → 进度事件。**存在的理由只有一条:text 块要延后一拍。**
+ *
+ * 最终答复本身也是一个 text 块,当场透出去用户就会收到两遍同一句话 ——
+ * 一遍当进度、一遍当正文。而"这个 text 是不是最终答复"只有看它后面还有没有动静
+ * 才知道:后面又来了块,它就是中途说的话;回合结束时它还攒着,它就是答复。
+ *
+ * 单独拎出来是为了能测 —— `query()` 是直接 import 的,那个循环没法在单测里驱动。
+ */
+export class ProgressFan {
+  private pending: AgentProgressEvent | undefined;
+
+  /** 交一条 assistant 消息的内容块进来,拿回**此刻**该推出去的事件(按序)。 */
+  take(blocks: readonly ContentBlockLike[]): AgentProgressEvent[] {
+    const out: AgentProgressEvent[] = [];
+    for (const block of blocks) {
+      // display 未生效或被覆盖时 thinking 可能为空串,跳过以免发出空的 💭 消息。
+      const ev: AgentProgressEvent | undefined =
+        block.type === "thinking" && block.thinking?.trim()
+          ? { kind: "thinking", text: block.thinking }
+          : block.type === "tool_use" && block.name
+            ? { kind: "tool", name: block.name, input: block.input }
+            : block.type === "text" && block.text?.trim()
+              ? { kind: "text", text: block.text }
+              : undefined;
+      if (!ev) continue;
+      // 后面来了动静,攒着的那个就确定不是答复了 —— 按原顺序先放它出去。
+      if (this.pending) {
+        out.push(this.pending);
+        this.pending = undefined;
+      }
+      if (ev.kind === "text") {
+        this.pending = ev;
+        continue;
+      }
+      out.push(ev);
+    }
+    return out;
+  }
+}
 
 /**
  * 往**正在跑的**回合里追加一批输入。回合已收摊则返回 false。
@@ -256,6 +315,8 @@ export class Agent {
     let steps = 0;
     let lastAt = startedAt;
     let lastStep: string | undefined;
+    // 内容块 → 进度事件。它替我们攒着最后那个 text 块(见 ProgressFan)。
+    const fan = new ProgressFan();
     const heartbeat =
       HEARTBEAT_MS > 0
         ? setInterval(() => {
@@ -283,15 +344,9 @@ export class Agent {
         lastAt = Date.now();
 
         if (message.type === "assistant") {
-          for (const block of message.message.content) {
-            // display 未生效或被覆盖时 thinking 可能为空串,跳过以免发出空的 💭 消息。
-            const ev: AgentProgressEvent | undefined =
-              block.type === "thinking" && block.thinking.trim()
-                ? { kind: "thinking", text: block.thinking }
-                : block.type === "tool_use"
-                  ? { kind: "tool", name: block.name, input: block.input }
-                  : undefined;
-            if (!ev) continue;
+          // 攒着的那个 text 块留在 fan 里,回合结束时随它一起丢掉 ——
+          // 那就是最终答复,它会走正文那条路。
+          for (const ev of fan.take(message.message.content)) {
             steps += 1;
             lastStep = describeProgress(ev);
             opts.onProgress?.(ev);

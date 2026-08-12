@@ -668,6 +668,37 @@ tier_report() { # tier_report <base-ref> <head-ref>
 # 结果**也要说给人听**:调用方读 `PUSH_OK` / `PUSH_DETAIL` 写一条里程碑。
 # "本地上线了但远端没有"是个下次开工才会踩到的事实(再从远端拉一次就把它拉丢了),
 # 只躺在 deployer 的容器日志里等于没人知道。
+# 推成功之后,把制备时用的那个本地临时分支删掉。
+#
+# 它的内容此刻已经在远端的主线上了,留着只会让下次开工时 `git branch` 里堆一排
+# 早就上线过的 evolve/*,而人还得逐个回想哪些能删。
+#
+# 四道闸,少一道都可能删掉不该删的东西:
+#   ① 只删 `evolve/` 开头的 —— main 与人手工开的分支一概不碰;
+#   ② 当前检出的那个不删(那会让工作区落到 detached HEAD 上);
+#   ③ **必须确认它的尖端已经包含在这次上线的提交里**(merge-base --is-ancestor)。
+#      这是唯一真正的安全依据:分支上还有没合进来的提交时,这一步会拦下来。
+#   ④ 删不掉只记一行日志,绝不影响部署结论 —— 部署早就成功了。
+drop_prepared_branch() { # drop_prepared_branch <branch> <sha>
+  local branch="$1" sha="$2" current
+  case "$branch" in evolve/*) ;; *) return 0 ;; esac
+  git_trust_repo "$SRC_DIR"
+  current="$(git -C "$SRC_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [ "$branch" = "$current" ] && { log "push:$branch 是当前检出的分支,不删"; return 0; }
+  git -C "$SRC_DIR" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null || return 0
+  if ! git -C "$SRC_DIR" merge-base --is-ancestor "$branch" "$sha" 2>/dev/null; then
+    log "push:$branch 上还有没上线的提交,不删"
+    return 0
+  fi
+  # -D 而不是 -d:安全性由上面那道 is-ancestor 保证,而 -d 判的是"合进当前 HEAD 没有",
+  # 那取决于 SRC_DIR 此刻检出的是什么,与我们要问的问题不是一回事。
+  if git -C "$SRC_DIR" branch -D "$branch" >/dev/null 2>&1; then
+    log "push:本地分支 $branch 已删(内容都在 ${sha:0:7} 里)"
+  else
+    log "push:本地分支 $branch 没删掉,留着不影响什么"
+  fi
+}
+
 PUSH_OK=0
 PUSH_DETAIL=""
 push_upstream() { # push_upstream <sha>
@@ -686,10 +717,19 @@ push_upstream() { # push_upstream <sha>
       PUSH_DETAIL="origin 是本地路径,这次上线不会记录到远端。"
       log "push:origin 是本地路径($url),跳过"; return 0 ;;
   esac
-  branch="$(json_get "$dir/VERSION" 'd.branch')"
-  # detached 制备(prepare 传的是裸 sha)时 branch 是 "HEAD" 或空,那就推主线:
-  # 走到这一步的提交已经上线并过了观察期,主线本就该是它。
-  case "$branch" in "" | HEAD) branch="${CATMAN_UPSTREAM_BRANCH:-main}" ;; esac
+  # **一律推主线,不管这个 release 是在哪个分支上制备的。**
+  #
+  # 从前推的是 VERSION 里记的那个分支名,于是自我进化的常规流程(开 evolve/xxx →
+  # 制备 → ff-merge 回 main → 删掉本地分支)会把每一次上线都推到一个**临时分支**上,
+  # main 反而长期停在很早以前。真机上攒出过 5 个提交的差距,远端还多了一堆
+  # evolve/* 残骸 —— 而人正是靠远端的 main 判断"线上现在是什么"。
+  #
+  # 走到这一步的提交已经上线、过了观察期,主线本就该是它。快进不了(有人在 GitHub
+  # 上也提交了)就失败,由下面那段如实报出来 —— 绝不 --force。
+  branch="${CATMAN_UPSTREAM_BRANCH:-main}"
+  # 制备时所在的分支只用来做一件事:推成功之后把本地那个临时分支删掉(见下)。
+  local prepared_on
+  prepared_on="$(json_get "$dir/VERSION" 'd.branch')"
   # 先说清"有没有钥匙"。没有这一句的话,没配可写密钥的机器上每次部署都会在这里
   # 甩一段 ssh 的 Permission denied,看起来像部署出了问题,其实只是没打算推远端。
   case "$url" in
@@ -706,6 +746,7 @@ push_upstream() { # push_upstream <sha>
     PUSH_OK=1
     PUSH_DETAIL="分支 $branch 已指向这个提交。"
     log "push:${sha:0:7} → $branch"
+    drop_prepared_branch "$prepared_on" "$sha"
   else
     # 只留末尾一段:git 的失败输出前面多半是无关的提示,原因在最后。
     PUSH_DETAIL="推 $branch 失败:$(echo "$out" | tr '\n' ' ' | tail -c 200)"

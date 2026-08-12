@@ -98,6 +98,9 @@ export function summarizeToolInput(input: unknown): string {
 /** 进度事件的单行描述。心跳与 /状态 都用它,保证"最后一步"到处是同一句话。 */
 export function describeProgress(ev: AgentProgressEvent): string {
   if (ev.kind === "thinking") return `💭 ${cut(ev.text, 60)}`;
+  // 💬 与 💭 分开:一个是它想的,一个是它说的。混成同一个符号之后,
+  // "它在琢磨"和"它在跟你交代"就分不出来了,而那两件事的意味完全不同。
+  if (ev.kind === "text") return `💬 ${cut(ev.text, 60)}`;
   const summary = cut(summarizeToolInput(ev.input), 60);
   return summary ? `🔧 ${ev.name}: ${summary}` : `🔧 ${ev.name}`;
 }

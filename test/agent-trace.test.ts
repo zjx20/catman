@@ -188,6 +188,9 @@ test("describeProgress:用户看到的步骤与日志里的是同一句", () => 
   assert.equal(describeProgress({ kind: "tool", name: "Foo", input: {} }), "🔧 Foo: {}");
   assert.equal(describeProgress({ kind: "thinking", text: "在想" }), "💭 在想");
   assert.ok(describeProgress({ kind: "thinking", text: "x".repeat(500) }).endsWith("…"));
+  // 💬 与 💭 分开:一个是它说的,一个是它想的。混成同一个符号就分不出
+  // "在琢磨"和"在跟你交代",而那两件事的意味完全不同。
+  assert.equal(describeProgress({ kind: "text", text: "先看看日志" }), "💬 先看看日志");
 });
 
 test("summarizeToolInput 挑代表性字段,挑不出就退到 JSON", () => {

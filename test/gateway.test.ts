@@ -528,6 +528,11 @@ test("formatProgress:超长内容截断,工具入参挑代表性字段", () => {
     "🔧 Read: /etc/hosts",
   );
   assert.equal(formatProgress({ kind: "tool", name: "Foo", input: { n: 1 } }), '🔧 Foo: {"n":1}');
+  // 中途说的话也推给用户 —— 大多数时候它埋头调工具,偶尔开口那几句正是最能
+  // 看出它在怎么干活的地方。前缀与 describeProgress 必须一致,两处各写各的就会
+  // 出现"/状态 里是 💬,推送里是别的"。
+  assert.equal(formatProgress({ kind: "text", text: "先看看日志" }), "💬 先看看日志");
+  assert.equal(formatProgress({ kind: "text", text: long }), `💬 ${"x".repeat(200)}…`);
 });
 
 /** 造一个工具事件,名字带序号便于断言"发出去的是最新那条"。 */
