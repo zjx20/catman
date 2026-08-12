@@ -200,8 +200,16 @@ export const PROGRESS_INTERVALS_MS = [5_000, 15_000, 30_000, 60_000];
  * 这个概念)就**不设总量上限** —— 那时唯一的节流是下面的间隔阶梯,而那是对的。
  */
 
-/** 额度用尽时附在最后一条进度后面的交代。 */
-const PROGRESS_CAP_NOTICE = "(进度就报到这儿,接下来直接等答案)";
+/**
+ * 额度用尽时附在最后一条进度后面的交代。
+ *
+ * 后半句是**出路**而不只是说明:额度是按"这条来信"算的,用户再发一句话就重来一份,
+ * 而 `/nop` 就是那句"随便的话"(见 COMMAND_TABLE)。不给出路的话,这句交代等于
+ * 通知他"接下来只能干等" —— 长回合下那可能是好几分钟的静默。
+ */
+const PROGRESS_CAP_NOTICE =
+  `(进度就报到这儿,接下来直接等答案。` +
+  `想接着看进度就发一句 ${canonicalOf("nop")} —— 它什么也不做,只把额度续上)`;
 
 /**
  * 进度推送节流器。
@@ -950,6 +958,22 @@ export class Gateway {
         await this.trySend(userKey, this.upgradeStatusText(), "升级状态");
         return;
 
+      case "nop": {
+        // 额度在这条消息**抵达渠道**的那一刻就续上了(新 context_token),这里
+        // 只要把节流器重新开闸,并且真的发一条出去 —— 网关手里的余量是上一次
+        // 发送响应带回来的,不发就永远停留在"0",下一条进度照样被自己挡掉。
+        const fg = this.turns.foregroundFor(userKey);
+        fg?.resetProgress?.();
+        await this.trySend(
+          userKey,
+          fg
+            ? "好,额度续上了,进度接着报。"
+            : "好,什么也没做 —— 额度续上了。",
+          "续额",
+        );
+        return;
+      }
+
       case "cancel": {
         // 还在聚合窗口里的消息也算"正在处理" —— 用户看不见队列,他要取消的是
         // 刚发出去的那几条,不管它们变没变成回合。
@@ -1484,6 +1508,9 @@ export class Gateway {
     const throttle = new ProgressThrottle(this.now(), PROGRESS_INTERVALS_MS, () =>
       this.channel.progressBudget?.(userKey),
     );
+    // `/nop` 走 immediate 路径、不经过追加输入,但额度确实在它抵达时续上了 ——
+    // 挂出来让它也能开闸。挂在这里而不是 mint 时:节流器是这一轮的局部状态。
+    turn.ctx.resetProgress = () => throttle.reset(this.now());
     let progress: Promise<void> = Promise.resolve();
     // **回调无条件挂上**,progressEnabled 只决定要不要推给用户。
     // 关掉进度推送的用户同样需要 /状态 答得出"现在在干什么" —— 把观测和

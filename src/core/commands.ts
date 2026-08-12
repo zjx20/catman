@@ -30,6 +30,7 @@
 export type CommandName =
   | "help"
   | "status"
+  | "nop"
   | "newSession"
   | "cancel"
   | "continue"
@@ -103,6 +104,21 @@ export const COMMAND_TABLE: readonly CommandDef[] = [
     canonical: "/状态",
     aliases: ["/status", "/狀態"],
     desc: "看当前模型、会话空闲时长、各项生效配置(不花额度)",
+    immediate: true,
+  },
+  {
+    name: "nop",
+    canonical: "/nop",
+    aliases: ["/noop"],
+    desc: "什么也不做 —— 但这条消息本身会把微信那边的发送额度续上,进度停住时发它(不花额度)",
+    // 续额靠的不是这条指令做了什么,而是**这条消息存在**:iLink 的每条来信都带来
+    // 新的 context_token,信使那边的计数随之归零(见 courier/reply-store.ts)。
+    // 所以它的实现只有两件事:重置进度节流器、回一句"续上了"。两件都幂等,
+    // 符合 immediate 的约束 —— 而 immediate 正是它需要的:额度耗尽最常发生在
+    // 长回合跑到一半,那时队列里的消息还轮不到。
+    //
+    // 刻意**不是 adminOnly**:任何用户都可能撞上额度耗尽,而进度的最后一条会把
+    // 这个口令直接告诉他。
     immediate: true,
   },
   {

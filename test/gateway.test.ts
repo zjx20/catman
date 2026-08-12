@@ -579,6 +579,26 @@ test("进度节流:总条数封顶用的是**渠道现报**的余量,不是自�
   // 最后一条要交代"后面没了" —— 否则长回合里那段几分钟的静默与卡死无从分辨。
   assert.ok(texts.at(-1)!.includes("进度就报到这儿"), `缺少收尾交代:${texts.at(-1)}`);
   assert.ok(!texts.at(-2)!.includes("进度就报到这儿"), "只有最后一条该带交代");
+  // 而且要给出路:额度是按"这条来信"算的,再发一句话就重来一份,/nop 就是那句话。
+  // 只说"没了"不说怎么办,等于通知他接下来只能干等。
+  assert.ok(texts.at(-1)!.includes("/nop"), `收尾交代该带上续额的办法:${texts.at(-1)}`);
+});
+
+test("进度节流:开闸之后余量回来,进度接着报 —— 这是 /nop 的另一半", () => {
+  // 收尾那句让用户发 /nop 续额。额度确实在那条消息抵达时回来了,但节流器还记着
+  // "余量为 0",不开闸的话它从此一条不发 —— 用户照做了却什么也没发生,
+  // 而那句提示正是我们让他信的。
+  const t0 = 1_000_000;
+  let left = 1;
+  const th = new ProgressThrottle(t0, undefined, () => left);
+  assert.ok(th.offer(t0 + 5_000, toolEv(1)), "还剩 1 条,放行");
+  left = 0;
+  assert.equal(th.offer(t0 + 100_000, toolEv(2)), undefined, "额度用尽就闭嘴");
+
+  left = 16; // 新 context_token,信使那边的计数归零
+  th.reset(t0 + 200_000);
+  assert.equal(th.offer(t0 + 200_000, toolEv(3)), undefined, "阶梯一并重来,不会变成刷屏");
+  assert.ok(th.offer(t0 + 205_000, toolEv(4)), "满第一档之后接着报");
 });
 
 test("进度节流:渠道说不上来余量就不设总量上限 —— stdin / dashboard 没有发送预算", () => {
@@ -1996,6 +2016,35 @@ test("/取消 只中断前台,后台那些继续跑", async () => {
   fgOpen();
   open();
   await Promise.all([bg, fg]);
+});
+
+test("/nop:回合跑到一半也能续额,节流器跟着重新开闸", async () => {
+  // 它的全部作用来自"这条消息存在"(新 context_token = 新预算),而不是它做了什么。
+  // 但网关这边得配合两件事,少一件那句提示就是空头支票:重新开闸、并且真发一条 ——
+  // 手里的余量是上一次发送响应带回来的,不发就永远停在 0。
+  const { channel, agent, turns } = build(() => 1_000_000);
+  const open = stuckTurn(agent);
+  const running = channel.receive(U1, "长任务");
+  await waitUntil(() => turns.foregroundFor(U1) !== undefined, "前台回合起来了");
+
+  const ctx = turns.foregroundFor(U1)!;
+  const reopen = ctx.resetProgress;
+  assert.ok(reopen, "回合跑起来之后必须挂得出开闸的手柄");
+  let reopened = 0;
+  ctx.resetProgress = () => {
+    reopened += 1;
+    reopen();
+  };
+
+  channel.sent.length = 0;
+  await channel.receive(U1, "/nop");
+  assert.equal(reopened, 1, "额度回来了,节流器必须重新开闸");
+  assert.equal(channel.sent.length, 1, `/nop 得回一句:${JSON.stringify(channel.sent)}`);
+  assert.equal(agent.fed.length, 0, "它不是补话,不该被折进在飞回合");
+
+  open();
+  await running;
+  assert.equal(agent.calls.length, 1, "也不该另起一个回合");
 });
 
 test("/状态 交代后台还有几段在跑 —— 别处看不见它们", async () => {

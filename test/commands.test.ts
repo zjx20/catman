@@ -89,10 +89,24 @@ test("/发布 必须带得了参数 —— 那个 sha 就是确认口令本身",
 });
 
 test("日常指令一个都不能是 adminOnly —— 那会让普通用户连 /取消 都用不了", () => {
-  for (const name of ["help", "status", "cancel", "continue", "newSession", "switchSession"]) {
+  for (const name of ["help", "status", "nop", "cancel", "continue", "newSession", "switchSession"]) {
     const cmd = COMMAND_TABLE.find((c) => c.name === name);
     assert.notEqual(cmd?.adminOnly, true, `${name} 不该是 adminOnly`);
   }
+});
+
+test("/nop 由人格就地执行,而且人人可用 —— 它是额度耗尽时唯一的出路", () => {
+  // 进度的最后一条会把这个口令直接告诉用户(gateway 的 PROGRESS_CAP_NOTICE),
+  // 所以三件事都不能变:① 认得出来;② 不是 adminOnly,否则那句提示对普通用户
+  // 就是骗人的;③ immediate —— 额度耗尽最常发生在长回合跑到一半,那时队列里的
+  // 消息还轮不到,走队列等于要等它跑完,而用户想要的恰恰是"跑的过程中能看见"。
+  const parsed = parseCommand("/nop");
+  assert.equal(parsed?.cmd.name, "nop");
+  assert.equal(parsed?.cmd.adminOnly, undefined);
+  assert.equal(parsed?.cmd.immediate, true);
+  // 人格侧执行:信使把它消化掉的话,人格那边的节流器永远不知道额度回来了。
+  assert.notEqual(parsed?.cmd.where, "courier");
+  assert.equal(parseCommand("/noop")?.cmd.name, "nop");
 });
 
 test("帮助文案默认不列管理员指令,漏传 isAdmin 的后果是少显示而不是泄露", () => {
