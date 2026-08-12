@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Outbox, backlogText } from "../src/courier/outbox.js";
-import { ReplyStore, SEND_BUDGET } from "../src/courier/reply-store.js";
+import { MAX_PROGRESS_PER_TOKEN, ReplyStore, SEND_BUDGET } from "../src/courier/reply-store.js";
 import type { SendKind } from "../src/ipc/protocol.js";
 
 function withDir(fn: (dir: string) => void | Promise<void>): void | Promise<void> {
@@ -227,6 +227,36 @@ test("发件队列:积压超上限时先丢可丢的,不先丢正文", async () 
     for (let i = 0; i < 60; i++) await box.submit(U, `正文 ${i}`, "body");
     assert.ok(box.depth(U) <= 40, "要有上限,否则最不该 OOM 的进程去扛峰值");
     assert.ok(box.dropped > 0, "丢了就要记一笔");
+  });
+});
+
+test("发件队列:进度撞上限时由信使说那句「发 /nop」—— 人格不该知道预算这回事", async () => {
+  await withDir(async (dir) => {
+    const replies = new ReplyStore(join(dir, "ctx.json"));
+    replies.remember(U, "raw", "tok-1");
+    const ch = fakeChannel(replies);
+    const box = new Outbox({ replies, deliver: ch.deliver, paceMs: 5 });
+
+    // 把进度额度用光(总额还剩保留的那几条 —— 那句提示的落脚点就在里面)。
+    for (let i = 0; i < MAX_PROGRESS_PER_TOKEN; i++) await box.submit(U, `进度 ${i}`, "progress");
+    assert.equal(replies.remainingProgress(U), 0);
+    assert.ok(replies.remainingSends(U) > 0, "保留额还在");
+    assert.equal(
+      ch.sent.filter((s) => s.text.includes("/nop")).length,
+      0,
+      "还没被拒之前不该提前说",
+    );
+
+    // 再来一条进度 —— 这条会被拒,而"被拒"正是该说那句话的时刻。
+    await box.submit(U, "进度 再一条", "progress");
+    const hint = ch.sent.filter((s) => s.text.includes("/nop"));
+    assert.equal(hint.length, 1, `该说一次:${JSON.stringify(ch.sent.map((s) => s.text))}`);
+    assert.ok(hint[0]!.text.includes("进度就报到这儿"));
+    assert.equal(hint[0]!.kind, "reminder", "走保留额,不占进度的名额");
+
+    // 同一份 token 不重复说 —— 说这句话本身也花一格。
+    await box.submit(U, "进度 又一条", "progress");
+    assert.equal(ch.sent.filter((s) => s.text.includes("/nop")).length, 1, "只说一次");
   });
 });
 

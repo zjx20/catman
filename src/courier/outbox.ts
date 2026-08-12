@@ -121,8 +121,13 @@ export class Outbox {
    * 得再发一句才动 —— 而那句提示正是我们让他信的。
    */
   private readonly rekick = new Set<string>();
-  /** 已经就哪一份 context_token 说过"还有 N 条" —— 每份只说一次,不刷屏。 */
-  private readonly noticed = new Map<string, string>();
+  /**
+   * 已经就哪一份 context_token 提示过额度的事 —— 每份只说一次,不刷屏。
+   *
+   * "进度报到头了"和"还有 N 条没发"共用这一份记录:两句话结尾都是"发 /nop",
+   * 同一个 token 里说两遍就是噪音。
+   */
+  private readonly hinted = new Map<string, string>();
   /** 睡在限速里的那些,stop() 时叫醒。 */
   private waking: Array<() => void> = [];
   private running = true;
@@ -168,12 +173,23 @@ export class Outbox {
         // 发失败也要留住它 —— 这正是队列存在的理由。**但不立刻重试**:
         // 刚失败的那一下多半会再失败一次,而失败的尝试照样烧额度。
         console.warn(`[outbox] ${userKey} 直发失败,转入队列:${String(err)}`);
-        this.enqueue(userKey, text, kind);
+        await this.queueIt(userKey, text, kind);
         return;
       }
     }
+    await this.queueIt(userKey, text, kind);
+    this.kick(userKey);
+  }
+
+  /**
+   * 入队,并在该说的时候说那句"进度报到头了"。
+   *
+   * 两条路都要走这里:队列本来就非空时是直接入队,队列空着时是**直发失败之后**
+   * 入队 —— 而进度撞上限恰恰走的是后面那条(它是被渠道拒的)。
+   */
+  private async queueIt(userKey: string, text: string, kind: SendKind): Promise<void> {
     this.enqueue(userKey, text, kind);
-    if (queued) this.kick(userKey);
+    if (kind === "progress") await this.noticeProgressCapped(userKey);
   }
 
   /**
@@ -295,11 +311,34 @@ export class Outbox {
    * 每条来信都会走到这里。同一个 token 反复说 = 用剩下的额度刷屏,而不是发积压。
    */
   private async noticeBacklog(userKey: string, pending: number): Promise<void> {
-    const token = this.opts.replies.target(userKey)?.contextToken;
-    if (!token || this.noticed.get(userKey) === token) return;
-    if (this.opts.replies.remainingSends(userKey) <= 0) return;
-    this.noticed.set(userKey, token);
+    if (!this.claimHint(userKey)) return;
     await this.deliverOrDrop(userKey, backlogText(pending), "reminder");
+  }
+
+  /**
+   * 进度额度到头时说一句"后面没了,发 /nop 可以续上"。
+   *
+   * **这句话归信使说,不归人格说。** 人格那边不该知道预算这回事(那是渠道的事),
+   * 而知道预算的是这里。触发条件写成"进度**被拒**了"而不是"余量等于 1",
+   * 顺带得到一个好性质:还带着自己那份余量判断的老人格根本不会撞到这个条件
+   * (它在上限之前就收手了),于是新旧两侧不会各说一遍。
+   *
+   * 例外是罕见的抢跑:人格手里的余量落后一条时会多发一条被拒的进度,那时两边
+   * 可能各说一次。要等人格侧那份判断删掉之后才彻底没有 —— 那是下一步的事。
+   */
+  private async noticeProgressCapped(userKey: string): Promise<void> {
+    if (this.opts.replies.remainingProgress(userKey) > 0) return;
+    if (!this.claimHint(userKey)) return;
+    await this.deliverOrDrop(userKey, progressCapText(), "reminder");
+  }
+
+  /** 这份 token 还没提示过就占下它,返回 true。提示本身也花一格,所以只说一次。 */
+  private claimHint(userKey: string): boolean {
+    const token = this.opts.replies.target(userKey)?.contextToken;
+    if (!token || this.hinted.get(userKey) === token) return false;
+    if (this.opts.replies.remainingSends(userKey) <= 0) return false;
+    this.hinted.set(userKey, token);
+    return true;
   }
 
   private async deliverOrDrop(userKey: string, text: string, kind: SendKind): Promise<void> {
@@ -335,6 +374,14 @@ export class Outbox {
 /** 停在积压上时说的那句话。口令从指令表取,避免与 `/nop` 的规范形式脱节。 */
 export function backlogText(pending: number): string {
   return `还有 ${pending} 条没发出去(这条来信的额度用完了)。发一句 ${canonicalOf("nop")} 我接着发。`;
+}
+
+/** 进度额度到头时说的那句话。 */
+export function progressCapText(): string {
+  return (
+    `进度就报到这儿,接下来直接等答案。` +
+    `想接着看进度就发一句 ${canonicalOf("nop")} —— 它什么也不做,只把额度续上。`
+  );
 }
 
 function parseItems(v: unknown): OutboxItem[] {

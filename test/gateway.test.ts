@@ -52,6 +52,13 @@ class FakeChannel implements Channel {
   recalled: string[] = [];
   /** 设为 true 时 send 抛错,模拟主动推送发不出去(预算耗尽 / 上下文失效)。 */
   failSend = false;
+  /**
+   * 只让**第 N+1 条**失败(前面已成功 N 条时抛),之后恢复正常。
+   *
+   * 一直失败下去的话,"接着发后面几段"与"停下"两种实现看起来一模一样 ——
+   * 后面几段反正都发不出去。只坏一条才分得出来。
+   */
+  failSendOn?: number;
   /** 试过几次发送(**含失败的**)。失败的尝试照样烧 iLink 的发送预算,所以要单独数。 */
   attempted = 0;
   /** 仅"支持撤回"的实例才有 recall 方法(网关按方法是否存在判断能力)。 */
@@ -74,6 +81,10 @@ class FakeChannel implements Channel {
   async send(userKey: string, text: string, kind: SendKind = "body"): Promise<string | void> {
     this.attempted += 1;
     if (this.failSend) throw new Error("push not supported");
+    if (this.failSendOn !== undefined && this.sent.length === this.failSendOn) {
+      this.failSendOn = undefined; // 只坏这一条
+      throw new Error("push not supported");
+    }
     this.sent.push({ userKey, text, kind });
     // 进度花的是同一份预算 —— 发一条少一条,与信使那边的账同源。
     if (kind === "progress" && this.budget !== undefined) this.budget -= 1;
@@ -2039,6 +2050,29 @@ test("/取消 只中断前台,后台那些继续跑", async () => {
   fgOpen();
   open();
   await Promise.all([bg, fg]);
+});
+
+test("分段正文发到一半失败:停下,而且不把这一轮记成出错", async () => {
+  // 两件事各自都出过问题:① 直接 channel.send 抛出去会被 runTurn 的 catch 接住,
+  // 用户于是收到半截答案**外加**一句"处理出错了",而那一轮其实跑成功了;
+  // ② 接着发后面几段的话,用户看到的是中间缺一块 —— 截断看得出来,空洞看不出来。
+  const { channel, agent } = build(() => 1_000_000, { settings: { maxReplyChars: 10 } });
+  agent.nextSessionId = "s1";
+  // 已成功 2 条(回执 + 正文第 1 段)时坏一条,之后恢复 —— 坏的是正文第 2 段。
+  channel.failSendOn = 2;
+
+  await channel.receive(U1, "这是一个很长的问题需要分成好几段来回答才发得完");
+
+  const bodies = channel.sent.filter((m) => m.kind === "body");
+  assert.equal(
+    bodies.length,
+    1,
+    `断了就该停下,不能跳过坏掉那段接着发(那是空洞):${JSON.stringify(bodies.map((m) => m.text))}`,
+  );
+  assert.ok(
+    !channel.sent.some((m) => m.text.includes("处理出错")),
+    `回合跑成功了,不该顺带报一句错:${JSON.stringify(channel.sent.map((m) => m.text))}`,
+  );
 });
 
 test("额度报到头的交代是**单独一条**,而且走保留额而不是进度额度", async () => {

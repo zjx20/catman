@@ -76,13 +76,16 @@ export const DEPLOY_NEWS_INTERVAL_MS = 15_000;
 /**
  * 一条主动播报最多试几次、两次之间至少隔多久。
  *
- * **上限不是为了省事,是为了不把发送预算烧光。** 一个 context_token 只够发约 10 条
- * (见 courier/reply-store.ts 那笔账),而失败的尝试照样计数。15 秒一轮无限重试的话,
- * 两分半就能把额度耗尽 —— 那时连正文都发不出去,用户彻底静默,而起因只是一条
- * 本来可以晚点再说的进度。
+ * ⚠️ **这个上限原来的理由已经不成立了,别照着它推理。** 从前它防的是"失败的尝试
+ * 照样烧发送预算,15 秒一轮无限重试两分半就能把额度耗尽"。信使有了发件队列之后
+ * (courier/outbox.ts),额度不够时那条播报是**排队**而不是失败 —— `trySend` 回 true,
+ * 当场就标记已播,压根走不到重试这条路。
  *
- * 放弃的只是**主动**这条路:用户下次开口时仍然会补播(那时他有一份崭新的上下文,
- * 发送几乎不会失败),所以"放弃"从不等于"这条消息丢了"。
+ * 留着它是因为还有一种失败没被队列覆盖:**信使自己不可达**(IPC 断了、信封读不懂)。
+ * 那种失败下 15 秒一轮无限重试只是对着一个死 socket 刷日志。所以上限还在,
+ * 但它现在防的是刷屏,不是烧额度。
+ *
+ * 放弃的只是**主动**这条路:用户下次开口时仍然会补播,所以"放弃"从不等于"这条消息丢了"。
  */
 const NEWS_MAX_ATTEMPTS = 3;
 const NEWS_RETRY_MS = 60_000;
@@ -1758,9 +1761,25 @@ export class Gateway {
     }
   }
 
+  /**
+   * 分段发正文。
+   *
+   * **一段失败就停下,不接着发后面的。** 少一截和中间缺一块是两种不同的坏:
+   * 截断看得出来(话没说完),空洞看不出来(读起来像另一句话)。
+   *
+   * 走 `trySend` 而不是直接 `channel.send`:抛出去会被 runTurn 的 catch 接住,
+   * 于是用户收到半截答案**外加**一句"处理出错了",而那一轮其实跑成功了。
+   * 发不出去本身现在也基本不会发生 —— 信使那边有发件队列接着(courier/outbox.ts),
+   * 走到这个失败分支说明的是 IPC 层面的问题(信使不可达),那时后面几段同样发不出去。
+   */
   private async sendChunked(userKey: string, text: string, maxChars: number): Promise<void> {
-    for (let i = 0; i < text.length; i += maxChars) {
-      await this.channel.send(userKey, text.slice(i, i + maxChars));
+    const total = Math.ceil(text.length / maxChars);
+    for (let i = 0, n = 1; i < text.length; i += maxChars, n += 1) {
+      const ok = await this.trySend(userKey, text.slice(i, i + maxChars), "正文");
+      if (!ok) {
+        console.error(`[gateway] ${userKey} 的正文发到第 ${n}/${total} 段停下 —— 后面几段不再发`);
+        return;
+      }
     }
   }
 
