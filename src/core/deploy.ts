@@ -9,6 +9,7 @@ import {
   type PreparedRelease,
 } from "./releases.js";
 import { shortSha } from "./version.js";
+import { canonicalOf } from "./commands.js";
 
 /**
  * 部署控制面 —— catman 这一侧看到的那点点接口。
@@ -73,12 +74,12 @@ export function parseVerifiedHistory(v: unknown): VerifiedRelease[] {
 
 export interface DeployControl {
   /**
-   * 请求把某个已制备的 release 部署上线。`shaPrefix` 是人在 `/发布` 后面打的那几位。
-   * 返回给用户的一句话(已经排好版)—— 包括各种拒绝的情形。
+   * 请求把某个已制备的 release 部署上线。`request` 是人在 `/发布` 后面打的那一整串:
+   * `<版本号前几位> [观察期秒数]`。返回给用户的一句话(已经排好版)—— 包括各种拒绝的情形。
    *
    * 与 requestRollback 一样只负责**发起**:结论由下一次启动读报告播报。
    */
-  requestDeploy(shaPrefix: string, requestedBy: string): Promise<string>;
+  requestDeploy(request: string, requestedBy: string): Promise<string>;
   /**
    * 请求一次回滚。返回给用户的一句话(已经排好版)。
    *
@@ -138,9 +139,39 @@ export interface ScriptDeployControlOptions {
    * 按指针拒绝会把这条修复路径堵死。
    */
   runningSha?: string | undefined;
-  /** 起子进程的方式。单测注入,免得真去 spawn。 */
-  spawnRunner?: (runnerPath: string, args: readonly string[]) => Promise<void>;
+  /**
+   * 起子进程的方式。单测注入,免得真去 spawn。
+   *
+   * `env` 是**追加**到当前环境上的几个变量(目前只有观察期)。走 env 而不是命令行参数
+   * 是因为 `deployer-run.sh` 属 Tier 3:它早就认 `CATMAN_BAKE_SECONDS` 并转发给容器,
+   * 而加一个新的命令行开关要重新 bless 才生效。
+   */
+  spawnRunner?: (
+    runnerPath: string,
+    args: readonly string[],
+    env?: Record<string, string>,
+  ) => Promise<void>;
 }
+
+/**
+ * 默认观察期。**与 `scripts/evolve/deployer.sh` 里那个默认值是同一个数**,
+ * 但这里不依赖它:每次都把值显式传过去(见 `requestDeploy`),
+ * 于是"告诉用户要等多久"与"deployer 实际等多久"永远是同一个数,不会各说各的。
+ */
+export const DEFAULT_BAKE_SECONDS = 1800;
+
+/**
+ * 观察期能给多短、多长。
+ *
+ * 下限不是 0:观察期是**自动回滚的那张网** —— 新版本起来之后当场崩掉,靠的就是这段
+ * 时间内的健康检查把它退回去。短到几秒钟等于把网撤了。30 秒足够让一个起不来的
+ * 进程暴露(它多半在第一次装配就死),同时又不至于让人等。
+ *
+ * 上限纯粹是防手滑:打错一个零就是十小时不转稳定,而 `stable` 不动就意味着
+ * 下一次 bless 没有目标。
+ */
+const MIN_BAKE_SECONDS = 30;
+const MAX_BAKE_SECONDS = 3600;
 
 /**
  * 走"固化脚本"的实现。
@@ -176,7 +207,10 @@ export class ScriptDeployControl implements DeployControl {
    * `/发布 <前6位>`。四种拒绝各说各的话 —— 处置完全不同:太短要重打、没有要先制备、
    * 歧义要写长一点、已经是当前版本则根本不用动。含糊一句"发布失败"会让人反复重试。
    */
-  async requestDeploy(shaPrefix: string, requestedBy: string): Promise<string> {
+  async requestDeploy(request: string, requestedBy: string): Promise<string> {
+    const parsed = parseDeployRequest(request);
+    if ("error" in parsed) return parsed.error;
+    const { shaPrefix, bakeSeconds } = parsed;
     const candidates = this.publishable();
     const found = resolveShaPrefix(
       candidates.map((c) => c.sha),
@@ -203,16 +237,22 @@ export class ScriptDeployControl implements DeployControl {
     }
 
     const spawnRunner = this.opts.spawnRunner ?? defaultSpawnRunner;
-    await spawnRunner(this.opts.runnerPath, [
-      "deploy",
-      target.sha,
-      "--requested-by",
-      requestedBy,
-    ]);
+    // **值总是显式传过去**,哪怕就是默认值 —— 这样下面那句"要等多久"说的
+    // 必定是 deployer 实际会等的时间,不依赖脚本里那个默认值跟这里保持一致。
+    const bake = bakeSeconds ?? DEFAULT_BAKE_SECONDS;
+    await spawnRunner(
+      this.opts.runnerPath,
+      ["deploy", target.sha, "--requested-by", requestedBy],
+      { CATMAN_BAKE_SECONDS: String(bake) },
+    );
     return (
       `已提交部署 ${shortSha(target.sha)}${target.branch ? `(${target.branch})` : ""}。\n` +
-      "接下来是自检 → 切换 → 30 分钟观察期 → 转稳定 → 推远端,期间我会被停掉换版本、失联几分钟。\n" +
-      "任何一步没过都会自动退回原来的版本。**每过一关我都主动发消息告诉你**,不用一直等着问。"
+      `接下来是自检 → 切换 → ${humanSeconds(bake)}观察期 → 转稳定 → 推远端,` +
+      "期间我会被停掉换版本、失联几分钟。\n" +
+      "任何一步没过都会自动退回原来的版本。**每过一关我都主动发消息告诉你**,不用一直等着问。" +
+      (bakeSeconds !== undefined && bakeSeconds < DEFAULT_BAKE_SECONDS
+        ? `\n(观察期缩短到 ${humanSeconds(bake)}:过了这段时间之后再崩就不会自动退回了,得你自己发 ${canonicalOf("rollback")}。)`
+        : "")
     );
   }
 
@@ -263,6 +303,50 @@ export class ScriptDeployControl implements DeployControl {
  * 拒绝的话后面跟一句候选清单 —— 人多半是记错了那几位,直接给他看有哪些
  * 比让他去翻聊天记录快得多。一个都没有时如实说,并指出下一步是制备。
  */
+/**
+ * 拆 `/发布` 后面那串:`<版本号前几位> [观察期秒数]`。
+ *
+ * **口令那一半一个字都不加工**(照旧原样交给 `resolveShaPrefix`)—— 它是整条流水线里
+ * 那把"人批准了什么 = 机器部署了什么"的机械锁。这里只是在它后面允许再跟一个数字。
+ *
+ * 拒绝的情形各说各的话,因为处置不同:第二段不是数字多半是把 sha 打断了,
+ * 而超出范围是明确知道自己在干什么但填错了量级。
+ */
+function parseDeployRequest(
+  raw: string,
+): { shaPrefix: string; bakeSeconds?: number } | { error: string } {
+  const parts = raw.trim().split(/\s+/).filter(Boolean);
+  const shaPrefix = parts[0] ?? "";
+  if (parts.length <= 1) return { shaPrefix };
+  if (parts.length > 2) {
+    return { error: `${canonicalOf("publish")} 最多跟两段:版本号,以及可选的观察期秒数。` };
+  }
+  const raw2 = parts[1]!;
+  const n = Number(raw2);
+  if (!Number.isInteger(n)) {
+    return {
+      error:
+        `观察期要给一个整数秒数,「${raw2}」不是。` +
+        `想用默认的 ${humanSeconds(DEFAULT_BAKE_SECONDS)}就只发版本号。`,
+    };
+  }
+  if (n < MIN_BAKE_SECONDS || n > MAX_BAKE_SECONDS) {
+    return {
+      error:
+        `观察期要在 ${MIN_BAKE_SECONDS}–${MAX_BAKE_SECONDS} 秒之间,给的是 ${n}。` +
+        `太短等于把自动回滚那张网撤了(新版本当场崩掉就没人退回它),太长则是 stable 迟迟不动。`,
+    };
+  }
+  return { shaPrefix, bakeSeconds: n };
+}
+
+/** 把秒说成人话。观察期在文案里出现好几处,统一在这儿排版。 */
+function humanSeconds(s: number): string {
+  if (s < 120) return `${s} 秒`;
+  const min = s / 60;
+  return `${Number.isInteger(min) ? min : min.toFixed(1)} 分钟`;
+}
+
 function listCandidates(candidates: readonly PublishCandidate[]): string {
   const usable = candidates.filter((c) => !c.running);
   if (!usable.length) return "现在没有已制备、待发布的版本 —— 要先制备一次。";
@@ -292,11 +376,14 @@ const SPAWN_GRACE_MS = 3_000;
 export async function defaultSpawnRunner(
   runnerPath: string,
   args: readonly string[],
+  env?: Record<string, string>,
 ): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const child = spawn(runnerPath, [...args], {
       detached: true,
       stdio: ["ignore", "ignore", "pipe"],
+      // 追加而不是替换:脚本要用到 PATH、以及固化时写进 env 的宿主路径。
+      env: { ...process.env, ...(env ?? {}) },
     });
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => {
