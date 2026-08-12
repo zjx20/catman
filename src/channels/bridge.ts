@@ -130,8 +130,6 @@ export class BridgeChannel implements Channel {
   private readonly failures = new Map<string, number>();
   /** 投不下去而交回信使的条数。非零就该显眼 —— 静默跳过等于没有隔离。 */
   private poisoned = 0;
-  /** 每用户还剩几条进度额度,由信使在每次发送响应里给。**不自己记账。** */
-  private readonly budget = new Map<string, number>();
   /** 在跑的投递链。 */
   private delivering?: Promise<void>;
   /** stop() 时要唤醒的那些 sleep。 */
@@ -175,26 +173,20 @@ export class BridgeChannel implements Channel {
     return this.poisoned;
   }
 
+  /**
+   * 把一条消息交给信使。
+   *
+   * **交出去就算数,不再问余量。** 额度是信使那一侧的事:发得出去它就发,
+   * 发不出去它排队(courier/outbox.ts),两种都回 ok。这里曾经缓存过
+   * `remainingProgress` 转给节流器用,那是"核心也得懂一点预算"的最后一块 ——
+   * 现在核心一点都不懂,这块也就没有了。
+   *
+   * 回 `ok:false` 只剩下真正的坏事:信封读不懂、路由已经切走、信使不可达。
+   * 那些是该抛的。
+   */
   async send(userKey: string, text: string, kind: SendKind = "body"): Promise<void> {
     const r = await this.opts.client.send(userKey, text, kind);
-    // **只信成功那次报的余量。** 失败的响应里这个字段未必是真的预算:
-    // 信封读不懂、路由已经切走这两种拒绝都硬填 0,而它们说的是"这条不该发",
-    // 不是"你没额度了"。把 0 当预算记下会让节流器从此闭嘴,连那个用户切回来
-    // 之后也不再有进度。而真正的额度耗尽不需要走这条路 —— 最后一条**成功**的
-    // 发送就会带回 0,下一条自然被挡。
-    if (r.ok) this.budget.set(userKey, r.remainingProgress);
     if (!r.ok) throw new Error(r.reason ?? "信使拒绝了这条消息");
-  }
-
-  /**
-   * 还能给这个用户发几条进度 —— 转述信使的账,自己不记。
-   *
-   * 一次都还没发过时返回 `undefined`(不设上限):第一条发出去就有权威值了,
-   * 而在那之前编一个数就是在重建那份刚被删掉的第二账本。间隔阶梯保证
-   * 第一条之后至少隔 5 秒,足够让响应回来。
-   */
-  progressBudget(userKey: string): number | undefined {
-    return this.budget.get(userKey);
   }
 
   /**

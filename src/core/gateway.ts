@@ -187,37 +187,19 @@ export function formatProgress(ev: AgentProgressEvent, skipped = 0): string {
 export const PROGRESS_INTERVALS_MS = [5_000, 15_000, 30_000, 60_000];
 
 /**
- * 进度的总量上限**不在这里** —— 它由渠道现问(`Channel.progressBudget`)。
+ * **发送预算这件事整个不在核心里。**
  *
- * 曾经这里有一份自己的账:`SEND_BUDGET(10) − 回执 1 − 预留 2`。而信使上线之后
- * 预算的权威搬到了 `courier/reply-store.ts`(它按 kind 预留 3 条:正文 / 空闲提醒 /
- * 部署结果播报),**旧的那份却没删** —— 两份账于是各算各的,7 对 6。
- * 后果不是超发(信使会拒),而是**每个长回合都多发一条注定被拒的进度**,
- * 并且「进度就报到这儿」那句提示**永远不会触发**:信使在第 6 条就拒了,
- * 网关要到第 7 条才提示。用户看到的是进度毫无征兆地停住 —— 正是那句提示要防的事。
- *
- * 更根本的是:预算必须**只有一个权威**,那是信使存在的理由之一(守护人格可能也在往
- * 同一个 `context_token` 发东西)。两处常量碰巧相等不叫单一权威,叫还没出事。
- *
- * 所以这里一条也不记:上限从渠道现问,渠道说不上来(stdin / dashboard 没有发送预算
- * 这个概念)就**不设总量上限** —— 那时唯一的节流是下面的间隔阶梯,而那是对的。
+ * 演进的三步值得记着,因为每一步都是踩了坑才走的:
+ * ① 网关自己记一份账(`SEND_BUDGET − 回执 − 预留`)。信使上线后预算的权威搬了过去,
+ *    而旧的那份没删 —— 两份账各算各的(7 对 6),每个长回合都多发一条注定被拒的进度,
+ *    而「进度就报到这儿」那句提示永远不触发。
+ * ② 改成**每次现问渠道**(`Channel.progressBudget`)。单一权威有了,但核心仍然要懂
+ *    "还剩几条"这个概念,而它压根不该懂 —— stdin / dashboard 上这个方法只能返回
+ *    `undefined`,一个渠道无关的类型里挂着一个只有微信才有意义的问题。
+ * ③ 现在:核心**只管把消息交出去**。发得出去渠道就发,发不出去渠道排队
+ *    (`courier/outbox.ts`),额度到头时由**渠道**告诉用户"发 /nop 可以续上"。
+ *    核心这边只剩下面这个间隔阶梯,而它管的是**观感**(多久说一次话),不是额度。
  */
-
-/**
- * 额度用尽时的交代。**单独一条消息,而且信使那边给它留了一格额度**
- * (`RESERVED_SENDS`)—— 不是附在最后一条进度后面。
- *
- * 为什么值得占一格:后半句是**出路**而不只是说明 —— 额度按"这条来信"算,用户再发
- * 一句话就重来一份,而 `/nop` 就是那句"随便的话"(见 COMMAND_TABLE)。附在进度尾巴上
- * 它就成了一行工具调用摘要的补注,而这句话恰恰要被看见:不给出路的话,这条交代等于
- * 通知他"接下来只能干等",长回合下那可能是好几分钟的静默。
- *
- * 走保留额还有一层:它因此**不占进度的名额**,也不会被进度的上限挤掉 ——
- * 而"进度用完了"正是它唯一该出现的时刻。
- */
-const PROGRESS_CAP_NOTICE =
-  `进度就报到这儿,接下来直接等答案。` +
-  `想接着看进度就发一句 ${canonicalOf("nop")} —— 它什么也不做,只把额度续上。`;
 
 /**
  * 进度推送节流器。
@@ -234,6 +216,10 @@ const PROGRESS_CAP_NOTICE =
  * **纯事件驱动,不用定时器**:没有新事件就不推进。这一点与旧实现一致 ——
  * agent 卡在一次长工具调用里时两者都不会更新进度,所以没有退步;而不引入定时器
  * 就不存在"回合结束后定时器才触发、进度插到正式回复后面"这类乱序风险。
+ *
+ * **它不再管总条数。** 阶梯管的是观感,额度是渠道那一侧的事:发不出去的进度由
+ * 信使排队(而且只留最新一条),额度到头时也由信使去说那句"发 /nop 可以续上"。
+ * 上面那段记着这条边界是怎么划出来的。
  */
 export class ProgressThrottle {
   private nextAllowedAt: number;
@@ -241,18 +227,10 @@ export class ProgressThrottle {
   private sent = 0;
   /** 上次放行之后被丢掉几条。 */
   private skipped = 0;
-  /** 刚放行的那条是不是最后一条 —— 交代由 `takeCapNotice` 取走。 */
-  private capped = false;
 
-  /**
-   * @param remaining 该用户**还能收几条进度**,由渠道现问。返回 `undefined` 表示
-   *   这个渠道没有发送预算的概念(stdin / dashboard),那时不设总量上限。
-   *   传函数而不是值:预算是信使那边的实时状态,守护人格可能也在花同一份。
-   */
   constructor(
     startedAt: number,
     private readonly intervals: readonly number[] = PROGRESS_INTERVALS_MS,
-    private readonly remaining: () => number | undefined = () => undefined,
   ) {
     this.nextAllowedAt = startedAt + (intervals[0] ?? 0);
   }
@@ -262,12 +240,6 @@ export class ProgressThrottle {
    * 时刻在**决定放行时**推进而不是发送完成后 —— 否则一次慢发送期间会漏过好几条。
    */
   offer(now: number, ev: AgentProgressEvent): string | undefined {
-    // 渠道给的是**上一次发送响应**里的余量,所以可能落后一条。间隔阶梯保证两次放行
-    // 至少隔 5 秒,而一次 IPC 往返是毫秒级,实际追得上;真追不上也只是多发一条,
-    // 由信使当场拒掉 —— 权威在它那里,这里的数只用来把话说清楚。
-    const left = this.remaining();
-    // 额度用尽就彻底不发了,连计数都不必再攒 —— 后面没有任何一条会被放出去。
-    if (left !== undefined && left <= 0) return undefined;
     if (now < this.nextAllowedAt) {
       this.skipped += 1;
       return undefined;
@@ -277,42 +249,23 @@ export class ProgressThrottle {
     this.sent += 1;
     // 第 n 条发完之后用第 n 档间隔;超出阶梯长度就一直用最后一档。
     this.nextAllowedAt = now + (this.intervals[Math.min(this.sent, this.intervals.length - 1)] ?? 0);
-    // 刚放行的这条是最后一条 —— 后面没了要说清楚,否则用户看到的是进度突然断掉,
-    // 与"卡死了"无从分辨(长回合下这段静默可能长达好几分钟)。那句交代**单独发**,
-    // 由调用方取走:它走保留额,不占进度的名额,见 PROGRESS_CAP_NOTICE。
-    if (left === 1) this.capped = true;
     return text;
   }
 
   /**
-   * 取走"进度到此为止"的交代,**取走即清** —— 同一轮里只说一次。
+   * 追加输入(或 `/nop`)之后重新开闸 —— 阶梯从头开始。
    *
-   * 与 `offer` 分开而不是拼在它的返回值里:这句话是一条**独立的消息**,用的是
-   * 保留额而不是进度额度。拼在一起就只能跟着进度走,而进度恰恰在这一刻用完了。
-   */
-  takeCapNotice(): string | undefined {
-    if (!this.capped) return undefined;
-    this.capped = false;
-    return PROGRESS_CAP_NOTICE;
-  }
-
-  /**
-   * 追加输入之后重新开闸(条数与间隔阶梯都从头开始)。
+   * 用户刚开口,正是最想知道"接住了没"的时刻;不重置的话,被追加过的长回合后半段
+   * 要等满 60 秒才有下一条,与卡死无从分辨。阶梯一并重来所以不会变成刷屏:
+   * 下一条仍要等满第一档。
    *
-   * 依据是**发送预算确实回来了**:iLink 的 replyCtx 在收到新消息时换成新的
-   * `context_token`,信使那边的计数随之归零。同时用户刚补完话,正是最想知道
-   * "接住了没"的时刻 —— 不重置的话,被追加过的长回合后半段完全静默,与卡死无从分辨。
-   * 阶梯一并重来,所以重置不会变成刷屏:下一条仍要等满第一档。
-   *
-   * 余量本身不在这里重置 —— 它由渠道现问,而渠道要等下一次发送的响应才知道
-   * 新预算。落后一条,与 offer 里那条说明同源。
+   * 顺带一提,那一刻**额度也确实回来了**(新来信换新 `context_token`),
+   * 但那是渠道那边的事,这里不需要知道。
    */
   reset(now: number): void {
     this.sent = 0;
     this.skipped = 0;
     this.nextAllowedAt = now + (this.intervals[0] ?? 0);
-    // 还没送出去的那句交代作废:额度回来了,它说的话已经不成立。
-    this.capped = false;
   }
 }
 
@@ -1530,11 +1483,9 @@ export class Gateway {
 
     // 进度消息串行链:保证按事件产生顺序逐条发送,最终回复排在链尾之后。
     // 节流从**回合开始**起算,而不是从第一个事件 —— 用户等待的是前者。
-    // 上限从渠道现问 —— 网关自己不记发送预算的账,见 PROGRESS_CAP_NOTICE 上面那段。
-    const throttle = new ProgressThrottle(this.now(), PROGRESS_INTERVALS_MS, () =>
-      this.channel.progressBudget?.(userKey),
-    );
-    // `/nop` 走 immediate 路径、不经过追加输入,但额度确实在它抵达时续上了 ——
+    // 只剩间隔阶梯:发多少条由渠道那边的额度说了算,核心不问,见类上面那段。
+    const throttle = new ProgressThrottle(this.now(), PROGRESS_INTERVALS_MS);
+    // `/nop` 走 immediate 路径、不经过追加输入,但用户刚开口正是最想看进度的时刻 ——
     // 挂出来让它也能开闸。挂在这里而不是 mint 时:节流器是这一轮的局部状态。
     turn.ctx.resetProgress = () => throttle.reset(this.now());
     let progress: Promise<void> = Promise.resolve();
@@ -1554,13 +1505,10 @@ export class Gateway {
       // "这个事件是什么时候发生的"整个搞乱,节流间隔也就不准了。
       const text = throttle.offer(this.now(), ev);
       if (text === undefined) return;
+      // 发不出去不是这里的事:渠道那边会排队,额度到头时也由它去说
+      // "进度就报到这儿,发 /nop 可以续上"(courier/outbox.ts)。
       progress = progress.then(async () => {
         await this.trySend(userKey, text, "进度", "progress");
-        // 额度报到头的那句交代**单独发一条**,而且走 `reminder` 的保留额 ——
-        // 信使那边给它留了一格(见 reply-store 的 RESERVED_SENDS)。排在同一条链上,
-        // 所以它必定紧跟在最后那条进度后面,不会插到正文之后。
-        const notice = throttle.takeCapNotice();
-        if (notice) await this.trySend(userKey, notice, "额度提示", "reminder");
       });
     };
 

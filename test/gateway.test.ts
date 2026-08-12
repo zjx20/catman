@@ -44,11 +44,6 @@ class FakeChannel implements Channel {
   readonly name = "fake";
   handler?: MessageHandler;
   sent: Array<{ userKey: string; text: string; kind: SendKind }> = [];
-  /**
-   * 渠道现报的进度余量。`undefined` = 这个渠道没有发送预算的概念(stdin / dashboard),
-   * 真实的 iLink 侧由信使报回来(bridge 转述,自己不记账)。
-   */
-  budget?: number;
   recalled: string[] = [];
   /** 设为 true 时 send 抛错,模拟主动推送发不出去(预算耗尽 / 上下文失效)。 */
   failSend = false;
@@ -75,9 +70,6 @@ class FakeChannel implements Channel {
   onMessage(h: MessageHandler): void {
     this.handler = h;
   }
-  progressBudget(_userKey: string): number | undefined {
-    return this.budget;
-  }
   async send(userKey: string, text: string, kind: SendKind = "body"): Promise<string | void> {
     this.attempted += 1;
     if (this.failSend) throw new Error("push not supported");
@@ -86,8 +78,6 @@ class FakeChannel implements Channel {
       throw new Error("push not supported");
     }
     this.sent.push({ userKey, text, kind });
-    // 进度花的是同一份预算 —— 发一条少一条,与信使那边的账同源。
-    if (kind === "progress" && this.budget !== undefined) this.budget -= 1;
     // 支持撤回的渠道返回消息 id
     if (this.recall) return `msg-${this.sent.length}`;
   }
@@ -583,61 +573,11 @@ test("进度节流:同一间隔内只发最新那条,丢掉的条数如实交代
   assert.ok(next && !next.includes("步"), `不该重复计数:${next}`);
 });
 
-test("进度节流:总条数封顶用的是**渠道现报**的余量,不是自己的常量", () => {
-  // 阶梯只拉长间隔,不限制总数 —— 一个十分钟的回合照样能发十几条,
-  // 撞满预算后被挤掉的正好是正文和超时提醒(两者共用同一个 context_token)。
-  // 而这个上限必须来自信使:它才是预算的权威(守护人格可能也在花同一份)。
-  const t0 = 1_000_000;
-  let left = 4; // 假装信使说还剩 4 条
-  const th = new ProgressThrottle(t0, undefined, () => left);
-  const texts: string[] = [];
-  const notices: Array<string | undefined> = [];
-  // 跨度 30 分钟,远超阶梯能自然产生的条数。
-  for (let ms = 0; ms <= 1_800_000; ms += 1_000) {
-    const out = th.offer(t0 + ms, toolEv(ms));
-    if (out) {
-      texts.push(out);
-      notices.push(th.takeCapNotice());
-      left -= 1; // 发出去一条,信使那边的余量跟着减
-    }
-  }
-  assert.equal(texts.length, 4, "封顶后不该再放行");
-  // 交代**不在进度文本里** —— 它是单独一条消息,走保留额(见 RESERVED_SENDS)。
-  assert.ok(
-    !texts.some((t) => t.includes("进度就报到这儿")),
-    `交代不该混进进度文本:${texts.at(-1)}`,
-  );
-  // 但必须有,而且只在最后那条之后有一次:否则用户看到的是进度突然断掉。
-  assert.deepEqual(
-    notices.map(Boolean),
-    [false, false, false, true],
-    `交代该只跟在最后一条进度后面:${JSON.stringify(notices)}`,
-  );
-  assert.ok(notices.at(-1)!.includes("/nop"), "交代里要带上续额的办法,不能只说没了");
-  assert.equal(th.takeCapNotice(), undefined, "取走即清,同一轮不重复说");
-});
-
-test("进度节流:开闸之后余量回来,进度接着报 —— 这是 /nop 的另一半", () => {
-  // 收尾那句让用户发 /nop 续额。额度确实在那条消息抵达时回来了,但节流器还记着
-  // "余量为 0",不开闸的话它从此一条不发 —— 用户照做了却什么也没发生,
-  // 而那句提示正是我们让他信的。
-  const t0 = 1_000_000;
-  let left = 1;
-  const th = new ProgressThrottle(t0, undefined, () => left);
-  assert.ok(th.offer(t0 + 5_000, toolEv(1)), "还剩 1 条,放行");
-  left = 0;
-  assert.equal(th.offer(t0 + 100_000, toolEv(2)), undefined, "额度用尽就闭嘴");
-
-  left = 15; // 新 context_token,信使那边的计数归零
-  th.reset(t0 + 200_000);
-  assert.equal(th.takeCapNotice(), undefined, "额度回来了,还没送出去的那句交代作废");
-  assert.equal(th.offer(t0 + 200_000, toolEv(3)), undefined, "阶梯一并重来,不会变成刷屏");
-  assert.ok(th.offer(t0 + 205_000, toolEv(4)), "满第一档之后接着报");
-});
-
-test("进度节流:渠道说不上来余量就不设总量上限 —— stdin / dashboard 没有发送预算", () => {
-  // 给它们套一个凭空来的上限,等于把 iLink 的协议限制强加到根本没有这个限制的渠道上,
-  // 而本地调试恰恰最需要看见进度。唯一的节流是间隔阶梯,那是对的。
+test("进度节流:核心不再有总条数上限 —— 发多少条由渠道那边的额度说了算", () => {
+  // 阶梯管的是**观感**(多久说一次话),不是额度。额度是渠道那一侧的事:
+  // 发不出去的进度由信使排队(而且只留最新一条),额度到头也由信使去说
+  // "发 /nop 可以续上"。核心这边曾经现问渠道要余量,那是"核心也得懂一点预算"的
+  // 最后一块 —— 而 stdin / dashboard 上那个问题压根没有答案。
   const t0 = 1_000_000;
   const th = new ProgressThrottle(t0);
   let sent = 0;
@@ -646,8 +586,25 @@ test("进度节流:渠道说不上来余量就不设总量上限 —— stdin / 
   }
   // 30 分钟 / 最后一档 60 秒 ≈ 30 条,远多于任何常量上限。
   assert.ok(sent > 20, `不该被封顶,实际只发了 ${sent} 条`);
+  assert.ok(
+    !th.offer(t0 + 1_800_500, toolEv(1))?.includes("进度就报到这儿"),
+    "那句交代不归核心说了",
+  );
 });
 
+test("进度节流:开闸只是阶梯重来 —— /nop 之后不必等满 60 秒", () => {
+  // 用户刚开口,正是最想知道"接住了没"的时刻。不重置的话,长回合后半段要等满
+  // 最后一档(60 秒)才有下一条,与卡死无从分辨。
+  const t0 = 1_000_000;
+  const th = new ProgressThrottle(t0);
+  assert.ok(th.offer(t0 + 5_000, toolEv(1)), "第一档 5 秒");
+  assert.ok(th.offer(t0 + 20_000, toolEv(2)), "第二档 15 秒");
+  assert.equal(th.offer(t0 + 30_000, toolEv(3)), undefined, "第三档要等 30 秒");
+
+  th.reset(t0 + 30_000);
+  assert.equal(th.offer(t0 + 34_999, toolEv(4)), undefined, "阶梯一并重来,不会变成刷屏");
+  assert.ok(th.offer(t0 + 35_000, toolEv(5)), "但只要等满第一档就接着报");
+});
 test("进度节流:一个 83 秒的回合只发 3 条进度", () => {
   // 真机上那次失败的回合:每约 10 秒一组三条事件,旧实现共发了 21 条进度。
   const t0 = 1_000_000;
@@ -2073,38 +2030,6 @@ test("分段正文发到一半失败:停下,而且不把这一轮记成出错", 
     !channel.sent.some((m) => m.text.includes("处理出错")),
     `回合跑成功了,不该顺带报一句错:${JSON.stringify(channel.sent.map((m) => m.text))}`,
   );
-});
-
-test("额度报到头的交代是**单独一条**,而且走保留额而不是进度额度", async () => {
-  // 附在最后一条进度尾巴上的话,它就跟进度共用一份额度 —— 而"进度用完了"正是它
-  // 唯一该出现的时刻。信使那边为它留了一格(RESERVED_SENDS),这里守的是人格侧
-  // 确实按那个约定发:kind 是 reminder,不是 progress。
-  let t = 1_000_000;
-  const { channel, agent } = build(() => t);
-  channel.budget = 1; // 信使说进度只剩 1 条 —— 下面这条就是最后一条
-  agent.progressEvents = [{ kind: "tool", name: "Bash", input: { command: "npm test" } }];
-  agent.beforeProgress = () => (t += 60_000);
-
-  await channel.receive(U1, "长任务");
-
-  const progress = channel.sent.filter((m) => m.kind === "progress");
-  assert.equal(progress.length, 1, `余量只有 1 条,进度就该只发 1 条:${progress.length}`);
-  assert.ok(
-    !progress[0]!.text.includes("进度就报到这儿"),
-    `交代不该混进进度文本:${progress[0]!.text}`,
-  );
-
-  const notice = channel.sent.find((m) => m.text.includes("进度就报到这儿"));
-  assert.ok(notice, `该单独发一条交代:${JSON.stringify(channel.sent.map((m) => m.text))}`);
-  assert.equal(notice.kind, "reminder", "它走保留额 —— progress 的名额已经用完了");
-  assert.ok(notice.text.includes("/nop"), "交代里要带上续额的办法");
-  // 顺序:进度 → 交代 → 正文。交代插到正文后面的话,用户会以为答案还没完。
-  const order = channel.sent.map((m) => m.kind);
-  assert.ok(
-    order.indexOf("progress") < order.indexOf("reminder"),
-    `交代该紧跟在进度后面:${JSON.stringify(order)}`,
-  );
-  assert.equal(order.at(-1), "body", `正文必须排在最后:${JSON.stringify(order)}`);
 });
 
 test("/nop:回合跑到一半也能续额,节流器跟着重新开闸", async () => {

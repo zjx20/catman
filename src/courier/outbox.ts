@@ -172,7 +172,12 @@ export class Outbox {
       } catch (err) {
         // 发失败也要留住它 —— 这正是队列存在的理由。**但不立刻重试**:
         // 刚失败的那一下多半会再失败一次,而失败的尝试照样烧额度。
-        console.warn(`[outbox] ${userKey} 直发失败,转入队列:${String(err)}`);
+        //
+        // 「进度撞上限」不算异常,它是设计的一部分(核心不知道额度,一路推到被拒
+        // 为止),长回合里每分钟都会发生一次 —— 按 warn 打就是拿预期行为刷屏,
+        // 真正的异常反而淹在里面。
+        const expected = kind === "progress" && this.opts.replies.remainingProgress(userKey) <= 0;
+        if (!expected) console.warn(`[outbox] ${userKey} 直发失败,转入队列:${String(err)}`);
         await this.queueIt(userKey, text, kind);
         return;
       }
