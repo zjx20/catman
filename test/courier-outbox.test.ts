@@ -7,10 +7,19 @@ import { Outbox, backlogText } from "../src/courier/outbox.js";
 import { MAX_PROGRESS_PER_TOKEN, ReplyStore, SEND_BUDGET } from "../src/courier/reply-store.js";
 import type { SendKind } from "../src/ipc/protocol.js";
 
-function withDir(fn: (dir: string) => void | Promise<void>): void | Promise<void> {
+/**
+ * **必须 `await fn`,不能 `return fn(dir)`。**
+ *
+ * 后者会在 fn 遇到第一个 await 就把 pending 的 promise 交出来,`finally` 当场
+ * 执行 —— 临时目录在用例还跑到一半时就被删掉了。落盘那条用例长期靠一个巧合
+ * 活着:从前第一次写盘发生在 `deliver` 抛错**之后**,而那时目录已经被删,
+ * `writeJsonFileAtomic` 里的 `mkdirSync(recursive)` 又把它建了回来。改动一下
+ * 写盘的时机,这条用例就会以"重启后积压没了"的面目失败 —— 而真正没了的是目录。
+ */
+async function withDir(fn: (dir: string) => void | Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "catman-outbox-"));
   try {
-    return fn(dir);
+    await fn(dir);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -257,6 +266,40 @@ test("发件队列:进度撞上限时由信使说那句「发 /nop」—— 人�
     // 同一份 token 不重复说 —— 说这句话本身也花一格。
     await box.submit(U, "进度 又一条", "progress");
     assert.equal(ch.sent.filter((s) => s.text.includes("/nop")).length, 1, "只说一次");
+  });
+});
+
+/**
+ * 这条守的是整件事的目的:**没发全,用户一定会被告知**。
+ *
+ * 真机上的形态是长回合 + 长答案:回执 1、进度吃满、答案分段。从前最后一格被
+ * 正文的下一段吃掉,于是答案在半截处停住、一句话都没有 —— 与卡死无从分辨,
+ * 而用户根本不知道发一句 /nop 就能接着收。静默过 14 分钟和 2 小时 24 分。
+ */
+test("发件队列:正文分段撞上预算时,最后一格拿去说话而不是再发半段", async () => {
+  await withDir(async (dir) => {
+    const replies = new ReplyStore(join(dir, "ctx.json"));
+    replies.remember(U, "raw", "tok-1");
+    const ch = fakeChannel(replies);
+    const box = new Outbox({ replies, deliver: ch.deliver, paceMs: 5 });
+
+    await box.submit(U, "收到,正在处理中…", "ack");
+    for (let i = 0; i < MAX_PROGRESS_PER_TOKEN; i++) await box.submit(U, `进度 ${i}`, "progress");
+    await box.submit(U, "进度 溢出的那条", "progress"); // 被拒 → "进度就报到这儿"
+
+    // 一条 3 段的长答案:第 1 段发得出去,第 2 段起额度不够了。
+    for (const seg of ["答案 1/3", "答案 2/3", "答案 3/3"]) await box.submit(U, seg, "body");
+
+    const texts = ch.sent.map((s) => s.text);
+    assert.ok(texts.includes("答案 1/3"), `第 1 段该当场发出去:${JSON.stringify(texts)}`);
+    const stranded = ch.sent.filter((s) => s.text.includes("只发了一半"));
+    assert.equal(stranded.length, 1, `必须交代一次:${JSON.stringify(texts)}`);
+    assert.ok(stranded[0]!.text.includes("/nop"), "交代里要带着出路");
+    assert.equal(stranded[0]!.kind, "reminder");
+    // 交代必须是**最后**一条:它之后再塞半段正文,等于用最后一格换来一句谎话。
+    assert.equal(ch.sent.at(-1)!.text, stranded[0]!.text);
+    assert.equal(replies.remainingSends(U), 0, "最后一格正是花在这句交代上");
+    assert.equal(box.depth(U), 2, "没发出去的两段正文还在队列里(过期进度已被答案作废)");
   });
 });
 

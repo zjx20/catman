@@ -41,6 +41,21 @@ import { LIVE_TURN_SENDS, type ReplyStore } from "./reply-store.js";
  * 回执、进度、以及这一轮的答案。把新额度全用来还旧账,等于让他每问一句都得先
  * 替上一轮买单。停下时队列还没空的话说一句"还有 N 条",那句话本身就是下一次
  * 排空的开关。
+ *
+ * ## 交代永远排在内容前面
+ *
+ * 队列保证了消息不丢,但**没保证用户知道有东西没发出去**。他看到的只是话说到一半
+ * 就停了,与卡死无从分辨 —— 而解药(发一句 `/nop`)恰恰只有那句交代会告诉他。
+ * 真机上就这么静默过两次:一次 14 分钟,一次 2 小时 24 分,都是等他自己开口才补发。
+ *
+ * 所以定这条规矩:**只要这份 token 的交代还没说出去,内容就不许动最后一格。**
+ * 正文分段发到额度见底时,最后一格拿去说"还有 N 条没发出去,发 /nop 我接着发",
+ * 而不是再多发半段正文。少半段看得出来,静默看不出来。
+ *
+ * 一份 token 最多说两句交代,各一次:进度到头(`progressCapText`)、
+ * 内容积压(`backlogText`)。两句说的是不同的事,合成一句必然有一次要撒谎 ——
+ * "接下来直接等答案"在答案也发不出去时就是假话。预算里给它们各留了一格,
+ * 见 `reply-store.ts` 的 `RESERVED_SENDS`。
  */
 
 /** 两条排队消息之间至少隔多久。见文件头「限速」。 */
@@ -122,12 +137,14 @@ export class Outbox {
    */
   private readonly rekick = new Set<string>();
   /**
-   * 已经就哪一份 context_token 提示过额度的事 —— 每份只说一次,不刷屏。
+   * 这份 context_token 上已经说过哪几句交代 —— 每句只说一次,不刷屏。
    *
-   * "进度报到头了"和"还有 N 条没发"共用这一份记录:两句话结尾都是"发 /nop",
-   * 同一个 token 里说两遍就是噪音。
+   * **两句分开记**(从前共用一把锁):它们说的不是同一件事。"进度报到头了"许诺
+   * 的是"接下来直接等答案",而答案也发不出去时,用户需要的是另一句
+   * "还有 N 条没发出去"。共用一把锁的话,先说出口的那句会把后一句锁死 ——
+   * 而被锁死的恰恰是更要紧的那句。
    */
-  private readonly hinted = new Map<string, string>();
+  private readonly said = new Map<string, { token: string; capped: boolean; backlog: boolean }>();
   /** 睡在限速里的那些,stop() 时叫醒。 */
   private waking: Array<() => void> = [];
   private running = true;
@@ -152,6 +169,12 @@ export class Outbox {
    * "先回答上一个问题"这件事必须看得出来。
    */
   async submit(userKey: string, text: string, kind: SendKind): Promise<void> {
+    // 答案来了,排在它前面的那些"正在算"就没有意义了 —— 清掉,别让它们挡路。
+    //
+    // 不清的话有个很坏的连锁:进度撞上限时那条被拒的进度留在队里,队列从此非空,
+    // 于是**答案再也走不了直发那条路**(队列非空一律排队尾),预留给正文的那一格
+    // 白留了。用户等来的是"答案在队列里等你开口",而不是答案。
+    if (POLICY[kind] === "append") this.dropSuperseded(userKey);
     const queued = this.queues.get(userKey)?.length ?? 0;
     if (POLICY[kind] === "drop") {
       // 排不上队的那类:当场发得出去就发,发不出去就算了(还要记一笔)。
@@ -160,6 +183,13 @@ export class Outbox {
         return;
       }
       await this.deliverOrDrop(userKey, text, kind);
+      return;
+    }
+    // 内容不许吃掉留给交代的那一格 —— 见文件头「交代永远排在内容前面」。
+    // 只挡 `append` 那类(正文 / 播报 / 兜底):进度是可丢的状态,它撞上限本来
+    // 就有自己那句交代,不必也不该在这里再让一次。
+    if (POLICY[kind] === "append" && this.mustYield(userKey)) {
+      await this.queueIt(userKey, text, kind);
       return;
     }
     // **队列空着就直接试一次,不先问额度。** 问了反而更糟:预算的判断在渠道那一侧
@@ -194,7 +224,13 @@ export class Outbox {
    */
   private async queueIt(userKey: string, text: string, kind: SendKind): Promise<void> {
     this.enqueue(userKey, text, kind);
-    if (kind === "progress") await this.noticeProgressCapped(userKey);
+    if (kind === "progress") {
+      await this.noticeProgressCapped(userKey);
+      return;
+    }
+    // 内容排上队了 —— **这一刻就得说**,不能等下次排空。排空要等下一条来信来催,
+    // 而用户正是因为没收到交代才不知道该开口:那是个死锁,真机上就这么静默过。
+    if (POLICY[kind] === "append") await this.noticeStranded(userKey);
   }
 
   /**
@@ -291,7 +327,7 @@ export class Outbox {
       const q = this.queues.get(userKey);
       if (!q?.length) return;
       if (this.opts.replies.remainingSends(userKey) <= DRAIN_FLOOR) {
-        await this.noticeBacklog(userKey, q.length);
+        await this.noticeBacklog(userKey);
         return;
       }
       try {
@@ -315,9 +351,46 @@ export class Outbox {
    * **每份 context_token 只说一次**:说这句话本身也要花一格额度,而积压期间
    * 每条来信都会走到这里。同一个 token 反复说 = 用剩下的额度刷屏,而不是发积压。
    */
-  private async noticeBacklog(userKey: string, pending: number): Promise<void> {
-    if (!this.claimHint(userKey)) return;
+  /**
+   * 内容当场就发不出去时的那句交代。
+   *
+   * **不报条数**,与排空时那句不同:这一刻回合还在跑,后面还有几段正文要交进来,
+   * 此时数出来的"还有 1 条"下一秒就成了假话。而排空时队列是稳定的,那里报得准。
+   * 宁可说得糙一点,也不说一个会当场过期的数。
+   */
+  private async noticeStranded(userKey: string): Promise<void> {
+    if (!this.contentDepth(userKey)) return;
+    if (!this.claim(userKey, "backlog")) return;
+    await this.deliverOrDrop(userKey, strandedText(), "reminder");
+  }
+
+  private async noticeBacklog(userKey: string): Promise<void> {
+    // **只为真内容说话。** 队列里躺着一条过期进度不值得占一格 —— 进度是可丢的
+    // 状态,补发它对用户没有价值,而这一格是那句交代唯一的落脚点。
+    const pending = this.contentDepth(userKey);
+    if (!pending) return;
+    if (!this.claim(userKey, "backlog")) return;
     await this.deliverOrDrop(userKey, backlogText(pending), "reminder");
+  }
+
+  /** 队列里有几条是"少一条就少一件事"的内容(正文 / 播报 / 兜底)。 */
+  private contentDepth(userKey: string): number {
+    const q = this.queues.get(userKey);
+    if (!q) return 0;
+    return q.filter((x) => POLICY[x.kind] === "append").length;
+  }
+
+  /**
+   * 清掉被内容作废的那些排队进度。**不记进 `dropped`** —— 那个计数是给
+   * "本不该丢却丢了"的东西看的,而进度过期本就是 `replace` 策略的日常。
+   */
+  private dropSuperseded(userKey: string): void {
+    const q = this.queues.get(userKey);
+    if (!q?.some((x) => x.kind === "progress")) return;
+    const kept = q.filter((x) => x.kind !== "progress");
+    if (kept.length) this.queues.set(userKey, kept);
+    else this.queues.delete(userKey);
+    this.flush();
   }
 
   /**
@@ -333,17 +406,48 @@ export class Outbox {
    */
   private async noticeProgressCapped(userKey: string): Promise<void> {
     if (this.opts.replies.remainingProgress(userKey) > 0) return;
-    if (!this.claimHint(userKey)) return;
+    // 这句是"锦上添花"的那一句(它许诺答案还会来),所以它自己也要让出最后一格 ——
+    // 万一答案真的发不出去,那一格得留给说实话的那句。
+    if (this.mustYield(userKey)) return;
+    if (!this.claim(userKey, "capped")) return;
     await this.deliverOrDrop(userKey, progressCapText(), "reminder");
   }
 
-  /** 这份 token 还没提示过就占下它,返回 true。提示本身也花一格,所以只说一次。 */
-  private claimHint(userKey: string): boolean {
+  /**
+   * 还欠着那句"还有 N 条没发出去"时,最后一格谁也不许动。
+   *
+   * 已经说过了就不再留 —— 那一格该拿去发内容,留着只是浪费。
+   *
+   * **没有回复上下文时一律放行**:那时 `remainingSends` 也是 0,但它说的是
+   * "不知道这个人的预算",不是"预算用完了"。当成用完的话,没有 replyCtx 的
+   * 用户(没有预算概念的渠道、还没说过话的人)会连试都不试,消息全烂在队列里。
+   * 让它照常试一次 —— 真发不出去自然会抛,那条路本来就通向队列。
+   */
+  private mustYield(userKey: string): boolean {
+    if (!this.opts.replies.target(userKey)) return false;
+    const reserve = this.saidFor(userKey).backlog ? 0 : 1;
+    return this.opts.replies.remainingSends(userKey) <= reserve;
+  }
+
+  /** 这份 token 上这句交代还没说过就占下它,返回 true。交代本身也花一格。 */
+  private claim(userKey: string, which: "capped" | "backlog"): boolean {
     const token = this.opts.replies.target(userKey)?.contextToken;
-    if (!token || this.hinted.get(userKey) === token) return false;
+    if (!token) return false;
     if (this.opts.replies.remainingSends(userKey) <= 0) return false;
-    this.hinted.set(userKey, token);
+    const rec = this.saidFor(userKey);
+    if (rec[which]) return false;
+    rec[which] = true;
     return true;
+  }
+
+  /** 取这份 token 的"说过哪几句"记录;换了 token 就是新的一份(额度也归零了)。 */
+  private saidFor(userKey: string): { token: string; capped: boolean; backlog: boolean } {
+    const token = this.opts.replies.target(userKey)?.contextToken ?? "";
+    const rec = this.said.get(userKey);
+    if (rec && rec.token === token) return rec;
+    const fresh = { token, capped: false, backlog: false };
+    this.said.set(userKey, fresh);
+    return fresh;
   }
 
   private async deliverOrDrop(userKey: string, text: string, kind: SendKind): Promise<void> {
@@ -379,6 +483,19 @@ export class Outbox {
 /** 停在积压上时说的那句话。口令从指令表取,避免与 `/nop` 的规范形式脱节。 */
 export function backlogText(pending: number): string {
   return `还有 ${pending} 条没发出去(这条来信的额度用完了)。发一句 ${canonicalOf("nop")} 我接着发。`;
+}
+
+/**
+ * 回合还在跑、内容却已经发不出去时说的那句话。
+ *
+ * 明说"可能只发了一半" —— 用户收到半截答案时最需要确认的正是这件事:
+ * 是话说完了,还是被截断了。含糊过去的话,他多半会当成答案本身。
+ */
+export function strandedText(): string {
+  return (
+    `这条来信的额度用完了,后面还有没发出去的(答案可能只发了一半)。` +
+    `发一句 ${canonicalOf("nop")} 我接着发。`
+  );
 }
 
 /** 进度额度到头时说的那句话。 */
