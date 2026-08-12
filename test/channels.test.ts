@@ -81,11 +81,12 @@ test("onMessage 转发到全部子渠道", async () => {
   const b = new Fake("dashboard");
   const c = new CompositeChannel([a, b]);
   const got: string[] = [];
-  c.onMessage(async (m) => {
+  c.onMessage((m) => {
     got.push(m.userKey);
+    return { settled: Promise.resolve() };
   });
-  await a.handler!({ userKey: "wechat:acct:u1", text: "x" });
-  await b.handler!({ userKey: "dashboard:admin:admin", text: "y" });
+  await a.handler!({ userKey: "wechat:acct:u1", text: "x" }).settled;
+  await b.handler!({ userKey: "dashboard:admin:admin", text: "y" }).settled;
   assert.deepEqual(got, ["wechat:acct:u1", "dashboard:admin:admin"]);
 });
 
@@ -162,8 +163,9 @@ test("只服务内置管理员,发给别人直接报错", async () => {
 test("receive 把管理员的话回显进缓冲再交给网关", async () => {
   const ch = mk();
   const got: string[] = [];
-  ch.onMessage(async (m) => {
+  ch.onMessage((m) => {
     got.push(`${m.userKey}|${m.text}`);
+    return { settled: Promise.resolve() };
   });
   await ch.receive("你好");
   assert.deepEqual(got, [`${BUILTIN_ADMIN_USER_KEY}|你好`]);

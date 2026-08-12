@@ -45,7 +45,41 @@ export interface IncomingMessage {
   greeted?: boolean;
 }
 
-export type MessageHandler = (msg: IncomingMessage) => Promise<void>;
+/**
+ * 网关**收下**一条消息之后交回的凭据。
+ *
+ * ## 为什么"收下"与"处理完"必须分开
+ *
+ * 它们以前是同一个 promise:`handler()` resolve 的时机是这批起的**回合跑完**。
+ * 于是任何"投递完再投下一条"的渠道都被这个 promise 钉在原地 —— bridge 的
+ * `deliverLoop` 正是如此,一个三分钟的回合期间它一条消息都投不进网关。
+ * 后果不是"慢一点",而是**两个功能整个够不着**:
+ *
+ *   - **中途插话**:网关备好的追加通道(`AgentFeed`)要求消息在回合还跑着的时候
+ *     到达。消息卡在渠道里等那个回合结束,追加窗口只在它够不到的时间里开着,
+ *     于是那套机制一次都没被触发过 —— 用户看到的是"说了等于没说,得等它跑完"。
+ *   - **消息聚合**:微信的「图 + 文字」是相隔约 120ms 的两条。第一条把渠道钉住,
+ *     第二条进不来,1.5 秒的聚合窗口只等到了它自己 —— 攒消息形同虚设。
+ *
+ * 所以 `handler()` 现在**同步返回**,含义只有一个:这条消息已经落进网关
+ * (聚合批 / 分拣链),渠道可以接着投下一条了。想知道"这批真的处理完了"
+ * 的渠道去等 `settled`。
+ */
+export interface Accepted {
+  /**
+   * 这批消息处理完 —— 含它起的回合跑完。
+   *
+   * **绝不 reject**:回合内部已把异常都收敛成给用户的回复,而等它的人
+   * (bridge 的延后 ack)不该因为一次回合失败就走进重试分支。
+   */
+  readonly settled: Promise<void>;
+}
+
+/**
+ * 收到一条消息。**同步返回** —— 见 `Accepted` 上面那段:让渠道等回合跑完
+ * 会把中途插话与消息聚合一起废掉。
+ */
+export type MessageHandler = (msg: IncomingMessage) => Accepted;
 
 /**
  * 渠道的健康自述,供 `/health` 汇报、部署的健康门查验。

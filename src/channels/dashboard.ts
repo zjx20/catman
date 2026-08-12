@@ -115,10 +115,16 @@ export class DashboardChannel implements Channel {
     this.subscribers.clear();
   }
 
-  /** 管理员在网页上发来一条消息。回显进缓冲,再交给网关。 */
+  /**
+   * 管理员在网页上发来一条消息。回显进缓冲,再交给网关。
+   *
+   * 等的是整批处理完(`settled`):网页那边靠 SSE 收回复,这个 promise 只有
+   * 测试与"发完再发下一条"的顺序在用。中途插话走的是网关内部的追加通道,
+   * 与这里等不等无关 —— 收下消息本来就是同步的。
+   */
   async receive(text: string): Promise<void> {
     this.push("user", text);
-    await this.handler?.({ userKey: this.userKey, text });
+    await this.handler?.({ userKey: this.userKey, text }).settled;
   }
 
   /**

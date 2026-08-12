@@ -72,14 +72,19 @@ class FakeChannel implements Channel {
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
 
-  /** 注入一条用户消息并等待处理完成。 */
+  /**
+   * 注入一条用户消息并等待**整批处理完**(`settled`,含它起的回合)。
+   *
+   * 用例大多写成"发一条、断言结果",等的正是这个。真实渠道不该这么等 ——
+   * 见 channels/types.ts 的 `Accepted`:等回合跑完的渠道收不到中途插话。
+   */
   async receive(userKey: string, text: string, attachments?: readonly Attachment[]): Promise<void> {
-    await this.handler!({ userKey, text, ...(attachments ? { attachments } : {}) });
+    await this.handler!({ userKey, text, ...(attachments ? { attachments } : {}) }).settled;
   }
 
   /** 注入一条**渠道说他早收过指引**的消息(bridge 就是这么带 greeted 的)。 */
   async receiveGreeted(userKey: string, text: string): Promise<void> {
-    await this.handler!({ userKey, text, greeted: true });
+    await this.handler!({ userKey, text, greeted: true }).settled;
   }
 }
 

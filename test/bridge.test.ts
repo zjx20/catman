@@ -17,7 +17,17 @@ import {
 // 自己拼 ParsedPull 的话,就把"解析器怎么对待坏信封"这件事从用例里挖掉了。
 const parse = (raw: unknown): ParsedPull | undefined => parsePull(raw);
 import type { CourierLink } from "../src/ipc/client.js";
-import type { IncomingMessage } from "../src/channels/types.js";
+import type { Accepted, IncomingMessage } from "../src/channels/types.js";
+
+/** "收下了,而且这批也已经处理完" —— 不关心回合的用例用它。 */
+const took: Accepted = { settled: Promise.resolve() };
+
+/** 一个永远跑不完的回合:收下了,但 settled 悬着,直到调用返回的那个函数。 */
+function stuckTurn(): { accepted: Accepted; finish: () => void } {
+  let finish!: () => void;
+  const settled = new Promise<void>((resolve) => (finish = resolve));
+  return { accepted: { settled }, finish };
+}
 
 /**
  * bridge 的**时序**。它是整条链路上最容易出微妙错误的一段,而每一种错误在用户
@@ -97,8 +107,9 @@ async function run(
     spoolDir,
     ...(onDetach ? { onDetach } : {}),
   });
-  bridge.onMessage(async (m) => {
+  bridge.onMessage((m) => {
     got.push(m);
+    return took;
   });
   await bridge.start();
   const deadline = Date.now() + 2000;
@@ -131,8 +142,9 @@ test("**落进批之后才 ack** —— 提前 ack 时进程在聚合窗口里�
     c.rounds = [{ messages: [msg("m1", "喂")] }];
     const order: string[] = [];
     const bridge = new BridgeChannel({ client: c, spoolDir: dir });
-    bridge.onMessage(async () => {
+    bridge.onMessage(() => {
       order.push("deliver");
+      return took;
     });
     const origAck = c.ack.bind(c);
     c.ack = async (ids) => {
@@ -175,8 +187,9 @@ test("重复在投递完成之后到达:**必须补 ack** —— 不出队就把
     c.holdFrom = 1; // 第二轮挂住,等第一条投完再放行
     const got: unknown[] = [];
     const bridge = new BridgeChannel({ client: c, spoolDir: dir });
-    bridge.onMessage(async (m) => {
+    bridge.onMessage((m) => {
       got.push(m);
+      return took;
     });
     await bridge.start();
     while (!c.acked.flat().includes("m1")) await new Promise((r) => setTimeout(r, 10));
@@ -218,8 +231,9 @@ test("控制帧先于消息应用 —— 后面那批不该落进一个刚被切
       spoolDir: dir,
       onDetach: () => order.push("detach"),
     });
-    bridge.onMessage(async () => {
+    bridge.onMessage(() => {
       order.push("deliver");
+      return took;
     });
     await bridge.start();
     await new Promise((r) => setTimeout(r, 120));
@@ -333,6 +347,82 @@ test("没拉取成功过就不算 live —— 「已启动」不等于「收得�
   });
 });
 
+test("长回合期间**照样投递** —— 中途插话的消息必须在那一轮还跑着的时候送到网关", async () => {
+  // 这是"插话"整条链路上唯一没被守住的一段,而它坏了整整一个版本:
+  // 拉取早就拆出去了,投递却还在 `await handler(...)` 上等回合跑完,于是
+  //   ① 网关的追加通道(AgentFeed)只在消息够不到的时间里开着 —— 真机日志里
+  //      「追加输入」一行都没有;
+  //   ② 微信「图 + 文字」那 120ms 的第二条也进不来,1.5 秒的聚合窗口只等到它自己。
+  // 用户那边两种都长成同一副样子:说了等于没说,得干等它跑完。
+  await withDir(async (dir) => {
+    const c = new FakeCourier();
+    c.rounds = [{ messages: [msg("m1", "帮我改那个脚本")] }, { messages: [msg("m2", "等下,用 sed")] }];
+    const turn = stuckTurn(); // 第一条起的回合一直没跑完
+    const got: string[] = [];
+    const bridge = new BridgeChannel({ client: c, spoolDir: dir });
+    bridge.onMessage((m) => {
+      got.push(m.text);
+      // 第一条起回合(settled 悬着),后面的是追加进去的,当场就算处理完。
+      return got.length === 1 ? turn.accepted : took;
+    });
+    await bridge.start();
+    await new Promise((r) => setTimeout(r, 400));
+    assert.deepEqual(got, ["帮我改那个脚本", "等下,用 sed"], "插话必须在回合还跑着时就送到");
+    assert.ok(!c.acked.flat().includes("m1"), "起回合的那条要等回合跑完才 ack");
+    assert.ok(c.acked.flat().includes("m2"), "追加那条已经处理完,该 ack 了");
+    turn.finish();
+    await new Promise((r) => setTimeout(r, 40));
+    assert.ok(c.acked.flat().includes("m1"), "回合跑完之后才补上它的 ack");
+    await bridge.stop();
+  });
+});
+
+test("回合还没跑完时重复拉到同一条:不重投也不提前 ack —— ack 是它跑完的凭据", async () => {
+  // ack 延后到 settled 才有意义:这段时间里信使会反复送来同一条(它还没出队),
+  // 走 `seen` 的补 ack 分支就等于替一个没跑完的回合提前签收。
+  await withDir(async (dir) => {
+    const c = new FakeCourier();
+    c.rounds = [{ messages: [msg("m1", "跑个长的")] }, { messages: [msg("m1", "跑个长的")] }];
+    const turn = stuckTurn();
+    let delivered = 0;
+    const bridge = new BridgeChannel({ client: c, spoolDir: dir });
+    bridge.onMessage(() => {
+      delivered += 1;
+      return turn.accepted;
+    });
+    await bridge.start();
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(delivered, 1, "同一条不能投两次");
+    assert.deepEqual(c.acked.flat(), [], "回合没跑完,一次都不该 ack");
+    turn.finish();
+    await new Promise((r) => setTimeout(r, 40));
+    assert.deepEqual(c.acked.flat(), ["m1"]);
+    await bridge.stop();
+  });
+});
+
+test("关停前把已跑完那些回合的 ack 补上 —— 漏掉就是重启后同一句话被回答两遍", async () => {
+  // ack 从投递链上摘下来之后就不在 `delivering` 里了,stop() 不额外等的话,
+  // 一条"回合跑完、只差 ack 那一下"的消息会留在信使队列里被重放。
+  await withDir(async (dir) => {
+    const c = new FakeCourier();
+    c.rounds = [{ messages: [msg("m1", "喂")] }];
+    const turn = stuckTurn();
+    const origAck = c.ack.bind(c);
+    c.ack = async (ids) => {
+      await new Promise((r) => setTimeout(r, 50)); // ack 本身也要一小会儿
+      await origAck(ids);
+    };
+    const bridge = new BridgeChannel({ client: c, spoolDir: dir });
+    bridge.onMessage(() => turn.accepted);
+    await bridge.start();
+    await new Promise((r) => setTimeout(r, 100));
+    turn.finish(); // 回合刚跑完,ack 还在路上
+    await bridge.stop();
+    assert.deepEqual(c.acked.flat(), ["m1"], "stop() 返回之前 ack 必须落地");
+  });
+});
+
 test("长回合期间照样拉取:控制帧不被投递挡住 —— detach 唯一该起作用的场景就是长回合", async () => {
   // 耦合版在这里必然失败:handler 等的是回合跑完,而 detach 要送到的正是那个回合。
   // 期间那一轮的正文照发,且没有出处前缀 —— 而 labelIfDetached 存在的理由就是它。
@@ -342,23 +432,18 @@ test("长回合期间照样拉取:控制帧不被投递挡住 —— detach 唯�
       { messages: [msg("m1", "跑个长的")] },
       { controls: [{ schema: IPC_SCHEMA, type: "detach", userKey: "wechat:a:u1" }] },
     ];
-    let releaseTurn: (() => void) | undefined;
+    const turn = stuckTurn(); // 一个一直没跑完的回合
     const detached: string[] = [];
     const bridge = new BridgeChannel({
       client: c,
       spoolDir: dir,
       onDetach: (u) => detached.push(u),
     });
-    bridge.onMessage(
-      () =>
-        new Promise<void>((res) => {
-          releaseTurn = res; // 模拟一个一直没跑完的回合
-        }),
-    );
+    bridge.onMessage(() => turn.accepted);
     await bridge.start();
     await new Promise((r) => setTimeout(r, 400));
     assert.deepEqual(detached, ["wechat:a:u1"], "回合还没跑完,detach 就该已经应用了");
-    releaseTurn?.();
+    turn.finish();
     await bridge.stop();
   });
 });
@@ -367,18 +452,13 @@ test("长回合期间 live 不该翻假 —— 它替换掉的 iLink 渠道没�
   await withDir(async (dir) => {
     const c = new FakeCourier();
     c.rounds = [{ messages: [msg("m1", "跑个长的")] }];
-    let releaseTurn: (() => void) | undefined;
+    const turn = stuckTurn();
     const bridge = new BridgeChannel({ client: c, spoolDir: dir });
-    bridge.onMessage(
-      () =>
-        new Promise<void>((res) => {
-          releaseTurn = res;
-        }),
-    );
+    bridge.onMessage(() => turn.accepted);
     await bridge.start();
     await new Promise((r) => setTimeout(r, 400));
     assert.equal(bridge.health()[0]!.live, true, "拉取一直在继续,渠道当然是通的");
-    releaseTurn?.();
+    turn.finish();
     await bridge.stop();
   });
 });
@@ -392,7 +472,7 @@ test("投递一直失败时要退避并最终交回信使 —— 否则是每秒
     c.rounds = [{ messages: [msg("m1", "毒")] }];
     let tries = 0;
     const bridge = new BridgeChannel({ client: c, spoolDir: dir });
-    bridge.onMessage(async () => {
+    bridge.onMessage(() => {
       tries += 1;
       throw new Error("投不下去");
     });

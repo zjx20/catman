@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Channel, ChannelHealth, MessageHandler } from "./types.js";
+import type { Accepted, Channel, ChannelHealth, MessageHandler } from "./types.js";
 import { WECHAT_CHANNEL } from "./ilink-protocol.js";
 import type { Attachment } from "../core/attachments.js";
 import type { CourierLink } from "../ipc/client.js";
@@ -31,8 +31,19 @@ import type { AttachmentRef, InboundEnvelope, SendKind } from "../ipc/protocol.j
  *     用的是"有没有没失效的连接",不含这个耦合,属于回归。
  *
  * 所以:`pullLoop` 只管拉取、**立刻**应用控制帧、把消息塞进本地队列;
- * `deliverLoop` 串行地投递并 ack。顺序仍然严格(本地队列 FIFO + 串行投递),
- * 而"落进批之后才 ack"这条也没变 —— 只是它不再挡着拉取。
+ * `deliverLoop` 串行地投递。顺序仍然严格(本地队列 FIFO + 串行投递),
+ * 只是它不再挡着拉取。
+ *
+ * ## 投递也不等回合 —— 否则中途插话根本无从谈起
+ *
+ * 拆出 `deliverLoop` 只治好了"拉取"那一半。投递这一半还在 `await handler(...)`,
+ * 而它 resolve 的时机同样是**回合跑完**:于是长回合期间消息拉得进本地队列、
+ * 投不进网关,和从前一样堵着,只是堵的位置换了个地方。网关备好的追加通道
+ * (`AgentFeed`)要求消息在回合还跑着的时候到达,而这道闸保证了它永远不会 ——
+ * 真机日志里「追加输入」一行都没有,原因就在这里。
+ *
+ * 现在 `handler` **同步返回**(见 `Accepted`),含义是"落进网关了",投递链拿到
+ * 它就接着投下一条。等回合跑完的那个 promise 交给 ack 去等。
  *
  * ## 另外两条不能改的
  *
@@ -40,11 +51,15 @@ import type { AttachmentRef, InboundEnvelope, SendKind } from "../ipc/protocol.j
  * ② **同步逐条投递。** 微信的「图 + 文字」是两条相隔约 120ms 的消息,顺序即语义。
  *    信使侧"下载完成才入队"与这里的"串行投递"是同一个保证在新边界上的两半。
  *
- * ## ack 的时机
+ * ## ack 的时机:仍然等回合跑完,但**不占着投递链**
  *
- * `handler` 返回之后才 ack。它等的其实比"进了批"更久(一直等到回合跑完),
- * 那是**偏保守**的一侧:代价是消息在信使队列里多待一会儿(排水会等它,那是对的),
- * 而提前 ack 的代价是进程在聚合窗口那 1.5 秒里被杀 = 真丢。
+ * 提前 ack 的代价是进程被杀时那条消息真丢(而且现在的窗口不是聚合那 1.5 秒,
+ * 是整个回合),所以这条保守的一侧值得留着 —— 只是它不该顺便把投递也钉住。
+ * 于是:投递完就往下走,`settled` 兑现时才异步 ack。
+ *
+ * 在 ack 落地之前 msgId 一直留在 `queuedIds` 里,信使反复送来的同一条会被它
+ * 挡掉(而不是走 `seen` 的补 ack —— 那等于替一个还没跑完的回合提前 ack)。
+ * ack 失败才把它放回去,让下一次拉取重新走 `seen` 的补 ack 分支。
  */
 
 /** 记住最近见过多少个 msgId 用于去重。够覆盖一次崩溃重放的整批,又不占内存。 */
@@ -68,6 +83,15 @@ const MAX_DELIVER_TRIES = 3;
  * 撞上限的总时长(次数 × 这个值)就是全体用户的堵塞时长。
  */
 const DELIVER_BACKOFF_MS = 400;
+
+/**
+ * 关停时最多等多久让在飞的 ack 落地。
+ *
+ * 等的是"回合已经跑完、只差 ack 那一下"的那些 —— 漏掉它们等于让信使重放,
+ * 而重放在用户那边就是同一句话被回答两遍。还没跑完的回合等不到,也不该等:
+ * 那种情况下重放正是想要的处置。
+ */
+const ACK_DRAIN_MS = 2000;
 
 export interface BridgeOptions {
   client: CourierLink;
@@ -94,8 +118,14 @@ export class BridgeChannel implements Channel {
   private lastOk = 0;
   /** 等着投递的本地队列(FIFO)。拉取往里塞,投递链往外取。 */
   private readonly pending: InboundEnvelope[] = [];
-  /** 已在本地队列或正在投的 id。未 ack 的消息会被反复拉到,靠它去重。 */
+  /**
+   * 已在本地队列、正在投、或**投完还等着 ack** 的 id。未 ack 的消息会被反复
+   * 拉到,靠它去重 —— 它覆盖到 ack 落地为止,这样回合跑着的那段时间里
+   * 重复拉到的同一条不会走 `seen` 的补 ack(那等于替它提前签收)。
+   */
   private readonly queuedIds = new Set<string>();
+  /** 在飞的 ack(回合已收下、还没 ack 完)。关停时等它们一小会儿。 */
+  private readonly acking = new Set<Promise<void>>();
   /** 每条消息连续投递失败了几次。 */
   private readonly failures = new Map<string, number>();
   /** 投不下去而交回信使的条数。非零就该显眼 —— 静默跳过等于没有隔离。 */
@@ -128,6 +158,16 @@ export class BridgeChannel implements Channel {
     for (const w of wake) w();
     await this.loop?.catch(() => undefined);
     await this.delivering?.catch(() => undefined);
+    // 已经跑完的回合把 ack 补上再走。ack 从投递链上摘下来之后就不在
+    // `delivering` 里了,而关停时漏掉的那条会被信使重放 —— 用户看到的是
+    // 同一句话被回答两遍,正是这个文件开头列为必须避免的那种症状。
+    // **有上限**:还在跑的回合等不到,那种情况下重放本来就是对的处置。
+    if (this.acking.size) {
+      await Promise.race([
+        Promise.all([...this.acking]).catch(() => undefined),
+        new Promise((r) => setTimeout(r, ACK_DRAIN_MS)),
+      ]);
+    }
   }
 
   /** 投不下去而交回信使的条数,供 `/health` 与日志。 */
@@ -252,11 +292,15 @@ export class BridgeChannel implements Channel {
     while (this.running && this.pending.length) {
       const m = this.pending[0]!;
       try {
-        await this.deliver(m);
+        const accepted = this.deliver(m);
         this.pending.shift();
-        this.queuedIds.delete(m.msgId);
         this.failures.delete(m.msgId);
-        await this.opts.client.ack([m.msgId]);
+        // **不 await**:这里等的是回合跑完,而投递链一旦停在这儿,后面那条
+        // 本该插进这个回合的话就再也送不到了 —— 那正是这次要修的东西。
+        // msgId 留在 `queuedIds` 里直到 ack 落地,期间重复拉到的同一条被它挡掉。
+        const acked = this.ackWhenSettled(m.msgId, accepted);
+        this.acking.add(acked);
+        void acked.finally(() => this.acking.delete(acked));
       } catch (err) {
         const n = (this.failures.get(m.msgId) ?? 0) + 1;
         this.failures.set(m.msgId, n);
@@ -279,14 +323,39 @@ export class BridgeChannel implements Channel {
     }
   }
 
-  private async deliver(m: InboundEnvelope): Promise<void> {
+  /**
+   * ack 排在回合后面,但**不排在投递前面**。
+   *
+   * 成功之前 msgId 一直占着 `queuedIds`,所以这段时间里信使重复送来的同一条
+   * 会在 `pullLoop` 就被挡掉;ack 失败才把它放回去 —— 那时下一次拉取会走
+   * `seen` 的补 ack 分支,而那时回合确实已经跑完了,补得心安理得。
+   */
+  private async ackWhenSettled(msgId: string, accepted: Accepted): Promise<void> {
+    await accepted.settled;
+    try {
+      await this.opts.client.ack([msgId]);
+    } catch (err) {
+      console.warn(`[bridge] ${msgId} 回合跑完后 ack 失败,等下次拉取补上:${String(err)}`);
+    } finally {
+      // 成功与失败都要放开:失败那条要靠下一次拉取重新走 `seen` 的补 ack,
+      // 一直占着 `queuedIds` 就等于让它永远出不了信使的队列。
+      this.queuedIds.delete(msgId);
+    }
+  }
+
+  /**
+   * 把一条消息交给网关。**同步返回** —— 见 `Accepted`:等回合跑完的是 ack,
+   * 不是投递链。
+   */
+  private deliver(m: InboundEnvelope): Accepted {
     if (this.seen.has(m.msgId)) {
       // 重复投递是 at-least-once 的正常代价(信使崩在"已入队、游标未落盘"之间时
       // 整批会重放)。**认出来直接跳过**,否则用户会看到同一句话被回答两次。
-      return;
+      // 照样要 ack —— 不出队的话它会被反复拉到。
+      return { settled: Promise.resolve() };
     }
     const attachments = this.loadAttachments(m.attachmentRefs);
-    await this.handler?.({
+    const accepted = this.handler?.({
       userKey: m.userKey,
       msgId: m.msgId,
       text: m.text,
@@ -297,6 +366,8 @@ export class BridgeChannel implements Channel {
       ...(attachments.length ? { attachments } : {}),
     });
     this.remember(m.msgId);
+    // 没挂 handler(装配还没接线)时当作已处理:留在队列里也没人会来取。
+    return accepted ?? { settled: Promise.resolve() };
   }
 
   /**

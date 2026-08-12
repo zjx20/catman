@@ -6,6 +6,7 @@ import { accountAdmission } from "../core/admission.js";
 import { parseUserKey } from "../core/identity.js";
 import { installLogStamps } from "../core/log-stamp.js";
 import { WechatILinkChannel } from "../channels/wechat-ilink.js";
+import type { IncomingMessage } from "../channels/types.js";
 import { ILinkLogin } from "../channels/ilink-login.js";
 import { IpcServer } from "../ipc/server.js";
 import { checkIpcSecret, PERSONA_IDS, type PersonaId } from "../ipc/protocol.js";
@@ -109,7 +110,9 @@ async function main(): Promise<void> {
     admin: courierAdmin({ accounts, login, routing, replies }),
   });
 
-  channel.onMessage(async (msg) => {
+  // 信使这一侧的"处理完"就是"落进收件队列",没有回合可等,所以整个函数体
+  // 都是 settled 该等的东西。
+  const accept = async (msg: IncomingMessage): Promise<void> => {
     const verdict = admission(msg.userKey);
     if (!verdict.ok) {
       // 拒绝的说明照发(它是唯一能让人知道"我被挡在门外"的东西),但走 fallback 类,
@@ -125,7 +128,8 @@ async function main(): Promise<void> {
       text: msg.text,
       ...(msg.attachments ? { attachments: msg.attachments } : {}),
     });
-  });
+  };
+  channel.onMessage((msg) => ({ settled: accept(msg) }));
 
   const ipc = new IpcServer({ socketPath: config.ipcSocketPath, api: core, secrets });
   ipc.start();

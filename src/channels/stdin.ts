@@ -97,10 +97,12 @@ export class StdinChannel implements Channel {
     process.stdout.write(
       `(已附上 ${path},${attachment.mediaType},${attachment.bytes} 字节)\n`,
     );
+    // 这条路径等的是整批处理完(`settled`),不是"收下了" —— 本地调试通道就该
+    // 一句说完再说下一句,而它没有中途插话的需求。
     await this.handler?.({
       userKey: makeUserKey(CHANNEL, ACCOUNT, this.currentUser),
       text: caption,
       attachments: [attachment],
-    });
+    }).settled;
   }
 }

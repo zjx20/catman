@@ -1,4 +1,4 @@
-import type { Channel, IncomingMessage } from "../channels/types.js";
+import type { Accepted, Channel, IncomingMessage } from "../channels/types.js";
 import type { Agent, AgentProgressEvent } from "./agent.js";
 import type { Decision, SessionManager, SessionRef } from "./session.js";
 import type { UserRegistry } from "./users.js";
@@ -616,11 +616,18 @@ export class Gateway {
    * 于是这里每加一件事,那份抄件就悄悄少一件,**测的是一条生产里不存在的路径**。
    * 收成一个方法之后两边共用同一份,想岔都岔不了。
    */
-  onIncoming(msg: IncomingMessage): Promise<void> {
+  onIncoming(msg: IncomingMessage): Accepted {
     // 渠道知道他早收过指引就记一笔。只**抑制**不触发:缺席表示这个渠道没有这项知识
     // (stdin / dashboard),那时退回人格自己的记录判断。见 courierGreeted 的说明。
     if (msg.greeted) this.courierGreeted.add(msg.userKey);
-    return this.dispatch(msg.userKey, msg.text, msg.attachments ?? []);
+    const settled = this.dispatch(msg.userKey, msg.text, msg.attachments ?? []);
+    // 交出去的 promise 绝不能 reject:等它的是渠道的延后 ack,那条路不该被
+    // 一次回合失败拽进重试分支。回合内部的异常本来就已经收敛成给用户的回复了。
+    return {
+      settled: settled.catch((err) => {
+        console.error(`[gateway] ${msg.userKey} 这批消息处理时意外抛错:`, err);
+      }),
+    };
   }
 
   /**
@@ -629,6 +636,12 @@ export class Gateway {
    * immediate 硬指令**不入队**,就地执行 —— 这是它们存在的理由:agent 卡死时
    * 队列里的消息永远轮不到,包括本该救命的那条。代价是它们与在飞回合并发,
    * 所以只做幂等的只读/打标记操作。
+   *
+   * ⚠️ **这条路径上的方法一个都不能是 `async`**(dispatch / collect / enqueue)。
+   * "收下"必须在渠道调用 `onIncoming` 的那一瞬间就完成 —— 顺序靠的正是它:
+   * 渠道按 FIFO 逐条调用,消息落进聚合批的先后就是到达的先后。中间只要插进
+   * 一个 await,渠道就得排队等,而这里恰恰是曾经把中途插话与消息聚合一起
+   * 废掉的地方(见 channels/types.ts 的 `Accepted`)。
    */
   private dispatch(
     userKey: string,

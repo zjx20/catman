@@ -135,12 +135,14 @@ export class WechatILinkChannel implements Channel {
         // **同步 await**:投递顺序严格等于收到顺序。「图 + 文字」那 120ms 的一对
         // 靠它保持先后 —— 并发投递会让它们颠倒着进队列。
         async (msg) => {
+          // 等 `settled` 而不只是"收下了":这条渠道跑在信使里,它的 settled 就是
+          // "已经落进收件队列",本来就快。等它是为了上面那条顺序保证。
           await this.handler?.({
             msgId: msg.msgId,
             userKey: msg.userKey,
             text: msg.text,
             ...(msg.attachments.length ? { attachments: msg.attachments } : {}),
-          });
+          }).settled;
         },
         this.limits,
         this.replies,
