@@ -26,6 +26,7 @@ import { BUILTIN_ADMIN_USER_KEY } from "../src/core/identity.js";
 import { loadConfig, type Config } from "../src/config.js";
 import type { AdmissionPolicy } from "../src/core/admission.js";
 import type { Channel, MessageHandler } from "../src/channels/types.js";
+import type { SendKind } from "../src/ipc/protocol.js";
 import type { Attachment } from "../src/core/attachments.js";
 import type { Agent, AgentProgressEvent, AgentReply, AgentRunOptions } from "../src/core/agent.js";
 import type { DeployControl, PublishCandidate, VerifiedRelease } from "../src/core/deploy.js";
@@ -42,7 +43,12 @@ const U2 = "stdin:local:u2";
 class FakeChannel implements Channel {
   readonly name = "fake";
   handler?: MessageHandler;
-  sent: Array<{ userKey: string; text: string }> = [];
+  sent: Array<{ userKey: string; text: string; kind: SendKind }> = [];
+  /**
+   * 渠道现报的进度余量。`undefined` = 这个渠道没有发送预算的概念(stdin / dashboard),
+   * 真实的 iLink 侧由信使报回来(bridge 转述,自己不记账)。
+   */
+  budget?: number;
   recalled: string[] = [];
   /** 设为 true 时 send 抛错,模拟主动推送发不出去(预算耗尽 / 上下文失效)。 */
   failSend = false;
@@ -62,10 +68,15 @@ class FakeChannel implements Channel {
   onMessage(h: MessageHandler): void {
     this.handler = h;
   }
-  async send(userKey: string, text: string): Promise<string | void> {
+  progressBudget(_userKey: string): number | undefined {
+    return this.budget;
+  }
+  async send(userKey: string, text: string, kind: SendKind = "body"): Promise<string | void> {
     this.attempted += 1;
     if (this.failSend) throw new Error("push not supported");
-    this.sent.push({ userKey, text });
+    this.sent.push({ userKey, text, kind });
+    // 进度花的是同一份预算 —— 发一条少一条,与信使那边的账同源。
+    if (kind === "progress" && this.budget !== undefined) this.budget -= 1;
     // 支持撤回的渠道返回消息 id
     if (this.recall) return `msg-${this.sent.length}`;
   }
@@ -329,8 +340,8 @@ test("完整回合:准入 → decide → 回执 → agent → record → send", 
   assert.equal(agent.calls.length, 1);
   assert.equal(agent.calls[0]!.resume, undefined); // 新会话
   assert.deepEqual(afterGreeting(channel.sent), [
-    { userKey: U1, text: ACK_TEXT },
-    { userKey: U1, text: "echo:你好" },
+    { userKey: U1, text: ACK_TEXT, kind: "ack" },
+    { userKey: U1, text: "echo:你好", kind: "body" },
   ]);
   // 渠道不支持撤回:回执保留
   assert.deepEqual(channel.recalled, []);
@@ -373,7 +384,9 @@ test("回执:ackEnabled=false 时不发回执", async () => {
   const t = 1_000_000;
   const { channel } = build(() => t, { settings: { ackEnabled: false } });
   await channel.receive(U1, "你好");
-  assert.deepEqual(afterGreeting(channel.sent), [{ userKey: U1, text: "echo:你好" }]);
+  assert.deepEqual(afterGreeting(channel.sent), [
+    { userKey: U1, text: "echo:你好", kind: "body" },
+  ]);
 });
 
 test("进度:按序转发,且最终回复永远排在进度之后", async () => {
@@ -567,21 +580,30 @@ test("进度节流:总条数封顶用的是**渠道现报**的余量,不是自�
   let left = 4; // 假装信使说还剩 4 条
   const th = new ProgressThrottle(t0, undefined, () => left);
   const texts: string[] = [];
+  const notices: Array<string | undefined> = [];
   // 跨度 30 分钟,远超阶梯能自然产生的条数。
   for (let ms = 0; ms <= 1_800_000; ms += 1_000) {
     const out = th.offer(t0 + ms, toolEv(ms));
     if (out) {
       texts.push(out);
+      notices.push(th.takeCapNotice());
       left -= 1; // 发出去一条,信使那边的余量跟着减
     }
   }
   assert.equal(texts.length, 4, "封顶后不该再放行");
-  // 最后一条要交代"后面没了" —— 否则长回合里那段几分钟的静默与卡死无从分辨。
-  assert.ok(texts.at(-1)!.includes("进度就报到这儿"), `缺少收尾交代:${texts.at(-1)}`);
-  assert.ok(!texts.at(-2)!.includes("进度就报到这儿"), "只有最后一条该带交代");
-  // 而且要给出路:额度是按"这条来信"算的,再发一句话就重来一份,/nop 就是那句话。
-  // 只说"没了"不说怎么办,等于通知他接下来只能干等。
-  assert.ok(texts.at(-1)!.includes("/nop"), `收尾交代该带上续额的办法:${texts.at(-1)}`);
+  // 交代**不在进度文本里** —— 它是单独一条消息,走保留额(见 RESERVED_SENDS)。
+  assert.ok(
+    !texts.some((t) => t.includes("进度就报到这儿")),
+    `交代不该混进进度文本:${texts.at(-1)}`,
+  );
+  // 但必须有,而且只在最后那条之后有一次:否则用户看到的是进度突然断掉。
+  assert.deepEqual(
+    notices.map(Boolean),
+    [false, false, false, true],
+    `交代该只跟在最后一条进度后面:${JSON.stringify(notices)}`,
+  );
+  assert.ok(notices.at(-1)!.includes("/nop"), "交代里要带上续额的办法,不能只说没了");
+  assert.equal(th.takeCapNotice(), undefined, "取走即清,同一轮不重复说");
 });
 
 test("进度节流:开闸之后余量回来,进度接着报 —— 这是 /nop 的另一半", () => {
@@ -595,8 +617,9 @@ test("进度节流:开闸之后余量回来,进度接着报 —— 这是 /nop �
   left = 0;
   assert.equal(th.offer(t0 + 100_000, toolEv(2)), undefined, "额度用尽就闭嘴");
 
-  left = 16; // 新 context_token,信使那边的计数归零
+  left = 15; // 新 context_token,信使那边的计数归零
   th.reset(t0 + 200_000);
+  assert.equal(th.takeCapNotice(), undefined, "额度回来了,还没送出去的那句交代作废");
   assert.equal(th.offer(t0 + 200_000, toolEv(3)), undefined, "阶梯一并重来,不会变成刷屏");
   assert.ok(th.offer(t0 + 205_000, toolEv(4)), "满第一档之后接着报");
 });
@@ -720,7 +743,7 @@ test("准入拒绝:不跑 agent、不写会话状态、不建工作目录", asyn
   assert.equal(agent.calls.length, 0);
   assert.deepEqual(sessions.snapshot(), {});
   assert.deepEqual(users.snapshot(), {});
-  assert.deepEqual(channel.sent, [{ userKey: U1, text: "没有对你开放。" }]);
+  assert.deepEqual(channel.sent, [{ userKey: U1, text: "没有对你开放。", kind: "body" }]);
   // 被拒的人连 greeting 都不该收到 —— 那会泄漏"这个服务存在且能用"。
 });
 
@@ -2016,6 +2039,38 @@ test("/取消 只中断前台,后台那些继续跑", async () => {
   fgOpen();
   open();
   await Promise.all([bg, fg]);
+});
+
+test("额度报到头的交代是**单独一条**,而且走保留额而不是进度额度", async () => {
+  // 附在最后一条进度尾巴上的话,它就跟进度共用一份额度 —— 而"进度用完了"正是它
+  // 唯一该出现的时刻。信使那边为它留了一格(RESERVED_SENDS),这里守的是人格侧
+  // 确实按那个约定发:kind 是 reminder,不是 progress。
+  let t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  channel.budget = 1; // 信使说进度只剩 1 条 —— 下面这条就是最后一条
+  agent.progressEvents = [{ kind: "tool", name: "Bash", input: { command: "npm test" } }];
+  agent.beforeProgress = () => (t += 60_000);
+
+  await channel.receive(U1, "长任务");
+
+  const progress = channel.sent.filter((m) => m.kind === "progress");
+  assert.equal(progress.length, 1, `余量只有 1 条,进度就该只发 1 条:${progress.length}`);
+  assert.ok(
+    !progress[0]!.text.includes("进度就报到这儿"),
+    `交代不该混进进度文本:${progress[0]!.text}`,
+  );
+
+  const notice = channel.sent.find((m) => m.text.includes("进度就报到这儿"));
+  assert.ok(notice, `该单独发一条交代:${JSON.stringify(channel.sent.map((m) => m.text))}`);
+  assert.equal(notice.kind, "reminder", "它走保留额 —— progress 的名额已经用完了");
+  assert.ok(notice.text.includes("/nop"), "交代里要带上续额的办法");
+  // 顺序:进度 → 交代 → 正文。交代插到正文后面的话,用户会以为答案还没完。
+  const order = channel.sent.map((m) => m.kind);
+  assert.ok(
+    order.indexOf("progress") < order.indexOf("reminder"),
+    `交代该紧跟在进度后面:${JSON.stringify(order)}`,
+  );
+  assert.equal(order.at(-1), "body", `正文必须排在最后:${JSON.stringify(order)}`);
 });
 
 test("/nop:回合跑到一半也能续额,节流器跟着重新开闸", async () => {

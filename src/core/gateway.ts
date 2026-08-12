@@ -201,15 +201,20 @@ export const PROGRESS_INTERVALS_MS = [5_000, 15_000, 30_000, 60_000];
  */
 
 /**
- * 额度用尽时附在最后一条进度后面的交代。
+ * 额度用尽时的交代。**单独一条消息,而且信使那边给它留了一格额度**
+ * (`RESERVED_SENDS`)—— 不是附在最后一条进度后面。
  *
- * 后半句是**出路**而不只是说明:额度是按"这条来信"算的,用户再发一句话就重来一份,
- * 而 `/nop` 就是那句"随便的话"(见 COMMAND_TABLE)。不给出路的话,这句交代等于
- * 通知他"接下来只能干等" —— 长回合下那可能是好几分钟的静默。
+ * 为什么值得占一格:后半句是**出路**而不只是说明 —— 额度按"这条来信"算,用户再发
+ * 一句话就重来一份,而 `/nop` 就是那句"随便的话"(见 COMMAND_TABLE)。附在进度尾巴上
+ * 它就成了一行工具调用摘要的补注,而这句话恰恰要被看见:不给出路的话,这条交代等于
+ * 通知他"接下来只能干等",长回合下那可能是好几分钟的静默。
+ *
+ * 走保留额还有一层:它因此**不占进度的名额**,也不会被进度的上限挤掉 ——
+ * 而"进度用完了"正是它唯一该出现的时刻。
  */
 const PROGRESS_CAP_NOTICE =
-  `(进度就报到这儿,接下来直接等答案。` +
-  `想接着看进度就发一句 ${canonicalOf("nop")} —— 它什么也不做,只把额度续上)`;
+  `进度就报到这儿,接下来直接等答案。` +
+  `想接着看进度就发一句 ${canonicalOf("nop")} —— 它什么也不做,只把额度续上。`;
 
 /**
  * 进度推送节流器。
@@ -233,6 +238,8 @@ export class ProgressThrottle {
   private sent = 0;
   /** 上次放行之后被丢掉几条。 */
   private skipped = 0;
+  /** 刚放行的那条是不是最后一条 —— 交代由 `takeCapNotice` 取走。 */
+  private capped = false;
 
   /**
    * @param remaining 该用户**还能收几条进度**,由渠道现问。返回 `undefined` 表示
@@ -267,9 +274,23 @@ export class ProgressThrottle {
     this.sent += 1;
     // 第 n 条发完之后用第 n 档间隔;超出阶梯长度就一直用最后一档。
     this.nextAllowedAt = now + (this.intervals[Math.min(this.sent, this.intervals.length - 1)] ?? 0);
-    // 最后一条要说清楚后面没了。否则用户看到的是进度突然断掉,与"卡死了"无从分辨 ——
-    // 长回合下这段静默可能长达好几分钟,正是最容易让人以为出事的时候。
-    return left === 1 ? `${text}\n${PROGRESS_CAP_NOTICE}` : text;
+    // 刚放行的这条是最后一条 —— 后面没了要说清楚,否则用户看到的是进度突然断掉,
+    // 与"卡死了"无从分辨(长回合下这段静默可能长达好几分钟)。那句交代**单独发**,
+    // 由调用方取走:它走保留额,不占进度的名额,见 PROGRESS_CAP_NOTICE。
+    if (left === 1) this.capped = true;
+    return text;
+  }
+
+  /**
+   * 取走"进度到此为止"的交代,**取走即清** —— 同一轮里只说一次。
+   *
+   * 与 `offer` 分开而不是拼在它的返回值里:这句话是一条**独立的消息**,用的是
+   * 保留额而不是进度额度。拼在一起就只能跟着进度走,而进度恰恰在这一刻用完了。
+   */
+  takeCapNotice(): string | undefined {
+    if (!this.capped) return undefined;
+    this.capped = false;
+    return PROGRESS_CAP_NOTICE;
   }
 
   /**
@@ -287,6 +308,8 @@ export class ProgressThrottle {
     this.sent = 0;
     this.skipped = 0;
     this.nextAllowedAt = now + (this.intervals[0] ?? 0);
+    // 还没送出去的那句交代作废:额度回来了,它说的话已经不成立。
+    this.capped = false;
   }
 }
 
@@ -1530,6 +1553,11 @@ export class Gateway {
       if (text === undefined) return;
       progress = progress.then(async () => {
         await this.trySend(userKey, text, "进度", "progress");
+        // 额度报到头的那句交代**单独发一条**,而且走 `reminder` 的保留额 ——
+        // 信使那边给它留了一格(见 reply-store 的 RESERVED_SENDS)。排在同一条链上,
+        // 所以它必定紧跟在最后那条进度后面,不会插到正文之后。
+        const notice = throttle.takeCapNotice();
+        if (notice) await this.trySend(userKey, notice, "额度提示", "reminder");
       });
     };
 
