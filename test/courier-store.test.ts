@@ -134,18 +134,20 @@ test("inbox:日志长度有界 —— 不能因为长期运行而无限增长", 
 
 // ── 发送预算 ──────────────────────────────────────────────────────
 
-test("预算:那笔账 —— 20 条总额,回执 1,保留 4,进度 15", () => {
-  // 保留是靠进度的上限实现的:进度撞到上限就再也发不出去,剩下 4 条谁也抢不走。
-  // 第四格是给"进度报到头了,发 /nop 续上"那句交代的 —— 它要是跟进度共用额度,
-  // 就会跟进度一起被挤掉,而那正是它唯一该出现的时刻。
+test("预算:那笔账 —— 20 条总额,回执 1,保留 2,进度 17", () => {
+  // 保留额从 4 降到 2:有了发件队列之后,发不出去的消息进队列等额度回来,
+  // "丢了"这件事本身没有了 —— 而保留额存在的理由曾经就是给丢不起的消息占位子。
+  // 剩下这 2 格是时延旋钮(正文当场就发,不排队)与那句续额提示的落脚点。
   // 20 是在试而不是实测值(实测过的是 10),所以这里钉住 —— 改动它是一次
   // 有代价的实验,不该被顺手改掉:真上限若仍是 10,第 11 条起全败且永不恢复。
   assert.equal(SEND_BUDGET, 20);
-  assert.equal(MAX_PROGRESS_PER_TOKEN, 15);
+  assert.equal(MAX_PROGRESS_PER_TOKEN, 17);
 });
 
-test("预算:进度撞上限之后,正文与提醒仍然发得出去", () => {
-  // 这是整条设计的核心:进度把额度吃光的话,最不能丢的那几条就一定发不出去。
+test("预算:进度撞上限之后,正文与那句续额提示仍然发得出去", () => {
+  // 进度把额度吃光的话,最不能丢的那两条就一定发不出去 —— 而它们恰恰是
+  // "答案"和"怎么把额度要回来"。别的类别不再各占一格:它们进发件队列,
+  // 一条都不会少(见 outbox.ts)。
   withDir((dir) => {
     const store = new ReplyStore(join(dir, "ctx.json"), () => 1000);
     store.remember("u", "raw-u", "tok-1");
@@ -158,11 +160,26 @@ test("预算:进度撞上限之后,正文与提醒仍然发得出去", () => {
     assert.match(over.reason ?? "", /进度额度/);
 
     assert.equal(store.begin("u", "body").allowed, true, "正文必须还发得出去");
-    assert.equal(store.begin("u", "reminder").allowed, true, "会话空闲提醒也是");
-    assert.equal(store.begin("u", "announce").allowed, true, "部署结果播报也是");
-    // 第四格:那句"进度报到头了,发 /nop 续上"的交代。它走 reminder 的额度 ——
+    // 第二格:那句"进度报到头了,发 /nop 续上"的交代。它走 reminder 的额度 ——
     // 新开一种 kind 会让老信使(跑 pinned,版本天然更老)读不懂整个信封。
-    assert.equal(store.begin("u", "reminder").allowed, true, "额度提示还有一格");
+    assert.equal(store.begin("u", "reminder").allowed, true, "续额提示还有一格");
+  });
+});
+
+test("预算:remainingSends 答的是「这个 token 还剩多少」,与进度余量分开", () => {
+  // 发件队列问的是这一个:它要决定排空停在哪儿,而那与"进度还能推几条"无关。
+  withDir((dir) => {
+    const store = new ReplyStore(join(dir, "ctx.json"), () => 1000);
+    assert.equal(store.remainingSends("u"), 0, "没有上下文时压根发不出去");
+    store.remember("u", "raw-u", "tok-1");
+    assert.equal(store.remainingSends("u"), SEND_BUDGET);
+    for (let i = 0; i < MAX_PROGRESS_PER_TOKEN; i++) store.begin("u", "progress");
+    assert.equal(store.remainingProgress("u"), 0, "进度用完了");
+    assert.equal(
+      store.remainingSends("u"),
+      SEND_BUDGET - MAX_PROGRESS_PER_TOKEN,
+      "但总额还剩保留的那几条 —— 队列据此判断还能不能排空",
+    );
   });
 });
 

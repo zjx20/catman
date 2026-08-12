@@ -22,6 +22,7 @@ import {
   switchedToRescueText,
 } from "./routing.js";
 import { fallbackText } from "./fallback.js";
+import { Outbox } from "./outbox.js";
 import type { SettingsView } from "./settings-view.js";
 
 /**
@@ -67,10 +68,12 @@ export interface CourierCoreOptions {
   replies: ReplyStore;
   spool: Spool;
   settings: SettingsView;
-  /** 真正把字节发出去(渠道)。 */
+  /** 真正把字节发出去(渠道)。**不要直接调它** —— 一切出站都过发件队列,见 `outbox`。 */
   send: CourierSend;
   /** 见过谁的记录(greeting 判定)。 */
   greetedPath: string;
+  /** 发件队列的落盘路径。省略 = 只在内存里(单测)。 */
+  outboxPath?: string;
   /** 应急绑定口令。空 = 没配,`/绑定` 一律拒绝。 */
   bindPassphrase?: string;
   /** 收到有效 `/绑定` 时强制完成绑定。返回给用户的一句话。 */
@@ -98,9 +101,20 @@ export class CourierCore implements CourierApi {
   private readonly nacked = new Map<PersonaId, number>();
   /** 压根没能收下的条数(写盘失败等)。与 inbox 的 dropped 是两回事。 */
   private lost = 0;
+  /**
+   * 出站的唯一出口。**core 自己不调 `opts.send`** —— 一切出站都过它,
+   * 否则"发不出去就排队"这条性质会被绕过的那条路径悄悄破掉。
+   */
+  private readonly outbox: Outbox;
 
   constructor(private readonly opts: CourierCoreOptions) {
     this.now = opts.now ?? (() => Date.now());
+    this.outbox = new Outbox({
+      replies: opts.replies,
+      deliver: (userKey, text, kind) => opts.send(userKey, text, kind),
+      ...(opts.outboxPath ? { path: opts.outboxPath } : {}),
+      ...(opts.now ? { now: opts.now } : {}),
+    });
     // **"还没拉取过"不等于"不可达"。** 初值给 0 的话,信使刚起来时的第一条消息
     // 必定触发一句"主人格没有响应"—— 而主人格可能正常得很,只是还没来得及拉第一次
     // (它要先起 dashboard、装配、连 socket)。用启动时刻打底之后,判据变成
@@ -125,6 +139,12 @@ export class CourierCore implements CourierApi {
     attachments?: readonly Attachment[];
   }): Promise<void> {
     try {
+      // ⓪ 这条来信带来一份新的 `context_token`,额度跟着归零 —— 那是积压唯一等得到
+      //    的东西,所以**每条来信都催一次排空**。放在最前面:它不该被指令消化
+      //    (`/救援`)或投递失败挡掉,那两种情况下积压同样该往外走。
+      //    不 await:排空是限速的、可能要跑好几秒,而"收下这条消息"必须立刻完成。
+      this.outbox.kick(msg.userKey);
+
       // ① 信使自己消化的指令。**在路由与投递之前** —— `/救援` 的全部意义就是
       //    主人格卡死时它照样管用,进了队列就没这个性质了。
       const handled = await this.tryCourierCommand(msg.userKey, msg.text);
@@ -305,10 +325,15 @@ export class CourierCore implements CourierApi {
       };
     }
     try {
-      await this.opts.send(env.userKey, env.text, env.kind);
+      // **发不出去不等于失败**:`submit` 要么当场发,要么排进队列等额度回来,
+      // 两种都算收下了。所以这里回 ok —— 人格据此判断"这条交出去了",
+      // 而它交出去的东西从此由队列负责,不会再无声无息地消失。
+      await this.outbox.submit(env.userKey, env.text, env.kind);
       return {
         schema: IPC_SCHEMA,
         ok: true,
+        // 余量照实说。进度节流器据此收缩 —— 额度见底时**不该**再往队列里塞进度,
+        // 那只会让排空排的全是过期状态。
         remainingProgress: this.opts.replies.remainingProgress(env.userKey),
       };
     } catch (err) {
@@ -349,6 +374,19 @@ export class CourierCore implements CourierApi {
     return this.lost;
   }
 
+  /**
+   * 出站积压。**与收件队列的深度是两个方向的堵**:那个是"人格没在消费",
+   * 这个是"微信那边没额度",处置完全不同,合成一个数就看不出来了。
+   */
+  outboxStats(): { pending: number; dropped: number } {
+    return { pending: this.outbox.depth(), dropped: this.outbox.dropped };
+  }
+
+  /** 关停:把在飞的那一轮排空等完。队列已落盘,没发完的下次起来接着发。 */
+  async stop(): Promise<void> {
+    await this.outbox.stop();
+  }
+
   // ── 内部 ────────────────────────────────────────────────────────
 
   private pushControl(persona: PersonaId, ctrl: ControlEnvelope): void {
@@ -361,7 +399,7 @@ export class CourierCore implements CourierApi {
   /** 发一条信使自己的话。失败只记日志 —— 它是解释,不该反过来把流程搞挂。 */
   private async reply(userKey: string, text: string, kind: SendKind): Promise<void> {
     try {
-      await this.opts.send(userKey, text, kind);
+      await this.outbox.submit(userKey, text, kind);
     } catch (err) {
       console.warn(`[courier] 给 ${userKey} 发信失败:${String(err)}`);
     }

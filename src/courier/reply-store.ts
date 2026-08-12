@@ -69,15 +69,22 @@ export const SEND_BUDGET = 20;
 const ACK_SENDS = 1;
 
 /**
- * 给非进度用途预留的条数:正文 / 会话空闲提醒 / 部署结果播报 / 额度提示。
- * `fallback` 与正文互斥(人格不可达时才有它),共用这份额度。
+ * 给非进度用途预留的条数:正文 + 额度提示。
  *
- * 第四格是给"进度报到头了,发 /nop 可以续上"那句话的。它不新开一种 kind 而是走
- * `reminder`:**信使跑的是 pinned,版本天然比人格老**,而 `parseSendKind` 认不出的
- * kind 会让整个信封读不懂 —— 那句提示于是恰好在最需要它的时候消失。用已有的 kind
- * 意味着这件事在 bless 之前就能用。
+ * **有了发件队列之后,保留额不再是安全机制。** 发不出去的消息现在进 `Outbox` 等额度
+ * 回来,"丢了"这件事本身没有了 —— 而保留额存在的全部理由曾经就是给"丢了就没有第二次"
+ * 的消息占位子。所以会话空闲提醒(`reminder`)与部署结果播报(`announce`)不再各占
+ * 一格:它们排队,一条都不会少。
+ *
+ * 剩下这 2 格是**时延旋钮**,不是保险:
+ * ① 正文 —— 让常见的那种长回合仍然当场就把答案发出去,而不是排队等用户刷额度;
+ * ② 额度提示 —— "进度报到这儿,发 /nop 可以续上"那句话得有地方发,它是队列排空的开关。
+ *
+ * 提示走 `reminder` 而不新开一种 kind:**信使跑的是 pinned,版本天然比人格老**,
+ * 而 `parseSendKind` 认不出的 kind 会让整个信封读不懂 —— 那句提示于是恰好在最需要
+ * 它的时候消失。
  */
-const RESERVED_SENDS = 4;
+const RESERVED_SENDS = 2;
 
 /** 一个回合里最多推几条进度。 */
 export const MAX_PROGRESS_PER_TOKEN = SEND_BUDGET - ACK_SENDS - RESERVED_SENDS;
@@ -163,6 +170,19 @@ export class ReplyStore {
   target(userKey: string): { toUserId: string; contextToken: string } | undefined {
     const c = this.ctxs.get(userKey);
     return c ? { toUserId: c.toUserId, contextToken: c.contextToken } : undefined;
+  }
+
+  /**
+   * 这条来信总共还能发几条(不分类别)。没有上下文时是 0。
+   *
+   * 发件队列据此决定"当场发还是排队",以及排空要停在哪儿。**它与
+   * `remainingProgress` 是两个问题**:那个答的是"进度还能推几条"(人格的节流器问),
+   * 这个答的是"这个 token 还剩多少"(队列问)。
+   */
+  remainingSends(userKey: string): number {
+    const c = this.ctxs.get(userKey);
+    if (!c) return 0;
+    return Math.max(0, SEND_BUDGET - c.attempts);
   }
 
   /** 还能发几条进度。没有上下文时是 0(压根发不出去)。 */

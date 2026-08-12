@@ -93,6 +93,8 @@ async function main(): Promise<void> {
     spool,
     settings,
     greetedPath: join(dir, "greeted.json"),
+    // 出站积压落盘:信使重启时里面可能正躺着一条已经跑完却没送出去的答案。
+    outboxPath: join(dir, "outbox.json"),
     send: (userKey, text, kind) => channel.send(userKey, text, kind),
     ...(readBindPassphrase(join(dir, "bind-passphrase")) ?? {}),
     onForceBind: (userKey) => {
@@ -149,6 +151,9 @@ async function main(): Promise<void> {
   const shutdown = async (sig: string): Promise<void> => {
     console.info(`收到 ${sig},关闭 courier`);
     clearInterval(sweep);
+    // 先停发件队列再停渠道:反过来的话正在排空的那一条会撞上已经关掉的连接,
+    // 白烧一格额度(失败的尝试照样计数)。
+    await core.stop().catch(() => undefined);
     await channel.stop().catch(() => undefined);
     await ipc.stop().catch(() => undefined);
     process.exit(0);
