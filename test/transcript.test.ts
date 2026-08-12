@@ -61,6 +61,94 @@ test("readSession 解析 string 与 block 数组两种 content", () => {
   assert.equal(entries[2]!.text, "完成了");
 });
 
+test("readSession 保留 tool_use/tool_result,结果块配回工具名", () => {
+  const { configDir, writeSession } = fixture();
+  writeSession("s1", [
+    {
+      type: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "我看一下" },
+          { type: "tool_use", id: "tu_1", name: "Bash", input: { command: "df -h", description: "看磁盘" } },
+        ],
+      },
+    },
+    {
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "tu_1", content: "/dev/sda1  20G  8G" }] },
+    },
+  ]);
+  const entries = readSession(configDir, PROJ, "s1");
+  assert.equal(entries.length, 2);
+
+  // 助手这条:文本仍是文本,工具调用另存一块
+  assert.equal(entries[0]!.text, "我看一下");
+  const use = entries[0]!.blocks!;
+  assert.equal(use.length, 1);
+  assert.equal(use[0]!.kind, "tool_use");
+  assert.equal(use[0]!.label, "Bash");
+  assert.equal(use[0]!.summary, "df -h", "摘要取 command 而不是整个 JSON");
+  assert.match(use[0]!.detail, /"description": "看磁盘"/, "展开能看到完整入参");
+
+  // 工具结果这条:文本为空,但不再是空盒子
+  assert.equal(entries[1]!.text, "");
+  const res = entries[1]!.blocks!;
+  assert.equal(res[0]!.kind, "tool_result");
+  assert.equal(res[0]!.label, "Bash 结果", "tool_use_id 配回了工具名");
+  assert.match(res[0]!.detail, /dev\/sda1/);
+  assert.equal(res[0]!.isError, undefined);
+});
+
+test("失败的工具结果带 isError,拿不到工具名时退回泛称", () => {
+  const { configDir, writeSession } = fixture();
+  writeSession("s1", [
+    {
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "无主的id", content: "boom", is_error: true }] },
+    },
+  ]);
+  const b = readSession(configDir, PROJ, "s1")[0]!.blocks![0]!;
+  assert.equal(b.isError, true);
+  assert.equal(b.label, "工具 结果");
+});
+
+test("thinking 块被保留成折叠块", () => {
+  const { configDir, writeSession } = fixture();
+  writeSession("s1", [
+    { type: "assistant", message: { content: [{ type: "thinking", thinking: "先看日志\n再决定", signature: "x" }] } },
+  ]);
+  const entries = readSession(configDir, PROJ, "s1");
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0]!.blocks![0]!.kind, "thinking");
+  assert.equal(entries[0]!.blocks![0]!.summary, "先看日志 再决定", "摘要压成一行");
+  assert.equal(entries[0]!.blocks![0]!.detail, "先看日志\n再决定");
+});
+
+test("既无文本也无块的行被丢弃(元信息行不渲染成空盒子)", () => {
+  const { configDir, writeSession } = fixture();
+  writeSession("s1", [
+    { type: "queue-operation", op: "enqueue" },
+    { type: "assistant", message: { content: [] } },
+    { type: "user", message: { content: "真的有话" } },
+  ]);
+  const entries = readSession(configDir, PROJ, "s1");
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0]!.text, "真的有话");
+});
+
+test("超长工具输出被截断且说明还剩多少", () => {
+  const { configDir, writeSession } = fixture();
+  writeSession("s1", [
+    {
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "t", content: "x".repeat(100_050) }] },
+    },
+  ]);
+  const b = readSession(configDir, PROJ, "s1")[0]!.blocks![0]!;
+  assert.match(b.detail, /还有 50 字符未显示/);
+  assert.ok(b.detail.length < 100_100);
+});
+
 test("脏行被跳过而非崩溃", () => {
   const { configDir } = fixture();
   const proj = join(configDir, "projects", "-data-workspace");

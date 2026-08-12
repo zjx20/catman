@@ -36,9 +36,28 @@ export interface SessionSummary {
   preview: string;
 }
 
+/**
+ * 一条消息里的**非文本**块。会话记录里绝大多数内容是这些 —— 一个跑工具的回合
+ * 通常是几条 text 配几十条 tool_use/tool_result,只抽 text 的话详情页就是一排
+ * 空盒子。dashboard 把它们折叠展示:收起看 label + summary,展开看 detail。
+ */
+export interface TranscriptBlock {
+  kind: "tool_use" | "tool_result" | "thinking";
+  /** 折叠标题:工具名,或「思考」。 */
+  label: string;
+  /** 收起时跟在标题后的一行摘要。 */
+  summary: string;
+  /** 展开后的完整内容。 */
+  detail: string;
+  /** 工具执行失败(tool_result 的 is_error)。 */
+  isError?: boolean;
+}
+
 export interface TranscriptEntry {
   role: "user" | "assistant" | "system" | "result" | "other";
   text: string;
+  /** 本条消息里的非文本块,按原顺序。没有则不设置。 */
+  blocks?: TranscriptBlock[];
   /** 原始行里的时间戳(若有)。 */
   ts?: string;
 }
@@ -248,6 +267,9 @@ function parseFile(path: string): TranscriptEntry[] {
     return [];
   }
   const entries: TranscriptEntry[] = [];
+  // tool_use_id → 工具名。tool_result 自己不带工具名,而它总是出现在对应的
+  // tool_use 之后,所以边扫边记就够了 —— 拿不到时退回泛称,不影响其它块。
+  const toolNames = new Map<string, string>();
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
     let obj: unknown;
@@ -256,7 +278,7 @@ function parseFile(path: string): TranscriptEntry[] {
     } catch {
       continue; // 跳过脏行
     }
-    const entry = toEntry(obj);
+    const entry = toEntry(obj, toolNames);
     if (entry) entries.push(entry);
   }
   return entries;
@@ -269,8 +291,8 @@ function firstUserPreview(path: string): string {
   return "";
 }
 
-/** 从一行(未知形态)提取角色与文本。 */
-function toEntry(obj: unknown): TranscriptEntry | null {
+/** 从一行(未知形态)提取角色、文本与非文本块。 */
+function toEntry(obj: unknown, toolNames: Map<string, string>): TranscriptEntry | null {
   if (!obj || typeof obj !== "object") return null;
   const o = obj as Record<string, unknown>;
   const type = typeof o["type"] === "string" ? (o["type"] as string) : "";
@@ -288,8 +310,11 @@ function toEntry(obj: unknown): TranscriptEntry | null {
             : "other";
 
   const text = extractText(o);
-  if (!text && role === "other") return null;
-  return { role, text, ...(ts ? { ts } : {}) };
+  const blocks = extractBlocks(o, toolNames);
+  // 两样都空 = 这一行没有任何可看的内容(队列操作、模式切换之类的元信息行)。
+  // 留着只会在详情页渲染成一个没有正文的空盒子,比不显示更让人费解。
+  if (!text && !blocks.length) return null;
+  return { role, text, ...(blocks.length ? { blocks } : {}), ...(ts ? { ts } : {}) };
 }
 
 /** 尽量从多种消息形态里抽取纯文本。 */
@@ -322,4 +347,128 @@ function extractText(o: Record<string, unknown>): string {
   const content = o["content"];
   if (typeof content === "string") return content;
   return "";
+}
+
+/** 单个块 detail 的上限。超长输出(几 MB 的日志)会把详情页撑爆,整页是一次性渲染的。 */
+const MAX_DETAIL = 100_000;
+
+/** 摘要优先取这些键 —— 一眼能认出这次调用干了什么的那个参数。 */
+const SUMMARY_KEYS = [
+  "command",
+  "file_path",
+  "path",
+  "pattern",
+  "query",
+  "url",
+  "skill",
+  "prompt",
+  "description",
+  "name",
+];
+
+/** 抽出消息里的 tool_use / tool_result / thinking 块。 */
+function extractBlocks(o: Record<string, unknown>, toolNames: Map<string, string>): TranscriptBlock[] {
+  const message = o["message"];
+  if (!message || typeof message !== "object") return [];
+  const content = (message as Record<string, unknown>)["content"];
+  if (!Array.isArray(content)) return [];
+
+  const blocks: TranscriptBlock[] = [];
+  for (const raw of content) {
+    if (!raw || typeof raw !== "object") continue;
+    const b = raw as Record<string, unknown>;
+
+    if (b["type"] === "tool_use") {
+      const name = typeof b["name"] === "string" ? (b["name"] as string) : "工具";
+      const id = typeof b["id"] === "string" ? (b["id"] as string) : "";
+      if (id) toolNames.set(id, name);
+      const detail = jsonish(b["input"]);
+      blocks.push({
+        kind: "tool_use",
+        label: name,
+        summary: summarizeInput(b["input"]),
+        detail: clip(detail),
+      });
+      continue;
+    }
+
+    if (b["type"] === "tool_result") {
+      const id = typeof b["tool_use_id"] === "string" ? (b["tool_use_id"] as string) : "";
+      const name = (id && toolNames.get(id)) || "工具";
+      const detail = resultText(b["content"]);
+      const isError = b["is_error"] === true;
+      blocks.push({
+        kind: "tool_result",
+        label: `${name} 结果`,
+        summary: oneLine(detail) || (isError ? "(失败,无输出)" : "(无输出)"),
+        detail: clip(detail),
+        ...(isError ? { isError: true } : {}),
+      });
+      continue;
+    }
+
+    if (b["type"] === "thinking" && typeof b["thinking"] === "string") {
+      const detail = b["thinking"] as string;
+      if (!detail.trim()) continue;
+      blocks.push({
+        kind: "thinking",
+        label: "思考",
+        summary: oneLine(detail),
+        detail: clip(detail),
+      });
+    }
+  }
+  return blocks;
+}
+
+/** tool_result 的 content:字符串,或 text/图片块的数组。 */
+function resultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return content === undefined || content === null ? "" : jsonish(content);
+  return content
+    .map((raw) => {
+      if (typeof raw === "string") return raw;
+      if (!raw || typeof raw !== "object") return "";
+      const b = raw as Record<string, unknown>;
+      if (typeof b["text"] === "string") return b["text"] as string;
+      if (b["type"] === "image") return "[图片]";
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** 从工具入参里挑一行摘要。挑不出有意义的字符串就退回整个 JSON。 */
+function summarizeInput(input: unknown): string {
+  if (input === null || input === undefined) return "";
+  if (typeof input !== "object") return oneLine(String(input));
+  const o = input as Record<string, unknown>;
+  for (const key of SUMMARY_KEYS) {
+    const v = o[key];
+    if (typeof v === "string" && v.trim()) return oneLine(v);
+  }
+  for (const v of Object.values(o)) {
+    if (typeof v === "string" && v.trim()) return oneLine(v);
+  }
+  return oneLine(jsonish(o));
+}
+
+/** 压成一行并截断,供折叠标题用。 */
+function oneLine(s: string, max = 110): string {
+  const flat = s.replace(/\s+/g, " ").trim();
+  return flat.length > max ? flat.slice(0, max) + "…" : flat;
+}
+
+function clip(s: string): string {
+  return s.length > MAX_DETAIL ? `${s.slice(0, MAX_DETAIL)}\n…(还有 ${s.length - MAX_DETAIL} 字符未显示)` : s;
+}
+
+/** 尽量格式化成可读 JSON;不可序列化时退回 String()。 */
+function jsonish(v: unknown): string {
+  if (typeof v === "string") return v;
+  try {
+    return JSON.stringify(v, null, 2) ?? String(v);
+  } catch {
+    return String(v);
+  }
 }

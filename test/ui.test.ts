@@ -45,6 +45,55 @@ test("列表页渲染会话预览与链接", () => {
   assert.match(html, /\/session\/s1/);
 });
 
+test("会话详情页把工具调用渲染成默认收起的折叠块", () => {
+  const html = renderPage("session", {
+    sessionId: "s1",
+    entries: [
+      {
+        role: "assistant",
+        text: "看一下",
+        blocks: [
+          { kind: "tool_use", label: "Bash", summary: "df -h", detail: '{\n  "command": "df -h"\n}' },
+        ],
+      },
+      {
+        role: "user",
+        text: "",
+        blocks: [{ kind: "tool_result", label: "Bash 结果", summary: "满了", detail: "/dev/sda1 100%" }],
+      },
+    ],
+  });
+  assert.match(html, /<details class="blk">/);
+  assert.doesNotMatch(html, /<details[^>]*\sopen/, "默认收起,几十个块摊开就没法读了");
+  assert.match(html, /Bash 结果/);
+  assert.match(html, /df -h/, "收起时的摘要");
+  assert.match(html, /\/dev\/sda1 100%/, "展开后的完整输出也在页面里");
+});
+
+test("会话详情页转义工具输出,不让它注入页面", () => {
+  const html = renderPage("session", {
+    sessionId: "s1",
+    entries: [
+      {
+        role: "user",
+        text: "",
+        blocks: [
+          {
+            kind: "tool_result",
+            label: "Bash 结果",
+            summary: "<script>alert(1)</script>",
+            detail: "<script>alert(2)</script>",
+            isError: true,
+          },
+        ],
+      },
+    ],
+  });
+  assert.doesNotMatch(html, /<script>alert/);
+  assert.match(html, /&lt;script&gt;alert\(2\)/);
+  assert.match(html, /class="blk bad"/, "失败的工具结果要看得出来");
+});
+
 test("列表页按用户分组,展示各自的显示名", () => {
   const base = { path: "/x.jsonl", mtimeMs: Date.now(), sizeBytes: 1, preview: "p" };
   const html = renderPage("list", {

@@ -1,4 +1,4 @@
-import type { SessionSummary, TranscriptEntry } from "../core/transcript.js";
+import type { SessionSummary, TranscriptBlock, TranscriptEntry } from "../core/transcript.js";
 import type { PublicAccount } from "../core/accounts.js";
 import type { UserRecord } from "../core/users.js";
 import type { ChatMessage } from "../channels/dashboard.js";
@@ -54,6 +54,21 @@ const STYLE = `
   .result{background:#ecfdf5;border:1px solid #a7f3d0}
   .system,.other{background:#f3f4f6;border:1px solid #e5e7eb;color:#6b7280}
   .role{font-size:11px;text-transform:uppercase;color:#6b7280;margin-bottom:2px}
+  .mtext{white-space:pre-wrap}
+  /* 折叠的工具调用/思考块。white-space 复位:.msg 是 pre-wrap,标题行不该跟着换行 */
+  .blk{white-space:normal;border:1px solid #e5e7eb;border-left:3px solid #9ca3af;border-radius:6px;
+    background:#fafafa;margin:6px 0;font-size:13px}
+  .blk>summary{cursor:pointer;padding:5px 9px;display:flex;gap:8px;align-items:baseline;list-style:none}
+  .blk>summary::-webkit-details-marker{display:none}
+  .blk>summary::before{content:"▸";color:#9ca3af;font-size:11px}
+  .blk[open]>summary::before{content:"▾"}
+  .blk .blabel{font-weight:600;color:#374151;white-space:nowrap}
+  .blk .bsum{color:#6b7280;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px}
+  .blk>pre{margin:0;padding:8px 10px;border-top:1px solid #e5e7eb;background:#fff;
+    white-space:pre-wrap;word-break:break-word;font-size:12px;max-height:60vh;overflow:auto}
+  .blk.think{border-left-color:#a5b4fc;background:#f8f8ff}
+  .blk.think .blabel{color:#4338ca}
+  .blk.bad{border-left-color:#ef4444;background:#fef2f2}
   h4.group{margin:22px 0 6px;font-size:13px;color:#374151;border-bottom:1px solid #e5e7eb;padding-bottom:4px}
   .tag{display:inline-block;background:#eef2ff;color:#3730a3;border-radius:4px;padding:0 6px;font-size:11px;margin-left:6px}
   .tag.bad{background:#fee2e2;color:#991b1b}
@@ -178,14 +193,28 @@ function renderList({ sessions, users }: ListPageData): string {
   return shell("会话列表", `${search}${blocks.join("")}`);
 }
 
+/**
+ * 一个非文本块。收起时是「工具名 + 一行参数摘要」,展开看完整输入/输出。
+ * 默认全部收起 —— 一个跑工具的回合有几十个块,摊开就没法读了。
+ */
+function renderBlock(b: TranscriptBlock): string {
+  const cls = b.kind === "thinking" ? "blk think" : b.isError ? "blk bad" : "blk";
+  const icon = b.kind === "thinking" ? "💭" : b.kind === "tool_result" ? "↩" : "🔧";
+  return (
+    `<details class="${cls}"><summary><span class="blabel">${icon} ${escapeHtml(b.label)}</span>` +
+    `<span class="bsum">${escapeHtml(b.summary)}</span></summary>` +
+    `<pre>${escapeHtml(b.detail)}</pre></details>`
+  );
+}
+
 function renderSession({ sessionId, entries }: SessionPageData): string {
   const msgs = entries
-    .map(
-      (e) =>
-        `<div class="msg ${e.role}"><div class="role">${e.role}${
-          e.ts ? " · " + escapeHtml(e.ts) : ""
-        }</div>${escapeHtml(e.text)}</div>`,
-    )
+    .map((e) => {
+      const head = `<div class="role">${e.role}${e.ts ? " · " + escapeHtml(e.ts) : ""}</div>`;
+      const text = e.text ? `<div class="mtext">${escapeHtml(e.text)}</div>` : "";
+      const blocks = (e.blocks ?? []).map(renderBlock).join("");
+      return `<div class="msg ${e.role}">${head}${text}${blocks}</div>`;
+    })
     .join("");
   const body = `<p><a href="/">← 返回列表</a></p><h3>${escapeHtml(sessionId)}</h3>${
     entries.length ? msgs : `<p class="meta">空会话。</p>`
