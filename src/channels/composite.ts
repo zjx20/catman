@@ -1,6 +1,7 @@
 import { parseUserKey } from "../core/identity.js";
 import type { AdmissionPolicy, AdmissionResult } from "../core/admission.js";
 import type { Channel, ChannelHealth, MessageHandler } from "./types.js";
+import type { SendKind } from "../ipc/protocol.js";
 
 /**
  * 多渠道复合。按 userKey 的第一段(channel)把 send/recall 路由到对应渠道,
@@ -38,8 +39,18 @@ export class CompositeChannel implements Channel {
     for (const c of this.byName.values()) c.onMessage(handler);
   }
 
-  async send(userKey: string, text: string): Promise<string | void> {
-    return this.route(userKey).send(userKey, text);
+  /**
+   * **`kind` 必须原样转下去。** 这里曾经只写了两个形参,于是网关交下来的
+   * kind 在复合渠道这一层无声蒸发,所有消息到信使时都成了默认的 `body`:
+   * 进度不再被认成进度,`reply-store` 的 7 条进度上限从来没生效过,进度一路
+   * 吃光 10 条预算,给正文和"发 /nop 续额"那句提示预留的 2 格全被挤掉 ——
+   * 用户看到的就是进度发着发着断掉、答案和交代一起消失,直到他自己开口才补发。
+   *
+   * TypeScript 拦不住这个:少写形参的函数可以赋给多形参的类型,`implements Channel`
+   * 一声不吭。所以守卫只能是用例(test/channels.test.ts)。
+   */
+  async send(userKey: string, text: string, kind?: SendKind): Promise<string | void> {
+    return this.route(userKey).send(userKey, text, kind);
   }
 
   /** 把各成员的自述摊平。不实现 health() 的成员不出现 —— 不替它编一个健康状态。 */

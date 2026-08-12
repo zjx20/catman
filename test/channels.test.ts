@@ -13,9 +13,12 @@ import { WECHAT_CHANNEL } from "../src/channels/ilink-protocol.js";
 import { FakeReplies } from "./helpers/replies.js";
 import { AccountStore } from "../src/core/accounts.js";
 import type { Channel, MessageHandler } from "../src/channels/types.js";
+import type { SendKind } from "../src/ipc/protocol.js";
 
 class Fake implements Channel {
-  sent: Array<{ userKey: string; text: string }> = [];
+  // kind 也记下来:复合渠道曾经把它整个吞掉,而假渠道当时同样只写两个形参,
+  // 于是用例跟着一起瞎了。记住它,那个洞才有人守。
+  sent: Array<{ userKey: string; text: string; kind: SendKind }> = [];
   recalled: string[] = [];
   started = 0;
   stopped = 0;
@@ -35,8 +38,8 @@ class Fake implements Channel {
   onMessage(h: MessageHandler): void {
     this.handler = h;
   }
-  async send(userKey: string, text: string): Promise<void> {
-    this.sent.push({ userKey, text });
+  async send(userKey: string, text: string, kind: SendKind = "body"): Promise<void> {
+    this.sent.push({ userKey, text, kind });
   }
   async start(): Promise<void> {
     this.started++;
@@ -54,8 +57,26 @@ test("按 userKey 的 channel 段路由 send", async () => {
   const c = new CompositeChannel([a, b]);
   await c.send("wechat:acct:u1", "给微信的");
   await c.send("dashboard:admin:admin", "给面板的");
-  assert.deepEqual(a.sent, [{ userKey: "wechat:acct:u1", text: "给微信的" }]);
-  assert.deepEqual(b.sent, [{ userKey: "dashboard:admin:admin", text: "给面板的" }]);
+  assert.deepEqual(a.sent, [{ userKey: "wechat:acct:u1", text: "给微信的", kind: "body" }]);
+  assert.deepEqual(b.sent, [{ userKey: "dashboard:admin:admin", text: "给面板的", kind: "body" }]);
+});
+
+/**
+ * 这条守的是一个真机上烧了两个多小时的 bug:`CompositeChannel.send` 只声明了
+ * 两个形参,`kind` 在这一层无声消失,信使那边看到的全是 `body` —— 进度不再被
+ * 认成进度,预算里给正文和"发 /nop 续额"那句提示留的格子被进度吃光,用户看到
+ * 的是进度断掉之后彻底静默。类型系统在这里是瞎的(形参少的函数可以赋给形参多的
+ * 类型),所以只能靠用例守。
+ */
+test("send 把 kind 原样转给子渠道 —— 少一个形参就是预算账本失灵", async () => {
+  const a = new Fake("wechat");
+  const c = new CompositeChannel([a, new Fake("dashboard")]);
+  const kinds: SendKind[] = ["ack", "progress", "reminder", "body"];
+  for (const kind of kinds) await c.send("wechat:acct:u1", kind, kind);
+  assert.deepEqual(
+    a.sent.map((s) => s.kind),
+    kinds,
+  );
 });
 
 test("未知渠道前缀报错,而不是发给随便某个渠道", async () => {
