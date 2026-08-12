@@ -1,7 +1,7 @@
 import { readJsonFile, writeJsonFileAtomic } from "../core/file-store.js";
 import { canonicalOf } from "../core/commands.js";
 import { parseSendKind, type SendKind } from "../ipc/protocol.js";
-import type { ReplyStore } from "./reply-store.js";
+import { LIVE_TURN_SENDS, type ReplyStore } from "./reply-store.js";
 
 /**
  * 发件队列 —— 发不出去的消息在这里等额度回来,而不是就地丢掉。
@@ -47,10 +47,13 @@ import type { ReplyStore } from "./reply-store.js";
 const PACE_MS = 1_500;
 
 /**
- * 排空停在还剩几条时。留给用户刚发的这一轮:回执 1 + 答案 1 + 那句"还有 N 条" 1,
- * 再加 1 条余量。填 0 的话新问题的答案会排在旧积压后面,而他要的是新问题的答案。
+ * 排空停在还剩几条时 —— 留给用户刚发的这一轮:回执 + 答案 + 那句"还有 N 条"。
+ *
+ * 填 0 的话新问题的答案会排在旧积压后面,而他要的是新问题的答案。
+ * 取自那笔账而不是另写一个常量:`SEND_BUDGET` 一动(20 试过、又改回 10),
+ * 排空的余地必须跟着动。
  */
-const DRAIN_FLOOR = 4;
+const DRAIN_FLOOR = LIVE_TURN_SENDS;
 
 /** 每个用户最多积压几条。到顶了先丢可丢的,见 `enqueue`。 */
 const MAX_ITEMS_PER_USER = 40;

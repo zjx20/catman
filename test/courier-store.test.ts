@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Inbox, inboundOf } from "../src/courier/inbox.js";
 import {
+  LIVE_TURN_SENDS,
   MAX_PROGRESS_PER_TOKEN,
   ReplyStore,
   SEND_BUDGET,
@@ -134,14 +135,18 @@ test("inbox:日志长度有界 —— 不能因为长期运行而无限增长", 
 
 // ── 发送预算 ──────────────────────────────────────────────────────
 
-test("预算:那笔账 —— 20 条总额,回执 1,保留 2,进度 17", () => {
+test("预算:那笔账 —— 10 条总额,回执 1,保留 2,进度 7", () => {
   // 保留额从 4 降到 2:有了发件队列之后,发不出去的消息进队列等额度回来,
   // "丢了"这件事本身没有了 —— 而保留额存在的理由曾经就是给丢不起的消息占位子。
   // 剩下这 2 格是时延旋钮(正文当场就发,不排队)与那句续额提示的落脚点。
-  // 20 是在试而不是实测值(实测过的是 10),所以这里钉住 —— 改动它是一次
-  // 有代价的实验,不该被顺手改掉:真上限若仍是 10,第 11 条起全败且永不恢复。
-  assert.equal(SEND_BUDGET, 20);
-  assert.equal(MAX_PROGRESS_PER_TOKEN, 17);
+  //
+  // **10 是实测值,而且复测过**:2026-08-12 放宽到 20 试了一次,当天就撞回来 ——
+  // 两次记录都是恰好 10 条成功,第 11 条起 ret=-2 且永不恢复。这里钉死它,
+  // 再往上调是一次有代价的实验,不该被顺手改掉。
+  assert.equal(SEND_BUDGET, 10);
+  assert.equal(MAX_PROGRESS_PER_TOKEN, 7);
+  // 排空的余地必须跟着这笔账走,不能各写各的。
+  assert.equal(LIVE_TURN_SENDS, SEND_BUDGET - MAX_PROGRESS_PER_TOKEN);
 });
 
 test("预算:进度撞上限之后,正文与那句续额提示仍然发得出去", () => {
