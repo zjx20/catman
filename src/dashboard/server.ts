@@ -33,6 +33,7 @@ import type { DashboardChannel } from "../channels/dashboard.js";
 import { renderPage, type UserRow } from "./ui.js";
 import { DashboardAuth, urlWithoutToken } from "./auth.js";
 import { handleSelfApi, isSelfApiPath, SESSION_HEADER, type SelfApiDeps } from "./api-self.js";
+import { handleCronApi, isCronApiPath, type CronApiDeps } from "./api-cron.js";
 import { handleAdminApi, isAdminApiPath, type AdminApiDeps } from "./api-admin.js";
 import { buildHealth, isHealthPath, type HealthDeps } from "./health.js";
 
@@ -85,6 +86,8 @@ export interface DashboardOptions {
   /** 管理员聊天渠道。 */
   chat: DashboardChannel;
   selfApi: SelfApiDeps;
+  /** 定时任务接口。没有调度器的场合(守护人格、本地开发)可以不传,那时整段路由不挂。 */
+  cronApi?: CronApiDeps;
   adminApi: AdminApiDeps;
   /**
    * `/health` 的数据源。不传则不开这个端点 —— 单测里起 Dashboard 不必装配整个网关。
@@ -186,6 +189,19 @@ export class Dashboard {
       // 不鉴权的代价已在 health.ts 里控住:这份 payload 只有标量与版本号。
       if (isHealthPath(path) && this.opts.health) {
         return json(res, buildHealth(this.opts.health));
+      }
+
+      // ⚠️ 必须排在 isSelfApiPath **之前**:那个判定认领整个 /api/me/ 前缀,
+      // 排在它后面的话定时任务的路径会被它接走然后回一个 404。
+      if (isCronApiPath(path)) {
+        if (!this.opts.cronApi) return jsonError(res, 503, "这台机器没有定时任务调度器");
+        const raw = req.headers[SESSION_HEADER];
+        const token = Array.isArray(raw) ? raw[0] : raw;
+        const body = await readJsonBody(req);
+        const r = await handleCronApi(req.method ?? "GET", path, token, body, this.opts.cronApi);
+        res.writeHead(r.status, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(r.body, null, 2));
+        return;
       }
 
       // ⚠️ 回合令牌的接口必须排在 admin 读闸门**之前** —— 它过不了那道闸。

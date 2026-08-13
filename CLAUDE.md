@@ -144,6 +144,13 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 | `src/channels/composite.ts` | 多渠道复合 + 复合准入,按 userKey 前缀路由 |
 | `src/channels/dashboard.ts` | 管理员聊天渠道(记录落盘 + SSE 订阅 + 回执撤回) |
 | `src/dashboard/api-self.ts` | `/api/me`:回合令牌鉴权,agent 管自己的配置 |
+| `src/dashboard/api-cron.ts` | `/api/me/cron`:同一枚回合令牌,agent 管自己的定时任务(**必须排在 `isSelfApiPath` 之前**,那个判定认领整个 `/api/me/` 前缀) |
+| `src/core/cron/schedule.ts` | cron 解析 + 下次触发时刻 + 频率下限判据。**纯函数**,自带时区换算,零依赖 |
+| `src/core/cron/validate.ts` | 创建/修改任务的入口校验。调用方是 LLM,所以未知字段一律拒收、字段名自带单位、能当场算的都当场算 |
+| `src/core/cron/store.ts` | 任务表 + 执行记录 + 保留策略(按次数为主、年龄为辅);**认不出的任务隔离不删**(回滚安全) |
+| `src/core/cron/docker.ts` | 脚本任务的执行面:detached 一次性容器 + 隔离参数;**catman 重启不打断在跑的任务** |
+| `src/core/cron/scheduler.ts` | tick 调度:先收尸再点火;错过只补一次且要在窗口内;overlap 判定排在全局并发之前 |
+| `src/core/cron/notify.ts` | 通知文案(纯函数)。只用信使已认识的 SendKind:开跑 `reminder`(只留最新)、结果 `announce`(一条不丢) |
 | `src/dashboard/api-admin.ts` | `/api/settings`、`/api/users`:管理员改全局与他人(含提权) |
 | `src/core/transcript.ts` | JSONL 防御式解析、检索、**workspace 范围**清理 |
 | `src/core/file-store.ts` | 状态原子写(tmp + rename) |

@@ -1740,6 +1740,20 @@ export class Gateway {
    * 排查发送问题时,看不见的失败比失败本身更难办:日志里只剩最后一步正文报错,
    * 会让人以为前面都成功了。`what` 用来分辨是哪一类发送坏掉的。
    */
+  /**
+   * 主动推一条消息给某个用户(定时任务的开跑/结果播报走这里)。
+   *
+   * 与网关自己那些播报共用同一条发送路径,于是也共用同一份纪律:发不出去不是
+   * 这里的事 —— 信使有发件队列,它会在用户下次开口时补发。所以这个方法**不抛错**,
+   * 调用方不必(也不应该)自己重试。
+   *
+   * `kind` 只能用信使已经认识的那几种:它跑的是钉住的旧版本,不认识的 kind 会让
+   * 整个信封读不懂,那条消息就恰好在最需要它的时候消失。
+   */
+  async push(userKey: string, text: string, kind: SendKind): Promise<void> {
+    await this.trySend(userKey, text, "定时任务播报", kind);
+  }
+
   private async trySend(
     userKey: string,
     text: string,

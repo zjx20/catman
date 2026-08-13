@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   ADMIN_SKILL,
   ADMIN_SKILLS,
+  CRON_SKILL,
   EVOLVE_SKILL,
   RESCUE_SKILL,
   USER_SKILL,
@@ -35,8 +36,9 @@ test("自进化 skill 只对管理员回合可见", () => {
   // 更要紧的是 description 常驻上下文:列进普通名单等于告诉每个用户有这条路。
   assert.equal(USER_SKILLS.includes(EVOLVE_SKILL), false);
   assert.equal(ADMIN_SKILLS.includes(EVOLVE_SKILL), true);
-  // 顺带钉住另两个的分配没被改乱。
-  assert.deepEqual([...USER_SKILLS], [USER_SKILL]);
+  // 顺带钉住另几个的分配没被改乱。定时任务是每人自己的(接口按回合令牌定身份),
+  // 所以它在普通名单里 —— 与改自己的设置同一个模型。
+  assert.deepEqual([...USER_SKILLS], [USER_SKILL, CRON_SKILL]);
   assert.equal(ADMIN_SKILLS.includes(ADMIN_SKILL), true);
 });
 
@@ -107,10 +109,11 @@ test("守护人格拿 catman-rescue,拿不到 catman-evolve", () => {
   assert.equal(primaryAdmin.includes(RESCUE_SKILL), false);
 });
 
-test("非管理员回合两个人格都只有 catman-settings", () => {
-  for (const p of ["primary", "rescue"] as const) {
-    assert.deepEqual(skillsFor(p, false), [USER_SKILL]);
-  }
+test("非管理员回合:主人格给设置与定时任务,守护人格只给设置", () => {
+  assert.deepEqual(skillsFor("primary", false), [USER_SKILL, CRON_SKILL]);
+  // 守护人格里没有调度器,连接口都不存在 —— 摆一份说明只会让它去调一个必然 404 的东西。
+  assert.deepEqual(skillsFor("rescue", false), [USER_SKILL]);
+  assert.equal(skillsFor("rescue", true).includes(CRON_SKILL), false);
 });
 
 test("skillsFor 列出的每个 skill,writeSkills 都真的写了文件", () => {

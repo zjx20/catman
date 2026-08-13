@@ -155,6 +155,20 @@ export interface Config {
    * 否则它会去自己的小卷里找那些文件然后什么都读不到,而且**不报错**。
    */
   mainDataDir: string;
+  /**
+   * /data 在**宿主**上的绝对路径。缺席 = 这台机器没配。
+   *
+   * 定时任务要用它把工作目录挂进一次性容器 —— docker 的 `-v` 只认宿主视角,
+   * 传容器内的路径进去,dockerd 会在宿主上静默建一个空目录然后挂上,症状是
+   * "任务跑了但什么都没有"。缺席时脚本任务在创建那一步就被拒,而不是每次都失败。
+   */
+  hostDataDir: string | undefined;
+  /**
+   * 展示用时区(IANA 名)。容器不继承宿主时区,不设就是 UTC。
+   * 定时任务的"每天 8 点"是谁的 8 点、通知里那句"下次 08-14 08:00"按哪儿算,
+   * 都取决于它 —— 所以它是配置项而不是散落在各处的 `process.env.TZ`。
+   */
+  tz: string;
 }
 
 export function loadConfig(): Config {
@@ -205,5 +219,7 @@ export function loadConfig(): Config {
     persona: process.env.CATMAN_PERSONA === "rescue" ? "rescue" : "primary",
     adminUserKeys: list("CATMAN_ADMIN_USER_KEYS", []),
     mainDataDir,
+    hostDataDir: process.env.CATMAN_HOST_DATA_DIR || undefined,
+    tz: str("TZ", "UTC"),
   };
 }

@@ -51,6 +51,12 @@ export interface Settings {
   maxImageBytes: number;
   maxImagesPerTurn: number;
   messageAggregationMs: number;
+  cronEnabled: boolean;
+  cronMaxConcurrent: number;
+  cronMinIntervalMs: number;
+  cronKeepRuns: number;
+  cronCatchUpMs: number;
+  cronMountAllowlist: string[];
 }
 
 /** scope="user" 的那些项:全局可设默认值,每用户还能各自覆盖。 */
@@ -188,6 +194,18 @@ function stringArrayDef(
   };
 }
 
+/** 宿主路径前缀列表。空数组合法(表示"全部禁止"),坏值返回 undefined。 */
+function parsePathList(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: string[] = [];
+  for (const v of raw) {
+    if (typeof v !== "string" || !v.startsWith("/") || v.includes("..")) return undefined;
+    const p = v.endsWith("/") && v.length > 1 ? v.slice(0, -1) : v;
+    if (!out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
 // --- schema ---
 
 export const SETTING_SCHEMA: Schema = {
@@ -254,6 +272,47 @@ export const SETTING_SCHEMA: Schema = {
     10_000,
     " 毫秒",
   ),
+  // ── 定时任务 ──
+  //
+  // 六项全是**闸门**而不是偏好:它们决定一个写错的任务最坏能把这台 2 核软路由
+  // 折腾成什么样。所以默认值一律取保守的那一端(并发 1、最快 5 分钟一次、
+  // 默认不许挂宿主目录之外的东西),要放宽得管理员自己动手。
+  cronEnabled: boolDef("global", "定时任务", "总开关。关掉后到点的任务一律不触发(排期不丢)。", true),
+  cronMaxConcurrent: intDef("global", "定时任务并发", "同时最多跑几个定时任务。", 1, 1, 4),
+  cronMinIntervalMs: intDef(
+    "global",
+    "定时任务最小间隔",
+    "两次触发之间的下限,创建任务时校验。调小之前先想清楚宿主扛不扛得住。",
+    5 * MINUTE,
+    MINUTE,
+    DAY,
+    " 毫秒",
+  ),
+  cronKeepRuns: intDef("global", "执行记录条数", "每个任务默认保留多少条执行记录。", 20, 1, 200),
+  cronCatchUpMs: intDef(
+    "global",
+    "补跑窗口",
+    "错过的那一档在这个窗口内还补跑一次(部署重启会造成错过),超出就只等下一档。",
+    15 * MINUTE,
+    MINUTE,
+    6 * HOUR,
+    " 毫秒",
+  ),
+  cronMountAllowlist: {
+    scope: "global",
+    label: "任务可挂载目录",
+    desc: "定时任务能挂进容器的宿主路径前缀。设成空数组 = 一个都不许挂。",
+    floor: ["/opt/services"],
+    hint: () => "宿主上的绝对路径前缀数组,如 [\"/opt/services\"];空数组表示全部禁止",
+    validate(raw) {
+      const v = parsePathList(raw);
+      if (!v) throw new Error("任务可挂载目录需要一个数组,每一项是宿主上的绝对路径(不含 ..)");
+      return v;
+    },
+    // 与别的白名单不同:**空数组是合法值**,它表示"一个都不许挂"。
+    // 复用 stringArrayDef 的话空数组会被当坏值退回默认,管理员就永远收不紧这一项。
+    parse: (raw) => parsePathList(raw),
+  },
   adminUserKeys: stringArrayDef(
     "管理员",
     `额外拥有管理员权限的 userKey。内置的 ${BUILTIN_ADMIN_USER_KEY} 不在此列且无法移除。`,
@@ -414,6 +473,12 @@ export class GlobalSettings {
       maxImageBytes: pick("maxImageBytes"),
       maxImagesPerTurn: pick("maxImagesPerTurn"),
       messageAggregationMs: pick("messageAggregationMs"),
+      cronEnabled: pick("cronEnabled"),
+      cronMaxConcurrent: pick("cronMaxConcurrent"),
+      cronMinIntervalMs: pick("cronMinIntervalMs"),
+      cronKeepRuns: pick("cronKeepRuns"),
+      cronCatchUpMs: pick("cronCatchUpMs"),
+      cronMountAllowlist: pick("cronMountAllowlist"),
     };
   }
 

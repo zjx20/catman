@@ -25,12 +25,18 @@ import { SETTING_SCHEMA, USER_SETTING_KEYS, type SettingContext, type SettingKey
  */
 
 export const USER_SKILL = "catman-settings";
+export const CRON_SKILL = "catman-cron";
 export const ADMIN_SKILL = "catman-admin";
 export const EVOLVE_SKILL = "catman-evolve";
 export const RESCUE_SKILL = "catman-rescue";
 
-/** 普通回合可见的 skill。 */
-export const USER_SKILLS: readonly string[] = [USER_SKILL];
+/**
+ * 普通回合可见的 skill。
+ *
+ * `catman-cron` 在这里而不是 admin 那边:定时任务是**每人自己的**,接口按回合
+ * 令牌定身份,一个用户既看不见也动不了别人的任务 —— 与改自己的设置同一个模型。
+ */
+export const USER_SKILLS: readonly string[] = [USER_SKILL, CRON_SKILL];
 /**
  * admin 回合可见的 skill。
  *
@@ -38,12 +44,14 @@ export const USER_SKILLS: readonly string[] = [USER_SKILL];
  * 用户都换了版本),与 `/发布` `/回滚` 的 adminOnly 是同一个决定。普通用户的回合里
  * 连这份说明都不该出现 —— 它的 description 常驻上下文,列出来等于告诉每个人有这条路。
  */
-export const ADMIN_SKILLS: readonly string[] = [USER_SKILL, ADMIN_SKILL, EVOLVE_SKILL];
+export const ADMIN_SKILLS: readonly string[] = [USER_SKILL, CRON_SKILL, ADMIN_SKILL, EVOLVE_SKILL];
 /**
  * 守护人格的 admin 回合可见的 skill。
  *
- * 与主人格的区别只有一处:`catman-evolve` 换成 `catman-rescue`。**不是两者都给** ——
- * 它跑的是钉住的稳定版本,改了代码也上不了线,而人正在等它诊断。
+ * 与主人格的区别有两处:`catman-evolve` 换成 `catman-rescue`(它跑的是钉住的稳定
+ * 版本,改了代码也上不了线,而人正在等它诊断);以及**没有 `catman-cron`** ——
+ * 调度器只在主人格里跑,守护人格那边连接口都不存在,摆一份说明只会让它去调
+ * 一个必然 404 的东西。
  */
 export const RESCUE_SKILLS: readonly string[] = [USER_SKILL, ADMIN_SKILL, RESCUE_SKILL];
 
@@ -130,6 +138,102 @@ curl -s -H "X-Catman-Session: $CATMAN_SESSION_TOKEN" "$CATMAN_API_BASE/api/me/se
 - 改不了的东西别硬试:${globalKeys.map((k) => `\`${k}\``).join("、")} 是全局配置,
   只有管理员能改。用户想改这些,告诉他找管理员。
 - 接口返回 400 时,错误文案是写给人看的,直接转述给用户并列出可选值。
+`;
+}
+
+function cronSkillBody(): string {
+  return `${frontmatter(
+    CRON_SKILL,
+    "管理当前用户的定时任务:按 cron / 固定间隔 / 指定时刻,在隔离的 docker 容器里跑一条命令," +
+      "跑完把结果推给他。用户说「每天几点帮我…」「定时」「自动跑」「以后每隔多久…」时用它。",
+  )}
+# 定时任务
+
+用户说"每天早上八点看一眼磁盘""每周日备份一次"这类话时,用这套接口给他建一个定时任务。
+任务是**每个用户自己的**,凭据与 \`catman-settings\` 同一枚回合令牌,动不了别人的。
+
+- \`$CATMAN_API_BASE\` — 接口地址,请求头 \`X-Catman-Session: $CATMAN_SESSION_TOKEN\`
+- 根路径 \`/api/me/cron\`
+
+## 先看清楚:你只能定"跑一条命令"
+
+P1 只支持 \`task.kind = "script"\` —— 在一次性 docker 容器里跑一条命令。
+**还不能定"让 agent 去想点什么"**(那是下一期)。用户要的是后者时,如实告诉他还没有,
+别用一条 curl 硬凑。
+
+## 建一个
+
+\`\`\`bash
+curl -s -X POST -H "X-Catman-Session: $CATMAN_SESSION_TOKEN" \\
+  -H 'content-type: application/json' "$CATMAN_API_BASE/api/me/cron" -d '{
+    "name": "每天早八看一眼磁盘",
+    "schedule": { "kind": "cron", "expr": "0 8 * * *" },
+    "task": { "cmd": ["bash","-lc","df -h /"] }
+  }'
+\`\`\`
+
+返回 201 与完整任务(含 \`nextAtText\` —— **把它念给用户听**,那是他最关心的一句)。
+
+### schedule 三选一
+
+| 写法 | 含义 |
+|---|---|
+| \`{"kind":"cron","expr":"0 8 * * *","tz":"Asia/Shanghai"}\` | 5 字段 cron:分 时 日 月 周。\`tz\` 不给就用本机时区 |
+| \`{"kind":"every","minutes":30}\` | 每 30 分钟。**单位是分钟**,字段名就写着 |
+| \`{"kind":"once","at":"2026-08-20T03:00:00+08:00"}\` | 只跑一次。时刻**必须带时区**,跑完自动停用 |
+
+cron 支持 \`*\`、\`1-5\`、\`*/15\`、\`1,3,5\`、以及 \`mon\`/\`jan\` 这类英文缩写。
+星期位 0 和 7 都是周日。日期位与星期位**都**收窄时取并集(标准 cron 的老规矩)。
+
+### task 字段
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| \`cmd\` | 必填 | **字符串数组**,exec 形式不过 shell。要 shell 就 \`["bash","-lc","…"]\` |
+| \`image\` | \`catman-env:1\` | 本机一定有,带 bash / node / curl |
+| \`network\` | \`"none"\` | **默认断网**。要联网写 \`"mynet"\` |
+| \`mounts\` | \`[]\` | \`[{"host":"/opt/services/x","at":"/x","ro":true}]\`,host 是**宿主**路径,默认只读 |
+| \`env\` | \`{}\` | 环境变量。**别往里放密钥** —— 它明文存在任务表里 |
+| \`limits\` | 512m / 0.5 核 / 128 pid | 宿主是 2 核软路由,调大前先想清楚 |
+
+任务自己的工作目录挂在容器里的 \`/work\`(可写、跨次保留),写中间结果放那儿。
+
+### 其余字段
+
+\`enabled\`(默认 true)、\`timeoutMinutes\`(默认 10,但不会超过一个触发间隔 —— 密集的任务会自动缩)、\`overlap\`(\`skip\` / \`replace\`,默认 skip)、
+\`keepRuns\`(保留多少条执行记录,默认 20)、
+\`notify\`(\`{"start":false,"end":true,"onlyFailure":false}\`)。
+
+**通知要克制**:主动推送花的是他上一条来信的发送预算,半夜跑的任务多半要等他
+下次开口才收得到。默认只在跑完时推一条(带下次触发时刻)。巡检类任务建议
+\`onlyFailure: true\` —— 成功就闭嘴。
+
+## 其余接口
+
+\`\`\`bash
+S="X-Catman-Session: $CATMAN_SESSION_TOKEN"
+curl -s -H "$S" "$CATMAN_API_BASE/api/me/cron"                 # 列出(含下次触发)
+curl -s -H "$S" "$CATMAN_API_BASE/api/me/cron/<id>"            # 单个
+curl -s -X PATCH -H "$S" -H 'content-type: application/json' \\
+     -d '{"enabled":false}' "$CATMAN_API_BASE/api/me/cron/<id>"  # 改(整体重校验)
+curl -s -X DELETE -H "$S" "$CATMAN_API_BASE/api/me/cron/<id>"  # 删(记录一起删)
+curl -s -X POST -H "$S" "$CATMAN_API_BASE/api/me/cron/<id>/run" # 立即试跑,不动排期
+curl -s -H "$S" "$CATMAN_API_BASE/api/me/cron/<id>/runs"       # 最近的执行记录
+curl -s -H "$S" "$CATMAN_API_BASE/api/me/cron/<id>/runs/<runId>" # 某次的完整输出
+\`\`\`
+
+## 规矩
+
+- **建完必须试跑一次**(\`/run\`,不影响排期),等几秒再看 \`runs\` ——
+  "我给你建好了"和"它真的能跑"是两件事,而用户要到明天早上才发现区别。
+- 校验很严:未知字段直接 400。**错误文案是写给人看的,原样转述给用户**,
+  别自己猜着改参数重试。常见的三种错都在文案里写清了怎么改。
+- 频率有下限(默认 5 分钟一次)。用户要更密的,告诉他这是软路由的保护,
+  管理员可以调 \`cronMinIntervalMs\`。
+- 连续失败 3 次的任务会被**自动停用**并通知。用户说"那个任务怎么不跑了",
+  先看 \`enabled\` 和 \`runs\`。
+- 一次执行的容器是 detached 的:catman 自己重启(比如部署)**不会**打断它,
+  回来之后接着收结果。别拿"我要重启了"当理由劝用户改任务。
 `;
 }
 
@@ -455,6 +559,7 @@ export function writeSkills(
         ]
       : [
           [USER_SKILL, userSkillBody(ctx)],
+          [CRON_SKILL, cronSkillBody()],
           [ADMIN_SKILL, adminSkillBody(ctx)],
           [EVOLVE_SKILL, evolveSkillBody(paths)],
         ];
@@ -472,6 +577,8 @@ export function writeSkills(
  * SDK 那边只是安静地少一份说明,而它恰好是最需要的那份。有单测钉住两者对齐。
  */
 export function skillsFor(persona: Persona, isAdmin: boolean): string[] {
-  if (!isAdmin) return [...USER_SKILLS];
-  return persona === "rescue" ? [...RESCUE_SKILLS] : [...ADMIN_SKILLS];
+  // 守护人格那边没有调度器,所以两条分支都要把 catman-cron 摘掉 ——
+  // 普通用户这一支同样要摘,否则它会去调一个必然 404 的接口。
+  if (persona === "rescue") return isAdmin ? [...RESCUE_SKILLS] : [USER_SKILL];
+  return isAdmin ? [...ADMIN_SKILLS] : [...USER_SKILLS];
 }

@@ -27,6 +27,10 @@ import { installLogStamps, redirectConsoleToStderr } from "./core/log-stamp.js";
 import { readVersion, versionLine, type VersionInfo } from "./core/version.js";
 import { runSelfCheck } from "./core/selfcheck.js";
 import { ScriptDeployControl } from "./core/deploy.js";
+import { CronStore, DEFAULT_RUN_MAX_AGE_MS } from "./core/cron/store.js";
+import { CronScheduler } from "./core/cron/scheduler.js";
+import { DockerScriptRunner } from "./core/cron/docker.js";
+import type { CronApiDeps } from "./dashboard/api-cron.js";
 import { formatDeployReport } from "./core/deploy-report.js";
 import { RescueRunner } from "./rescue/runner.js";
 
@@ -182,6 +186,13 @@ async function main(): Promise<void> {
   });
   gatewayRef = gateway;
 
+  // ── 定时任务 ────────────────────────────────────────────────────
+  //
+  // **只在主人格里跑。** 守护人格挂的主 /data 是只读的,执行记录一个字都写不下去;
+  // 而"每类状态只有一个写者"这条纪律里,任务表的写者就是主人格。两边都跑的话,
+  // 一次 `/救援` 期间两个进程会各自去点同一批火。
+  const cron = config.persona === "primary" ? createCron(config, settings, turns, gateway) : undefined;
+
   const adminToken = resolveAdminToken(config);
   // 渠道起来之前一律报 bootOk=false:部署的健康门等的就是这个翻转,
   // 提前报 true 会让它把一个还没就绪的进程判成部署成功。
@@ -196,6 +207,7 @@ async function main(): Promise<void> {
     ...(bridgeClient ? { accounts: new IpcAccountsProxy(bridgeClient) } : {}),
     chat,
     selfApi: { turns, prefs, users, sessions, settings, configDir },
+    ...(cron ? { cronApi: cron.api } : {}),
     adminApi: { settings, prefs, users },
     health: {
       version,
@@ -236,6 +248,9 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     console.info("正在关闭 catman…");
     clearInterval(cleanupTimer);
+    // 只停轮询,**不碰在跑的容器**:它们是 detached 的,本来就该活过这次重启,
+    // 回来之后照常认领(见 cron/docker.ts 开头)。
+    cron?.scheduler.stop();
     await gateway.stop();
     await dashboard.stop();
     await rescueRef?.stop();
@@ -249,9 +264,64 @@ async function main(): Promise<void> {
   // 与"起不来"。
   dashboard.start();
   await gateway.start();
+  // 调度器**排在渠道之后**起:它起来就会去收上一轮遗留的执行,而收完是要发通知的 ——
+  // 渠道还没起来时那条结果只能石沉大海,而它恰恰是用户睡前定下、等着看的那一条。
+  cron?.scheduler.start();
 
   bootOk = true;
   console.info(`catman 已启动,渠道=${channel.name},${versionLine(version)}`);
+}
+
+/**
+ * 装配定时任务:任务表 + docker 执行面 + 调度器 + 给 agent 用的接口。
+ *
+ * 配置一律**现读**(闭包里 `settings.effective()`),与并发上限、图片闸门同一套 ——
+ * 管理员在 dashboard 上把总开关关掉,下一次 tick 就停,不必重启。
+ */
+function createCron(
+  config: Config,
+  settings: GlobalSettings,
+  turns: TurnTokens,
+  gateway: Gateway,
+): { store: CronStore; scheduler: CronScheduler; api: CronApiDeps } {
+  const store = new CronStore({
+    dir: `${config.dataDir}/cron`,
+    // 宿主路径由**装配处**给出:只有这里同时知道容器内与宿主两个视角。
+    ...(config.hostDataDir ? { hostDir: `${config.hostDataDir.replace(/\/$/, "")}/cron` } : {}),
+  });
+  const scheduler = new CronScheduler({
+    store,
+    runner: new DockerScriptRunner(),
+    runtime: () => {
+      const s = settings.effective();
+      return {
+        enabled: s.cronEnabled,
+        maxConcurrent: s.cronMaxConcurrent,
+        catchUpMs: s.cronCatchUpMs,
+        runMaxAgeMs: DEFAULT_RUN_MAX_AGE_MS,
+      };
+    },
+    tz: config.tz,
+    notify: (userKey, text, kind) => gateway.push(userKey, text, kind),
+  });
+  const api: CronApiDeps = {
+    turns,
+    store,
+    scheduler,
+    validateContext: () => {
+      const s = settings.effective();
+      return {
+        defaultTz: config.tz,
+        minIntervalMs: s.cronMinIntervalMs,
+        defaultKeepRuns: s.cronKeepRuns,
+        mountAllowlist: s.cronMountAllowlist,
+        hostDataDir: config.hostDataDir,
+        now: Date.now(),
+      };
+    },
+    tz: config.tz,
+  };
+  return { store, scheduler, api };
 }
 
 /**
