@@ -2044,8 +2044,7 @@ test("分段正文发到一半失败:停下,而且不把这一轮记成出错", 
 
 test("/nop:回合跑到一半也能续额,节流器跟着重新开闸", async () => {
   // 它的全部作用来自"这条消息存在"(新 context_token = 新预算),而不是它做了什么。
-  // 但网关这边得配合两件事,少一件那句提示就是空头支票:重新开闸、并且真发一条 ——
-  // 手里的余量是上一次发送响应带回来的,不发就永远停在 0。
+  // 网关这边只配合一件事:重新开闸。
   const { channel, agent, turns } = build(() => 1_000_000);
   const open = stuckTurn(agent);
   const running = channel.receive(U1, "长任务");
@@ -2063,12 +2062,32 @@ test("/nop:回合跑到一半也能续额,节流器跟着重新开闸", async ()
   channel.sent.length = 0;
   await channel.receive(U1, "/nop");
   assert.equal(reopened, 1, "额度回来了,节流器必须重新开闸");
-  assert.equal(channel.sent.length, 1, `/nop 得回一句:${JSON.stringify(channel.sent)}`);
+  assert.equal(
+    channel.sent.length,
+    0,
+    `/nop 一个字都不回 —— 确认话术要从它刚续回来的额度里花掉一条,挤掉的正是` +
+      `用户发它想看的那条进度:${JSON.stringify(channel.sent)}`,
+  );
   assert.equal(agent.fed.length, 0, "它不是补话,不该被折进在飞回合");
 
   open();
   await running;
   assert.equal(agent.calls.length, 1, "也不该另起一个回合");
+});
+
+test("/nop:闲着的时候发它也一个字不回 —— 那就是「什么也不做」的字面意思", async () => {
+  // 没有在飞回合、也没有积压时,`/nop` 的可见效果是零。这是刻意的:它唯一的作用
+  // 发生在消息**抵达渠道**那一刻(新 context_token = 新预算),网关这边无事可做,
+  // 而"好,什么也没做"这句确认要从刚续回来的 10 条里花掉一条。
+  // 想确认还活着,那是 /状态 的活儿。
+  const { channel, agent } = build(() => 1_000_000);
+  // 头一条消息会把初次见面的问候推出来 —— 那是 prelude 的活儿,不是 /nop 的回话。
+  await channel.receive(U1, "/nop");
+  channel.sent.length = 0;
+
+  await channel.receive(U1, "/nop");
+  assert.equal(channel.sent.length, 0, `不该有任何回话:${JSON.stringify(channel.sent)}`);
+  assert.equal(agent.calls.length, 0, "更不该惊动 agent —— 它不花额度");
 });
 
 test("/状态 交代后台还有几段在跑 —— 别处看不见它们", async () => {
