@@ -30,6 +30,7 @@
 export type CommandName =
   | "help"
   | "status"
+  | "jobs"
   | "nop"
   | "newSession"
   | "cancel"
@@ -104,6 +105,15 @@ export const COMMAND_TABLE: readonly CommandDef[] = [
     canonical: "/状态",
     aliases: ["/status", "/狀態"],
     desc: "看当前模型、会话空闲时长、各项生效配置(不花额度)",
+    immediate: true,
+  },
+  {
+    name: "jobs",
+    canonical: "/任务",
+    aliases: ["/jobs", "/定时", "/任務"],
+    desc: "列出你的定时任务与下次触发时刻(不花额度)",
+    // immediate:只读、幂等,而且**正是助手卡住时最该问得出的东西** ——
+    // "那个半夜的备份到底还在不在"不该排在一个卡死的回合后面。
     immediate: true,
   },
   {

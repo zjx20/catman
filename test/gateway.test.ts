@@ -1,3 +1,4 @@
+import type { CronJob } from "../src/core/cron/types.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -5,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   Gateway,
+  type CronView,
   reminderText,
   shortSessionId,
   ACK_TEXT,
@@ -201,6 +203,8 @@ interface BuildOpts {
   deploy?: DeployControl;
   /** token 到期告警。不传 = 不播(stdin 调试就是这样)。 */
   tokenAlert?: { pending(): string | undefined; markAnnounced(): void };
+  /** 定时任务只读视图(/任务 用)。不传 = 这台机器没有定时任务。 */
+  cron?: CronView;
 }
 
 /** 可编排的假部署控制面:记录发布与回滚请求,报告、清单、候选由用例摆好。 */
@@ -304,6 +308,7 @@ function build(now: () => number, opts: BuildOpts = {}) {
     ...(opts.sessionExists ? { sessionExists: opts.sessionExists } : {}),
     ...(opts.deploy ? { deploy: opts.deploy } : {}),
     ...(opts.tokenAlert ? { tokenAlert: opts.tokenAlert } : {}),
+    ...(opts.cron ? { cron: opts.cron } : {}),
   });
   // 只注册 handler,不启动真实定时器/渠道 —— 但接线走 `onIncoming`,与
   // `Gateway.start()` **同一个方法**。这里曾经自己抄了一份等价接线,

@@ -7,6 +7,24 @@ import type { GlobalSettings } from "./settings.js";
 import type { MintedTurn, TurnContext, TurnTokens } from "./turn-tokens.js";
 import { allowAll, type AdmissionPolicy } from "./admission.js";
 import { buildTurnEnv } from "./turn-env.js";
+import { formatAt } from "./cron/schedule.js";
+import type { CronJob, RunStatus } from "./cron/types.js";
+
+/** 网关眼里的定时任务:只有"这个人有哪些任务"这一个问题。 */
+export interface CronView {
+  jobsOf(userKey: string): readonly CronJob[];
+  readonly tz: string;
+}
+
+const JOB_STATUS_CN: Partial<Record<RunStatus, string>> = {
+  ok: "成功",
+  failed: "失败",
+  timeout: "超时",
+  skipped: "跳过",
+  interrupted: "中断",
+  error: "没起来",
+  running: "还在跑",
+};
 import type { Attachment } from "./attachments.js";
 import { describeProgress, summarizeToolInput } from "./agent-trace.js";
 import {
@@ -135,6 +153,11 @@ export interface GatewayOptions {
    * 而不是假装成功 —— 本地开发与 stdin 调试就是这种情况。
    */
   deploy?: DeployControl;
+  /**
+   * 定时任务的只读视图,给 `/任务` 用。**只读** —— 网关不参与调度,
+   * 它唯一要做的是在用户问起时答得出来(而且是在 immediate 路径上答)。
+   */
+  cron?: CronView;
   /**
    * 部署进展主动播报的轮询间隔(ms)。不传用 `DEPLOY_NEWS_INTERVAL_MS`。
    * 单测传一个大到不会自己触发的值,然后手工调 `flushDeployNews()`。
@@ -544,6 +567,7 @@ export class Gateway {
    */
   private readonly courierGreeted = new Set<string>();
   private readonly deploy: DeployControl | undefined;
+  private readonly cron: CronView | undefined;
 
   constructor(opts: GatewayOptions) {
     this.channel = opts.channel;
@@ -563,6 +587,7 @@ export class Gateway {
     this.persona = opts.persona ?? "primary";
     this.tokenAlert = opts.tokenAlert;
     this.deploy = opts.deploy;
+    this.cron = opts.cron;
     this.semaphore = new Semaphore(this.settings.effective().maxConcurrentTurns);
     this.settings.onChange(() => {
       this.semaphore.setLimit(this.settings.effective().maxConcurrentTurns);
@@ -940,6 +965,10 @@ export class Gateway {
         await this.trySend(userKey, this.upgradeStatusText(), "升级状态");
         return;
 
+      case "jobs":
+        await this.trySend(userKey, this.jobsText(userKey), "定时任务");
+        return;
+
       case "nop": {
         // 额度在这条消息**抵达渠道**的那一刻就续上了(新 context_token),这里
         // 只要把节流器重新开闸,并且真的发一条出去 —— 网关手里的余量是上一次
@@ -1081,6 +1110,31 @@ export class Gateway {
   }
 
   /** `/升级状态` 的正文。纯读磁盘,不花额度 —— 升级出问题时唯一可靠的信息源。 */
+  /**
+   * `/任务` 的正文:这个用户自己的定时任务与下次触发时刻。
+   *
+   * 走 immediate 路径,所以**不进 LLM、不花额度**,而且助手卡死时照样答得出来 ——
+   * "那个半夜的备份到底还在不在"不该排在一个卡住的回合后面。
+   *
+   * 只读自己的:与 `/api/me/cron` 同一个作用域,与 dashboard 那个全站视图不同。
+   */
+  private jobsText(userKey: string): string {
+    if (!this.cron) return "这台机器没有定时任务功能。";
+    const jobs = this.cron.jobsOf(userKey);
+    if (!jobs.length) {
+      return "你还没有定时任务。跟我说一句「每天早上八点看一眼磁盘」就能建一个。";
+    }
+    const lines = [`⏰ 你有 ${jobs.length} 个定时任务`];
+    for (const j of jobs) {
+      const when = j.enabled && j.nextAt !== undefined ? formatAt(j.nextAt, this.cron.tz) : "已停用";
+      const last = j.lastStatus ? `,上次${JOB_STATUS_CN[j.lastStatus] ?? j.lastStatus}` : "";
+      const streak = j.failStreak >= 2 ? `(已连续失败 ${j.failStreak} 次)` : "";
+      lines.push(`· ${j.name} —— 下次 ${when}${last}${streak}`);
+    }
+    lines.push("要看某个任务跑出了什么,直接问我。");
+    return lines.join("\n");
+  }
+
   private upgradeStatusText(): string {
     const lines = ["🚀 升级状态", versionLine(this.version)];
     if (!this.deploy) {

@@ -87,11 +87,15 @@ const STYLE = `
     font:inherit;resize:vertical;min-height:44px}
 `;
 
-function shell(title: string, inner: string, script = ""): string {
+/**
+ * 页面外壳(样式 + 导航 + 骨架)。**导出**给 ui-cron.ts 用 —— 导航只有一份定义,
+ * 加一页就只改这里一行,不会出现某一页的导航少一项。
+ */
+export function shell(title: string, inner: string, script = ""): string {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHtml(title)}</title><style>${STYLE}</style></head>
-<body><header><span>catman</span><span><a href="/">会话记录</a><a href="/chat">聊天</a><a href="/users">用户</a><a href="/accounts">账号</a></span></header>
+<body><header><span>catman</span><span><a href="/">会话记录</a><a href="/chat">聊天</a><a href="/cron">定时任务</a><a href="/users">用户</a><a href="/accounts">账号</a></span></header>
 <main>${inner}</main>${script ? `<script>${script}</script>` : ""}</body></html>`;
 }
 

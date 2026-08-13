@@ -34,6 +34,12 @@ import { renderPage, type UserRow } from "./ui.js";
 import { DashboardAuth, urlWithoutToken } from "./auth.js";
 import { handleSelfApi, isSelfApiPath, SESSION_HEADER, type SelfApiDeps } from "./api-self.js";
 import { handleCronApi, isCronApiPath, type CronApiDeps } from "./api-cron.js";
+import {
+  handleCronAdminApi,
+  isCronAdminApiPath,
+  type CronAdminApiDeps,
+} from "./api-cron-admin.js";
+import { renderCronDetail, renderCronList, type CronJobRow } from "./ui-cron.js";
 import { handleAdminApi, isAdminApiPath, type AdminApiDeps } from "./api-admin.js";
 import { buildHealth, isHealthPath, type HealthDeps } from "./health.js";
 
@@ -88,6 +94,8 @@ export interface DashboardOptions {
   selfApi: SelfApiDeps;
   /** 定时任务接口。没有调度器的场合(守护人格、本地开发)可以不传,那时整段路由不挂。 */
   cronApi?: CronApiDeps;
+  /** 定时任务的**管理员**面:页面与页面上那几个按钮。与 cronApi 是两套鉴权。 */
+  cronAdmin?: CronAdminApiDeps & { tz: string; enabled: () => boolean };
   adminApi: AdminApiDeps;
   /**
    * `/health` 的数据源。不传则不开这个端点 —— 单测里起 Dashboard 不必装配整个网关。
@@ -153,6 +161,39 @@ export class Dashboard {
       createdAt: rec.createdAt,
       lastSeenAt: rec.lastSeenAt,
     }));
+  }
+
+  /**
+   * 定时任务的两个页面。归属名从 users.json 现查 —— 页面上光有 userKey
+   * 认不出是谁,而"这个定时任务是谁建的"正是管理员最先要问的。
+   */
+  private cronPage(path: string): string {
+    const cron = this.opts.cronAdmin!;
+    const owner = (userKey: string): string =>
+      this.opts.users.snapshot()[userKey]?.displayName || userKey;
+
+    if (path === "/cron") {
+      const rows: CronJobRow[] = cron.store.all().map((job) => {
+        const last = cron.store.listRuns(job.id, 1)[0];
+        return { job, owner: owner(job.userKey), ...(last ? { last } : {}) };
+      });
+      return renderCronList({
+        rows,
+        tz: cron.tz,
+        enabled: cron.enabled(),
+        token: this.opts.adminToken,
+      });
+    }
+
+    const id = decodeURIComponent(path.slice("/cron/".length));
+    const job = cron.store.get(id);
+    if (!job) return renderCronList({ rows: [], tz: cron.tz, enabled: cron.enabled(), token: this.opts.adminToken });
+    return renderCronDetail({
+      row: { job, owner: owner(job.userKey) },
+      runs: cron.store.listRuns(job.id, 30),
+      tz: cron.tz,
+      token: this.opts.adminToken,
+    });
   }
 
   /**
@@ -232,6 +273,20 @@ export class Dashboard {
         return await this.handleAccounts(req, res, path);
       }
 
+      // 定时任务的管理员面。与 /api/settings 同一条纪律:**写操作只认请求头**。
+      // 读也一样要求 —— 它会列出所有人的任务(含命令与挂载),凭据强度按写操作对待。
+      if (isCronAdminApiPath(path)) {
+        if (!this.opts.cronAdmin) return jsonError(res, 503, "这台机器没有定时任务调度器");
+        if (!this.auth.allowsWrite(req)) {
+          return jsonError(res, 403, "需要 X-Catman-Token 请求头");
+        }
+        const body = await readJsonBody(req);
+        const r = await handleCronAdminApi(req.method ?? "GET", path, body, this.opts.cronAdmin);
+        res.writeHead(r.status, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(r.body, null, 2));
+        return;
+      }
+
       if (isAdminApiPath(path)) {
         // 读也要求请求头:这两个接口会暴露全部用户的配置,凭据强度按写操作对待。
         if (!this.auth.allowsWrite(req)) {
@@ -292,6 +347,16 @@ export class Dashboard {
           }),
         );
       }
+      if (path === "/cron" || path.startsWith("/cron/")) {
+        // 没有调度器时如实说,而不是渲染一个空列表 —— 空列表看起来像"任务都没了"。
+        if (!this.opts.cronAdmin) {
+          res.writeHead(503, { "content-type": "text/plain; charset=utf-8" });
+          res.end("这台机器没有定时任务调度器(守护人格与本地开发都是这种情况)");
+          return;
+        }
+        return html(res, this.cronPage(path));
+      }
+
       if (path === "/users") {
         return html(res, renderPage("users", { users: this.userRows(), token: this.opts.adminToken }));
       }

@@ -144,6 +144,8 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 | `src/channels/composite.ts` | 多渠道复合 + 复合准入,按 userKey 前缀路由 |
 | `src/channels/dashboard.ts` | 管理员聊天渠道(记录落盘 + SSE 订阅 + 回执撤回) |
 | `src/dashboard/api-self.ts` | `/api/me`:回合令牌鉴权,agent 管自己的配置 |
+| `src/dashboard/ui-cron.ts` | 定时任务的两个页面(纯函数产出 HTML)。**全站视图**,与 /api/me/cron 的每人视角刻意不同 |
+| `src/dashboard/api-cron-admin.ts` | `/api/admin/cron`:页面上那几个按钮。**只让改 enabled** —— 别的改动必须走有完整校验的那条路 |
 | `src/dashboard/api-cron.ts` | `/api/me/cron`:同一枚回合令牌,agent 管自己的定时任务(**必须排在 `isSelfApiPath` 之前**,那个判定认领整个 `/api/me/` 前缀) |
 | `src/core/cron/schedule.ts` | cron 解析 + 下次触发时刻 + 频率下限判据。**纯函数**,自带时区换算,零依赖 |
 | `src/core/cron/validate.ts` | 创建/修改任务的入口校验。调用方是 LLM,所以未知字段一律拒收、字段名自带单位、能当场算的都当场算 |

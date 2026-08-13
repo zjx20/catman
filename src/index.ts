@@ -151,6 +151,7 @@ async function main(): Promise<void> {
   // 用一个后填的引用打破这个环。detach 帧在 gateway 装好之前不可能到达
   // (bridge 要等 start() 才开始拉取),所以这里的 undefined 窗口是安全的。
   let gatewayRef: Gateway | undefined;
+  let cronRef: { store: CronStore } | undefined;
   const { channel, admission, ipcClient: bridgeClient } = createChannel(
     config,
     chat,
@@ -185,6 +186,12 @@ async function main(): Promise<void> {
       sessionFileExists(configDir, encodeProjectDir(users.workspaceDirOf(userKey)), sessionId),
     // 提醒轮询:取超时时长的 1/10,但不短于 1 分钟。
     reminderIntervalMs: Math.max(60_000, Math.floor(config.sessionTimeoutMs / 10)),
+    // `/任务` 的数据源。任务表在 gateway 之后才建,用一个后填的引用打破这个环 ——
+    // 与上面 gatewayRef 同一个手法,而且 `/任务` 要等用户开口才可能被调到。
+    cron: {
+      jobsOf: (userKey) => cronRef?.store.ofUser(userKey) ?? [],
+      tz: config.tz,
+    },
   });
   gatewayRef = gateway;
 
@@ -197,6 +204,7 @@ async function main(): Promise<void> {
     config.persona === "primary"
       ? createCron(config, settings, turns, gateway, { agent, users, prefs })
       : undefined;
+  cronRef = cron;
 
   const adminToken = resolveAdminToken(config);
   // 渠道起来之前一律报 bootOk=false:部署的健康门等的就是这个翻转,
@@ -213,6 +221,16 @@ async function main(): Promise<void> {
     chat,
     selfApi: { turns, prefs, users, sessions, settings, configDir },
     ...(cron ? { cronApi: cron.api } : {}),
+    ...(cron
+      ? {
+          cronAdmin: {
+            store: cron.store,
+            scheduler: cron.scheduler,
+            tz: config.tz,
+            enabled: () => settings.effective().cronEnabled,
+          },
+        }
+      : {}),
     adminApi: { settings, prefs, users },
     health: {
       version,
