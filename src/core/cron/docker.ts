@@ -34,6 +34,8 @@ export interface LaunchSpec {
   readonly limits: CronLimits;
   /** 工作目录在**宿主**上的路径。传容器内路径的话 docker 会静默建一个空目录。 */
   readonly hostWorkDir: string;
+  /** 容器里的时区。不给的话容器里是 UTC,而任务里的 date 与 catman 的时间戳就对不上了。 */
+  readonly tz?: string;
 }
 
 export type PollResult =
@@ -97,6 +99,10 @@ export function buildRunArgs(spec: LaunchSpec): string[] {
   args.push("-v", `${spec.hostWorkDir}:/work`);
   for (const m of spec.mounts) args.push("-v", `${m.host}:${m.at}${m.ro ? ":ro" : ""}`);
   args.push("-w", "/work");
+  // 时区:容器**不继承**宿主也不继承 catman,不给就是 UTC —— 于是任务里一句
+  // date 打出来的时间和微信里看到的差好几个小时,而这件事没有任何报错。
+  // 任务自己在 env 里写了 TZ 就听他的。
+  if (spec.tz && !("TZ" in spec.env)) args.push("-e", `TZ=${spec.tz}`);
   for (const [k, v] of Object.entries(spec.env)) args.push("-e", `${k}=${v}`);
   args.push(spec.image, ...spec.cmd);
   return args;

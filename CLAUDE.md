@@ -149,7 +149,10 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 | `src/core/cron/validate.ts` | 创建/修改任务的入口校验。调用方是 LLM,所以未知字段一律拒收、字段名自带单位、能当场算的都当场算 |
 | `src/core/cron/store.ts` | 任务表 + 执行记录 + 保留策略(按次数为主、年龄为辅);**认不出的任务隔离不删**(回滚安全) |
 | `src/core/cron/docker.ts` | 脚本任务的执行面:detached 一次性容器 + 隔离参数;**catman 重启不打断在跑的任务** |
-| `src/core/cron/scheduler.ts` | tick 调度:先收尸再点火;错过只补一次且要在窗口内;overlap 判定排在全局并发之前 |
+| `src/core/cron/scheduler.ts` | tick 调度:先收尸再点火;错过只补一次且要在窗口内;overlap 判定排在全局并发之前;agent 任务**不等它跑完**(在 tick 里 await 会把整个调度器挂住) |
+| `src/core/cron/agent-runner.ts` | agent 任务的执行面。**必须把 turn 标成 detached** —— 否则它会被当成用户的前台回合,用户下一条消息会等它跑完 |
+| `src/core/cron/notices.ts` | 静默时段判定 + 攒着的结果合并成摘要。落盘(部署常常就发生在攒着的那几小时里) |
+| `src/core/turn-env.ts` | agent 子进程环境的**唯一**定义(用户回合与定时任务共用)。IPC secret 一条例外都不下放 |
 | `src/core/cron/notify.ts` | 通知文案(纯函数)。只用信使已认识的 SendKind:开跑 `reminder`(只留最新)、结果 `announce`(一条不丢) |
 | `src/dashboard/api-admin.ts` | `/api/settings`、`/api/users`:管理员改全局与他人(含提权) |
 | `src/core/transcript.ts` | JSONL 防御式解析、检索、**workspace 范围**清理 |

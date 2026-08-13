@@ -1,5 +1,5 @@
 import { minGapMs, nextAt, parseCronExpr, type CronSchedule } from "./schedule.js";
-import type { CronJob, CronMount, CronNotify, CronTask, OverlapPolicy } from "./types.js";
+import type { CronJob, CronLimits, CronMount, CronNotify, CronTask, OverlapPolicy } from "./types.js";
 
 /**
  * 创建/修改定时任务时的**入口校验**。
@@ -50,6 +50,15 @@ export const MIN_EVERY_MINUTES = 1;
 export const MAX_EVERY_MINUTES = 60 * 24 * 30;
 export const MIN_KEEP_RUNS = 1;
 export const MAX_KEEP_RUNS = 200;
+export const MAX_PROMPT_CHARS = 4000;
+export const MAX_AGENT_TURNS = 50;
+/**
+ * agent 任务的**额外**频率下限,在全局下限之上再压一道。
+ *
+ * 脚本任务跑飞了顶多占 CPU;agent 任务跑飞了烧的是订阅额度,而且没有人盯着。
+ * 15 分钟一次已经足够密 —— 真需要更密的,那件事多半不该交给大脑做。
+ */
+export const AGENT_MIN_INTERVAL_MS = 15 * 60_000;
 /** 默认镜像:catman 自己那个稳定基底,本机一定有,带 bash / node / curl。 */
 export const DEFAULT_IMAGE = "catman-env:1";
 export const DEFAULT_LIMITS = { memory: "512m", cpus: 0.5, pids: 128 } as const;
@@ -69,6 +78,8 @@ export interface ValidateContext {
    * 脚本任务在这台机器上根本跑不起来 —— 那就别让人建,而不是建完每次都失败。
    */
   readonly hostDataDir: string | undefined;
+  /** 允许 agent 任务指定的模型。与用户能给自己选的是同一份名单。 */
+  readonly modelAllowlist: readonly string[];
   readonly now: number;
 }
 
@@ -94,6 +105,21 @@ function reqString(v: unknown, where: string, max: number): string {
   // 控制字符进了容器命令行、推送文案或页面都是麻烦(换行还会把一条日志拆成两条),
   // 一律挡掉。命令里确实要换行的话,写成 bash -lc "…;…" 或者放进脚本文件。
   if (/[\u0000-\u001f\u007f]/.test(s)) fail(`${where} 里有控制字符(换行、制表符之类)`);
+  return s;
+}
+
+/**
+ * 允许换行的字符串。**只给 prompt 用** —— 交给大脑的话本来就可能是好几行,
+ * 而它不会进容器命令行、也不进容器名,换行在这里没有危害。
+ * 别的字段一律走 reqString(那边连换行都挡)。
+ */
+function multilineString(v: unknown, where: string, max: number): string {
+  if (typeof v !== "string") fail(`${where} 必须是字符串,给的是 ${typeName(v)}`);
+  const s = (v as string).trim();
+  if (!s) fail(`${where} 不能为空`);
+  if (s.length > max) fail(`${where} 太长了(上限 ${max} 字符,给的是 ${s.length})`);
+  // 换行和制表符放行,别的控制字符照挡。
+  if (/[\u0000-\u0008\u000b-\u001f\u007f]/.test(s)) fail(`${where} 里有控制字符`);
   return s;
 }
 
@@ -174,7 +200,7 @@ function validateSchedule(raw: unknown, ctx: ValidateContext): CronSchedule {
 }
 
 /** 频率闸:算真实的相邻间隔,而不是看表达式长什么样。 */
-function checkFrequency(schedule: CronSchedule, ctx: ValidateContext): number {
+function checkFrequency(schedule: CronSchedule, ctx: ValidateContext, isAgent: boolean): number {
   const first = nextAt(schedule, ctx.now);
   if (first === undefined || first - ctx.now > NO_FIRE_HORIZON_MS) {
     fail(
@@ -182,8 +208,15 @@ function checkFrequency(schedule: CronSchedule, ctx: ValidateContext): number {
     );
   }
   const gap = minGapMs(schedule, ctx.now);
+  const mins = (n: number) => Math.round(n / 60_000);
+  // agent 任务在全局下限之上再压一道:它烧的是订阅额度,而且没有人盯着。
+  if (isAgent && gap < AGENT_MIN_INTERVAL_MS) {
+    fail(
+      `agent 任务最快 ${mins(AGENT_MIN_INTERVAL_MS)} 分钟一次(这个周期是 ${mins(gap)} 分钟)。` +
+        "它每次都要花订阅额度,而且没人盯着 —— 真要更密的,那件事多半该写成脚本任务。",
+    );
+  }
   if (gap < ctx.minIntervalMs) {
-    const mins = (n: number) => Math.round(n / 60_000);
     fail(
       `这个周期最快 ${mins(gap)} 分钟就触发一次,低于当前下限 ${mins(ctx.minIntervalMs)} 分钟。` +
         "(这台机器是 2 核软路由,跑太密会把宿主拖垮;确实需要就让管理员调 cronMinIntervalMs。)",
@@ -281,7 +314,7 @@ function validateScriptTask(o: Record<string, unknown>, ctx: ValidateContext): C
   };
 }
 
-function validateLimits(raw: unknown): CronJob["task"]["limits"] {
+function validateLimits(raw: unknown): CronLimits {
   if (raw === undefined || raw === null) return { ...DEFAULT_LIMITS };
   if (!isObject(raw)) fail(`task.limits 必须是对象,给的是 ${typeName(raw)}`);
   const o = raw as Record<string, unknown>;
@@ -307,23 +340,60 @@ function validateLimits(raw: unknown): CronJob["task"]["limits"] {
   return { memory, cpus, pids };
 }
 
+/**
+ * agent 任务。闸门比脚本那边更要紧:脚本跑飞了顶多占 CPU,而 agent 跑飞了
+ * 烧的是订阅额度,而且**没有人盯着**。
+ */
+function validateAgentTask(o: Record<string, unknown>, ctx: ValidateContext): CronTask {
+  noExtraKeys(o, ["kind", "prompt", "session", "model", "maxTurns"], "task");
+  const prompt = multilineString(o["prompt"], "task.prompt", MAX_PROMPT_CHARS);
+  let model: string | undefined;
+  if (o["model"] !== undefined && o["model"] !== null) {
+    model = reqString(o["model"], "task.model", 64);
+    if (!ctx.modelAllowlist.includes(model)) {
+      fail(`task.model 只能是 ${ctx.modelAllowlist.join(" / ")},给的是 ${JSON.stringify(model)}`);
+    }
+  }
+  return {
+    kind: "agent",
+    prompt,
+    session: optEnum(o["session"], "task.session", ["fresh", "chain"] as const, "fresh"),
+    ...(model ? { model } : {}),
+    maxTurns: optInt(o["maxTurns"], "task.maxTurns", 1, MAX_AGENT_TURNS, 20),
+  };
+}
+
 function validateTask(raw: unknown, ctx: ValidateContext): CronTask {
   if (!isObject(raw)) fail(`task 必须是对象,给的是 ${typeName(raw)}`);
   const o = raw as Record<string, unknown>;
-  const kind = optEnum(o["kind"], "task.kind", ["script"] as const, "script");
-  if (kind !== "script") fail(`暂时只支持 task.kind = "script"`);
-  return validateScriptTask(o, ctx);
+  const kind = optEnum(o["kind"], "task.kind", ["script", "agent"] as const, "script");
+  return kind === "agent" ? validateAgentTask(o, ctx) : validateScriptTask(o, ctx);
 }
+
+/** `"23:00-08:00"`。允许跨零点(那正是它最常见的样子)。 */
+const QUIET_RE = /^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$/;
 
 function validateNotify(raw: unknown): CronNotify {
   if (raw === undefined || raw === null) return { start: false, end: true, onlyFailure: false };
   if (!isObject(raw)) fail(`notify 必须是对象,给的是 ${typeName(raw)}`);
   const o = raw as Record<string, unknown>;
-  noExtraKeys(o, ["start", "end", "onlyFailure"], "notify");
+  noExtraKeys(o, ["start", "end", "onlyFailure", "quiet"], "notify");
+  let quiet: string | undefined;
+  if (o["quiet"] !== undefined && o["quiet"] !== null) {
+    quiet = reqString(o["quiet"], "notify.quiet", 11);
+    const m = QUIET_RE.exec(quiet);
+    if (!m) fail(`notify.quiet 要写成 "23:00-08:00" 这样的 24 小时制区间,给的是 ${JSON.stringify(quiet)}`);
+    if (m![1] === m![3] && m![2] === m![4]) {
+      // 起止相同既可以理解成"整天静默"也可以理解成"完全不静默"。两种都说得通
+      // 就意味着用户必然有一半概率理解错,不如让他把话说清楚。
+      fail(`notify.quiet 的起止时刻一样(${quiet}),说不清是整天静默还是压根不静默`);
+    }
+  }
   return {
     start: optBool(o["start"], "notify.start", false),
     end: optBool(o["end"], "notify.end", true),
     onlyFailure: optBool(o["onlyFailure"], "notify.onlyFailure", false),
+    ...(quiet ? { quiet } : {}),
   };
 }
 
@@ -369,8 +439,9 @@ export function validateJobInput(raw: unknown, ctx: ValidateContext): ValidatedJ
 
   const name = reqString(o["name"], "name", MAX_NAME_CHARS);
   const schedule = validateSchedule(o["schedule"], ctx);
-  const firstAt = checkFrequency(schedule, ctx);
+  // 任务体要先验:频率下限对 agent 任务更严,而"是不是 agent"只有验完才知道。
   const task = validateTask(o["task"], ctx);
+  const firstAt = checkFrequency(schedule, ctx, task.kind === "agent");
   const gap = minGapMs(schedule, ctx.now);
   // 默认超时**跟着周期走**:10 分钟,但不超过一个触发间隔。密集的任务(每 5 分钟)
   // 于是不必每次都显式写超时,而"超时比周期还长"这条不变量照样成立。
@@ -439,6 +510,15 @@ function scheduleToInput(s: CronSchedule): Record<string, unknown> {
 }
 
 function taskToInput(t: CronTask): Record<string, unknown> {
+  if (t.kind === "agent") {
+    return {
+      kind: t.kind,
+      prompt: t.prompt,
+      session: t.session,
+      ...(t.model ? { model: t.model } : {}),
+      maxTurns: t.maxTurns,
+    };
+  }
   return {
     kind: t.kind,
     image: t.image,

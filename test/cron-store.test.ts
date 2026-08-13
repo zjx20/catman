@@ -87,10 +87,10 @@ test("删任务:执行记录与工作目录跟着一起走", () => {
 test("认不出的任务被隔离而不是删掉 —— 回滚不能吃掉用户的任务", () => {
   const { store, dir } = make();
   store.put(job());
-  // 模拟"新版本写的、本版本读不懂"的一条(比如下一期的 agent 任务)。
+  // 模拟"新版本写的、本版本读不懂"的一条(比如将来某一期的 webhook 任务)。
   const path = join(dir, "jobs.json");
   const raw = JSON.parse(readFileSync(path, "utf8")) as { jobs: unknown[] };
-  raw.jobs.push({ id: "j_future", userKey: "wechat:a:u1", name: "未来的", schedule: { kind: "cron", expr: "0 8 * * *", tz: "UTC" }, task: { kind: "agent", prompt: "看看磁盘" } });
+  raw.jobs.push({ id: "j_future", userKey: "wechat:a:u1", name: "未来的", schedule: { kind: "cron", expr: "0 8 * * *", tz: "UTC" }, task: { kind: "webhook", url: "https://example.com/hook" } });
   writeFileSync(path, JSON.stringify(raw), "utf8");
 
   const reopened = new CronStore({ dir, now: () => clock });

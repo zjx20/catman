@@ -340,6 +340,9 @@ function parseJob(raw: unknown): CronJob | undefined {
     (s["kind"] === "every" && typeof s["ms"] === "number") ||
     (s["kind"] === "once" && typeof s["at"] === "number");
   if (!okSchedule) return undefined;
-  if (t["kind"] !== "script" || !Array.isArray(t["cmd"])) return undefined;
+  const okTask =
+    (t["kind"] === "script" && Array.isArray(t["cmd"])) ||
+    (t["kind"] === "agent" && typeof t["prompt"] === "string");
+  if (!okTask) return undefined;
   return raw as CronJob;
 }

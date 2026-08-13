@@ -35,8 +35,30 @@ export interface ScriptTask {
   readonly limits: CronLimits;
 }
 
-/** P2 会加 agent 任务;留成联合类型,让新增分支时编译器逼着补全每一处分支。 */
-export type CronTask = ScriptTask;
+/**
+ * agent 任务:到点让大脑去做一件需要判断的事(「看看有没有异常」「变化了才报」)。
+ *
+ * 与用户对话**完全隔开**:它有自己的会话,不碰用户正在聊的那一段上下文。
+ * 这不是洁癖 —— 共用的话,半夜一次巡检会把用户第二天早上「接着昨天说」的那段
+ * 上下文顶掉,而他完全不知道发生了什么。
+ */
+export interface AgentTask {
+  readonly kind: "agent";
+  /** 交给它的话。就是你会在微信里说的那一句。 */
+  readonly prompt: string;
+  /**
+   * fresh = 每次干净起步;chain = 续这个任务自己上一次的上下文。
+   * chain 适合「变化了才报」这类要记得上次什么样的巡检。
+   */
+  readonly session: "fresh" | "chain";
+  /** 不给则用这个用户当前的模型偏好。 */
+  readonly model?: string;
+  /** 本次最多几轮。这是花钱的闸门 —— 没有人盯着的回合不能没有上限。 */
+  readonly maxTurns: number;
+}
+
+/** 联合类型:新增一种任务时,编译器会逼着把每一处分支都补全。 */
+export type CronTask = ScriptTask | AgentTask;
 
 export interface CronNotify {
   /** 开跑时推一条。默认关 —— 主动推送花的是发送预算,长任务才值。 */
@@ -45,6 +67,15 @@ export interface CronNotify {
   readonly end: boolean;
   /** 只在失败时推。成功就闭嘴,巡检类任务该用它。 */
   readonly onlyFailure: boolean;
+  /**
+   * 静默时段,形如 `"23:00-08:00"`(可跨零点)。窗口内**只记录不推送**,
+   * 出窗口时把攒下的合并成一条摘要。
+   *
+   * 存在的理由是发送预算:主动推送花的是用户上一条来信那份额度(一份 10 条),
+   * 而半夜跑的任务本来就发不出去 —— 它们只会挤在信使的发件队列里,
+   * 第二天早上他一开口全砸过来。攒起来合并成一条,是同一件事的体面版本。
+   */
+  readonly quiet?: string;
 }
 
 export type OverlapPolicy = "skip" | "replace";
@@ -73,6 +104,13 @@ export interface CronJob {
   readonly lastStatus?: RunStatus;
   /** 连续失败次数。到阈值自动停用 —— 半夜空转的任务不该一直烧资源。 */
   readonly failStreak: number;
+  /**
+   * agent 任务(session=chain)上一次的会话 id,下一次接着它跑。
+   *
+   * 存在任务表里而不是内存里:进程随时会被部署换掉,而「记得上次什么样」正是
+   * chain 模式唯一的卖点 —— 丢了它,巡检任务会在每次部署之后重新大惊小怪一遍。
+   */
+  readonly agentSessionId?: string;
 }
 
 /**

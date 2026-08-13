@@ -1,8 +1,10 @@
 import { containerNameFor, type ScriptRunner } from "./docker.js";
 import { renderAutoDisabled, renderEnd, renderNextLine, renderStart } from "./notify.js";
 import { formatAt, nextAt as computeNextAt } from "./schedule.js";
+import { inQuietHours, mergeNotices, type NoticeSpool } from "./notices.js";
+import type { AgentTaskRunner } from "./agent-runner.js";
 import type { CronStore } from "./store.js";
-import type { CronJob, CronRun, RunStatus, RunTrigger } from "./types.js";
+import type { CronJob, CronRun, CronTask, RunStatus, RunTrigger } from "./types.js";
 
 /**
  * 调度器:到点了就跑,跑完了就记账、就报信。
@@ -37,6 +39,13 @@ export interface CronRuntime {
 export interface SchedulerOptions {
   readonly store: CronStore;
   readonly runner: ScriptRunner;
+  /**
+   * agent 任务的执行面。缺席时 agent 任务会记一条 error 而不是静默不跑 ——
+   * 「建得出来但永远不执行」是最难查的一种坏。
+   */
+  readonly agentRunner?: AgentTaskRunner;
+  /** 攒在静默时段里的结果通知。缺席则不攒(直接推)。 */
+  readonly notices?: NoticeSpool;
   /** 现读配置。是函数不是快照 —— 与 prefs 那边同一个理由。 */
   readonly runtime: () => CronRuntime;
   /** 展示用时区。 */
@@ -59,6 +68,15 @@ export class CronScheduler {
   private ticking = false;
   /** 名额不够而没跑的事只说一次,免得每 30 秒刷一行。 */
   private warnedBusy = false;
+  /**
+   * 正在跑的 agent 任务:runId → 中断句柄。
+   *
+   * 脚本任务的现场在**宿主上**(容器),重启后靠容器名认领得回来;agent 任务的
+   * 现场只在**这个进程里**,重启就没了。所以这张表是内存里的,而它空着恰恰是
+   * 「这条 running 记录是上辈子留下的」的判据 —— reap 据此把它记成 interrupted,
+   * 而不是永远挂着一条谁也收不了的 running。
+   */
+  private readonly inFlightAgents = new Map<string, AbortController>();
 
   constructor(opts: SchedulerOptions) {
     this.opts = opts;
@@ -146,6 +164,8 @@ export class CronScheduler {
     try {
       await this.reap();
       await this.fireDue();
+      // 攒着的通知放在最后:这一轮刚收尾的那些也该有机会一起走。
+      await this.flushNotices();
     } catch (err) {
       // tick 绝不能抛:它挂在 setInterval 上,一次未捕获的异常就是一条
       // unhandled rejection,而定时器还在,于是每 30 秒复现一次。
@@ -161,6 +181,13 @@ export class CronScheduler {
     for (const run of this.opts.store.activeRuns()) {
       const job = this.opts.store.get(run.jobId);
       if (!job) continue;
+      // agent 任务:现场只在本进程里。还在跑就别碰它(它自己会来收尾);
+      // 不在表里说明这条记录是上一辈子留下的 —— 进程被部署换掉时它正跑着。
+      if (job.task.kind === "agent") {
+        if (this.inFlightAgents.has(run.id)) continue;
+        await this.settle(job, run, "interrupted", undefined, "我被重启了,这一轮没跑完");
+        continue;
+      }
       if (!run.container) {
         // 没有容器名却挂着 running:只可能是记录写到一半进程没了。
         await this.settle(job, run, "interrupted", undefined, "这次执行的现场丢了");
@@ -227,11 +254,30 @@ export class CronScheduler {
     if (run.status === "skipped") return;
     const tail = this.opts.store.readLog(job.id, run.id, TAIL_BYTES);
     const next = renderNextLine(job.nextAt, this.opts.tz, job.enabled, job.schedule.kind === "once");
-    await this.push(job.userKey, renderEnd(job, run, tail, next), "announce");
+    const text = renderEnd(job, run, tail, next);
+
+    // 静默时段:攒起来,出窗口时合并成一条。**不是丢掉** —— 半夜的结果照样是
+    // 用户第二天要看的东西,只是不该在半夜一条条砸过去(而且那时多半也发不出去)。
+    if (this.opts.notices && inQuietHours(job.notify.quiet, this.now(), this.opts.tz)) {
+      this.opts.notices.add(job.userKey, {
+        jobId: job.id,
+        jobName: job.name,
+        status: run.status,
+        at: this.now(),
+        text,
+      });
+      return;
+    }
+    await this.push(job.userKey, text, "announce");
   }
 
-  private async push(userKey: string, text: string, kind: NotifyKind): Promise<void> {
+  /**
+   * 推一条。给了 `job` 就先看它的静默时段 —— 开跑那条在窗口里**直接丢掉**
+   * (它描述的是"现在开始了",天亮再说毫无意义),与结果那条攒起来不同。
+   */
+  private async push(userKey: string, text: string, kind: NotifyKind, job?: CronJob): Promise<void> {
     if (!this.opts.notify) return;
+    if (job && inQuietHours(job.notify.quiet, this.now(), this.opts.tz)) return;
     try {
       await this.opts.notify(userKey, text, kind);
     } catch (err) {
@@ -353,8 +399,13 @@ export class CronScheduler {
         this.recordSkipped(job, trigger);
         return undefined;
       }
-      // replace:先把上一轮停掉,再跑新的。
-      if (active.container) {
+      // replace:先把上一轮停掉,再跑新的。agent 任务的"停掉"就是 abort 它。
+      const inflight = this.inFlightAgents.get(active.id);
+      if (inflight) {
+        inflight.abort();
+        // 不在这里 settle:被 abort 的那一轮自己会走到收尾分支去(它手里有
+        // 那条记录)。两边都写会让同一次执行被记两遍,而且第二遍会覆盖第一遍。
+      } else if (active.container) {
         await this.opts.runner.stop(active.container);
         const logs = await this.opts.runner.logs(active.container);
         await this.opts.runner.remove(active.container);
@@ -366,8 +417,10 @@ export class CronScheduler {
 
     const startedAt = this.now();
     const runId = store.newRunId(startedAt);
+    if (job.task.kind === "agent") return await this.fireAgent(job, job.task, runId, startedAt, trigger);
+
     const container = containerNameFor(job.id, runId);
-    let run: CronRun = {
+    const run: CronRun = {
       id: runId,
       jobId: job.id,
       userKey: job.userKey,
@@ -394,7 +447,7 @@ export class CronScheduler {
     }
 
     if (job.notify.start && !job.notify.onlyFailure) {
-      await this.push(job.userKey, renderStart(job, run), "reminder");
+      await this.push(job.userKey, renderStart(job, run), "reminder", job);
     }
 
     const r = await this.opts.runner.launch({
@@ -407,6 +460,7 @@ export class CronScheduler {
       mounts: job.task.mounts,
       limits: job.task.limits,
       hostWorkDir: hostWork,
+      tz: this.opts.tz,
     });
     if (!r.ok) {
       await this.settle(job, run, "error", undefined, `容器没起来:${r.error}`);
@@ -416,4 +470,106 @@ export class CronScheduler {
     return run;
   }
 
+  /**
+   * 起一轮 agent 任务。
+   *
+   * 与脚本任务的形状刻意不同:**不等它跑完**。tick 每 30 秒一次,而一轮 agent
+   * 可能要跑好几分钟 —— 在 tick 里 await 它,整个调度器(包括别的任务的收尾)
+   * 就一起卡在那儿了。所以这里只把它放出去,收尾由它自己那条 then 完成,
+   * 而 reap 靠 inFlightAgents 知道"它还活着,别动"。
+   */
+  private async fireAgent(
+    job: CronJob,
+    task: Extract<CronTask, { kind: "agent" }>,
+    runId: string,
+    startedAt: number,
+    trigger: RunTrigger,
+  ): Promise<CronRun> {
+    const store = this.opts.store;
+    const run: CronRun = {
+      id: runId,
+      jobId: job.id,
+      userKey: job.userKey,
+      startedAt,
+      status: "running",
+      trigger,
+    };
+    store.saveRun(run);
+
+    if (!this.opts.agentRunner) {
+      // 「建得出来但永远不执行」是最难查的一种坏:任务表里一切正常,记录里空空如也。
+      await this.settle(job, run, "error", undefined, "这个进程没有装配 agent 执行面,跑不了 agent 任务");
+      return { ...run, status: "error" };
+    }
+
+    if (job.notify.start && !job.notify.onlyFailure) {
+      await this.push(job.userKey, renderStart(job, run), "reminder", job);
+    }
+
+    const abort = new AbortController();
+    this.inFlightAgents.set(runId, abort);
+    // 超时靠它。**unref**:它要掐的那个回合就活在这个进程里,进程都没了的话
+    // 也就没什么可掐的了 —— 与脚本任务那边刻意不同(那边的现场在宿主上,
+    // 进程死了容器还在跑)。不 unref 的话,一个 30 分钟超时的任务会让进程
+    // 在收尾时白等半小时。
+    const timer = setTimeout(() => abort.abort(), job.timeoutMs);
+    timer.unref?.();
+    console.info(`[cron] ${job.id}「${job.name}」起跑(${trigger},agent)`);
+
+    void this.opts.agentRunner
+      .run({ job, task, abort })
+      .then(async (r) => {
+        // chain 模式要把会话 id 记下来,下一次接着它跑。
+        if (task.session === "chain" && r.sessionId) {
+          store.patch(job.id, { agentSessionId: r.sessionId });
+        }
+        const fresh = store.get(job.id) ?? job;
+        await this.settle(fresh, run, r.ok ? "ok" : "failed", undefined, undefined, r.text);
+      })
+      .catch(async (err) => {
+        const aborted = abort.signal.aborted;
+        const fresh = store.get(job.id) ?? job;
+        await this.settle(
+          fresh,
+          run,
+          aborted ? "timeout" : "failed",
+          undefined,
+          aborted ? `超过 ${Math.round(job.timeoutMs / 60_000)} 分钟没跑完,已中止` : undefined,
+          String(err),
+        );
+      })
+      .finally(() => {
+        clearTimeout(timer);
+        this.inFlightAgents.delete(runId);
+      });
+
+    return run;
+  }
+
+  // ── 静默时段与积压合并 ──────────────────────────────────────────
+
+  /**
+   * 把攒着的通知发出去 —— 只发那些**已经出了静默窗口**的用户。
+   *
+   * 判据用的是每条通知自己那个任务的窗口:同一个用户可能有几个任务、各设各的
+   * 静默时段,拿"随便哪一个"去判会让另一个任务的结果卡在里面出不来。
+   */
+  private async flushNotices(): Promise<void> {
+    const spool = this.opts.notices;
+    if (!spool) return;
+    const now = this.now();
+    for (const userKey of spool.users()) {
+      const pending = spool.peek(userKey);
+      // 还有任何一条仍在自己的静默窗口里,就整批再等等 —— 分两次发等于把
+      // 「合并成一条」这件事本身破坏掉。
+      const stillQuiet = pending.some((n) => {
+        const job = this.opts.store.get(n.jobId);
+        return job ? inQuietHours(job.notify.quiet, now, this.opts.tz) : false;
+      });
+      if (stillQuiet) continue;
+      for (const text of mergeNotices(spool.take(userKey))) {
+        await this.push(userKey, text, "announce");
+      }
+    }
+  }
 }

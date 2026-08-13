@@ -30,6 +30,8 @@ import { ScriptDeployControl } from "./core/deploy.js";
 import { CronStore, DEFAULT_RUN_MAX_AGE_MS } from "./core/cron/store.js";
 import { CronScheduler } from "./core/cron/scheduler.js";
 import { DockerScriptRunner } from "./core/cron/docker.js";
+import { RealAgentTaskRunner } from "./core/cron/agent-runner.js";
+import { NoticeSpool } from "./core/cron/notices.js";
 import type { CronApiDeps } from "./dashboard/api-cron.js";
 import { formatDeployReport } from "./core/deploy-report.js";
 import { RescueRunner } from "./rescue/runner.js";
@@ -191,7 +193,10 @@ async function main(): Promise<void> {
   // **只在主人格里跑。** 守护人格挂的主 /data 是只读的,执行记录一个字都写不下去;
   // 而"每类状态只有一个写者"这条纪律里,任务表的写者就是主人格。两边都跑的话,
   // 一次 `/救援` 期间两个进程会各自去点同一批火。
-  const cron = config.persona === "primary" ? createCron(config, settings, turns, gateway) : undefined;
+  const cron =
+    config.persona === "primary"
+      ? createCron(config, settings, turns, gateway, { agent, users, prefs })
+      : undefined;
 
   const adminToken = resolveAdminToken(config);
   // 渠道起来之前一律报 bootOk=false:部署的健康门等的就是这个翻转,
@@ -283,6 +288,7 @@ function createCron(
   settings: GlobalSettings,
   turns: TurnTokens,
   gateway: Gateway,
+  deps: { agent: Agent; users: UserRegistry; prefs: PrefsStore },
 ): { store: CronStore; scheduler: CronScheduler; api: CronApiDeps } {
   const store = new CronStore({
     dir: `${config.dataDir}/cron`,
@@ -292,6 +298,19 @@ function createCron(
   const scheduler = new CronScheduler({
     store,
     runner: new DockerScriptRunner(),
+    // agent 任务的执行面。它自己铸令牌、自己挑 skill —— 与用户回合共用同一份
+    // 环境组装规则(core/turn-env.ts),抄两份迟早走样。
+    agentRunner: new RealAgentTaskRunner({
+      agent: deps.agent,
+      users: deps.users,
+      prefs: deps.prefs,
+      settings,
+      turns,
+      apiBase: config.apiBase,
+      persona: config.persona,
+    }),
+    // 静默时段攒下来的结果。落盘 —— 部署很可能就发生在攒着的那几个小时里。
+    notices: new NoticeSpool(`${config.dataDir}/cron/notices.json`),
     runtime: () => {
       const s = settings.effective();
       return {
@@ -315,6 +334,7 @@ function createCron(
         minIntervalMs: s.cronMinIntervalMs,
         defaultKeepRuns: s.cronKeepRuns,
         mountAllowlist: s.cronMountAllowlist,
+        modelAllowlist: s.modelAllowlist,
         hostDataDir: config.hostDataDir,
         now: Date.now(),
       };

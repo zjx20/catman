@@ -6,7 +6,13 @@ import {
   validateJobInput,
   type ValidateContext,
 } from "../src/core/cron/validate.js";
-import type { CronJob } from "../src/core/cron/types.js";
+import type { CronJob, ScriptTask } from "../src/core/cron/types.js";
+
+/** 断言这是脚本任务并窄化 —— 联合类型之后,直接取 mounts/limits 编译不过。 */
+function script(t: { kind: string }): ScriptTask {
+  assert.equal(t.kind, "script");
+  return t as ScriptTask;
+}
 
 const NOW = Date.parse("2026-08-13T10:00:00+08:00");
 
@@ -17,6 +23,7 @@ function ctx(over: Partial<ValidateContext> = {}): ValidateContext {
     defaultKeepRuns: 20,
     mountAllowlist: ["/opt/services"],
     hostDataDir: "/mnt/usb/catman_data",
+    modelAllowlist: ["opus", "sonnet", "haiku"],
     now: NOW,
     ...over,
   };
@@ -53,10 +60,10 @@ test("最小输入:默认值全部填满,而且是保守的那一端", () => {
   assert.equal(v.keepRuns, 20);
   assert.deepEqual(v.notify, { start: false, end: true, onlyFailure: false });
   assert.equal(v.task.kind, "script");
-  assert.equal(v.task.image, "catman-env:1");
-  assert.equal(v.task.network, "none", "默认必须断网");
-  assert.deepEqual(v.task.mounts, [], "默认不挂任何宿主目录");
-  assert.deepEqual(v.task.limits, { memory: "512m", cpus: 0.5, pids: 128 });
+  assert.equal(script(v.task).image, "catman-env:1");
+  assert.equal(script(v.task).network, "none", "默认必须断网");
+  assert.deepEqual(script(v.task).mounts, [], "默认不挂任何宿主目录");
+  assert.deepEqual(script(v.task).limits, { memory: "512m", cpus: 0.5, pids: 128 });
   assert.equal(v.nextAt, Date.parse("2026-08-14T08:00:00+08:00"));
 });
 
@@ -126,7 +133,7 @@ test("name 的边界", () => {
 test("挂载必须落在白名单里,而且默认只读", () => {
   const mount = (m: unknown) => input({ task: { cmd: ["ls"], mounts: [m] } });
   const v = validateJobInput(mount({ host: "/opt/services/phonicsfun", at: "/svc" }), ctx());
-  assert.deepEqual(v.task.mounts[0], { host: "/opt/services/phonicsfun", at: "/svc", ro: true });
+  assert.deepEqual(script(v.task).mounts[0], { host: "/opt/services/phonicsfun", at: "/svc", ro: true });
 
   rejects(mount({ host: "/etc", at: "/etc2" }), /不在允许的范围内/);
   // 前缀比较要按路径段,不能被 /opt/services-evil 这种蒙混过去
@@ -145,7 +152,7 @@ test("资源上限有量程,写错的值不会被悄悄夹到边界", () => {
   rejects(limits({ cpus: 8 }), /应在 0.1-2 之间/);
   rejects(limits({ pids: 100000 }), /应在 16-512 之间/);
   const v = validateJobInput(limits({ memory: "1g", cpus: 1, pids: 256 }), ctx());
-  assert.deepEqual(v.task.limits, { memory: "1g", cpus: 1, pids: 256 });
+  assert.deepEqual(script(v.task).limits, { memory: "1g", cpus: 1, pids: 256 });
 });
 
 test("没配宿主 /data 路径时,脚本任务在创建这一步就被拒", () => {
@@ -153,15 +160,12 @@ test("没配宿主 /data 路径时,脚本任务在创建这一步就被拒", () 
 });
 
 test("network 与 env 的取值", () => {
-  assert.equal(validateJobInput(input({ task: { cmd: ["ls"], network: "mynet" } }), ctx()).task.network, "mynet");
+  assert.equal(script(validateJobInput(input({ task: { cmd: ["ls"], network: "mynet" } }), ctx()).task).network, "mynet");
   rejects(input({ task: { cmd: ["ls"], network: "host" } }), /只能是 none \/ mynet/);
   rejects(input({ task: { cmd: ["ls"], env: { "BAD-KEY": "v" } } }), /不是合法环境变量名/);
   rejects(input({ task: { cmd: ["ls"], env: { OK: 1 } } }), /必须是字符串/);
 });
 
-test("agent 任务还没做 —— 明说,而不是当成 script 跑", () => {
-  rejects(input({ task: { kind: "agent", cmd: ["ls"] } }), /只能是 script/);
-});
 
 test("整个输入不是对象、缺必填项", () => {
   rejects("每天八点跑一下", /必须是一个 JSON 对象/);

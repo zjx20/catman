@@ -4,7 +4,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CronStore } from "../src/core/cron/store.js";
-import { CronScheduler, type CronRuntime, type NotifyKind } from "../src/core/cron/scheduler.js";
+import {
+  CronScheduler,
+  type CronRuntime,
+  type NotifyKind,
+  type SchedulerOptions,
+} from "../src/core/cron/scheduler.js";
+import { NoticeSpool } from "../src/core/cron/notices.js";
+import type { AgentTaskRunner } from "../src/core/cron/agent-runner.js";
 import type { LaunchSpec, PollResult, ScriptRunner } from "../src/core/cron/docker.js";
 import type { CronJob } from "../src/core/cron/types.js";
 
@@ -60,11 +67,16 @@ class FakeRunner implements ScriptRunner {
 interface Harness {
   store: CronStore;
   runner: FakeRunner;
+  /** 默认那个调度器。withNotices() 会把它换成带攒发的那个。 */
   sched: CronScheduler;
   notes: Array<{ text: string; kind: NotifyKind }>;
   now: () => number;
   set: (t: number) => void;
   add: (over?: Partial<CronJob>) => CronJob;
+  /** 换一个带 agent 执行面的调度器(共用同一份 store 与时钟)。 */
+  withAgent: (brain: FakeAgentRunner) => CronScheduler;
+  /** 给默认调度器装上攒发,并把 spool 交出来供断言。 */
+  withNotices: () => NoticeSpool;
 }
 
 function harness(runtime: Partial<CronRuntime> = {}): Harness {
@@ -74,23 +86,26 @@ function harness(runtime: Partial<CronRuntime> = {}): Harness {
   const store = new CronStore({ dir, hostDir: "/mnt/usb/catman_data/cron", now: () => clock });
   const runner = new FakeRunner();
   const notes: Array<{ text: string; kind: NotifyKind }> = [];
-  const sched = new CronScheduler({
-    store,
-    runner,
-    runtime: () => ({
-      enabled: true,
-      maxConcurrent: 1,
-      catchUpMs: 15 * 60_000,
-      runMaxAgeMs: 90 * 24 * 3600_000,
-      ...runtime,
-    }),
-    tz: SH,
-    notify: async (_userKey, text, kind) => {
-      notes.push({ text, kind });
-    },
-    now: () => clock,
-    tickMs: 30_000,
-  });
+  const build = (extra: Partial<SchedulerOptions> = {}): CronScheduler =>
+    new CronScheduler({
+      store,
+      runner,
+      runtime: () => ({
+        enabled: true,
+        maxConcurrent: 1,
+        catchUpMs: 15 * 60_000,
+        runMaxAgeMs: 90 * 24 * 3600_000,
+        ...runtime,
+      }),
+      tz: SH,
+      notify: async (_userKey, text, kind) => {
+        notes.push({ text, kind });
+      },
+      now: () => clock,
+      tickMs: 30_000,
+      ...extra,
+    });
+  const sched = build();
   let n = 0;
   const add = (over: Partial<CronJob> = {}): CronJob => {
     const job: CronJob = {
@@ -120,7 +135,23 @@ function harness(runtime: Partial<CronRuntime> = {}): Harness {
     };
     return store.put(job);
   };
-  return { store, runner, sched, notes, now: () => clock, set: (t) => (clock = t), add };
+  let spool: NoticeSpool | undefined;
+  const h: Harness = {
+    store,
+    runner,
+    sched,
+    notes,
+    now: () => clock,
+    set: (t) => (clock = t),
+    add,
+    withAgent: (brain) => build({ agentRunner: brain as unknown as AgentTaskRunner, notices: spool }),
+    withNotices: () => {
+      spool = new NoticeSpool(join(dir, "notices.json"));
+      h.sched = build({ notices: spool });
+      return spool;
+    },
+  };
+  return h;
 }
 
 test("到点就起容器,而且隔离参数一个不少", async () => {
@@ -507,4 +538,195 @@ test("没有 reapOrphans 的执行面(测试替身)照样能启动", async () =>
   h.sched.stop();
   await new Promise((r) => setImmediate(r));
   assert.equal(h.store.get("j_1")!.nextAt !== undefined, true);
+});
+
+// ── agent 任务(P2) ───────────────────────────────────────────────
+
+/** 假的大脑。什么时候返回由用例说了算,于是"不等它跑完"这件事测得动。 */
+class FakeAgentRunner {
+  readonly calls: Array<{ jobId: string; prompt: string; resume?: string }> = [];
+  private settle?: (r: { ok: boolean; text: string; sessionId?: string }) => void;
+  private lastAbort?: AbortController;
+
+  async run(req: { job: CronJob; task: { prompt: string }; abort: AbortController }): Promise<{
+    ok: boolean;
+    text: string;
+    sessionId?: string;
+  }> {
+    this.calls.push({
+      jobId: req.job.id,
+      prompt: req.task.prompt,
+      ...(req.job.agentSessionId ? { resume: req.job.agentSessionId } : {}),
+    });
+    this.lastAbort = req.abort;
+    return await new Promise((resolve) => {
+      this.settle = resolve;
+      req.abort.signal.addEventListener("abort", () => resolve({ ok: false, text: "被中止了" }));
+    });
+  }
+  finish(text: string, sessionId?: string, ok = true): void {
+    this.settle?.({ ok, text, ...(sessionId ? { sessionId } : {}) });
+  }
+  get aborted(): boolean {
+    return this.lastAbort?.signal.aborted ?? false;
+  }
+}
+
+/** 让出事件循环,等那些 void 出去的收尾链跑完。 */
+const settleAll = (): Promise<void> => new Promise((r) => setImmediate(() => setImmediate(r)));
+
+function agentJob(h: Harness, over: Partial<CronJob> = {}): CronJob {
+  return h.add({
+    task: { kind: "agent", prompt: "看一眼磁盘", session: "fresh", maxTurns: 20 },
+    ...over,
+  });
+}
+
+test("agent 任务:到点交给大脑,而且**不等它跑完**", async () => {
+  const h = harness();
+  const brain = new FakeAgentRunner();
+  const sched = h.withAgent(brain);
+  agentJob(h);
+
+  await sched.tick(); // 这一步必须马上返回,不能挂在大脑那儿
+  assert.equal(brain.calls.length, 1);
+  assert.equal(brain.calls[0]!.prompt, "看一眼磁盘");
+  assert.equal(h.store.listRuns("j_1")[0]!.status, "running");
+  assert.equal(h.runner.launched.length, 0, "agent 任务不该去起容器");
+
+  brain.finish("磁盘 62%,没异常");
+  await settleAll();
+  const run = h.store.listRuns("j_1")[0]!;
+  assert.equal(run.status, "ok");
+  assert.equal(h.store.readLog("j_1", run.id), "磁盘 62%,没异常");
+  assert.match(h.notes[0]!.text, /磁盘 62%/);
+});
+
+test("agent 任务:tick 期间不会被自己收尸(它还在跑)", async () => {
+  const h = harness();
+  const brain = new FakeAgentRunner();
+  const sched = h.withAgent(brain);
+  agentJob(h);
+  await sched.tick();
+
+  await sched.tick(); // 再来一轮 reap
+  assert.equal(h.store.listRuns("j_1")[0]!.status, "running", "还在跑就别动它");
+
+  brain.finish("好了");
+  await settleAll();
+  assert.equal(h.store.listRuns("j_1")[0]!.status, "ok");
+});
+
+test("agent 任务:重启之后那条 running 记成 interrupted,而不是永远挂着", async () => {
+  const h = harness();
+  const brain = new FakeAgentRunner();
+  const sched = h.withAgent(brain);
+  agentJob(h);
+  await sched.tick();
+
+  // 换一个调度器实例 = 进程被部署换掉。agent 的现场只在进程里,没了就是没了。
+  const reborn = h.withAgent(new FakeAgentRunner());
+  await reborn.tick();
+  const runs = h.store.listRuns("j_1");
+  assert.equal(runs.find((r) => r.status === "interrupted")?.note, "我被重启了,这一轮没跑完");
+});
+
+test("agent 任务:超时把回合掐掉", async () => {
+  const h = harness();
+  const brain = new FakeAgentRunner();
+  const sched = h.withAgent(brain);
+  agentJob(h, { timeoutMs: 60_000 });
+  await sched.tick();
+
+  h.set(T0 + 61_000);
+  // 超时靠的是真定时器,这里直接驱动它:abort 之后大脑那侧立刻返回
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(brain.calls.length, 1);
+});
+
+test("agent 任务:chain 模式把会话 id 记下来,下一次接着跑", async () => {
+  const h = harness();
+  const brain = new FakeAgentRunner();
+  const sched = h.withAgent(brain);
+  agentJob(h, {
+    task: { kind: "agent", prompt: "变化了才说", session: "chain", maxTurns: 20 },
+    schedule: { kind: "every", ms: 3600_000 },
+  });
+
+  await sched.tick();
+  brain.finish("第一次:一切正常", "sess-abc");
+  await settleAll();
+  assert.equal(h.store.get("j_1")!.agentSessionId, "sess-abc");
+
+  h.set(T0 + 3600_000);
+  h.store.patch("j_1", { nextAt: h.now() - 1 });
+  await sched.tick();
+  assert.equal(brain.calls[1]!.resume, "sess-abc", "第二次要续上一次的会话");
+});
+
+test("agent 任务:没有装配执行面时记 error,而不是静默不跑", async () => {
+  const h = harness();
+  agentJob(h);
+  await h.sched.tick(); // 这个 harness 的 scheduler 没有 agentRunner
+
+  const run = h.store.listRuns("j_1")[0]!;
+  assert.equal(run.status, "error");
+  assert.match(run.note ?? "", /没有装配 agent 执行面/);
+});
+
+// ── 静默时段(P2) ─────────────────────────────────────────────────
+
+test("静默时段:结果攒起来不推,出窗口时合并成一条", async () => {
+  const h = harness();
+  const spool = h.withNotices();
+  // 23:00-08:00,而 T0 是 10:00 —— 先把时钟拨到窗口里
+  h.add({ notify: { start: false, end: true, onlyFailure: false, quiet: "23:00-08:00" } });
+  h.set(Date.parse("2026-08-13T23:30:00+08:00"));
+  h.store.patch("j_1", { nextAt: h.now() - 1 });
+
+  await h.sched.tick();
+  h.runner.finish(0, "半夜第一次");
+  await h.sched.tick();
+  assert.equal(h.notes.length, 0, "窗口里一条都不推");
+  assert.equal(spool.peek("wechat:a:u1").length, 1, "但要攒着,不是丢掉");
+
+  // 再跑一次
+  h.set(Date.parse("2026-08-14T03:00:00+08:00"));
+  h.store.patch("j_1", { nextAt: h.now() - 1 });
+  await h.sched.tick();
+  h.runner.finish(1, "半夜第二次炸了");
+  await h.sched.tick();
+  assert.equal(h.notes.length, 0);
+
+  // 天亮了
+  h.set(Date.parse("2026-08-14T08:30:00+08:00"));
+  await h.sched.tick();
+  const digest = h.notes.map((n) => n.text).join("\n");
+  assert.match(digest, /跑了 2 次:1 次成功、1 次失败/);
+  assert.match(digest, /半夜第二次炸了/);
+  assert.equal(spool.users().length, 0, "发完就不再欠了");
+});
+
+test("静默时段:开跑那条直接丢掉,不攒", async () => {
+  const h = harness();
+  const spool = h.withNotices();
+  h.add({ notify: { start: true, end: true, onlyFailure: false, quiet: "23:00-08:00" } });
+  h.set(Date.parse("2026-08-13T23:30:00+08:00"));
+  h.store.patch("j_1", { nextAt: h.now() - 1 });
+
+  await h.sched.tick();
+  assert.equal(h.notes.length, 0);
+  // 攒着的只有结果那一类;"现在开始了"天亮再说毫无意义
+  assert.equal(spool.peek("wechat:a:u1").length, 0);
+});
+
+test("静默时段:窗口外照常当场推", async () => {
+  const h = harness();
+  h.withNotices();
+  h.add({ notify: { start: false, end: true, onlyFailure: false, quiet: "23:00-08:00" } });
+  await h.sched.tick(); // T0 = 10:00,不在窗口里
+  h.runner.finish(0, "白天这次");
+  await h.sched.tick();
+  assert.equal(h.notes.length, 1);
+  assert.match(h.notes[0]!.text, /白天这次/);
 });
