@@ -13,6 +13,20 @@ export interface TurnEnvOptions {
   readonly sessionToken: string;
   /** 管理员回合才把 admin token 加回去。 */
   readonly isAdmin: boolean;
+  /**
+   * 这个用户的推送令牌(长期有效,见 core/notify-tokens.ts)。
+   *
+   * **和 sessionToken 一起注入,但寿命完全不同** —— 它就是给脱钩的后台任务用的:
+   * 回合结束时 sessionToken 作废,而后台任务往往那时候才跑到一半。
+   */
+  readonly notifyToken?: string;
+  /**
+   * 要挂进 PATH 最前面的目录(`catman-notify` 住在那儿)。
+   *
+   * 挂 PATH 而不是给绝对路径:助手写命令时会照着 skill 里的样子抄,
+   * 而 skill 里写 `catman-notify run -- …` 比写一长串路径更不容易抄错。
+   */
+  readonly binDir?: string;
 }
 
 /**
@@ -33,8 +47,16 @@ export function buildTurnEnv(opts: TurnEnvOptions): Record<string, string | unde
   const { CATMAN_ADMIN_TOKEN, CATMAN_IPC_SECRET: _ipc, ...rest } = process.env;
   return {
     ...rest,
+    ...(opts.binDir ? { PATH: prependPath(opts.binDir, rest.PATH) } : {}),
     CATMAN_API_BASE: opts.apiBase,
     CATMAN_SESSION_TOKEN: opts.sessionToken,
+    ...(opts.notifyToken ? { CATMAN_NOTIFY_TOKEN: opts.notifyToken } : {}),
     ...(opts.isAdmin ? { CATMAN_ADMIN_TOKEN } : {}),
   };
+}
+
+/** 已经在 PATH 里就不重复加 —— 每回合叠一次的话,长跑的进程 PATH 会越来越长。 */
+function prependPath(dir: string, current: string | undefined): string {
+  if (!current) return dir;
+  return current.split(":").includes(dir) ? current : `${dir}:${current}`;
 }

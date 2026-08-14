@@ -53,6 +53,10 @@ export interface RealAgentTaskRunnerOptions {
   readonly turns: TurnTokens;
   readonly apiBase: string;
   readonly persona: Persona;
+  /** 推送令牌的发放处。定时任务里的助手同样会起长任务,它也需要 `catman-notify`。 */
+  readonly notifyTokens?: { for(userKey: string): string };
+  /** 挂进 PATH 的目录(`catman-notify` 住在那儿)。 */
+  readonly binDir?: string;
 }
 
 export class RealAgentTaskRunner implements AgentTaskRunner {
@@ -88,7 +92,13 @@ export class RealAgentTaskRunner implements AgentTaskRunner {
           ? { resumeSessionId: job.agentSessionId }
           : {}),
         ...(model ? { model } : {}),
-        env: buildTurnEnv({ apiBase: o.apiBase, sessionToken: turn.token, isAdmin }),
+        env: buildTurnEnv({
+          apiBase: o.apiBase,
+          sessionToken: turn.token,
+          isAdmin,
+          ...(o.notifyTokens ? { notifyToken: o.notifyTokens.for(job.userKey) } : {}),
+          ...(o.binDir ? { binDir: o.binDir } : {}),
+        }),
         skills: skillsFor(o.persona, isAdmin),
         // 用调度器给的那个:超时与「任务被删了」都从它那边掐。
         abortController: req.abort,

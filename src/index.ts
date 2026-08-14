@@ -13,6 +13,9 @@ import { GlobalSettings } from "./core/settings.js";
 import { PrefsStore } from "./core/prefs.js";
 import { TurnTokens } from "./core/turn-tokens.js";
 import { writeSkills } from "./core/skills.js";
+import { NotifyTokens } from "./core/notify-tokens.js";
+import { writeNotifyBin } from "./core/notify-bin.js";
+import { NotifyRateLimiter } from "./dashboard/api-notify.js";
 import { StdinChannel } from "./channels/stdin.js";
 import { BridgeChannel } from "./channels/bridge.js";
 import { IpcClient } from "./ipc/client.js";
@@ -128,6 +131,16 @@ async function main(): Promise<void> {
     config.persona,
   );
 
+  // 推送令牌与 `catman-notify`。
+  //
+  // 这一对存在的理由是一句一直兑现不了的承诺:脱钩的长任务活得过会话,但回合令牌
+  // 不会,于是"跑完通知你"从来只能说成"你下次开口时我再去看日志"。令牌落盘(寿命
+  // 与回合无关),脚本挂进回合 PATH —— 与 skill 同一条规矩:每次启动覆盖写,
+  // 真相源是代码不是磁盘。
+  const notifyTokens = new NotifyTokens(`${config.dataDir}/notify-tokens.json`);
+  const binDir = `${config.dataDir}/bin`;
+  writeNotifyBin(binDir, config.apiBase);
+
   // 守护人格**不给**部署控制面:它跑 pinned release,不自进化;而 `/发布` `/回滚`
   // 是全局动作,让两个人格都能发等于多了一条谁也说不清是谁按的路径。
   // 它要动版本时走的是状态页上那个按钮(或看门狗自动),两者都经固化的 deployer。
@@ -170,6 +183,8 @@ async function main(): Promise<void> {
     settings,
     turns,
     apiBase: config.apiBase,
+    notifyTokens,
+    binDir,
     admission,
     version,
     persona: config.persona,
@@ -202,7 +217,7 @@ async function main(): Promise<void> {
   // 一次 `/救援` 期间两个进程会各自去点同一批火。
   const cron =
     config.persona === "primary"
-      ? createCron(config, settings, turns, gateway, { agent, users, prefs })
+      ? createCron(config, settings, turns, gateway, { agent, users, prefs, notifyTokens, binDir })
       : undefined;
   cronRef = cron;
 
@@ -220,6 +235,12 @@ async function main(): Promise<void> {
     ...(bridgeClient ? { accounts: new IpcAccountsProxy(bridgeClient) } : {}),
     chat,
     selfApi: { turns, prefs, users, sessions, settings, configDir },
+    notifyApi: {
+      tokens: notifyTokens,
+      limiter: new NotifyRateLimiter(),
+      // 与定时任务播报同一条出路,于是也同享那份纪律:发不出去有信使的发件队列兜着。
+      push: (userKey, text) => gateway.push(userKey, text, "announce"),
+    },
     ...(cron ? { cronApi: cron.api } : {}),
     ...(cron
       ? {
@@ -306,7 +327,13 @@ function createCron(
   settings: GlobalSettings,
   turns: TurnTokens,
   gateway: Gateway,
-  deps: { agent: Agent; users: UserRegistry; prefs: PrefsStore },
+  deps: {
+    agent: Agent;
+    users: UserRegistry;
+    prefs: PrefsStore;
+    notifyTokens: NotifyTokens;
+    binDir: string;
+  },
 ): { store: CronStore; scheduler: CronScheduler; api: CronApiDeps } {
   const store = new CronStore({
     dir: `${config.dataDir}/cron`,
@@ -326,6 +353,9 @@ function createCron(
       turns,
       apiBase: config.apiBase,
       persona: config.persona,
+      // 定时 agent 任务里的助手同样会起长任务,`catman-notify` 对它一样有用。
+      notifyTokens: deps.notifyTokens,
+      binDir: deps.binDir,
     }),
     // 静默时段攒下来的结果。落盘 —— 部署很可能就发生在攒着的那几个小时里。
     notices: new NoticeSpool(`${config.dataDir}/cron/notices.json`),

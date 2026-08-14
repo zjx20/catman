@@ -35,6 +35,12 @@ import { DashboardAuth, urlWithoutToken } from "./auth.js";
 import { handleSelfApi, isSelfApiPath, SESSION_HEADER, type SelfApiDeps } from "./api-self.js";
 import { handleCronApi, isCronApiPath, type CronApiDeps } from "./api-cron.js";
 import {
+  handleNotifyApi,
+  isNotifyApiPath,
+  NOTIFY_HEADER,
+  type NotifyApiDeps,
+} from "./api-notify.js";
+import {
   handleCronAdminApi,
   isCronAdminApiPath,
   type CronAdminApiDeps,
@@ -71,6 +77,8 @@ import { buildHealth, isHealthPath, type HealthDeps } from "./health.js";
  *   GET/PATCH /api/me                       agent 读写自己这个用户的配置
  *   POST   /api/me/session/reset            本回合结束后开新会话
  *   GET    /api/me/sessions                 自己的历史会话
+ * 推送令牌(**X-Catman-Notify**,长期有效、只能推消息,见 api-notify.ts):
+ *   POST   /api/me/notify                   给自己推一条(脱钩的后台任务用它收尾)
  * 无鉴权(只有标量与版本号,见 health.ts):
  *   GET    /health                          部署流水线的健康门/排水门/版本确证
  *
@@ -94,6 +102,8 @@ export interface DashboardOptions {
   selfApi: SelfApiDeps;
   /** 定时任务接口。没有调度器的场合(守护人格、本地开发)可以不传,那时整段路由不挂。 */
   cronApi?: CronApiDeps;
+  /** 推送接口。不传则整段路由不挂(单测起 Dashboard 时不必装配网关)。 */
+  notifyApi?: NotifyApiDeps;
   /** 定时任务的**管理员**面:页面与页面上那几个按钮。与 cronApi 是两套鉴权。 */
   cronAdmin?: CronAdminApiDeps & { tz: string; enabled: () => boolean };
   adminApi: AdminApiDeps;
@@ -240,6 +250,20 @@ export class Dashboard {
         const token = Array.isArray(raw) ? raw[0] : raw;
         const body = await readJsonBody(req);
         const r = await handleCronApi(req.method ?? "GET", path, token, body, this.opts.cronApi);
+        res.writeHead(r.status, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(r.body, null, 2));
+        return;
+      }
+
+      // 同样必须排在 isSelfApiPath 之前(它认领整个 /api/me/ 前缀)。
+      // 鉴权用的是**另一个请求头**:推送令牌长期有效,而 X-Catman-Session 只活一个回合 ——
+      // 收错头等于把一枚长期令牌的效力扩大到 /api/me 的全部读写。
+      if (isNotifyApiPath(path)) {
+        if (!this.opts.notifyApi) return jsonError(res, 503, "这台机器没有推送接口");
+        const raw = req.headers[NOTIFY_HEADER];
+        const token = Array.isArray(raw) ? raw[0] : raw;
+        const body = await readJsonBody(req);
+        const r = await handleNotifyApi(req.method ?? "GET", path, token, body, this.opts.notifyApi);
         res.writeHead(r.status, { "content-type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(r.body, null, 2));
         return;

@@ -123,6 +123,13 @@ export interface GatewayOptions {
   turns: TurnTokens;
   /** 告诉 agent 从容器内怎么访问本进程的 HTTP 接口。 */
   apiBase: string;
+  /**
+   * 推送令牌的发放处(core/notify-tokens.ts)。不配 = 回合里没有 `CATMAN_NOTIFY_TOKEN`,
+   * `catman-notify` 会明说"这不像是 catman 的回合环境"而不是安静地推不出去。
+   */
+  notifyTokens?: { for(userKey: string): string };
+  /** 挂进回合 PATH 的目录(`catman-notify` 住在那儿)。 */
+  binDir?: string;
   /** 提醒轮询间隔(ms)。 */
   reminderIntervalMs: number;
   /** 谁能使用本助手。默认全放行(仅适合 stdin 这类本地通道)。 */
@@ -568,6 +575,8 @@ export class Gateway {
   private readonly courierGreeted = new Set<string>();
   private readonly deploy: DeployControl | undefined;
   private readonly cron: CronView | undefined;
+  private readonly notifyTokens: { for(userKey: string): string } | undefined;
+  private readonly binDir: string | undefined;
 
   constructor(opts: GatewayOptions) {
     this.channel = opts.channel;
@@ -588,6 +597,8 @@ export class Gateway {
     this.tokenAlert = opts.tokenAlert;
     this.deploy = opts.deploy;
     this.cron = opts.cron;
+    this.notifyTokens = opts.notifyTokens;
+    this.binDir = opts.binDir;
     this.semaphore = new Semaphore(this.settings.effective().maxConcurrentTurns);
     this.settings.onChange(() => {
       this.semaphore.setLimit(this.settings.effective().maxConcurrentTurns);
@@ -1582,7 +1593,7 @@ export class Gateway {
         cwd: pre.cwd,
         resumeSessionId: decision.isNew ? undefined : decision.resumeSessionId,
         ...(prefs.model ? { model: prefs.model } : {}),
-        env: this.childEnv(isAdmin, turn.token),
+        env: this.childEnv(isAdmin, turn.token, userKey),
         skills: skillsFor(this.persona, isAdmin),
         abortController: turn.ctx.abort,
         onProgress,
@@ -1711,8 +1722,19 @@ export class Gateway {
    * 显式加回。这是管理员令牌下放到子进程的唯一出口。
    */
   /** 子进程环境。实现在 core/turn-env.ts —— 定时 agent 任务用的是同一份。 */
-  private childEnv(isAdmin: boolean, sessionToken: string): Record<string, string | undefined> {
-    return buildTurnEnv({ apiBase: this.apiBase, sessionToken, isAdmin });
+  private childEnv(
+    isAdmin: boolean,
+    sessionToken: string,
+    userKey: string,
+  ): Record<string, string | undefined> {
+    const notifyToken = this.notifyTokens?.for(userKey);
+    return buildTurnEnv({
+      apiBase: this.apiBase,
+      sessionToken,
+      isAdmin,
+      ...(notifyToken ? { notifyToken } : {}),
+      ...(this.binDir ? { binDir: this.binDir } : {}),
+    });
   }
 
 
