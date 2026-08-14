@@ -77,8 +77,11 @@ export interface Decision {
 export type SwitchResult =
   /** 切换成功:to 已成为当前会话;from 是切换前的当前会话(若有,已归档)。 */
   | { kind: "switched"; to: SessionRef; from?: SessionRef }
-  /** 目标就是当前会话,无事发生(仅刷新时钟)。 */
-  | { kind: "already-current"; current: SessionRef }
+  /**
+   * 目标就是当前会话,无事发生(仅刷新时钟)。
+   * revived:刷新之前它其实已经超时了 —— 这一下不是空操作,而是把它救了回来。
+   */
+  | { kind: "already-current"; current: SessionRef; revived: boolean }
   /** 没有任何会话的 id 以给定前缀开头。 */
   | { kind: "not-found" }
   /** 前缀太短,命中多段历史会话。 */
@@ -280,7 +283,19 @@ export class SessionManager {
     if (!st || !q) return { kind: "not-found" };
 
     if (st.current && st.current.sessionId.toLowerCase().startsWith(q)) {
-      return { kind: "already-current", current: cloneRef(st.current) };
+      // **和下面 switched 分支一样刷新时钟** —— 这不是可有可无的对称,而是这个
+      // 分支唯一的实质动作。decide() 判 resume 的依据只有 lastActive:只回一句
+      // "你已经在这段里了"却不动它,用户下一句话照样被判超时、开一段新的,
+      // 于是确认语说的和实际发生的正好相反,而且没有任何迹象。
+      //
+      // 偏偏这是超时之后最常走的一条路:那段会话在 /切换会话 的清单里排在最上面,
+      // 还标着「(当前)」—— 想接着聊的人自然就切它。真机上踩到过,人以为切回去了,
+      // 实际在跟一段空白上下文说话。
+      const revived = this.now() - st.current.lastActive >= this.timeoutFor(userKey);
+      st.current.lastActive = this.now();
+      st.reminded = false;
+      this.persist();
+      return { kind: "already-current", current: cloneRef(st.current), revived };
     }
     const matches = st.history.filter((h) => h.sessionId.toLowerCase().startsWith(q));
     if (matches.length === 0) return { kind: "not-found" };

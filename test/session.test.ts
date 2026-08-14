@@ -236,6 +236,31 @@ test("switchTo:大小写不敏感;目标是当前会话时如实说明", () => {
   sm.record("stdin:local:u1", "AbCd1234");
   const res = sm.switchTo("stdin:local:u1", "abcd");
   assert.equal(res.kind, "already-current");
+  assert.equal(res.kind === "already-current" && res.revived, false, "没超时,不算救回来");
+});
+
+test("switchTo:切到已超时的**当前**会话,同样即刻生效", () => {
+  const { sm, c } = mgr();
+  sm.record("stdin:local:u1", "aaaa1111");
+  c.advance(TIMEOUT * 3); // 放凉了 —— decide() 此刻会判新会话
+  assert.equal(sm.decide("stdin:local:u1").isNew, true, "前提:不切的话就是新会话");
+
+  const res = sm.switchTo("stdin:local:u1", "aaaa");
+  assert.equal(res.kind, "already-current");
+  assert.equal(res.kind === "already-current" && res.revived, true, "如实说明它刚才已经断了");
+  // 这条是本用例的全部理由:切完必须能 resume,否则确认语在骗人。
+  assert.equal(sm.decide("stdin:local:u1").resumeSessionId, "aaaa1111");
+});
+
+test("switchTo:切到当前会话会清掉超时提醒标记,下轮闲置能再提醒一次", () => {
+  const { sm, c } = mgr();
+  sm.record("stdin:local:u1", "aaaa1111");
+  c.advance(TIMEOUT * 2);
+  assert.deepEqual(sm.dueReminders(), ["stdin:local:u1"], "先提醒过一次");
+
+  sm.switchTo("stdin:local:u1", "aaaa");
+  c.advance(TIMEOUT * 2);
+  assert.deepEqual(sm.dueReminders(), ["stdin:local:u1"], "接回来又放凉,该再提醒");
 });
 
 test("switchTo:找不到与有歧义分别报出,状态不动", () => {

@@ -1442,7 +1442,11 @@ export class Gateway {
       case "already-current":
         await this.trySend(
           userKey,
-          `现在就在对话 ${shortSessionId(res.current.sessionId)} 里,直接发消息即可。`,
+          res.revived
+            ? // 它刚才已经超时了,switchTo 把时钟拨了回来。这一句必须与"无事发生"
+              // 区分开:用户切的多半正是一段放凉了的对话,而"接回来了"是他要的确认。
+              `对话 ${shortSessionId(res.current.sessionId)} 闲置太久已经断了,给你接回来了 —— 直接发消息接着聊。`
+            : `现在就在对话 ${shortSessionId(res.current.sessionId)} 里,直接发消息即可。`,
           "切换确认",
         );
         return true;
