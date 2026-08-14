@@ -52,9 +52,39 @@ FROM node:22-bookworm-slim
 # `--no-install-recommends`,所以不写就没有 —— 而没有它,任何 `git@github.com:` 形式的
 # 远端(部署密钥的唯一用法)都会以 "cannot run ssh: No such file or directory" 失败。
 # 私有仓库的拉取是自进化的必经之路,这一条不算可选。
+#
+# ## 第二组:助手的手边工具
+#
+# bookworm-slim 比想象的更裸 —— 连 `ps` / `less` / `file` 都没有。这件事的代价不是
+# "少点方便",而是**排查会当场断掉**:助手想看一眼脱钩的后台任务还在不在,
+# 一句 `pgrep -f prepare.sh` 报 command not found,于是只能改用更绕、更容易看错的
+# 办法(翻 /proc、猜日志),或者干脆放弃。而这个镜像**极少重建**(Tier 3,要人工
+# 构建并 bless),所以"下次缺了再加"这条路实际上是不通的 —— 宁可现在多装几 MB。
+#
+# 分组只为可读,`--no-install-recommends` 让它们都不带附赠品:
+#   procps psmisc lsof  —— 进程:ps/pgrep/pkill、pstree/killall/fuser、谁占着这个端口
+#   iproute2 iputils-ping bind9-dnsutils netcat-openbsd socat
+#                        —— 网络:ip/ss、ping、dig、连一下这个端口通不通
+#                           (这台机器上"是不是又是代理的事"是高频问题,见 CLAUDE.md)
+#   less file tree jq bc —— 看:分页、这是个什么文件、目录长什么样、切 JSON、算数
+#   unzip zip xz-utils rsync patch —— 搬运:解包、同步、打补丁
+#   sqlite3 strace vim-tiny        —— 偶尔要命:翻别的服务的库、查段错误、人 exec 进来编辑
+#   tzdata               —— base 里本来就有,显式列出是因为**有代码依赖它**:
+#                           cron 给一次性容器注入 TZ,zoneinfo 没了不会报错,
+#                           只会静默退回 UTC,于是任务里的 date 和微信里看到的差几小时。
+#
+# **刻意不装编译工具链**(build-essential / gcc / python3-dev):宿主是 2 核软路由,
+# 在上面本地编译会把 dockerd 一起拖垮 —— 需要什么就找预编译的包或镜像。
+# 把 gcc 放进镜像等于给自己留一个"其实可以编一下"的诱惑,而那条路每次都很贵。
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
        git openssh-client ripgrep ca-certificates curl tini \
+       procps psmisc lsof \
+       iproute2 iputils-ping bind9-dnsutils netcat-openbsd socat \
+       less file tree jq bc \
+       unzip zip xz-utils rsync patch \
+       sqlite3 strace vim-tiny \
+       tzdata \
   && rm -rf /var/lib/apt/lists/*
 
 # Docker CE 的 apt 源。默认官方站,但它是整个构建里**唯一**一处容易够不着的地方 ——
