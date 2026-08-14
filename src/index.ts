@@ -32,7 +32,7 @@ import { runSelfCheck } from "./core/selfcheck.js";
 import { ScriptDeployControl } from "./core/deploy.js";
 import { CronStore, DEFAULT_RUN_MAX_AGE_MS } from "./core/cron/store.js";
 import { CronScheduler } from "./core/cron/scheduler.js";
-import { DockerScriptRunner } from "./core/cron/docker.js";
+import { collectProxyEnv, DockerScriptRunner } from "./core/cron/docker.js";
 import { RealAgentTaskRunner } from "./core/cron/agent-runner.js";
 import { NoticeSpool } from "./core/cron/notices.js";
 import type { CronApiDeps } from "./dashboard/api-cron.js";
@@ -369,6 +369,10 @@ function createCron(
       };
     },
     tz: config.tz,
+    // 联网的脚本任务跟着 catman 用同一套代理。**NO_PROXY 必须一起给** ——
+    // 只给 HTTP_PROXY 的话,任务打内网地址会被送去代理然后收到一个 503,
+    // 而那个 503 是代理说的,看起来完全像目标服务坏了。
+    proxyEnv: collectProxyEnv(process.env),
     notify: (userKey, text, kind) => gateway.push(userKey, text, kind),
   });
   const api: CronApiDeps = {

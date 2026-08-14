@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildRunArgs, containerNameFor, CRON_LABEL } from "../src/core/cron/docker.js";
+import { buildRunArgs, collectProxyEnv, containerNameFor, CRON_LABEL } from "../src/core/cron/docker.js";
 import type { LaunchSpec } from "../src/core/cron/docker.js";
 
 /**
@@ -85,4 +85,65 @@ test("容器名合法:小写、可读、带得出任务与那一次", () => {
   const name = containerNameFor("j_7k2m", "20260813T081500Z-ab12");
   assert.match(name, /^[a-z0-9][a-z0-9_.-]*$/, "docker 对容器名有字符集要求");
   assert.ok(name.includes("j_7k2m"));
+});
+
+// ── 代理透传 ────────────────────────────────────────────────────────
+
+const PROXY = {
+  HTTP_PROXY: "http://192.168.1.95:1088",
+  HTTPS_PROXY: "http://192.168.1.95:1088",
+  NO_PROXY: "localhost,127.0.0.1,catman,10.0.0.0/8",
+  http_proxy: "http://192.168.1.95:1088",
+  https_proxy: "http://192.168.1.95:1088",
+  no_proxy: "localhost,127.0.0.1,catman,10.0.0.0/8",
+};
+
+test("联网的任务拿到全部六个代理变量 —— NO_PROXY 少一个就掉进 503 陷阱", () => {
+  const args = buildRunArgs(spec({ network: "mynet", proxyEnv: PROXY }));
+  for (const [k, v] of Object.entries(PROXY)) {
+    assert.ok(args.includes(`${k}=${v}`), `少了 ${k}`);
+  }
+  // 大小写各一份:curl 的 http_proxy 只认小写、HTTPS_PROXY 只认大写。
+  assert.ok(args.includes(`http_proxy=${PROXY.http_proxy}`));
+  assert.ok(args.includes(`HTTPS_PROXY=${PROXY.HTTPS_PROXY}`));
+  // NO_PROXY 是重点:只给代理地址不给排除名单,任务打内网会收到代理回的 503,
+  // 而那看起来完全像目标服务坏了。
+  assert.ok(args.includes(`NO_PROXY=${PROXY.NO_PROXY}`));
+  assert.ok(args.includes(`no_proxy=${PROXY.no_proxy}`));
+});
+
+test("断网的任务一个代理变量都不给 —— 摆在那儿只会让排错多绕一圈", () => {
+  const args = buildRunArgs(spec({ network: "none", proxyEnv: PROXY }));
+  assert.ok(!args.some((a) => a.startsWith("HTTP_PROXY=")));
+  assert.ok(!args.some((a) => a.startsWith("NO_PROXY=")));
+});
+
+test("任务自己写了同名变量就听他的(与 TZ 同一条规矩)", () => {
+  const args = buildRunArgs(
+    spec({ network: "mynet", proxyEnv: PROXY, env: { HTTP_PROXY: "http://自己的:8080" } }),
+  );
+  assert.ok(args.includes("HTTP_PROXY=http://自己的:8080"));
+  assert.ok(!args.includes(`HTTP_PROXY=${PROXY.HTTP_PROXY}`));
+  // 只覆盖他写了的那一个,别的照给 —— 否则他补一个代理就把 NO_PROXY 弄丢了。
+  assert.ok(args.includes(`NO_PROXY=${PROXY.NO_PROXY}`));
+});
+
+test("没配代理的机器上不多传任何东西", () => {
+  const args = buildRunArgs(spec({ network: "mynet" }));
+  assert.ok(!args.some((a) => a.includes("PROXY") || a.includes("proxy")));
+});
+
+test("collectProxyEnv:只摘那六个,空值按未设处理", () => {
+  const got = collectProxyEnv({
+    HTTP_PROXY: "http://p:1",
+    HTTPS_PROXY: "",
+    no_proxy: "localhost",
+    PATH: "/usr/bin",
+    CATMAN_ADMIN_TOKEN: "秘密",
+  });
+  assert.deepEqual(got, { HTTP_PROXY: "http://p:1", no_proxy: "localhost" });
+  // 空串不能透传成 HTTPS_PROXY="":有些程序会把它当成"配了一个空代理"。
+  assert.ok(!("HTTPS_PROXY" in got));
+  // 顺带钉一下别把无关的东西(尤其是凭据)一起摘走。
+  assert.ok(!("CATMAN_ADMIN_TOKEN" in got));
 });

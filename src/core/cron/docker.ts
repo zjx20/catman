@@ -36,6 +36,39 @@ export interface LaunchSpec {
   readonly hostWorkDir: string;
   /** 容器里的时区。不给的话容器里是 UTC,而任务里的 date 与 catman 的时间戳就对不上了。 */
   readonly tz?: string;
+  /**
+   * 从 catman 自己的环境里摘出来的代理变量(见 `collectProxyEnv`)。
+   *
+   * 由**装配处**给出而不是在这里读 `process.env`:这个函数是纯的,而它拼出来的
+   * 那串参数里有一半是隔离闸门,只有纯函数才断言得动。
+   */
+  readonly proxyEnv?: Readonly<Record<string, string>>;
+}
+
+/**
+ * 要透传的代理变量。**六个都要** —— 程序之间认哪种大小写并不统一
+ * (curl 的 `http_proxy` 只认小写、`HTTPS_PROXY` 只认大写),
+ * 与 compose、`prepare.sh`、`deployer-run.sh` 里那几处是同一份名单。
+ */
+export const PROXY_VARS = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+] as const;
+
+/** 从一份环境里摘出代理变量。空值按未设处理 —— 各程序对空串的行为与不设一致。 */
+export function collectProxyEnv(
+  env: Record<string, string | undefined>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const k of PROXY_VARS) {
+    const v = env[k];
+    if (v) out[k] = v;
+  }
+  return out;
 }
 
 export type PollResult =
@@ -103,6 +136,18 @@ export function buildRunArgs(spec: LaunchSpec): string[] {
   // date 打出来的时间和微信里看到的差好几个小时,而这件事没有任何报错。
   // 任务自己在 env 里写了 TZ 就听他的。
   if (spec.tz && !("TZ" in spec.env)) args.push("-e", `TZ=${spec.tz}`);
+  // 代理:**只在联网的任务里给**。断网的容器里摆一个代理地址不会让它更通,
+  // 只会让排错多绕一圈("配了代理啊,怎么还连不上" —— 因为它压根没有网卡)。
+  //
+  // ⚠️ NO_PROXY 必须跟着一起进来,不能只传 HTTP_PROXY。少了它,任务去打
+  // 127.0.0.1 或内网地址会被送去代理,收到的是一个 503(代理说的,不是服务),
+  // 看起来完全像目标服务坏了 —— 这是这套东西里最难查的一类错。
+  // 任务自己在 env 里写了同名变量就听他的(与上面 TZ 同一条规矩)。
+  if (spec.network !== "none") {
+    for (const [k, v] of Object.entries(spec.proxyEnv ?? {})) {
+      if (!(k in spec.env)) args.push("-e", `${k}=${v}`);
+    }
+  }
   for (const [k, v] of Object.entries(spec.env)) args.push("-e", `${k}=${v}`);
   args.push(spec.image, ...spec.cmd);
   return args;

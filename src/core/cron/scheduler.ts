@@ -50,6 +50,13 @@ export interface SchedulerOptions {
   readonly runtime: () => CronRuntime;
   /** 展示用时区。 */
   readonly tz: string;
+  /**
+   * 透传给**联网的**脚本任务的代理变量(`collectProxyEnv(process.env)`)。
+   *
+   * 由装配处给出:这台机器有没有代理是部署事实,调度器不该去猜,单测也不该
+   * 受跑测试那台机器的环境影响。
+   */
+  readonly proxyEnv?: Readonly<Record<string, string>>;
   readonly notify?: CronNotifier;
   readonly now?: () => number;
   readonly tickMs?: number;
@@ -461,6 +468,7 @@ export class CronScheduler {
       limits: job.task.limits,
       hostWorkDir: hostWork,
       tz: this.opts.tz,
+      ...(this.opts.proxyEnv ? { proxyEnv: this.opts.proxyEnv } : {}),
     });
     if (!r.ok) {
       await this.settle(job, run, "error", undefined, `容器没起来:${r.error}`);
