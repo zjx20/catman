@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
 import { query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Config } from "../config.js";
@@ -13,6 +22,7 @@ import {
   shortNum,
 } from "./agent-trace.js";
 import { personaBriefing } from "./persona.js";
+import { incidentLine } from "./mem-watchdog.js";
 import { startTurnWatchdog } from "./mem-watchdog-runner.js";
 import {
   DEFAULT_SESSION_LIMITS,
@@ -504,6 +514,19 @@ export class Agent {
             notifyUser: (text) => opts.onNotice?.(text),
             step: () => lastStep,
             log: (line) => console.warn(`${tag} ${line}`),
+            recordIncident: (info, via) => {
+              // 落 **SSD**,不落 U 盘 —— 事故当下 U 盘正是被打满的那块盘
+              // (2026-08-21 实测 ioticks 逼近 100%),往它上面写可能一卡几十秒,
+              // 而那正是最该赶紧把现场留下来的时刻。/opt/services 在 SSD 上。
+              try {
+                appendFileSync(
+                  "/opt/services/catman/mem-incidents.log",
+                  incidentLine(new Date().toISOString(), opts.logLabel ?? "?", info, via) + "\n",
+                );
+              } catch {
+                // 写不下去不该把中止流程带偏 —— 容器日志里那一行仍然在。
+              }
+            },
           })
         : undefined;
 
