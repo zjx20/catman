@@ -19,17 +19,30 @@ import { join } from "node:path";
  * 这些都是**一次性可以做对、每次重做必然做错**的事。封成脚本之后,
  * 助手只需要记住一句 `catman-notify run -- <命令>`。
  *
+ * ## 为什么必须是独立容器(2026-08-21 改)
+ *
+ * 原来用 `setsid nohup` 在本进程旁边脱钩。会话容器化之后这条路**必死**:
+ * 每个回合跑在自己的 `--rm` 容器里,回合一结束容器被删,里面所有进程无差别
+ * SIGKILL —— `setsid` 只脱离**会话**,脱不开**容器**。
+ *
+ * 真机上的样子:制备跑到第 249 条测试,日志戛然而止,既没有失败也没有结果。
+ * 而故障模式特别坏 —— 它照常回一句"跑完我会把结果推给用户",然后静默失效。
+ *
+ * 改成独立容器之后,顺带把原来那条"我被重新部署就跟着死"的限制也解决了:
+ * 任务跑在宿主上,与 catman 的生死无关。
+ *
  * ## 与定时任务的分工(别混用)
  *
  * | | `catman-notify run` | cron 一次性任务 |
  * |---|---|---|
- * | 现场 | **本容器内**的脱钩进程 | 宿主上的独立容器 |
+ * | 现场 | 宿主上的独立容器 | 宿主上的独立容器 |
  * | 起步 | 立刻 | 等下一次 tick(≤30 秒) |
- * | 我被重新部署 | **跟着死,通知发不出来** | 照跑不误,回来认领 |
- * | 能用 docker.sock / 完整挂载 | 能(就是本容器) | 受限(断网、只读挂载、无 socket) |
+ * | 回合结束 / 我被重新部署 | 照跑不误 | 照跑不误,回来认领 |
+ * | 能用 docker.sock / 完整挂载 | 能(挂了 socket 与数据卷) | 受限(断网、只读挂载、无 socket) |
+ * | 跨重启认领 | 不认领(容器 `--rm`,结果只在日志与推送里) | 认领 |
  *
- * 所以:要快、要用本容器的现场(比如制备 release,它自己要起容器)→ 用这个;
- * 跑很久、横跨一次自我进化也不能丢 → 用 cron 一次性任务。
+ * 所以:要立刻开跑、要完整现场(比如制备 release,它自己还要起容器)→ 用这个;
+ * 要能跨宿主重启被认领回来 → 用 cron 一次性任务。
  *
  * ## 每次启动幂等覆盖
  *
@@ -143,14 +156,38 @@ cmd_run() {
   log="\$LOGDIR/\$(printf '%s' "\$name" | tr '/ \\t' '___')-\$(date +%Y%m%d-%H%M%S).log"
   : > "\$log"
 
-  # setsid + nohup + </dev/null 三件套缺一不可:少了最后一个,回合结束拆会话时
-  # 它会跟着死,表现为日志停在中间、既没有失败也没有结果。
+  # 起一个**独立容器**来跑,而不是 setsid nohup —— 见文件头「为什么必须是独立容器」。
+  # 一句话:回合现在跑在每回合即焚的会话容器里,setsid 脱不开容器,任务必死。
+  local host="\${CATMAN_HOST_DATA_DIR:-}"
+  local cname="catman-notify-\$(date +%s)-\$\$"
+  local groups=""
+  for g in \$(id -G); do [ "\$g" = "\$(id -g)" ] || groups="\$groups --group-add \$g"; done
+
+  if [ -n "\$host" ] && command -v docker >/dev/null 2>&1 && docker run -d --rm \\
+      --name "\$cname" --user "\$(id -u):\$(id -g)" \$groups --network mynet \\
+      --log-driver json-file --log-opt max-size=4m --log-opt max-file=1 \\
+      -v "\$host:\${CATMAN_DATA_DIR:-/data}" \\
+      -v /var/run/docker.sock:/var/run/docker.sock \\
+      -v /opt/services:/opt/services \\
+      -e CATMAN_NOTIFY_TOKEN -e CATMAN_API_BASE -e CATMAN_DATA_DIR -e CATMAN_HOST_DATA_DIR \\
+      -e HTTP_PROXY -e HTTPS_PROXY -e NO_PROXY -e http_proxy -e https_proxy -e no_proxy -e TZ \\
+      "\${CATMAN_NOTIFY_IMAGE:-catman-env:1}" \\
+      "\$0" __child "\$log" "\$name" "\$@" >/dev/null 2>>"\$log"; then
+    echo "已经脱钩跑起来了:\$name(独立容器 \$cname)"
+    echo "日志:\$log"
+    echo "跑完我会把结果推给用户 —— 不用守着它,它也不怕回合结束或我被重新部署。"
+    return 0
+  fi
+
+  # 退回老路。**必须喊出来** —— 这条路在会话容器里活不过回合结束,
+  # 而"说了跑完通知你、然后静默失效"比一开始就报错糟得多。
+  echo "⚠️ 起不了任务容器(缺 CATMAN_HOST_DATA_DIR 或 docker 不可用),退回进程内脱钩。" >&2
+  echo "⚠️ 这条路**活不过回合结束**,通知很可能发不出来 —— 别指望它。" >&2
   setsid nohup "\$0" __child "\$log" "\$name" "\$@" >/dev/null 2>&1 </dev/null &
   disown 2>/dev/null || true
 
-  echo "已经脱钩跑起来了:\$name"
+  echo "已经脱钩跑起来了:\$name(进程内,不保证活到跑完)"
   echo "日志:\$log"
-  echo "跑完我会把结果推给用户 —— 不用守着它。"
 }
 
 case "\${1:-}" in

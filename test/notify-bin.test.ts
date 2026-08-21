@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NOTIFY_BIN_NAME, notifyBinBody, writeNotifyBin } from "../src/core/notify-bin.js";
@@ -60,6 +60,12 @@ async function rig(): Promise<Rig> {
       ...process.env,
       CATMAN_DATA_DIR: dataDir,
       CATMAN_NOTIFY_TOKEN: TOKEN,
+      // **必须显式抹掉**:有它的话 run 会去起独立容器(线上正是这么跑的),
+      // 而容器里的 127.0.0.1 不是本测试进程的 127.0.0.1 —— 收消息的服务就在
+      // 这个进程里,任务容器永远够不着它,表现为"等了 15 秒一条都没收到"。
+      // 所以这一组用例走进程内那条退路,验的是**投递逻辑**(child 那一半没动过);
+      // 容器那条路由下面用假 docker 单独验参数形状。
+      CATMAN_HOST_DATA_DIR: "",
       // 故意把 API_BASE 从环境里拿掉:烘进脚本的那个默认值也得是对的。
       CATMAN_API_BASE: "",
       // 这台机器上代理是常态,而 curl 会默认走它 —— 脚本里的 --noproxy '*'
@@ -178,4 +184,68 @@ test("run 的命令前必须有 --,写漏了要报错而不是把参数当命令
 
 test("正文里烘进去的默认 apiBase 就是传进来的那个", () => {
   assert.match(notifyBinBody("http://example:1234"), /http:\/\/example:1234/);
+});
+
+/**
+ * 容器那条路。
+ *
+ * 2026-08-21 改的:原来用 `setsid nohup`,而会话容器是每回合 `--rm` 即焚的 ——
+ * setsid 只脱离**会话**,脱不开**容器**,任务必死。真机上的样子是制备跑到第 249 条
+ * 测试戛然而止,而且脚本照常回一句"跑完推给你",然后静默失效。
+ *
+ * 这里不真的起容器(测试不该依赖 dockerd),而是把一个假 `docker` 摆进 PATH,
+ * 把它收到的 argv 拦下来断言 —— 与 session-container 那组同一套手法。
+ */
+function withFakeDocker(dir: string): string {
+  const bin = join(dir, "fakebin");
+  mkdirSync(bin, { recursive: true });
+  const argvFile = join(dir, "docker-argv.txt");
+  writeFileSync(
+    join(bin, "docker"),
+    `#!/bin/sh\nprintf '%s\\n' "$@" > ${argvFile}\necho fake-container-id\n`,
+    { mode: 0o755 },
+  );
+  return argvFile;
+}
+
+test("run:有 CATMAN_HOST_DATA_DIR 时起独立容器,而不是进程内脱钩", async () => {
+  const r = await rig();
+  const argvFile = withFakeDocker(r.dataDir);
+  const res = await run(r.bin, ["run", "-n", "任务", "--", "true"], {
+    ...r.env,
+    CATMAN_HOST_DATA_DIR: "/host/data",
+    PATH: `${join(r.dataDir, "fakebin")}:${process.env.PATH}`,
+  });
+  assert.match(res.stdout, /独立容器/);
+  const argv = readFileSync(argvFile, "utf8").split("\n");
+
+  // 隔离闸门:少任何一个都是"照跑不误,只是没有防护"。
+  assert.ok(argv.includes("-d"), "必须 -d,否则又变成跟着回合死");
+  assert.ok(argv.includes("--rm"));
+  assert.ok(argv.includes("--network") && argv.includes("mynet"), "不接 mynet 就发不出通知");
+  assert.ok(argv.includes("max-size=4m"), "容器日志要有上限");
+
+  // 数据卷必须按**宿主**路径挂 —— docker 的 -v 左边从来是宿主视角,
+  // 传容器内路径的话 docker 会静默建一个空目录,任务看不到自己的日志。
+  assert.ok(argv.some((x) => x.startsWith("/host/data:")), "数据卷没按宿主路径挂");
+
+  // 任务常常还要自己起容器(制备就是),socket 不给的话它们全跑不起来。
+  assert.ok(argv.some((x) => x.includes("docker.sock")));
+
+  // 值不进 argv:token 不该出现在 `docker inspect` 和宿主 ps 里。
+  assert.ok(argv.includes("CATMAN_NOTIFY_TOKEN"));
+  assert.ok(!argv.some((x) => x.startsWith("CATMAN_NOTIFY_TOKEN=")));
+});
+
+test("run:起不了容器时退回进程内,但**必须喊出来**", async () => {
+  // 静默退回是最坏的:脚本照常说"跑完推给你",而那条路在会话容器里活不过回合。
+  // 一开始就报错都比这个好。
+  const r = await rig();
+  const res = await run(r.bin, ["run", "-n", "任务", "--", "true"], {
+    ...r.env,
+    CATMAN_HOST_DATA_DIR: "", // 缺它 → 走不了容器
+  });
+  assert.match(res.stderr, /退回进程内/);
+  assert.match(res.stderr, /活不过回合结束/);
+  assert.match(res.stdout, /不保证活到跑完/);
 });
