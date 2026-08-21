@@ -16,8 +16,9 @@ import { personaBriefing } from "./persona.js";
 import { startTurnWatchdog } from "./mem-watchdog-runner.js";
 import {
   DEFAULT_SESSION_LIMITS,
-  PASS_THROUGH_ENV,
+  buildSessionImageArgs,
   buildSessionRunArgs,
+  type SessionContainerSpec,
   buildWrapperScript,
   claudePathIn,
   sessionContainerName,
@@ -290,7 +291,7 @@ export class Agent {
       return undefined;
     }
     const container = sessionContainerName(logLabel ?? "anon", String(process.hrtime.bigint()));
-    const args = buildSessionRunArgs({
+    const specIn = {
       container,
       image: this.config.sessionImage,
       claudePath,
@@ -302,7 +303,6 @@ export class Agent {
         { host: "/opt/services", at: "/opt/services" },
       ],
       cwd,
-      passEnv: [...PASS_THROUGH_ENV],
       tz: this.config.tz,
       // 身份从**自己的进程**读,不写死、也不再开配置项 —— 这一版三个 bug 全是
       // "我假设了环境而没去查环境",而进程自己的 uid/组是唯一不会猜错的来源。
@@ -310,11 +310,15 @@ export class Agent {
       // 主组已经在 --user 里了,附加组只留其余的(docker.sock 那个就在里面)。
       groupAdd: (process.getgroups?.() ?? []).filter((g) => g !== process.getgid?.()),
       addHosts: ["host.docker.internal:host-gateway"],
-    });
+    } satisfies SessionContainerSpec;
     const execPath = `${this.config.dataDir}/tmp/session-exec-${container}.sh`;
     try {
       mkdirSync(dirname(execPath), { recursive: true });
-      writeFileSync(execPath, buildWrapperScript(args), { mode: 0o755 });
+      writeFileSync(
+        execPath,
+        buildWrapperScript(buildSessionRunArgs(specIn), buildSessionImageArgs(specIn)),
+        { mode: 0o755 },
+      );
     } catch (err) {
       console.warn(`${tag} 包装脚本写不下去(${String(err)}) —— 退回本机执行`);
       return undefined;

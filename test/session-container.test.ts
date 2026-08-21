@@ -2,8 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   DEFAULT_SESSION_LIMITS,
-  PASS_THROUGH_ENV,
   SESSION_LABEL,
+  buildSessionImageArgs,
   buildSessionRunArgs,
   buildWrapperScript,
   claudePathIn,
@@ -30,7 +30,6 @@ const spec: SessionContainerSpec = {
     { host: "/mnt/usb/catman_data/workspace/u1", at: "/data/workspace/u1" },
   ],
   cwd: "/data/workspace/u1",
-  passEnv: [...PASS_THROUGH_ENV],
   tz: "Asia/Shanghai",
   user: "10001:10001",
   groupAdd: [32768],
@@ -72,28 +71,6 @@ test("cwd 在容器内外是同一个路径", () => {
   assert.ok(a.includes(`-v`) && a.some((x) => x.endsWith(`:${spec.cwd}`)));
 });
 
-test("透传环境变量用 `-e NAME` 而不是 `-e NAME=值`", () => {
-  // 值写进 argv 的话,OAuth token 会出现在 `docker inspect` 和宿主的 ps 里。
-  // 不带 = 时 docker 从当前进程环境取值,argv 里只有名字。
-  const a = argsOf();
-  for (const name of PASS_THROUGH_ENV) {
-    assert.ok(a.includes(name), `缺少透传 ${name}`);
-    assert.ok(!a.some((x) => x.startsWith(`${name}=`)), `${name} 的值不该进 argv`);
-  }
-});
-
-test("SDK 对表要用的那几个变量都在名单里", () => {
-  // 这份名单是拿探针从真实调用里抄的。少一个就是"大脑起不来"而且报错含糊,
-  // 排查起来要从 SDK 内部往回追。
-  for (const must of [
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CONFIG_DIR",
-  ]) {
-    assert.ok((PASS_THROUGH_ENV as readonly string[]).includes(must), `名单缺 ${must}`);
-  }
-});
-
 test("带 --rm 和 -i,不带 -t", () => {
   const a = argsOf();
   assert.ok(a.includes("--rm"));
@@ -128,24 +105,26 @@ test("只读挂载带 :ro,可写的不带", () => {
   assert.ok(a.includes("/mnt/usb/catman_data/workspace/u1:/data/workspace/u1"));
 });
 
-test("最后两项是镜像和大脑二进制的路径", () => {
+test("镜像与大脑路径由单独的函数给,不混在 flag 里", () => {
+  // 拆开是因为环境变量要在运行时才拼得出来,而它们必须排在镜像**之前**。
+  // 混在一起的话,包装脚本没法在中间插入 -e 参数。
+  assert.deepEqual(buildSessionImageArgs(spec), [spec.image, spec.claudePath]);
   const a = argsOf();
-  assert.equal(a[a.length - 2], spec.image);
-  assert.equal(a[a.length - 1], spec.claudePath);
+  assert.ok(!a.includes(spec.image), "镜像不该出现在 flag 段里");
 });
 
 test("包装脚本用 exec,并把 SDK 的参数原样转发", () => {
   // 必须 exec:中间多一层 shell 的话,SDK 的 abort 杀掉的是 shell,
   // docker 客户端会留下来。而客户端死掉也不会带走容器(实测),
   // 这正是 95% 那一级必须用 cgroup.kill 的原因。
-  const s = buildWrapperScript(["run", "--rm", "img"]);
+  const s = buildWrapperScript(["run", "--rm"], ["img", "/claude"]);
   assert.match(s, /^#!\/bin\/sh/);
   assert.match(s, /^exec docker /m);
   assert.match(s, /"\$@"/); // 七个 flag 原样转发
 });
 
 test("包装脚本对带单引号的参数做转义", () => {
-  const s = buildWrapperScript(["-e", "X=it's"]);
+  const s = buildWrapperScript(["-e", "X=it's"], ["img", "/claude"]);
   assert.ok(!/[^\\]'[^\\']*'[^\\']*'\s*$/.test(s.split("\n")[3] ?? ""));
   assert.match(s, /it/);
 });
@@ -184,16 +163,40 @@ test("必须带 --group-add —— 少了它容器里的 docker 全是 permissio
   assert.equal(a[i + 1], "32768");
 });
 
-test("六个代理变量一个都不能少 —— 少了每个回合都会失败", () => {
-  // 这是漏掉代价最大的一组:实测不带代理直连 api.anthropic.com 是 403,
-  // 于是整个助手停摆。而且 NO_PROXY 也必须在,少了它打内网会收到代理发的 503,
-  // 看起来完全像目标服务坏了。
-  for (const v of ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"]) {
-    assert.ok((PASS_THROUGH_ENV as readonly string[]).includes(v), `代理变量名单缺 ${v}`);
-  }
-});
-
 test("host.docker.internal 的映射跟 catman 自己保持一致", () => {
   const a = argsOf();
   assert.ok(a.includes("host.docker.internal:host-gateway"));
+});
+
+test("包装脚本在运行时转发**全部**环境变量,而不是照白名单挑", () => {
+  // 白名单栽过一次:网关的契约是「把 process.env 整个传下去,只剔两个密钥」,
+  // 而照名单挑会让容器里悄悄少 12 个变量(PATH 少了 /data/bin → catman-notify
+  // 直接 command not found;管理员少了 CATMAN_ADMIN_TOKEN)。每一个都是
+  // 「能跑,只是某个功能没了」,要等踩到才知道。
+  const s = buildWrapperScript(["run"], ["img", "/claude"]);
+  assert.match(s, /for _k in \$\(env /); // 运行时枚举,不是编译期名单
+  assert.match(s, /_e="\$_e -e \$_k"/); // 只传名字,值由 docker 从环境取
+});
+
+test("转发时挡掉 IPC 密钥 —— turn-env 刻意剔掉的,别在这里漏回去", () => {
+  const s = buildWrapperScript(["run"], ["img", "/claude"]);
+  assert.match(s, /CATMAN_IPC_SECRET\|/);
+});
+
+test("镜像与命令排在所有 flag 之后", () => {
+  // docker run 的语法要求。顺序错了 docker 会把镜像名当成 flag 的值,
+  // 报错含糊得很。
+  const s = buildWrapperScript(["run", "--rm"], ["img", "/claude"]);
+  const envLoop = s.indexOf("for _k in");
+  const image = s.lastIndexOf("'img'");
+  assert.ok(envLoop < image, "镜像必须排在环境变量转发之后");
+});
+
+test("SDK 传进来的 flag 必须活到最后 —— 别被攒参数的写法覆盖掉", () => {
+  // 真机上写错过一次:用 `set --` 攒环境变量参数,把位置参数(也就是 SDK 的
+  // 那七个 flag)整个覆盖了,症状是大脑拿不到 --output-format 直接起不来。
+  // 所以脚本里不能出现 `set --`,而且 "$@" 必须排在镜像和命令**之后**。
+  const s = buildWrapperScript(["run"], ["img", "/claude"]);
+  assert.doesNotMatch(s, /^set -- /m, "不能用 set -- 攒参数,它会吃掉 SDK 的 flag");
+  assert.match(s, /exec docker .*'img' '\/claude' "\$@"$/m);
 });

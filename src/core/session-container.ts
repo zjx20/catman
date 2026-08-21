@@ -1,5 +1,4 @@
 import type { Attachment } from "./attachments.js";
-import { PROXY_VARS } from "./cron/docker.js";
 
 /**
  * 把一个回合的大脑关进它自己的容器。
@@ -68,8 +67,6 @@ export interface SessionContainerSpec {
   readonly mounts: readonly SessionMount[];
   /** 回合的工作目录。容器内外必须是同一个路径,否则 SDK 写的会话 JSONL 找不回来。 */
   readonly cwd: string;
-  /** 要原样透传进容器的环境变量**名字**。值由 docker 从当前环境取。 */
-  readonly passEnv: readonly string[];
   readonly tz?: string;
   /**
    * 容器以谁的身份跑,`uid:gid`。
@@ -92,36 +89,6 @@ export interface SessionContainerSpec {
 
 /** 认领会话容器的标签。孤儿清理靠它,不必去猜容器名。 */
 export const SESSION_LABEL = "catman.session";
-
-/**
- * SDK 传给可执行文件的参数是固定的七个 flag(实测:`--output-format stream-json
- * --verbose --input-format stream-json --permission-mode <mode>`),包装脚本原样
- * `"$@"` 转发即可,不必解析。
- *
- * 但**环境变量必须点名透传**:SDK 靠 `CLAUDE_CODE_ENTRYPOINT`、`CLAUDE_CODE_SESSION_ID`、
- * `CLAUDE_CONFIG_DIR` 这些跟子进程对表,少一个就是一次"大脑起不来"而且报错含糊。
- * 这份名单是拿探针从真实调用里抄下来的,不是照文档猜的。
- */
-export const PASS_THROUGH_ENV = [
-  "CLAUDE_AGENT_SDK_VERSION",
-  "CLAUDE_CODE_CHILD_SESSION",
-  "CLAUDE_CODE_ENTRYPOINT",
-  "CLAUDE_CODE_EXECPATH",
-  "CLAUDE_CODE_SESSION_ID",
-  "CLAUDE_CODE_OAUTH_TOKEN",
-  "CLAUDE_CONFIG_DIR",
-  "CLAUDE_EFFORT",
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_BASE_URL",
-  "ANTHROPIC_AUTH_TOKEN",
-  "ANTHROPIC_MODEL",
-  // 代理**六个都要**,理由见 cron/docker.ts 的 PROXY_VARS(各程序认的大小写不统一)。
-  // 少了它们容器里根本连不上 API —— 实测不带代理直连 api.anthropic.com 是 403,
-  // 于是**每一个回合都会失败**,表现成整个助手停摆。这是漏掉代价最大的一组。
-  // NO_PROXY 同样不能少:少了它,打内网地址会被送去代理、收到一个代理发的 503,
-  // 看起来完全像目标服务坏了。
-  ...PROXY_VARS,
-] as const;
 
 /**
  * 拼 `docker run` 的参数。
@@ -154,11 +121,15 @@ export function buildSessionRunArgs(spec: SessionContainerSpec): string[] {
   // 两边不一致的话 resume 会找不到上一段 —— 表现为"助手失忆",而没有任何报错。
   args.push("-w", spec.cwd);
   if (spec.tz) args.push("-e", `TZ=${spec.tz}`);
-  // `-e NAME`(不带 =)让 docker 从**当前进程环境**取值。值不落进 argv,
-  // 于是 OAuth token 不会出现在 `docker inspect` 和 ps 里。
-  for (const name of spec.passEnv) args.push("-e", name);
-  args.push(spec.image, spec.claudePath);
+  // ⚠️ 环境变量**不在这里加**。它们由包装脚本在运行时整个转发 ——
+  // 这个函数拼不出那份名单,因为 SDK 还会往子进程环境里塞它自己的变量,
+  // 而那要等进程真的起来才看得到。见 buildWrapperScript 的说明。
   return args;
+}
+
+/** 镜像与要在容器里执行的命令。**必须排在所有 flag 之后**,所以单独给。 */
+export function buildSessionImageArgs(spec: SessionContainerSpec): string[] {
+  return [spec.image, spec.claudePath];
 }
 
 /**
@@ -170,14 +141,43 @@ export function buildSessionRunArgs(spec: SessionContainerSpec): string[] {
  * 中间多一层 shell 的话,abort 杀掉的是 shell,docker 客户端会留下来(而客户端
  * 死掉也不会带走容器 —— 这正是 95% 那级必须用 cgroup.kill 的原因)。
  */
-export function buildWrapperScript(args: readonly string[]): string {
-  const quoted = args.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
+export function buildWrapperScript(
+  preArgs: readonly string[],
+  imageAndCmd: readonly string[],
+): string {
+  const q = (a: string) => `'${a.replace(/'/g, `'\\''`)}'`;
   return [
     "#!/bin/sh",
     "# 由 catman 生成 —— 把这一回合的大脑关进它自己的容器。请勿手工编辑。",
     "# SDK 以为自己在 exec 一个原生二进制,实际 exec 的是这个脚本;",
     "# 它把固定的七个 flag 原样转发进容器,stdio 直通,SDK 那侧无感。",
-    `exec docker ${quoted} "$@"`,
+    "",
+    "# 环境变量**在运行时整个转发**,而不是照一份白名单挑。",
+    "#",
+    "# 白名单栽过一次:网关的契约本来就是「把 process.env 整个传下去,只剔除两个密钥」",
+    "# (见 turn-env.ts),而我照白名单挑,于是容器里悄悄少了 12 个变量 ——",
+    "# PATH 少了 /data/bin(catman-notify 直接 command not found)、管理员少了",
+    "# CATMAN_ADMIN_TOKEN、助手少了 CATMAN_HOST_DATA_DIR(共享人设教它拿这个做 docker -v)。",
+    "# 每一个都是「能跑,只是某个功能没了」,而且要等踩到才知道。",
+    "#",
+    "# 改成转发全部之后,网关以后加什么变量都自动跟着进来,不必两处同步。",
+    "# 值不进 argv:`-e NAME` 让 docker 从本进程环境取,于是 token 不会出现在",
+    "# `docker inspect` 和宿主的 ps 里。",
+    "#",
+    "# ⚠️ 这里**不能用 `set --`** 去攒参数:那会覆盖掉位置参数,而位置参数正是 SDK",
+    "# 传进来的那七个 flag,它们必须原样排在最后交给容器里的 claude。",
+    "# (写错过一次,症状是大脑拿不到 --output-format 直接起不来。)",
+    "# 环境变量**名**不含空格(正则已经限定),所以用变量拼、最后不加引号让它拆词是安全的。",
+    "_e=",
+    "for _k in $(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p'); do",
+    '  case "$_k" in',
+    "    # IPC 密钥是 turn-env 刻意剔掉的,别在这里又漏回去;",
+    "    # HOSTNAME/_/PWD 是当前进程自己的,带进去只会让人困惑。",
+    "    CATMAN_IPC_SECRET|HOSTNAME|PWD|_) continue ;;",
+    "  esac",
+    '  _e="$_e -e $_k"',
+    "done",
+    `exec docker ${preArgs.map(q).join(" ")} $_e ${imageAndCmd.map(q).join(" ")} "$@"`,
     "",
   ].join("\n");
 }
