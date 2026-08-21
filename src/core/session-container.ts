@@ -1,4 +1,5 @@
 import type { Attachment } from "./attachments.js";
+import { PROXY_VARS } from "./cron/docker.js";
 
 /**
  * 把一个回合的大脑关进它自己的容器。
@@ -70,6 +71,23 @@ export interface SessionContainerSpec {
   /** 要原样透传进容器的环境变量**名字**。值由 docker 从当前环境取。 */
   readonly passEnv: readonly string[];
   readonly tz?: string;
+  /**
+   * 容器以谁的身份跑,`uid:gid`。
+   *
+   * **不给就是 root**,而 root 建出来的文件 catman(uid 10001)下一回合就改不动了 ——
+   * 工作区会慢慢积满改不动的文件,而且没有任何报错。取值由装配处从**catman 自己的
+   * 进程**读(`process.getuid()`),不是写死也不是再开一个配置项。
+   */
+  readonly user: string;
+  /**
+   * 附加组。docker.sock 在这台机器上是 `root:32768` 且权限 660 ——
+   * 不把那个组带进去,容器里的 `docker` 一律 permission denied,而助手日常就在用它。
+   * GID **属于宿主、各机器不同**(与 compose 里 DOCKER_GID 那条注释同一个理由),
+   * 所以同样从 catman 自己的进程读(`process.getgroups()`)。
+   */
+  readonly groupAdd: readonly number[];
+  /** 额外的 hosts 映射,如 `host.docker.internal:host-gateway`。与 catman 自己保持一致。 */
+  readonly addHosts?: readonly string[];
 }
 
 /** 认领会话容器的标签。孤儿清理靠它,不必去猜容器名。 */
@@ -97,6 +115,12 @@ export const PASS_THROUGH_ENV = [
   "ANTHROPIC_BASE_URL",
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_MODEL",
+  // 代理**六个都要**,理由见 cron/docker.ts 的 PROXY_VARS(各程序认的大小写不统一)。
+  // 少了它们容器里根本连不上 API —— 实测不带代理直连 api.anthropic.com 是 403,
+  // 于是**每一个回合都会失败**,表现成整个助手停摆。这是漏掉代价最大的一组。
+  // NO_PROXY 同样不能少:少了它,打内网地址会被送去代理、收到一个代理发的 503,
+  // 看起来完全像目标服务坏了。
+  ...PROXY_VARS,
 ] as const;
 
 /**
@@ -119,6 +143,9 @@ export function buildSessionRunArgs(spec: SessionContainerSpec): string[] {
   args.push("--cpus", String(spec.limits.cpus));
   args.push("--pids-limit", String(spec.limits.pids));
   args.push("--network", "mynet");
+  args.push("--user", spec.user);
+  for (const g of spec.groupAdd) args.push("--group-add", String(g));
+  for (const h of spec.addHosts ?? []) args.push("--add-host", h);
   // 容器日志也要有上限:大脑话痨起来能把宿主磁盘写满,而磁盘满会让 dockerd
   // 全面异常 —— 那时候连回滚都做不了。
   args.push("--log-driver", "json-file", "--log-opt", "max-size=8m", "--log-opt", "max-file=1");
@@ -153,6 +180,18 @@ export function buildWrapperScript(args: readonly string[]): string {
     `exec docker ${quoted} "$@"`,
     "",
   ].join("\n");
+}
+
+/**
+ * 大脑二进制在一个 release 目录里的位置。
+ *
+ * 提出来是为了能测:这条路径拼错的话,症状是"容器起来了又立刻退出",而 SDK 那侧
+ * 只报一句含糊的子进程失败 —— 从那里回溯到"少了一段目录名"很贵。
+ * (`linux-x64` 是 glibc 那个变体,与 `catman-env` 的 Debian 底对得上;
+ * 换成 musl 底的镜像就要改这里。)
+ */
+export function claudePathIn(releaseDir: string): string {
+  return `${releaseDir}/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude`;
 }
 
 /** 会话容器的名字。一个会话同时只该有一个回合在跑,所以用 userKey 就够认。 */

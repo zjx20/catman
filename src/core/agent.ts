@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Config } from "../config.js";
@@ -19,6 +19,7 @@ import {
   PASS_THROUGH_ENV,
   buildSessionRunArgs,
   buildWrapperScript,
+  claudePathIn,
   sessionContainerName,
 } from "./session-container.js";
 
@@ -265,16 +266,34 @@ export class Agent {
       console.warn(`${tag} 会话容器已开启但缺 CATMAN_HOST_DATA_DIR —— 退回本机执行`);
       return undefined;
     }
-    const release = process.env.CATMAN_RELEASE_DIR;
-    if (!release) {
-      console.warn(`${tag} 会话容器已开启但缺 CATMAN_RELEASE_DIR —— 退回本机执行`);
+    // 大脑二进制在哪。**必须解开软链**:会话容器里要的是那条具体路径,
+    // 而 `current` 这个名字在它眼里随时可能指向别处(自我进化就在拨它)。
+    //
+    // ⚠️ 这里踩过一次:上一版我照着"应该有个 CATMAN_RELEASE_DIR"写,而部署根本
+    // 不提供那个变量 —— 于是开关打开了、日志喊了一句缺变量、防护整个是空的。
+    // 真实存在的是 `CATMAN_RELEASE_LINK`(entrypoint 注入,值是那条软链)。
+    // 教训不是"记住变量名",是**别信自己没在真机上查过的环境变量**。
+    const link = process.env.CATMAN_RELEASE_LINK || `${this.config.dataDir}/releases/current`;
+    let release: string;
+    try {
+      release = realpathSync(link);
+    } catch {
+      console.warn(`${tag} 会话容器已开启但解不开 release 软链(${link}) —— 退回本机执行`);
+      return undefined;
+    }
+    const claudePath = claudePathIn(release);
+    // 落地自检:路径拼错、二进制没跟着 release 一起制备,都在这里现形。
+    // 少了这一步,同一类错会表现成"容器起来了但立刻退出",而 SDK 那侧只报一句
+    // 含糊的子进程失败 —— 要从那里回溯到"路径少了一段"是很贵的。
+    if (!existsSync(claudePath)) {
+      console.warn(`${tag} 会话容器已开启但找不到大脑二进制(${claudePath}) —— 退回本机执行`);
       return undefined;
     }
     const container = sessionContainerName(logLabel ?? "anon", String(process.hrtime.bigint()));
     const args = buildSessionRunArgs({
       container,
       image: this.config.sessionImage,
-      claudePath: `${release}/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude`,
+      claudePath,
       limits: { ...DEFAULT_SESSION_LIMITS, memory: this.config.sessionMemoryLimit },
       mounts: [
         { host: `${host}/releases`, at: "/data/releases", ro: true },
@@ -285,6 +304,12 @@ export class Agent {
       cwd,
       passEnv: [...PASS_THROUGH_ENV],
       tz: this.config.tz,
+      // 身份从**自己的进程**读,不写死、也不再开配置项 —— 这一版三个 bug 全是
+      // "我假设了环境而没去查环境",而进程自己的 uid/组是唯一不会猜错的来源。
+      user: `${process.getuid?.() ?? 10001}:${process.getgid?.() ?? 10001}`,
+      // 主组已经在 --user 里了,附加组只留其余的(docker.sock 那个就在里面)。
+      groupAdd: (process.getgroups?.() ?? []).filter((g) => g !== process.getgid?.()),
+      addHosts: ["host.docker.internal:host-gateway"],
     });
     const execPath = `${this.config.dataDir}/tmp/session-exec-${container}.sh`;
     try {

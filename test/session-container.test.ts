@@ -6,6 +6,7 @@ import {
   SESSION_LABEL,
   buildSessionRunArgs,
   buildWrapperScript,
+  claudePathIn,
   sessionContainerName,
   type SessionContainerSpec,
 } from "../src/core/session-container.js";
@@ -31,6 +32,9 @@ const spec: SessionContainerSpec = {
   cwd: "/data/workspace/u1",
   passEnv: [...PASS_THROUGH_ENV],
   tz: "Asia/Shanghai",
+  user: "10001:10001",
+  groupAdd: [32768],
+  addHosts: ["host.docker.internal:host-gateway"],
 };
 
 const argsOf = (s = spec) => buildSessionRunArgs(s);
@@ -152,4 +156,44 @@ test("容器名对付得了 userKey 里的特殊字符", () => {
   const n = sessionContainerName("wechat:bc8a2ed2:o9cq80yCc7@im.wechat", "t1");
   assert.match(n, /^[a-z0-9][a-z0-9_.-]*$/);
   assert.ok(n.startsWith("catman-session-"));
+});
+
+test("大脑二进制的路径形状 —— 拼错的症状是「容器起来又立刻退出」", () => {
+  // 上一版在这条链上栽过一次(依赖了一个不存在的环境变量),所以路径这一段
+  // 单独钉住。`linux-x64` 是 glibc 那个变体,与 catman-env 的 Debian 底配套;
+  // 哪天镜像换成 musl 底,这条用例会提醒你这里也要跟着改。
+  assert.equal(
+    claudePathIn("/data/releases/abc"),
+    "/data/releases/abc/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude",
+  );
+});
+
+test("必须带 --user —— 不给就是 root,建出来的文件 catman 改不动", () => {
+  // 漏掉它的症状极其安静:回合照跑、结果照出,只是工作区里慢慢积满 root 属主的
+  // 文件,直到某天助手说"改不了这个文件"而没人知道为什么。
+  const a = argsOf();
+  assert.equal(valueAfter(a, "--user"), "10001:10001");
+});
+
+test("必须带 --group-add —— 少了它容器里的 docker 全是 permission denied", () => {
+  // docker.sock 在这台机器上是 root:32768 权限 660。助手日常就在用 docker,
+  // 少这一个组等于把它的手绑上,而报错只有一句 permission denied。
+  const a = argsOf();
+  const i = a.indexOf("--group-add");
+  assert.ok(i >= 0, "缺 --group-add");
+  assert.equal(a[i + 1], "32768");
+});
+
+test("六个代理变量一个都不能少 —— 少了每个回合都会失败", () => {
+  // 这是漏掉代价最大的一组:实测不带代理直连 api.anthropic.com 是 403,
+  // 于是整个助手停摆。而且 NO_PROXY 也必须在,少了它打内网会收到代理发的 503,
+  // 看起来完全像目标服务坏了。
+  for (const v of ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"]) {
+    assert.ok((PASS_THROUGH_ENV as readonly string[]).includes(v), `代理变量名单缺 ${v}`);
+  }
+});
+
+test("host.docker.internal 的映射跟 catman 自己保持一致", () => {
+  const a = argsOf();
+  assert.ok(a.includes("host.docker.internal:host-gateway"));
 });
