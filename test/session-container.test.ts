@@ -9,6 +9,7 @@ import {
   claudePathIn,
   orphanSessionContainers,
   sessionContainerName,
+  sessionMounts,
   staleWrappers,
   WRAPPER_TTL_MS,
   type SessionContainerSpec,
@@ -116,14 +117,26 @@ test("镜像与大脑路径由单独的函数给,不混在 flag 里", () => {
   assert.ok(!a.includes(spec.image), "镜像不该出现在 flag 段里");
 });
 
-test("包装脚本用 exec,并把 SDK 的参数原样转发", () => {
-  // 必须 exec:中间多一层 shell 的话,SDK 的 abort 杀掉的是 shell,
-  // docker 客户端会留下来。而客户端死掉也不会带走容器(实测),
-  // 这正是 95% 那一级必须用 cgroup.kill 的原因。
+test("包装脚本先跑 docker、再按退出码决定要不要兜底", () => {
+  // 原来这里是 `exec docker`,理由是"SDK 等的是这个进程的生死"。为了**运行时兜底**
+  // 改成先跑再看退出码 —— 代价是多一层 shell,abort 杀掉的是 shell、docker 客户端
+  // 会留下来。那个代价可以接受:客户端死掉本来就带不走容器(实测),而看门狗那一级
+  // 靠的是 docker kill,不指望信号顺着这条链传下去。
   const s = buildWrapperScript(["run", "--rm"], ["img", "/claude"]);
   assert.match(s, /^#!\/bin\/sh/);
-  assert.match(s, /^exec docker /m);
-  assert.match(s, /"\$@"/); // 七个 flag 原样转发
+  assert.match(s, /^docker .*"\$@"$/m);   // 参数原样转发
+  assert.match(s, /_rc=\$\?/);            // 退出码要接住
+});
+
+test("docker 自己起不来(125)时退回本机,而且要喊出来", () => {
+  // 125 是 docker 表示"我没能把容器跑起来"的专用码,与容器内命令的退出码不撞车。
+  // 这条对救援人格尤其要紧:主人格失败只是重发一次,而它是最后一道防线 ——
+  // 那时候不吭声就没有下一层了。
+  const s = buildWrapperScript(["run"], ["img", "/claude"]);
+  assert.match(s, /-eq 125/);
+  assert.match(s, /CATMAN_FALLBACK_CLAUDE/);
+  assert.match(s, /退回本机执行/);          // 静默退回是最坏的
+  assert.match(s, />&2/);                   // 喊到 stderr,别混进 stdout 弄脏 stream-json
 });
 
 test("包装脚本对带单引号的参数做转义", () => {
@@ -201,7 +214,7 @@ test("SDK 传进来的 flag 必须活到最后 —— 别被攒参数的写法�
   // 所以脚本里不能出现 `set --`,而且 "$@" 必须排在镜像和命令**之后**。
   const s = buildWrapperScript(["run"], ["img", "/claude"]);
   assert.doesNotMatch(s, /^set -- /m, "不能用 set -- 攒参数,它会吃掉 SDK 的 flag");
-  assert.match(s, /exec docker .*'img' '\/claude' "\$@"$/m);
+  assert.match(s, /^docker .*'img' '\/claude' "\$@"$/m);
 });
 
 test("清扫包装脚本:只删够老的,而且只认自己的前缀", () => {
@@ -250,4 +263,46 @@ test("孤儿回收:活跃名单为空时也不碰新起的", () => {
     new Set(),
   );
   assert.deepEqual(got, []);
+});
+
+test("救援人格:主 /data 必须**只读**挂载", () => {
+  // compose 里那条注释写着"每类状态只有一个写者,守护人格一个都不是"。
+  // 原来那版用 dataDir 一套通吃,会把主数据目录**读写**挂到 /data/rescue ——
+  // 既挂错位置又抹掉护栏,而且不报错:救援人格照常起来,只是从此能改主人格的状态。
+  const m = sessionMounts({
+    persona: "rescue", hostDataDir: "/h", dataDir: "/data/rescue", mainDataDir: "/data",
+  });
+  const main = m.find((x) => x.at === "/data");
+  assert.ok(main, "主 /data 必须挂进去(它要读部署报告、release 指针、信使队列)");
+  assert.equal(main!.ro, true, "主 /data 对救援人格必须只读");
+  assert.equal(main!.host, "/h");
+});
+
+test("救援人格:自己的命名空间与 IPC 目录要可写", () => {
+  // IPC 那个尤其容易漏:unix socket 的 connect() 需要对 socket 文件的写权限,
+  // 放在只读区的症状是"rescue 起来了但一条消息都收不到",日志上只有一句 EACCES。
+  const m = sessionMounts({
+    persona: "rescue", hostDataDir: "/h", dataDir: "/data/rescue", mainDataDir: "/data",
+  });
+  assert.equal(m.find((x) => x.at === "/data/rescue")?.ro, undefined);
+  assert.equal(m.find((x) => x.at === "/data/ipc")?.ro, undefined);
+});
+
+test("主人格:/data 可写,release 只读", () => {
+  const m = sessionMounts({
+    persona: "primary", hostDataDir: "/h", dataDir: "/data", mainDataDir: "/data",
+  });
+  assert.equal(m.find((x) => x.at === "/data")?.ro, undefined);
+  assert.equal(m.find((x) => x.at === "/data/releases")?.ro, true);
+});
+
+test("两个人格都要有 docker.sock 和 /opt/services", () => {
+  for (const persona of ["primary", "rescue"] as const) {
+    const m = sessionMounts({
+      persona, hostDataDir: "/h",
+      dataDir: persona === "rescue" ? "/data/rescue" : "/data", mainDataDir: "/data",
+    });
+    assert.ok(m.some((x) => x.at.includes("docker.sock")), `${persona} 缺 docker.sock`);
+    assert.ok(m.some((x) => x.at === "/opt/services"), `${persona} 缺 /opt/services`);
+  }
 });

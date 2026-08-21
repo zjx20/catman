@@ -177,7 +177,24 @@ export function buildWrapperScript(
     "  esac",
     '  _e="$_e -e $_k"',
     "done",
-    `exec docker ${preArgs.map(q).join(" ")} $_e ${imageAndCmd.map(q).join(" ")} "$@"`,
+    "# ⚠️ 不是 exec 而是先跑再看退出码 —— 为的是**运行时兜底**(见下)。",
+    "# 代价是多一层 shell:SDK 的 abort 杀掉的是这个 shell,docker 客户端会留下来。",
+    "# 那个代价可以接受 —— 客户端死掉本来就带不走容器(实测),内存看门狗那一级",
+    "# 靠的是 `docker kill`,不指望信号顺着这条链传下去。",
+    `docker ${preArgs.map(q).join(" ")} $_e ${imageAndCmd.map(q).join(" ")} "$@"`,
+    "_rc=$?",
+    "",
+    "# docker 用 125 表示**它自己没能把容器跑起来**(镜像不在、参数不对、daemon 忙),",
+    "# 与容器内命令的退出码不会撞车。这时候退回本机直接跑大脑。",
+    "#",
+    "# 为什么值得有这条:救援人格是主人格坏掉之后的最后一道防线。对主人格来说",
+    "# 「这条消息没回上」只是重发一次;对救援人格,那是**最后一道防线不吭声**,",
+    "# 而那时已经没有下一层了。主人格顺带也受益,代价只是一行判断。",
+    "if [ \"$_rc\" -eq 125 ] && [ -x \"$CATMAN_FALLBACK_CLAUDE\" ]; then",
+    "  echo \"catman: 会话容器起不来(docker 退出 125),退回本机执行\" >&2",
+    "  exec \"$CATMAN_FALLBACK_CLAUDE\" \"$@\"",
+    "fi",
+    "exit $_rc",
     "",
   ].join("\n");
 }
@@ -248,4 +265,50 @@ export function orphanSessionContainers(
     .filter((c) => !alive.has(c.name))
     .filter((c) => c.startedMsAgo > minAgeMs)
     .map((c) => c.name);
+}
+
+/**
+ * 按人格推导会话容器的挂载。
+ *
+ * **两个人格的文件系统视图刻意不同**,照抄一套会拆掉一条有意设计的护栏:
+ *
+ * - 主人格:`/data` 可写(它是那些状态的唯一写者),release 目录只读。
+ * - 救援人格:**主 `/data` 整个只读** —— compose 里那条注释写着"每类状态只有一个
+ *   写者,守护人格一个都不是"。它只对自己的命名空间 `/data/rescue` 和 IPC
+ *   socket 目录有写权限(unix socket 的 connect() 需要写权限,放只读区的症状是
+ *   "rescue 起来了但一条消息都收不到",日志上只有一句 EACCES)。
+ *
+ * 原来那版用 `{ host, at: config.dataDir }` 一套通吃,对救援人格会把**主数据目录
+ * 读写挂到 `/data/rescue`** —— 既挂错了位置,又把只读那条护栏整个抹掉。
+ * 而它不会报错:救援人格照常起来,只是从此能改主人格的状态。
+ */
+export function sessionMounts(opts: {
+  readonly persona: "primary" | "rescue";
+  /** 主数据目录在**宿主**上的绝对路径。 */
+  readonly hostDataDir: string;
+  /** 本人格数据目录在**容器内**的路径(主 `/data`;救援 `/data/rescue`)。 */
+  readonly dataDir: string;
+  /** 主数据目录在容器内的路径。两个人格都是 `/data`。 */
+  readonly mainDataDir: string;
+}): SessionMount[] {
+  const h = opts.hostDataDir;
+  const common: SessionMount[] = [
+    { host: "/var/run/docker.sock", at: "/var/run/docker.sock" },
+    { host: "/opt/services", at: "/opt/services" },
+  ];
+  if (opts.persona === "rescue") {
+    return [
+      // 顺序无关(docker 按挂载点深度排),但写成"先整体只读、再逐个开口"
+      // 更贴近它表达的意思。
+      { host: h, at: opts.mainDataDir, ro: true },
+      { host: `${h}/ipc`, at: `${opts.mainDataDir}/ipc` },
+      { host: `${h}/rescue`, at: opts.dataDir },
+      ...common,
+    ];
+  }
+  return [
+    { host: `${h}/releases`, at: `${opts.mainDataDir}/releases`, ro: true },
+    { host: h, at: opts.dataDir },
+    ...common,
+  ];
 }

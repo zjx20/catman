@@ -22,6 +22,7 @@ import {
   buildWrapperScript,
   claudePathIn,
   sessionContainerName,
+  sessionMounts,
   staleWrappers,
 } from "./session-container.js";
 
@@ -348,12 +349,14 @@ export class Agent {
       image: this.config.sessionImage,
       claudePath,
       limits: { ...DEFAULT_SESSION_LIMITS, memory: this.config.sessionMemoryLimit },
-      mounts: [
-        { host: `${host}/releases`, at: "/data/releases", ro: true },
-        { host, at: this.config.dataDir },
-        { host: "/var/run/docker.sock", at: "/var/run/docker.sock" },
-        { host: "/opt/services", at: "/opt/services" },
-      ],
+      // 挂载**按人格推导**。两个人格的文件系统视图刻意不同(救援人格的主 /data
+      // 是只读的),照抄一套会把那条护栏抹掉,而且不报错。见 sessionMounts。
+      mounts: sessionMounts({
+        persona: this.config.persona,
+        hostDataDir: host,
+        dataDir: this.config.dataDir,
+        mainDataDir: this.config.mainDataDir,
+      }),
       cwd,
       tz: this.config.tz,
       // 身份从**自己的进程**读,不写死、也不再开配置项 —— 这一版三个 bug 全是
@@ -366,6 +369,9 @@ export class Agent {
     const execPath = `${this.config.dataDir}/tmp/session-exec-${container}.sh`;
     try {
       mkdirSync(dirname(execPath), { recursive: true });
+      // 兜底路径通过环境变量给包装脚本 —— 写进脚本正文的话,同一份脚本
+      // 换个 release 就指向一个已经被清理掉的目录。
+      process.env.CATMAN_FALLBACK_CLAUDE = claudePath;
       writeFileSync(
         execPath,
         buildWrapperScript(buildSessionRunArgs(specIn), buildSessionImageArgs(specIn)),
