@@ -26,9 +26,40 @@ import { canonicalOf } from "./commands.js";
  * 只放"会改变行为的结论",细节交给 `catman-rescue` skill 按需加载。
  */
 
-/** 拼一段给 SDK `systemPrompt.append` 的人格简介。两个人格都有 —— 见文件头。 */
-export function personaBriefing(persona: Persona): string {
-  return persona === "rescue" ? RESCUE_BRIEFING : PRIMARY_BRIEFING;
+/**
+ * 拼一段给 SDK `systemPrompt.append` 的人格简介。两个人格都有 —— 见文件头。
+ *
+ * `memoryLimit` 给了就追加一段内存说明。**只在回合真的跑在受限容器里时才给** ——
+ * 会话容器没开启时说"你有 700m 上限"是假话,而大脑没法验证它,只会白白畏手畏脚。
+ */
+export function personaBriefing(persona: Persona, memoryLimit?: string): string {
+  const base = persona === "rescue" ? RESCUE_BRIEFING : PRIMARY_BRIEFING;
+  return memoryLimit ? `${base}\n\n${memoryBriefing(memoryLimit)}` : base;
+}
+
+/**
+ * 内存那一段。
+ *
+ * 为什么进系统提示词而不是 CLAUDE.md:与"我是哪个人格"同一条理由 —— 这是**装配
+ * 事实**,而 CLAUDE.md 住在数据卷里、用户能改能删。真被删了的话,大脑会在完全
+ * 不知道有上限的情况下撞上去。
+ *
+ * 里面每一句都对应一个真机上付过代价的事实:137 那句是因为大脑光看到工具失败
+ * 会当成命令写错了然后原样重试(于是再死一次);后半段点名的那两种写法,正是
+ * 2026-08-21 排查时反复出现的候选。**刻意写得短** —— 系统提示词每回合都要付钱。
+ */
+function memoryBriefing(limit: string): string {
+  return `# 内存
+
+你这一回合跑在一个内存受限的容器里(上限 ${limit};整台宿主也只有 3.8G)。
+看门狗分级动手:80% 往回合里塞一条警告,90% 杀掉你正在跑的那条命令,95% 中止整个回合。
+
+**被杀的命令以 137 退出。看到 137 不要当成命令写错了去原样重试** —— 那是内存超了,
+重试一遍还是同样的下场,必须换一个更省内存的做法。
+
+所以起命令前先想它的内存开销:大文件走流式管道,别把几百 MB 的中间结果物化到盘上
+或捞进内存;\`grep -o\` 配 \`.{0,N}\` 这类有界重复、\`sort -u\` 吃大输入,都可能上 GB。
+拿不准就先看一眼文件大小,或者用 \`-m N\`、重定向到文件再分段读,把输出封住。`;
 }
 
 /**

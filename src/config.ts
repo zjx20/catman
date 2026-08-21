@@ -67,6 +67,24 @@ export interface Config {
   dashboardTokenPath: string;
   /** 同时进行的 agent 回合数上限(跨用户)。 */
   maxConcurrentTurns: number;
+  /**
+   * 把每个回合的大脑关进它自己的容器(受内存上限与看门狗管束)。
+   *
+   * **默认关。** 它依赖两件本进程给不了自己的东西:compose 里 `/sys/fs/cgroup/docker`
+   * 的挂载(Tier 3,要管理员 `up -d`),以及宿主上存在 `sessionImage`。缺任一样就
+   * 只能退回原路,而"悄悄退回"比"没开"更糟 —— 所以做成显式开关,由管理员在
+   * 挂载就位之后再打开。
+   *
+   * ⚠️ 所有并发会话的上限之和必须小于宿主内存,否则两个会话同时失控照样拖垮宿主。
+   * 700m × maxConcurrentTurns 就是这条约束的实际形态。
+   */
+  sessionContainer: boolean;
+  /** 单个会话容器的内存上限,docker `--memory` 的写法。 */
+  sessionMemoryLimit: string;
+  /** 会话容器用的镜像。必须自带 glibc(大脑二进制是 linux-x64 那个变体)。 */
+  sessionImage: string;
+  /** 宿主 cgroup 里 docker 子树的位置。看门狗从这里读 anon、往这里写 cgroup.kill。 */
+  cgroupRoot: string;
   /** 超过此空闲时长的新消息归入新会话。默认 1 小时。 */
   sessionTimeoutMs: number;
   /** 会话 JSONL 超过此保留期后清理。默认 30 天。 */
@@ -221,5 +239,9 @@ export function loadConfig(): Config {
     mainDataDir,
     hostDataDir: process.env.CATMAN_HOST_DATA_DIR || undefined,
     tz: str("TZ", "UTC"),
+    sessionContainer: bool("CATMAN_SESSION_CONTAINER", false),
+    sessionMemoryLimit: str("CATMAN_SESSION_MEMORY", "700m"),
+    sessionImage: str("CATMAN_SESSION_IMAGE", "catman-env:1"),
+    cgroupRoot: str("CATMAN_CGROUP_ROOT", "/sys/fs/cgroup/docker"),
   };
 }

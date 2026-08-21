@@ -1,3 +1,5 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Config } from "../config.js";
 import type { Attachment } from "./attachments.js";
@@ -11,6 +13,14 @@ import {
   shortNum,
 } from "./agent-trace.js";
 import { personaBriefing } from "./persona.js";
+import { startTurnWatchdog } from "./mem-watchdog-runner.js";
+import {
+  DEFAULT_SESSION_LIMITS,
+  PASS_THROUGH_ENV,
+  buildSessionRunArgs,
+  buildWrapperScript,
+  sessionContainerName,
+} from "./session-container.js";
 
 /**
  * Agent SDK 封装。目标:尽量还原 Claude Code 的行为("脾气"),
@@ -235,6 +245,59 @@ export class Agent {
   constructor(private readonly config: Config) {}
 
   /**
+   * 把这一回合的大脑关进容器所需的那点准备:拼 `docker run` 参数、把包装脚本
+   * 落到盘上、返回给 SDK 的 `pathToClaudeCodeExecutable`。
+   *
+   * 任何一步不满足就返回 undefined 让回合**退回原路**(直接跑本机二进制)。
+   * 这里刻意不抛错:一次配置疏忽不该表现成"助手不回话了"。但每种退回都留一行
+   * 日志说清缺什么 —— 静默退回比不开更糟,那意味着你以为有防护而其实没有。
+   */
+  private prepareContainer(
+    tag: string,
+    cwd: string,
+    logLabel: string | undefined,
+  ): { execPath: string; container: string } | undefined {
+    if (!this.config.sessionContainer) return undefined;
+    // -v 的左边永远是**宿主**路径。容器里的 /data 在宿主上是别的位置,
+    // 不给 hostDataDir 的话 docker 会静默建一个空目录,而症状是"助手失忆"。
+    const host = this.config.hostDataDir;
+    if (!host) {
+      console.warn(`${tag} 会话容器已开启但缺 CATMAN_HOST_DATA_DIR —— 退回本机执行`);
+      return undefined;
+    }
+    const release = process.env.CATMAN_RELEASE_DIR;
+    if (!release) {
+      console.warn(`${tag} 会话容器已开启但缺 CATMAN_RELEASE_DIR —— 退回本机执行`);
+      return undefined;
+    }
+    const container = sessionContainerName(logLabel ?? "anon", String(process.hrtime.bigint()));
+    const args = buildSessionRunArgs({
+      container,
+      image: this.config.sessionImage,
+      claudePath: `${release}/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude`,
+      limits: { ...DEFAULT_SESSION_LIMITS, memory: this.config.sessionMemoryLimit },
+      mounts: [
+        { host: `${host}/releases`, at: "/data/releases", ro: true },
+        { host, at: this.config.dataDir },
+        { host: "/var/run/docker.sock", at: "/var/run/docker.sock" },
+        { host: "/opt/services", at: "/opt/services" },
+      ],
+      cwd,
+      passEnv: [...PASS_THROUGH_ENV],
+      tz: this.config.tz,
+    });
+    const execPath = `${this.config.dataDir}/tmp/session-exec-${container}.sh`;
+    try {
+      mkdirSync(dirname(execPath), { recursive: true });
+      writeFileSync(execPath, buildWrapperScript(args), { mode: 0o755 });
+    } catch (err) {
+      console.warn(`${tag} 包装脚本写不下去(${String(err)}) —— 退回本机执行`);
+      return undefined;
+    }
+    return { execPath, container };
+  }
+
+  /**
    * 处理一条用户消息,返回助手回复。
    * 每条消息一次 query();通过 resume 维持多轮上下文,由 SDK 负责
    * auto-compaction 与 JSONL 持久化。
@@ -254,30 +317,41 @@ export class Agent {
     const input = new InputChannel();
     input.push(buildUserMessage(prompt, attachments));
 
+    const cwd = opts.cwd ?? this.config.workspaceDir;
+    const boxed = this.prepareContainer(tag, cwd, opts.logLabel);
+    // 看门狗要能中止回合,所以 abortController 从"调用方给了才传"变成"没有就自己造"。
+    // 只在关进容器时才这样 —— 本机执行那条路没有 cgroup 可读,造了也没人用。
+    const abortController = opts.abortController ?? (boxed ? new AbortController() : undefined);
+
     const q = query({
       prompt: input,
       options: {
+        ...(boxed ? { pathToClaudeCodeExecutable: boxed.execPath } : {}),
         // append 是**唯一**无条件在场的身份出口:skill 正文按需加载(模型可能压根
         // 不去读)、CLAUDE.md 住在数据卷里(用户能改能删),而"我是哪个人格"是装配
         // 事实。守护人格真机上正是因为缺这一段,张口就自称主人格。见 persona.ts。
         systemPrompt: {
           type: "preset",
           preset: "claude_code",
-          append: personaBriefing(this.config.persona),
+          // 内存那一段**只在真的关进容器时才给** —— 没有上限却说有,是假话。
+          append: personaBriefing(
+            this.config.persona,
+            boxed ? this.config.sessionMemoryLimit : undefined,
+          ),
         },
         settingSources: ["user", "project", "local"],
         permissionMode: "bypassPermissions",
         // 当前模型的 API 默认 display="omitted":thinking 块存在但文本为空。
         // 要向用户透出思考摘要必须显式开启 summarized。
         thinking: { type: "adaptive", display: "summarized" },
-        cwd: opts.cwd ?? this.config.workspaceDir,
+        cwd,
         // 两个都空就整个不传 model —— 兜底链的末端,交给 SDK 决定。
         ...(model ? { model } : {}),
         ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
         ...(opts.env ? { env: opts.env } : {}),
         ...(opts.skills ? { skills: opts.skills } : {}),
         ...(opts.maxTurns === undefined ? {} : { maxTurns: opts.maxTurns }),
-        ...(opts.abortController ? { abortController: opts.abortController } : {}),
+        ...(abortController ? { abortController } : {}),
         // CLI 子进程的 stderr 是启动失败/鉴权报错的唯一去处,不接就彻底看不见。
         // 无条件转发(不受 TRACE 开关约束):正常回合它一个字都不输出,
         // 一旦有内容就正是要找的东西。
@@ -298,7 +372,9 @@ export class Agent {
     // 调用方据此回落去起新回合。
     let accepting = true;
     let fed = 0;
-    opts.onFeedReady?.((feedPrompt, feedAttachments) => {
+    // 提成具名的 const:看门狗要用同一个句柄往回合里塞警告,而不是自己
+    // 再造一条通往 InputChannel 的路(两条路会各自漏掉"窗口已关"这个判断)。
+    const feed: AgentFeed = (feedPrompt, feedAttachments) => {
       if (!accepting) return false;
       input.push(buildUserMessage(feedPrompt, feedAttachments));
       fed += 1;
@@ -306,7 +382,8 @@ export class Agent {
         `${tag} 追加输入 #${fed} ${feedPrompt.length}字 图${feedAttachments.length}`,
       );
       return true;
-    });
+    };
+    opts.onFeedReady?.(feed);
 
     // 心跳所需的状态。**覆盖所有 SDK 消息**而不只是 onProgress 透出的那两类:
     // 工具结果回填、API 重试同样是"还在动"的证据,漏掉它们会把正常推进的回合
@@ -328,6 +405,18 @@ export class Agent {
         : undefined;
     // 心跳不该拖着进程不退出 —— 它是观测,不是工作。
     heartbeat?.unref?.();
+
+    // 看门狗与心跳一样,起在 query() 之后、紧挨着 finally 所在的 try ——
+    // 中间任何一步抛错都不会留下一个空转着、还握着 feed 句柄的定时器。
+    const stopWatchdog =
+      boxed && abortController
+        ? startTurnWatchdog(this.config.cgroupRoot, boxed.container, this.config.sessionMemoryLimit, {
+            feed: (text) => void feed(text, []),
+            abort: (reason) => abortController.abort(new Error(`内存看门狗中止回合:${reason}`)),
+            step: () => lastStep,
+            log: (line) => console.warn(`${tag} ${line}`),
+          })
+        : undefined;
 
     try {
       for await (const message of q) {
@@ -384,6 +473,9 @@ export class Agent {
       accepting = false;
       input.close();
       if (heartbeat) clearInterval(heartbeat);
+      // 三条收尾路径(正常结束 / abort / SDK 内部抛错)都要停看门狗。
+      // 漏掉任一条都会留下一个每秒敲 dockerd、而且还握着 feed 的定时器。
+      stopWatchdog?.();
     }
 
     return { text: joinReplyTexts(texts, isError), sessionId, isError };

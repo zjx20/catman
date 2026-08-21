@@ -66,6 +66,16 @@ services:
       # ⚠️ 不能写 ${PWD}:那是 shell 变量,容器进程的环境里没有,compose 对未设变量
       # 只警告一句然后代入空串。要用自进化就在 .env 里写死绝对路径。
       CATMAN_HOST_DATA_DIR: ${CATMAN_HOST_DATA_DIR:-}
+      # ── 会话容器与内存看门狗 ──────────────────────────────────
+      # 默认**关**。打开之前必须先确认下面那个 cgroup 挂载已经生效
+      # (改 volumes 要 `up -d`,`restart` 不会让新挂载生效 —— 你会看到
+      # 一份语法完全正确的配置一直不起作用)。
+      CATMAN_SESSION_CONTAINER: ${CATMAN_SESSION_CONTAINER:-0}
+      CATMAN_SESSION_MEMORY: ${CATMAN_SESSION_MEMORY:-700m}
+      CATMAN_SESSION_IMAGE: ${CATMAN_SESSION_IMAGE:-catman-env:1}
+      # 挂在 /hostcgroup 而不是原路径:容器自己的 /sys/fs/cgroup 是它自己那个
+      # cgroup 命名空间,盖在原路径上会把两者搅在一起,排错时分不清读的是谁。
+      CATMAN_CGROUP_ROOT: /hostcgroup
       # 日志时间戳的时区。容器不会自动继承宿主时区,不设就是 UTC ——
       # 拿日志和微信里的消息时间对账时会差好几个小时。在 .env 里设 TZ=Asia/Shanghai。
       TZ: ${TZ:-UTC}
@@ -129,6 +139,13 @@ services:
       # 读写宿主整个文件系统。容器不再是隔离边界,仅在自己完全信任的机器上开启;
       # 不需要该能力时删掉这一行(镜像里的 docker CLI 没有 socket 就是个摆设,无害)。
       - ${DOCKER_SOCK_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+      # 内存看门狗要读会话容器的 cgroup(anon),并在越过 95% 时往 cgroup.kill 写一下。
+      # **只挂 docker 子树**:catman 因此动不了 hostapd / dnsmasq / system.slice 那些 ——
+      # 权限停在"容器体系"这个圈里,与 docker.sock 本来就有的能力同级,没有外扩。
+      # 必须 rw:只读挂载读得到 anon 却写不了 cgroup.kill,而那是整条阶梯上唯一
+      # **有保证**的一级 —— 事故当下 dockerd 本身是废的(实测 `docker restart`
+      # 十几分钟不返回),`docker kill` 指望不上,只有内核那一下一定管用。
+      - /sys/fs/cgroup/docker:/hostcgroup:rw
     # 容器以非 root 的 catman(uid 10001)运行(bypassPermissions 的硬性要求),
     # 需补一个能读 docker.sock 的补充组,否则容器内 docker 报 permission denied。
     # 该 GID 属于宿主而非镜像,各机器不同,所以运行时注入而不是写死进镜像 ——
@@ -137,6 +154,12 @@ services:
     # Debian/Ubuntu 多为 root:docker,必须显式设置。
     group_add:
       - "${DOCKER_GID:-0}"
+    # 最后一道背板。会话容器开启后大脑搬出去了,catman 自己只剩网关与信使客户端
+    # (常态约 150M);没开启时大脑还在里面,常态约 510M —— 两种情况 1500m 都有
+    # 三倍以上余量。它防的是"上限之外还有东西在涨":真涨上来时被 cgroup 精准
+    # 干掉、由 restart 拉回来,而**不是把整台路由器拖进回收活锁** ——
+    # 2026-08-21 那次就是后者,而且 OOM killer 全程没开火,最后只能断电。
+    mem_limit: ${CATMAN_MEM_LIMIT:-1500m}
     # 代理跑在 docker 宿主自己身上时,HTTP_PROXY 可写成 http://host.docker.internal:<端口>。
     # Linux 上这个名字不是内建的,靠这行映射到宿主网关;不用代理时它只是个多余的 hosts 条目。
     extra_hosts:
