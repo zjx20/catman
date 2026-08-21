@@ -125,20 +125,38 @@ export async function killLargestChild(name: string): Promise<string | undefined
 }
 
 /**
- * 把容器里所有进程杀干净。**内核动手,不经过 dockerd。**
+ * 把容器里所有进程杀干净。先试内核那一下,不行再走 dockerd。
  *
- * 实测:从一个只挂了 `/sys/fs/cgroup/docker` 的兄弟容器里写这一下,目标容器
- * 立刻 `Exited (137)`。而且退出状态是 `OOMKilled=false` —— 正好用来跟
- * "内核的 OOM killer 先动手"(那种是 true)区分开。
+ * ## 为什么需要退路(这里栽过一次)
+ *
+ * `cgroup.kill` 的权限是 `--w------- root root`,而 catman 跑在 uid 10001 上 ——
+ * **写不进去**。当初我"端到端验证通过"是在一个没加 `--user` 的容器里以 root 跑的,
+ * 验证条件和生产条件不一致,等于没验。
+ *
+ * 于是内核那条路在当前部署形态下用不了,得靠 `docker kill`(实测 364ms,
+ * 8 个进程的容器整个带走,退出码 137)。代价是它经过 dockerd,而事故当下
+ * dockerd 可能是废的 —— 但那种"整机活锁"恰恰是 700m 上限要防止的事:
+ * 会话撞的是自己的上限,那一刻宿主还剩好几个 G,dockerd 是健康的。
+ *
+ * 内核那条路仍然留着放在前面:哪天 catman 以 root 跑、或者做了 cgroup 委派,
+ * 它会自动变回"不经过守护进程"的那条。
+ *
+ * 返回走的是哪条路,给日志用 —— 事后要能一眼看出当时是哪种。
  */
-export function cgroupKill(root: string, id: string): boolean {
+export async function killContainerHard(
+  root: string,
+  id: string,
+  name: string,
+): Promise<"cgroup" | "docker" | "failed"> {
   try {
     // cgroupfs 的控制文件只认一个整数,写 "1" 即触发。
     writeFileSync(join(root, id, "cgroup.kill"), "1");
-    return true;
+    return "cgroup";
   } catch {
-    return false;
+    // 落到这里是常态,不是异常 —— 见上面的权限说明。
   }
+  const r = await dockerRun(["kill", name], EXEC_TIMEOUT_MS);
+  return r.ok ? "docker" : "failed";
 }
 
 /** 看门狗在一个回合里累积的状态。决策是纯函数,状态得由这里带着。 */
@@ -266,12 +284,14 @@ export function startTurnWatchdog(
 
     if (action.kind === "kill-container") {
       stopped = true;
-      const ok = cgroupKill(cgroupRoot, id);
+      // **先杀后收**:反过来的话,abort 与容器真正死掉之间那段窗口里内存还在涨。
+      // (而且实测 SIGKILL 掉 docker 客户端根本带不走容器,abort 一个人办不成这件事。)
+      const via = await killContainerHard(cgroupRoot, id, containerName);
       // 事故记录先落日志再中止:catman 的容器日志是持久的,而这一行是事后
       // 唯一说得清"死在哪一步"的东西。
       hooks.log(
         `⛔ 看门狗:回合被中止 原因=${action.reason} anon=${pct}% ` +
-          `上限=${memoryLimit} 当时在跑=${hooks.step() ?? "(未知)"} cgroup.kill=${ok ? "成功" : "失败"}`,
+          `上限=${memoryLimit} 当时在跑=${hooks.step() ?? "(未知)"} 杀法=${via}`,
       );
       hooks.abort(action.reason);
       return;
