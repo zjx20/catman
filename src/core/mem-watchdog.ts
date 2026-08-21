@@ -169,3 +169,83 @@ export function killNoticeText(ratio: number, victim: string | undefined): strin
     `它会以 137 退出 —— 那不是命令本身出错,是被杀了。**不要原样重试**,换个省内存的做法。`
   );
 }
+
+/**
+ * 看门狗中止回合时,塞进 `AbortSignal.reason` 的凭据。
+ *
+ * 为什么要凭据而不是字符串匹配:网关那边要分辨「这次中止是谁干的」,而
+ * `signal.aborted` 只是个布尔 —— 用户按了 /取消、超时、崩溃、内存看门狗动手,
+ * 四种情况**措辞一模一样**(真机上就是光秃秃一句「已中断这一轮。」),
+ * 而这四种用户该做的事完全不同。尤其内存那种:默认反应"再发一遍"恰恰是错的。
+ */
+export interface MemAbortInfo {
+  readonly reason: "threshold" | "kernel-oom" | "no-relief";
+  /** 中止那一刻在跑哪一步。用户最想知道的就是这个。 */
+  readonly step: string | undefined;
+  readonly pct: number;
+  readonly limit: string;
+}
+
+const MEM_ABORT = Symbol.for("catman.memAbort");
+
+/** 造一个带凭据的中止原因。 */
+export function memAbortError(info: MemAbortInfo): Error {
+  const e = new Error(`内存看门狗中止回合:${info.reason} anon=${info.pct}%`);
+  (e as unknown as Record<symbol, unknown>)[MEM_ABORT] = info;
+  return e;
+}
+
+/** 从 `signal.reason` 里认出凭据。不是看门狗干的就返回 undefined。 */
+export function readMemAbort(reason: unknown): MemAbortInfo | undefined {
+  if (!reason || typeof reason !== "object") return undefined;
+  return (reason as Record<symbol, MemAbortInfo | undefined>)[MEM_ABORT];
+}
+
+/**
+ * 回合非正常结束时给用户的那句话。
+ *
+ * **每一种都要说清「接下来怎么办」**:真机上用户看到光秃秃一句「已中断这一轮」,
+ * 很可能以为整段对话废了,于是重开一个会话 —— 而那才是真的把上下文丢了。
+ * 死的只是这一个回合,transcript 还在盘上,下一条消息会 resume。
+ */
+export function abortNoticeText(mem: MemAbortInfo | undefined): string {
+  const tail = "**会话没丢**,接着说就行 —— 死的只是这一个回合,上下文还在。";
+  if (!mem) return `已按你的要求中断这一轮。${tail}`;
+  const where = mem.step ? `(当时在跑:${mem.step})` : "";
+  if (mem.reason === "kernel-oom") {
+    return (
+      `⛔ 这一回合内存超了上限 ${mem.limit},内核先动手把进程杀了${where}。` +
+      `直接重发大概率还会撞上,换个省内存的问法。${tail}`
+    );
+  }
+  return (
+    `⛔ 这一回合因内存超限被中止${where}:用到了上限 ${mem.limit} 的 ${mem.pct}%。` +
+    `直接重发大概率还会撞上,换个省内存的问法(大文件走流式、别把大输出捞进内存)。${tail}`
+  );
+}
+
+/** 80%/90% 两档给**用户**看的简短提示。跟喂给大脑的那条不同 —— 用户要的是"发生了什么"。 */
+export function userNoticeText(kind: "warn" | "kill-process", pct: number, victim?: string): string {
+  if (kind === "warn") {
+    return `⚠️ 这一回合内存到了上限的 ${pct}%,我正在让它换个省内存的做法。回合继续。`;
+  }
+  return `⛔ 内存到 ${pct}%,我杀掉了那条最吃内存的命令${victim ? `(${victim})` : ""}。回合继续。`;
+}
+
+/**
+ * 下一回合开头注入的前情。
+ *
+ * 回合被硬杀之后,transcript 末尾留下一个**悬空的 tool_use**(有调用、没结果)。
+ * resume 上去的大脑看到的是一个没有下文的工具调用 —— 它不知道发生过什么,
+ * 而用户往往只回一句"继续"。没有这段前情,它大概率原样再撞一次。
+ *
+ * 与 persona 里那段 137 预教是两回事:那个教它**认信号**(看到 137 别重试),
+ * 这个告诉它**上一回合具体发生了什么**。前者是常识,后者是现场。
+ */
+export function priorAbortPrefix(mem: MemAbortInfo): string {
+  const where = mem.step ? `,当时在跑:${mem.step}` : "";
+  return (
+    `(系统提示:上一回合因内存超限被中止 —— 用到了上限 ${mem.limit} 的 ${mem.pct}%${where}。` +
+    `transcript 末尾那个没有结果的工具调用就是它。**同样的做法会再死一次**,换个省内存的路子。)\n\n`
+  );
+}

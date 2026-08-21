@@ -10,6 +10,11 @@ import {
   parseAnonBytes,
   parseOomKills,
   warnText,
+  abortNoticeText,
+  memAbortError,
+  readMemAbort,
+  priorAbortPrefix,
+  userNoticeText,
   type MemObservation,
 } from "../src/core/mem-watchdog.js";
 
@@ -137,4 +142,72 @@ test("击杀通知用「正在杀掉」而不是「已杀掉」", () => {
   // 说过头就成了假消息,而大脑没法验证它。
   assert.match(killNoticeText(0.91, undefined), /正在杀掉/);
   assert.doesNotMatch(killNoticeText(0.91, undefined), /已杀掉/);
+});
+
+/**
+ * 中止文案。真机演练时管理员看到的是光秃秃一句「已中断这一轮。」——
+ * 分不清是自己按了取消、还是超时、还是内存看门狗动的手,而这几种该做的事完全不同。
+ */
+test("内存中止:说清死因、点名哪一步、并劝阻原样重发", () => {
+  const t = abortNoticeText({
+    reason: "threshold", step: "Bash: grep 大文件", pct: 97, limit: "700m",
+  });
+  assert.match(t, /内存/);
+  assert.match(t, /grep 大文件/);          // 点名哪一步
+  assert.match(t, /重发/);                  // 默认反应"再发一遍"恰恰是错的
+  assert.match(t, /会话没丢/);              // 否则用户会重开会话,那才真丢上下文
+});
+
+test("用户主动取消:不该说得像出了故障", () => {
+  const t = abortNoticeText(undefined);
+  assert.match(t, /按你的要求/);
+  assert.doesNotMatch(t, /内存/);
+  assert.match(t, /会话没丢/);
+});
+
+test("内核抢先开火那种,措辞要跟阈值中止分得开", () => {
+  const t = abortNoticeText({ reason: "kernel-oom", step: undefined, pct: 100, limit: "700m" });
+  assert.match(t, /内核/);
+  assert.match(t, /会话没丢/);
+});
+
+test("每一种中止都必须带「接下来怎么办」", () => {
+  // 这条是管理员特意补的:不说这句,用户看到"已中断"会以为整段对话废了,
+  // 于是重开一个会话 —— 而那才是真的把上下文丢了。
+  for (const mem of [
+    undefined,
+    { reason: "threshold" as const, step: "X", pct: 96, limit: "700m" },
+    { reason: "kernel-oom" as const, step: undefined, pct: 100, limit: "700m" },
+    { reason: "no-relief" as const, step: "Y", pct: 93, limit: "700m" },
+  ]) {
+    assert.match(abortNoticeText(mem), /接着说/, `这一种没说清接下来怎么办`);
+  }
+});
+
+test("中止凭据能被认出来,而普通错误认不出", () => {
+  // 网关靠它分岔。认错的后果是把内存中止说成"你取消了",用户会直接重发再死一次。
+  const info = { reason: "threshold" as const, step: "X", pct: 96, limit: "700m" };
+  assert.deepEqual(readMemAbort(memAbortError(info)), info);
+  assert.equal(readMemAbort(new Error("别的错")), undefined);
+  assert.equal(readMemAbort(undefined), undefined);
+  assert.equal(readMemAbort("字符串"), undefined);
+});
+
+test("给用户的提示跟喂给大脑的那条不是一回事", () => {
+  // 大脑要的是"该怎么改",用户要的是"发生了什么、要不要管"。
+  const u = userNoticeText("warn", 81);
+  assert.match(u, /81%/);
+  assert.match(u, /回合继续/);              // 让用户安心,不必插手
+  assert.doesNotMatch(u, /流式管道/);        // 那是给大脑的操作建议,用户不关心
+});
+
+test("前情注入:说清上一回合怎么死的,并点名那个悬空的工具调用", () => {
+  // 被硬杀之后 transcript 末尾留下一个有调用、没结果的 tool_use。resume 上去的
+  // 大脑看到的是一个没有下文的调用 —— 而用户往往只回一句"继续"。
+  // 没有这段前情,它大概率原样再撞一次。
+  const p = priorAbortPrefix({ reason: "threshold", step: "Bash: grep 大文件", pct: 97, limit: "700m" });
+  assert.match(p, /上一回合/);
+  assert.match(p, /grep 大文件/);
+  assert.match(p, /再死一次/);       // 话要说硬,不然"继续"两个字就把它带回坑里
+  assert.ok(p.endsWith("\n\n"));     // 是前缀,后面要接用户原话
 });

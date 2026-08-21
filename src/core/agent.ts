@@ -163,6 +163,14 @@ export interface AgentRunOptions {
    * (返回 false),调用方不必自己判断时机。
    */
   onFeedReady?: (feed: AgentFeed) => void;
+  /**
+   * 给**用户**发一条带外通知(目前只有内存看门狗在用)。
+   *
+   * 与 onProgress 分开:进度是"助手在干什么",这条是"系统对这个回合做了什么"。
+   * 混在进度里的话,用户按偏好关掉进度推送就再也看不到看门狗动手了 ——
+   * 而那恰恰是最该让他知道的一类消息。
+   */
+  onNotice?: (text: string) => void;
 }
 
 /**
@@ -470,7 +478,8 @@ export class Agent {
       boxed && abortController
         ? startTurnWatchdog(this.config.cgroupRoot, boxed.container, this.config.sessionMemoryLimit, {
             feed: (text) => void feed(text, []),
-            abort: (reason) => abortController.abort(new Error(`内存看门狗中止回合:${reason}`)),
+            abortWith: (err) => abortController.abort(err),
+            notifyUser: (text) => opts.onNotice?.(text),
             step: () => lastStep,
             log: (line) => console.warn(`${tag} ${line}`),
           })

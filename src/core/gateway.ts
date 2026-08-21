@@ -38,6 +38,7 @@ import { SETTING_SCHEMA, USER_SETTING_KEYS } from "./settings.js";
 import { skillsFor } from "./skills.js";
 import { readVersion, shortSha, versionLine, type VersionInfo } from "./version.js";
 import type { DeployControl } from "./deploy.js";
+import { abortNoticeText, priorAbortPrefix, readMemAbort, type MemAbortInfo } from "./mem-watchdog.js";
 import { formatDeployReport } from "./deploy-report.js";
 import { formatDeployProgress } from "./deploy-progress.js";
 import type { SendKind } from "../ipc/protocol.js";
@@ -518,6 +519,15 @@ export class Gateway {
   private readonly settings: GlobalSettings;
   private readonly turns: TurnTokens;
   private readonly apiBase: string;
+  /**
+   * 上一回合被内存看门狗中止的用户 → 中止详情。
+   *
+   * **刻意不落盘**:落盘要动 state.json 的格式,而部署随时可能回滚 ——
+   * 新代码必须能读旧数据、旧代码也得能读新代码写的。为一句前情提示付这个代价
+   * 不划算。catman 重启后这条信息就没了,但 persona 里那段 137 预教仍然在,
+   * 大脑不至于完全没线索。
+   */
+  private readonly lastMemAbort = new Map<string, MemAbortInfo>();
   private readonly admission: AdmissionPolicy;
   private readonly sessionExists: ((userKey: string, sessionId: string) => boolean) | undefined;
   private readonly now: () => number;
@@ -1593,13 +1603,22 @@ export class Gateway {
     const release = await this.semaphore.acquire();
     turn.ctx.progress.running = this.now();
     try {
-      const reply = await this.agent.run(text, {
+      // 上一回合被内存中止过的话,把前情缀在这条消息前面。**取走即清** ——
+      // 它只对紧接着的那一条有意义,留着会在几轮之后冒出来把人搞糊涂。
+      const prior = this.lastMemAbort.get(userKey);
+      if (prior) this.lastMemAbort.delete(userKey);
+      const reply = await this.agent.run(prior ? priorAbortPrefix(prior) + text : text, {
         cwd: pre.cwd,
         resumeSessionId: decision.isNew ? undefined : decision.resumeSessionId,
         ...(prefs.model ? { model: prefs.model } : {}),
         env: this.childEnv(isAdmin, turn.token, userKey),
         skills: skillsFor(this.persona, isAdmin),
         abortController: turn.ctx.abort,
+        // 看门狗动手时给用户带外发一条。不走 onProgress —— 用户可能把进度关了,
+        // 而"系统对这个回合做了什么"是不该被那个开关埋掉的。
+        onNotice: (text: string) => {
+          void this.trySend(userKey, this.labelIfDetached(turn.ctx, undefined, text), "看门狗");
+        },
         onProgress,
         logLabel: userKey,
         ...(attachments.length ? { attachments } : {}),
@@ -1664,6 +1683,8 @@ export class Gateway {
     } catch (err) {
       // 用户主动中断不算"回合出错":把 /取消 记成失败会让观测数据长期偏红。
       if (!turn.ctx.abort.signal.aborted) this.lastTurn = { at: this.now(), isError: true };
+      const memAbort = readMemAbort(turn.ctx.abort.signal.reason);
+      if (memAbort) this.lastMemAbort.set(userKey, memAbort);
       console.error(`[gateway] 处理 ${userKey} 消息失败:`, err);
       await progress;
       // 错误说明与正文同样要标出处 —— 后台回合报错时用户多半正在跟另一段对话
@@ -1677,7 +1698,12 @@ export class Gateway {
           turn.ctx,
           decision.isNew ? undefined : decision.resumeSessionId,
           turn.ctx.abort.signal.aborted
-            ? "已中断这一轮。"
+            // 分辨中止原因。光秃秃一句「已中断这一轮」在真机上被证明是不够的:
+            // 用户按了 /取消、超时、崩了、内存看门狗动手 —— 四种措辞一模一样,
+            // 而该做的事完全不同。内存那种尤其要紧,因为默认反应"再发一遍"
+            // 恰恰是错的。每一种都补一句「会话没丢」,否则用户会重开会话,
+            // 而那才是真的把上下文丢了。
+            ? abortNoticeText(readMemAbort(turn.ctx.abort.signal.reason))
             : `处理出错了:${(err as Error).message}`,
         ),
         "错误说明",

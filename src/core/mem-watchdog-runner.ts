@@ -7,6 +7,8 @@ import {
   parseAnonBytes,
   parseOomKills,
   warnText,
+  memAbortError,
+  userNoticeText,
   type MemAction,
   type MemObservation,
 } from "./mem-watchdog.js";
@@ -198,10 +200,16 @@ const RESOLVE_TIMEOUT_MS = 20_000;
 export interface TurnWatchdogHooks {
   /** 往正在跑的回合里塞一条消息(就是 agent 的 feed)。 */
   readonly feed: (text: string) => void;
-  /** 中止这一回合。 */
-  readonly abort: (reason: string) => void;
+  /** 中止这一回合,带上可辨认的原因凭据。 */
+  readonly abortWith: (err: Error) => void;
   /** 当前跑到哪一步,用来写进警告文案。 */
   readonly step: () => string | undefined;
+  /**
+   * 给**用户**发一条。与 feed 不是一回事:feed 是说给大脑听的(让它换做法),
+   * 这条是说给人听的 —— 否则他只看到助手忽然改了路子、或者忽然不回话,
+   * 完全不知道是内存看门狗在动手。
+   */
+  readonly notifyUser: (text: string) => void;
   readonly log: (line: string) => void;
 }
 
@@ -258,6 +266,7 @@ export function startTurnWatchdog(
     if (action.kind === "warn") {
       hooks.log(`看门狗:anon 到 ${pct}%,喂警告`);
       hooks.feed(warnText(action.ratio, memoryLimit, hooks.step()));
+      hooks.notifyUser(userNoticeText("warn", pct));
       return;
     }
 
@@ -269,6 +278,7 @@ export function startTurnWatchdog(
       hooks.log(`看门狗:anon 到 ${pct}%,杀掉最大的非大脑进程`);
       const victim = await killLargestChild(containerName);
       hooks.log(victim ? `看门狗:已杀 ${victim}` : "看门狗:没找到可杀的进程(等复查升级)");
+      hooks.notifyUser(userNoticeText("kill-process", pct, victim));
       return;
     }
 
@@ -283,7 +293,9 @@ export function startTurnWatchdog(
         `⛔ 看门狗:回合被中止 原因=${action.reason} anon=${pct}% ` +
           `上限=${memoryLimit} 当时在跑=${hooks.step() ?? "(未知)"} 杀法=${via}`,
       );
-      hooks.abort(action.reason);
+      // 带凭据地中止 —— 网关那边靠它把"内存中止"和"用户按了取消"分开,
+      // 而这两种用户该做的事恰好相反(前者重发还会死,后者重发就好)。
+      hooks.abortWith(memAbortError({ reason: action.reason, step: hooks.step(), pct, limit: memoryLimit }));
       return;
     }
   };
