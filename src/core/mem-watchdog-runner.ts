@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   decideMemAction,
@@ -20,15 +20,15 @@ import {
  * 差约 18000 倍。每秒对每个会话轮询一次的话,后者根本跑不动,而且它还把守护进程
  * 拽进了观测路径。
  *
- * ## 为什么兜底那一刀走 cgroup.kill 而不是 `docker kill`
+ * ## 动手那两级都经过 dockerd,这是想清楚之后的选择
  *
- * 事故当下 dockerd 本身就是废的(管理员实测 `docker restart` 十几分钟不返回)。
- * 写 `cgroup.kill` 是一次几字节的文件写,内核直接把该 cgroup 里所有进程 SIGKILL,
- * **完全不经过守护进程** —— 这是整条阶梯上唯一有保证的动作,所以它必须在末端。
+ * 原设计里 95% 那级用 `cgroup.kill`,图的是"不经过守护进程"。**那条路是死的** ——
+ * 文件权限 `--w------- root root`,而 catman 跑在 uid 10001 上,详见 killContainerHard。
  *
- * 中间那一级(90% 杀单个进程)倒是可以用 `docker exec`:那一刻会话撞的是自己的
- * 700m 上限,宿主还剩好几个 G、守护进程是健康的。它只求方便,不求保证 ——
- * 超时或失败就让 95% 那级兜底,所以给它一个短超时、失败不阻塞。
+ * 顾虑本身也不成立了:它担心的是事故当下 dockerd 被整机内存活锁拖垮,而那正是
+ * 700m 上限消除掉的场景 —— 会话撞的是自己的上限,那一刻宿主还剩好几个 G。
+ * 所以 90%(`docker exec`)和 95%(`docker kill`)都走 dockerd,各给一个短超时,
+ * 失败不阻塞下一级。
  */
 
 /** 宿主 cgroup 里 docker 子树的默认位置。只挂这个子树,catman 就动不了系统的 cgroup。 */
@@ -125,36 +125,26 @@ export async function killLargestChild(name: string): Promise<string | undefined
 }
 
 /**
- * 把容器里所有进程杀干净。先试内核那一下,不行再走 dockerd。
+ * 把容器里所有进程杀干净。
  *
- * ## 为什么需要退路(这里栽过一次)
+ * ## 为什么不用 `cgroup.kill`(试过,是条死路)
  *
- * `cgroup.kill` 的权限是 `--w------- root root`,而 catman 跑在 uid 10001 上 ——
- * **写不进去**。当初我"端到端验证通过"是在一个没加 `--user` 的容器里以 root 跑的,
- * 验证条件和生产条件不一致,等于没验。
+ * 设计时我把 `cgroup.kill` 当成"唯一有保证、不经过 dockerd"的那一级,理由是
+ * 事故当下 dockerd 本身可能是废的。**但它在这个部署形态下永远写不进去**:
+ * 那个文件是 `--w------- root root`,而 catman 跑在 uid 10001 上。
  *
- * 于是内核那条路在当前部署形态下用不了,得靠 `docker kill`(实测 364ms,
- * 8 个进程的容器整个带走,退出码 137)。代价是它经过 dockerd,而事故当下
- * dockerd 可能是废的 —— 但那种"整机活锁"恰恰是 700m 上限要防止的事:
- * 会话撞的是自己的上限,那一刻宿主还剩好几个 G,dockerd 是健康的。
+ * 当初那次"端到端验证通过"是在一个没加 `--user` 的容器里以 root 跑的 ——
+ * 验证条件和生产条件不一致,等于没验。真机演练两次中止,`杀法` 字段都是 docker,
+ * 内核那条一次都没成功过。留着它只会让人误以为存在一条更硬的保证,所以删掉。
  *
- * 内核那条路仍然留着放在前面:哪天 catman 以 root 跑、或者做了 cgroup 委派,
- * 它会自动变回"不经过守护进程"的那条。
+ * ## 那条"dockerd 可能是废的"的顾虑还成立吗
  *
- * 返回走的是哪条路,给日志用 —— 事后要能一眼看出当时是哪种。
+ * 不成立了 —— 因为它描述的是**整机内存活锁**,而那正是 700m 上限消除掉的场景:
+ * 会话撞的是自己的 cgroup 上限,那一刻宿主还剩好几个 G,dockerd 是健康的。
+ * 实测 `docker kill` 364ms,8 个进程的容器整个带走,退出 137 且 OOMKilled=false
+ * (与"内核 OOM killer 先动手"仍然分得开)。
  */
-export async function killContainerHard(
-  root: string,
-  id: string,
-  name: string,
-): Promise<"cgroup" | "docker" | "failed"> {
-  try {
-    // cgroupfs 的控制文件只认一个整数,写 "1" 即触发。
-    writeFileSync(join(root, id, "cgroup.kill"), "1");
-    return "cgroup";
-  } catch {
-    // 落到这里是常态,不是异常 —— 见上面的权限说明。
-  }
+export async function killContainerHard(name: string): Promise<"docker" | "failed"> {
   const r = await dockerRun(["kill", name], EXEC_TIMEOUT_MS);
   return r.ok ? "docker" : "failed";
 }
@@ -286,7 +276,7 @@ export function startTurnWatchdog(
       stopped = true;
       // **先杀后收**:反过来的话,abort 与容器真正死掉之间那段窗口里内存还在涨。
       // (而且实测 SIGKILL 掉 docker 客户端根本带不走容器,abort 一个人办不成这件事。)
-      const via = await killContainerHard(cgroupRoot, id, containerName);
+      const via = await killContainerHard(containerName);
       // 事故记录先落日志再中止:catman 的容器日志是持久的,而这一行是事后
       // 唯一说得清"死在哪一步"的东西。
       hooks.log(

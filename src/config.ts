@@ -83,7 +83,7 @@ export interface Config {
   sessionMemoryLimit: string;
   /** 会话容器用的镜像。必须自带 glibc(大脑二进制是 linux-x64 那个变体)。 */
   sessionImage: string;
-  /** 宿主 cgroup 里 docker 子树的位置。看门狗从这里读 anon、往这里写 cgroup.kill。 */
+  /** 宿主 cgroup 里 docker 子树的位置。看门狗从这里读 anon(只读,不写)。 */
   cgroupRoot: string;
   /** 超过此空闲时长的新消息归入新会话。默认 1 小时。 */
   sessionTimeoutMs: number;

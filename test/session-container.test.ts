@@ -8,6 +8,8 @@ import {
   buildWrapperScript,
   claudePathIn,
   sessionContainerName,
+  staleWrappers,
+  WRAPPER_TTL_MS,
   type SessionContainerSpec,
 } from "../src/core/session-container.js";
 
@@ -199,4 +201,28 @@ test("SDK 传进来的 flag 必须活到最后 —— 别被攒参数的写法�
   const s = buildWrapperScript(["run"], ["img", "/claude"]);
   assert.doesNotMatch(s, /^set -- /m, "不能用 set -- 攒参数,它会吃掉 SDK 的 flag");
   assert.match(s, /exec docker .*'img' '\/claude' "\$@"$/m);
+});
+
+test("清扫包装脚本:只删够老的,而且只认自己的前缀", () => {
+  // 这里唯一致命的错是**把还在用的那个删掉** —— 正在跑的回合下次 exec 时
+  // 找不到文件,症状是"助手忽然不回话了",而且完全看不出跟清理有关。
+  // 所以两条判据都保守:前缀对得上、且超过 TTL。
+  const now = 1_000_000_000;
+  const old = now - WRAPPER_TTL_MS - 1;
+  const got = staleWrappers(
+    [
+      { name: "session-exec-a.sh", mtimeMs: old },      // 该删
+      { name: "session-exec-b.sh", mtimeMs: now },      // 还新,留着
+      { name: "制备-20260821.log", mtimeMs: old },       // 不是我的,别碰
+      { name: "str.txt", mtimeMs: old },                 // 同上
+      { name: "session-exec-c.txt", mtimeMs: old },      // 前缀对但不是 .sh
+    ],
+    now,
+  );
+  assert.deepEqual(got, ["session-exec-a.sh"]);
+});
+
+test("清扫的 TTL 要够长 —— 回合跑几小时是正常的", () => {
+  // 短 TTL 会在长回合跑到一半时把它的脚本删掉。12 小时是刻意的余量。
+  assert.ok(WRAPPER_TTL_MS >= 12 * 60 * 60 * 1000);
 });

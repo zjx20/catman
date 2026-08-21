@@ -194,6 +194,30 @@ export function claudePathIn(releaseDir: string): string {
   return `${releaseDir}/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude`;
 }
 
+/** 包装脚本的文件名前缀。生成与清扫两处都用它,免得两边各写一份而慢慢走样。 */
+export const WRAPPER_PREFIX = "session-exec-";
+
+/** 多久算过期。给足余量 —— 一个回合跑几小时是正常的,删掉正在用的那个是灾难。 */
+export const WRAPPER_TTL_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * 挑出该删的包装脚本。
+ *
+ * 纯函数是为了能测:这里唯一致命的错是**把还在用的那个删掉** ——
+ * 那会让正在跑的回合下一次 exec 时找不到文件,而症状是"助手忽然不回话了"。
+ * 所以判据只有两条,都保守:名字前缀对得上、而且**足够老**。
+ */
+export function staleWrappers(
+  entries: ReadonlyArray<{ name: string; mtimeMs: number }>,
+  now: number,
+  ttlMs: number = WRAPPER_TTL_MS,
+): string[] {
+  return entries
+    .filter((e) => e.name.startsWith(WRAPPER_PREFIX) && e.name.endsWith(".sh"))
+    .filter((e) => now - e.mtimeMs > ttlMs)
+    .map((e) => e.name);
+}
+
 /** 会话容器的名字。一个会话同时只该有一个回合在跑,所以用 userKey 就够认。 */
 export function sessionContainerName(userKey: string, turnId: string): string {
   const safe = userKey.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 40);

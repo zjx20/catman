@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Config } from "../config.js";
@@ -22,6 +22,7 @@ import {
   buildWrapperScript,
   claudePathIn,
   sessionContainerName,
+  staleWrappers,
 } from "./session-container.js";
 
 /**
@@ -243,6 +244,30 @@ export class InputChannel {
   }
 }
 
+/**
+ * 清扫过期的包装脚本。失败一律吞掉 —— 清理不该把回合带走。
+ */
+function sweepStaleWrappers(tmpDir: string): void {
+  try {
+    const entries = readdirSync(tmpDir).map((name) => {
+      try {
+        return { name, mtimeMs: statSync(`${tmpDir}/${name}`).mtimeMs };
+      } catch {
+        return { name, mtimeMs: Date.now() }; // 读不到就当它是新的,宁可不删
+      }
+    });
+    for (const name of staleWrappers(entries, Date.now())) {
+      try {
+        unlinkSync(`${tmpDir}/${name}`);
+      } catch {
+        /* 删不掉就算了,下次再说 */
+      }
+    }
+  } catch {
+    /* 目录不在等等,不是问题 */
+  }
+}
+
 export class Agent {
   constructor(private readonly config: Config) {}
 
@@ -291,6 +316,10 @@ export class Agent {
       return undefined;
     }
     const container = sessionContainerName(logLabel ?? "anon", String(process.hrtime.bigint()));
+    // 顺手扫掉过期的包装脚本。**不能只靠回合结束时删** —— 进程被 SIGKILL(内存
+    // 看门狗动手、或部署换版本)时 finally 根本不跑,那些文件就永远留下了。
+    // 真机上两小时攒了 14 个。放在这里是因为它天然随"新回合"触发,不必另接生命周期。
+    sweepStaleWrappers(`${this.config.dataDir}/tmp`);
     const specIn = {
       container,
       image: this.config.sessionImage,
@@ -502,6 +531,8 @@ export class Agent {
       accepting = false;
       input.close();
       if (heartbeat) clearInterval(heartbeat);
+      // 删掉本回合的包装脚本。正常路径靠这里,被 SIGKILL 时靠下一回合开头的清扫。
+      if (boxed) { try { unlinkSync(boxed.execPath); } catch { /* 已经没了就算了 */ } }
       // 三条收尾路径(正常结束 / abort / SDK 内部抛错)都要停看门狗。
       // 漏掉任一条都会留下一个每秒敲 dockerd、而且还握着 feed 的定时器。
       stopWatchdog?.();
