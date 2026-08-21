@@ -16,6 +16,7 @@ import {
   priorAbortPrefix,
   userNoticeText,
   type MemObservation,
+  incidentLine,
 } from "../src/core/mem-watchdog.js";
 
 /**
@@ -210,4 +211,26 @@ test("前情注入:说清上一回合怎么死的,并点名那个悬空的工具
   assert.match(p, /grep 大文件/);
   assert.match(p, /再死一次/);       // 话要说硬,不然"继续"两个字就把它带回坑里
   assert.ok(p.endsWith("\n\n"));     // 是前缀,后面要接用户原话
+});
+
+const INCIDENT = { reason: "threshold" as const, step: "Bash(grep …)", pct: 98, limit: "700m" };
+
+test("incidentLine:一行制表符分隔,字段齐全", () => {
+  const line = incidentLine("2026-08-21T10:00:00.000Z", "wechat:abc", INCIDENT, "docker");
+  assert.equal(line.includes("\n"), false, "必须单行 —— 多行就没法 grep 了");
+  assert.deepEqual(line.split("\t"), [
+    "2026-08-21T10:00:00.000Z",
+    "user=wechat:abc",
+    "reason=threshold",
+    "anon=98%",
+    "limit=700m",
+    "via=docker",
+    "step=Bash(grep …)",
+  ]);
+});
+
+test("incidentLine:step 缺失时留占位而不是空字段", () => {
+  // 空字段会让列错位,而这份记录的全部用途就是几周后有人拿 awk 去读它。
+  const line = incidentLine("t", "u", { ...INCIDENT, step: undefined }, "failed");
+  assert.ok(line.endsWith("step=(未知)"));
 });

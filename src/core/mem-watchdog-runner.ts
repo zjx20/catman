@@ -8,6 +8,7 @@ import {
   parseOomKills,
   warnText,
   memAbortError,
+  type MemAbortInfo,
   userNoticeText,
   type MemAction,
   type MemObservation,
@@ -210,6 +211,11 @@ export interface TurnWatchdogHooks {
    * 完全不知道是内存看门狗在动手。
    */
   readonly notifyUser: (text: string) => void;
+  /**
+   * 把事故落一份到盘上(SSD)。可选 —— 装配处给不出落点时就只剩容器日志,
+   * 那仍然能用,只是会被轮转掉。
+   */
+  readonly recordIncident?: (info: MemAbortInfo, via: string) => void;
   readonly log: (line: string) => void;
 }
 
@@ -295,7 +301,9 @@ export function startTurnWatchdog(
       );
       // 带凭据地中止 —— 网关那边靠它把"内存中止"和"用户按了取消"分开,
       // 而这两种用户该做的事恰好相反(前者重发还会死,后者重发就好)。
-      hooks.abortWith(memAbortError({ reason: action.reason, step: hooks.step(), pct, limit: memoryLimit }));
+      const info = { reason: action.reason, step: hooks.step(), pct, limit: memoryLimit };
+      hooks.recordIncident?.(info, via);
+      hooks.abortWith(memAbortError(info));
       return;
     }
   };

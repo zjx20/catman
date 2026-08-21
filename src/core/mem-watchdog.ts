@@ -285,3 +285,31 @@ export function circuitTripText(consecutive: number, limit: string): string {
     `**会话没丢**,想好了接着说就行。`
   );
 }
+
+/**
+ * 事故记录的一行。
+ *
+ * 为什么单独落一份而不是只靠容器日志:容器日志会轮转(compose 里限了 8MB),
+ * 而内存事故恰恰是那种"几周后才有人回头查"的东西。一行一条、纯文本、可 grep,
+ * 就够了 —— 不需要结构化,需要的是**它还在**。
+ *
+ * ⚠️ 落点必须在 **SSD**,不能在 U 盘:事故当下 U 盘正是被打满的那块盘
+ * (2026-08-21 实测 ioticks 逼近 100%),往它上面写记录可能一卡就是几十秒,
+ * 而那时候我们正想赶紧把现场留下来。`/opt/services` 在 SSD 上。
+ */
+export function incidentLine(
+  at: string,
+  userKey: string,
+  mem: MemAbortInfo,
+  via: string,
+): string {
+  return [
+    at,
+    `user=${userKey}`,
+    `reason=${mem.reason}`,
+    `anon=${mem.pct}%`,
+    `limit=${mem.limit}`,
+    `via=${via}`,
+    `step=${mem.step ?? "(未知)"}`,
+  ].join("\t");
+}

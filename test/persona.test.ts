@@ -125,3 +125,15 @@ test("主 settings.json 读不懂就当空,绝不抛", () => {
     "a:b:c",
   ]);
 });
+
+test("共享 CLAUDE.md:主人格那份带省内存指引", () => {
+  const s = initialSharedClaudeMd("primary");
+  assert.match(s, /## 省内存地写命令/);
+  // 具体上限不在这里写死 —— 它由系统提示词按实际装配给出。这份是人手可改的文件,
+  // 在这里写"700m"会在改了 compose 之后变成一句假话,而没人会想起来同步它。
+  assert.doesNotMatch(s, /700m/);
+});
+
+test("共享 CLAUDE.md:守护人格那份不带 —— 它不干重活,那份刻意只写风格", () => {
+  assert.doesNotMatch(initialSharedClaudeMd("rescue"), /省内存/);
+});
