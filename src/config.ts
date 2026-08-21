@@ -101,8 +101,35 @@ export interface Config {
   ackEnabled: boolean;
   /** 是否把思考/工具调用过程转发给用户。 */
   progressEnabled: boolean;
-  /** 告诉 agent 从容器内怎么访问本进程的 HTTP 接口。 */
+  /**
+   * 告诉 agent 怎么访问本进程的 HTTP 接口。
+   *
+   * ⚠️ **这个值的正确答案取决于 agent 跑在哪儿**,而 2026-08-21 会话容器化把它改了。
+   *
+   * 原来 agent 就在本进程里,所以 `127.0.0.1:<port>` 是对的。现在每个回合跑在
+   * **自己的容器**里,`127.0.0.1` 指向那个容器自己 —— 什么都没有。实测:
+   *
+   *     http://127.0.0.1:8787/api/health   → HTTP 000(连不上)
+   *     http://catman:8787/api/health      → HTTP 401(通了,401 是正常鉴权响应)
+   *
+   * 而且这**不只影响 catman-notify** —— `catman-settings`/`catman-admin`/`catman-cron`
+   * 这几个 skill 教着调的 `/api/me`、`/api/me/cron`、`/api/admin` 全都打在自己身上,
+   * 静默失败。因为那阵子只在做自我进化,没碰那些功能,所以一直没暴露。
+   *
+   * 所以默认值改成按**容器名**寻址(见 `containerName`):docker 的内嵌 DNS 在
+   * 用户自定义网络上解析容器名,而两个人格各自的容器名是确定的。容器名寻址在
+   * **本进程内部也通**(容器解析得了自己的名字),于是两种模式下同一个值都对。
+   */
   apiBase: string;
+  /**
+   * 本进程所在容器的名字。默认按人格给(`catman` / `catman-rescue`),与 compose
+   * 里的 `container_name` 对应。
+   *
+   * 单独一个配置项而不是写死:它是 `apiBase` 默认值的来源,而一旦这台机器的
+   * compose 改了容器名,症状是**所有 skill 的 API 调用静默失败** —— 那时候
+   * 要有一个地方能改回来,而不必去改代码。
+   */
+  containerName: string;
   /** 单张图片的原始字节上限,超过就拒收(不缩图 —— 运行时没有图像库)。 */
   maxImageBytes: number;
   /** 一条消息最多内联几张图。 */
@@ -195,6 +222,9 @@ export function loadConfig(): Config {
   // 而部署报告、release 指针、信使队列都在主 /data 里,只读)。
   const mainDataDir = str("CATMAN_MAIN_DATA_DIR", dataDir);
   const dashboardPort = num("CATMAN_DASHBOARD_PORT", 8787);
+  const persona: Persona = process.env.CATMAN_PERSONA === "rescue" ? "rescue" : "primary";
+  // 容器名默认按人格给 —— 与 compose 里的 container_name 一一对应。
+  const containerName = str("CATMAN_CONTAINER_NAME", persona === "rescue" ? "catman-rescue" : "catman");
   return {
     dataDir,
     workspaceDir: str("CATMAN_WORKSPACE_DIR", `${dataDir}/workspace`),
@@ -215,7 +245,9 @@ export function loadConfig(): Config {
     modelAllowlist: list("CATMAN_MODEL_ALLOWLIST", ["opus", "sonnet", "haiku"]),
     ackEnabled: bool("CATMAN_ACK", true),
     progressEnabled: bool("CATMAN_PROGRESS", true),
-    apiBase: str("CATMAN_API_BASE", `http://127.0.0.1:${dashboardPort}`),
+    // 默认按容器名寻址,不再用 127.0.0.1 —— 见 Config.apiBase 上面那段。
+    apiBase: str("CATMAN_API_BASE", `http://${containerName}:${dashboardPort}`),
+    containerName,
     maxImageBytes: num("CATMAN_MAX_IMAGE_BYTES", 3_500_000),
     maxImagesPerTurn: num("CATMAN_MAX_IMAGES_PER_TURN", 4),
     messageAggregationMs: num("CATMAN_MESSAGE_AGGREGATION_MS", 1500),
@@ -234,7 +266,7 @@ export function loadConfig(): Config {
     ipcSocketPath: str("CATMAN_IPC_SOCKET", `${mainDataDir}/ipc/courier.sock`),
     ipcSecret: process.env.CATMAN_IPC_SECRET || undefined,
     rescueStatusPort: num("CATMAN_RESCUE_STATUS_PORT", 8789),
-    persona: process.env.CATMAN_PERSONA === "rescue" ? "rescue" : "primary",
+    persona,
     adminUserKeys: list("CATMAN_ADMIN_USER_KEYS", []),
     mainDataDir,
     hostDataDir: process.env.CATMAN_HOST_DATA_DIR || undefined,

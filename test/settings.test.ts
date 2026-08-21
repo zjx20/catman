@@ -178,3 +178,37 @@ test("图片上限:坏值只让这一项回落,不波及别的项", () => {
   assert.equal(eff.maxImagesPerTurn, 4, "坏值应回落到 env 基线");
   assert.equal(eff.maxImageBytes, 2_000_000, "同一份文件里的别的项不受影响");
 });
+
+test("apiBase 默认按容器名寻址,不是 127.0.0.1", () => {
+  // 2026-08-21 会话容器化之后,127.0.0.1 对 agent 是错的 —— 每个回合跑在自己的
+  // 容器里,127.0.0.1 指向那个容器自己。实测 HTTP 000 连不上,而 http://catman:8787
+  // 是 401(正常鉴权响应)。受影响的不只 catman-notify,还有 catman-settings /
+  // catman-admin / catman-cron 教着调的那些 API —— 它们会**静默失败**。
+  const saved = { ...process.env };
+  try {
+    delete process.env.CATMAN_API_BASE;
+    delete process.env.CATMAN_PERSONA;
+    delete process.env.CATMAN_DASHBOARD_PORT;
+    assert.equal(loadConfig().apiBase, "http://catman:8787");
+
+    // 两个人格各自寻址自己的容器,别串台。
+    process.env.CATMAN_PERSONA = "rescue";
+    process.env.CATMAN_DASHBOARD_PORT = "8788";
+    assert.equal(loadConfig().apiBase, "http://catman-rescue:8788");
+  } finally {
+    for (const k of Object.keys(process.env)) delete process.env[k];
+    Object.assign(process.env, saved);
+  }
+});
+
+test("容器名可以被环境覆盖 —— compose 改了名字得有地方改回来", () => {
+  const saved = { ...process.env };
+  try {
+    delete process.env.CATMAN_API_BASE;
+    process.env.CATMAN_CONTAINER_NAME = "别的名字";
+    assert.match(loadConfig().apiBase, /^http:\/\/别的名字:/);
+  } finally {
+    for (const k of Object.keys(process.env)) delete process.env[k];
+    Object.assign(process.env, saved);
+  }
+});
