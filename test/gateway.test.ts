@@ -171,6 +171,11 @@ class FakeAgent {
       this.fed.push({ prompt: feedPrompt, attachments: feedAttachments });
       return true;
     });
+    // 真实 SDK 的 session_id 随**第一条**消息就到,远早于任何工具调用 ——
+    // 假件必须照做,否则"回合中途死掉时 id 已经到手了"这个前提在测试里不成立,
+    // 而那正是要验的东西。
+    const sessionId = opts.resumeSessionId ?? this.nextSessionId ?? `sess-${++this.n}`;
+    opts.onSessionId?.(sessionId);
     try {
       // abort 会打断正在跑的回合,而不是等它跑完 —— 如实模拟 SDK 的行为。
       if (this.gate) await Promise.race([this.gate, rejectOnAbort(opts.abortController)]);
@@ -179,7 +184,6 @@ class FakeAgent {
         opts.onProgress?.(ev);
       }
       if (this.fail) throw new Error("agent boom");
-      const sessionId = opts.resumeSessionId ?? this.nextSessionId ?? `sess-${++this.n}`;
       if (this.replyIsError) {
         return { text: "Credit balance is too low", sessionId, isError: true };
       }
@@ -1962,9 +1966,13 @@ test("后台回合报错时,错误说明也要标明出处", async () => {
 
   const err = channel.sent.find((m) => m.text.includes("处理出错了"));
   assert.ok(err, `报错要送到用户那儿,实际:${JSON.stringify(channel.sent.map((m) => m.text))}`);
-  // 这一轮是新会话的首轮、又抛错告终,sessionId 压根还没存在过 ——
-  // 出处照说,切回的指令给不出就不给。
-  assert.ok(err.text.startsWith("【后台对话的结果】"), `实际:${err.text}`);
+  // 2026-08-21 改:这里原来断言的是「【后台对话的结果】」(不带 id),理由写着
+  // "新会话的首轮抛错,sessionId 压根还没存在过"。**那个前提是错的** ——
+  // sessionId 随第一条 SDK 消息就到,远早于任何工具调用,只是从前没往外传。
+  // 同一个错误认知让被中止的会话再也接不上(见「回合被中止:会话仍要记下来」),
+  // 修好之后这里顺带也能给出切回的指令了。
+  assert.ok(err.text.startsWith("【后台对话 sess-1 的结果】"), `实际:${err.text}`);
+  assert.match(err.text, /切换会话 sess-1/, "id 有了就该告诉用户怎么切回去");
 });
 
 test("后台回合报错:resume 的那轮报得出会话 id", async () => {
@@ -2452,4 +2460,56 @@ test("普通用户的帮助文案里没有部署指令,管理员的有", async (
   await channel.receive(U2, "/帮助");
   const withAdmin = channel.sent.map((m) => m.text).join("\n");
   assert.equal(withAdmin.includes(canonicalOf("rollback")), true);
+});
+
+/**
+ * 2026-08-21 真机 bug:内存看门狗中止了某人会话的**第一个**回合,他说"再试试",
+ * 大脑答「I don't have the prior context — the earlier part got cut off」。
+ *
+ * 而我们刚刚才在中止通知里跟他说过「会话没丢,接着说就行」。
+ *
+ * 盘上的记录一直是好的(实测那份 15 条对话条目,每个 tool_use 都有配对的
+ * tool_result,尾巴停在合法的 resume 点上)—— 缺的只是**谁记得它的 id**:
+ * `record()` 排在 `Agent.run()` 返回之后,而回合是抛错告终的,永远走不到。
+ * 于是那段对话在盘上完好无损却再也没人指得到。
+ */
+test("回合被中止:会话仍要记下来,下一句话能接上", async () => {
+  const t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  agent.nextSessionId = "sess-被中止的那段";
+  agent.gate = new Promise<void>(() => {}); // 永不放行,只能靠 abort 打断
+
+  const stuck = channel.receive(U1, "帮我调研一件很费内存的事");
+  await new Promise((r) => setImmediate(r));
+  await channel.receive(U1, "/取消");
+  await stuck;
+
+  // 关键断言:下一句话必须 resume 到那一段,而不是开一个全新会话。
+  agent.gate = undefined;
+  await channel.receive(U1, "再试试");
+  const last = agent.calls.at(-1);
+  assert.equal(
+    last?.resume,
+    "sess-被中止的那段",
+    "回合死了但会话没死 —— 不接上的话,那句「会话没丢」就是假话",
+  );
+});
+
+test("回合被中止:被切走的回合写 history,不能顶掉用户刚切过去的那段", async () => {
+  // 与成功路径同一条纪律。分岔写错的话,用户切到别的会话正说着话,
+  // 后台那个死掉的回合会把 current 覆盖成自己 —— 比不记还糟。
+  const t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  agent.nextSessionId = "sess-后台";
+  const open = stuckTurn(agent);
+
+  const stuck = channel.receive(U1, "跑个长任务");
+  await new Promise((r) => setImmediate(r));
+  await channel.receive(U1, "/新会话"); // 把它切走 → detached
+  open(); // 放它跑完(detached 的回合不会被 /新会话 杀掉,只是转后台)
+  await stuck;
+
+  await channel.receive(U1, "新会话里说话");
+  const last = agent.calls.at(-1);
+  assert.notEqual(last?.resume, "sess-后台", "后台那段不该顶掉当前会话");
 });

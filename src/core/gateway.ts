@@ -1574,6 +1574,9 @@ export class Gateway {
 
     const isAdmin = this.settings.isAdmin(userKey);
     const hint = sessionHint(text, attachments.length > 0);
+    // 回合一开始就拿得到的 sessionId。**存在的全部理由是抛错那条路** ——
+    // 成功时用 reply.sessionId 就够了,而抛错时 reply 根本不存在。
+    let observedSessionId: string | undefined;
     const pre = { cwd };
 
     // 进度消息串行链:保证按事件产生顺序逐条发送,最终回复排在链尾之后。
@@ -1630,6 +1633,11 @@ export class Gateway {
         // 而"系统对这个回合做了什么"是不该被那个开关埋掉的。
         onNotice: (text: string) => {
           void this.trySend(userKey, this.labelIfDetached(turn.ctx, undefined, text), "看门狗");
+        },
+        // 只是记在手边,**不在这里写盘** —— 回合还可能被切走(detached),
+        // 那时该写 history 而不是 current,而那个判断要等 finally 才作数。
+        onSessionId: (id) => {
+          observedSessionId = id;
         },
         onProgress,
         logLabel: userKey,
@@ -1703,18 +1711,32 @@ export class Gateway {
         this.lastMemAbort.set(userKey, memAbort);
         this.memAbortStreak.set(userKey, (this.memAbortStreak.get(userKey) ?? 0) + 1);
       }
+      // **把这段会话记下来,哪怕这一轮是死的。**
+      // 记录本身在盘上是完好的(实测:被 docker kill 的那次,15 条对话条目里每个
+      // tool_use 都有配对的 tool_result,尾巴停在一个合法的 resume 点上)——
+      // 缺的只是"谁记得它的 id"。不记的话用户下一句话会开一个全新会话,而我们
+      // 刚刚才跟他说过「会话没丢,接着说就行」。
+      //
+      // 分岔与成功路径**必须一致**:被切走的回合写 history,否则会把用户刚切过去
+      // 的那段顶掉,而他正在跟它说话。
+      if (observedSessionId) {
+        if (turn.ctx.detached) this.sessions.archiveTurn(userKey, observedSessionId, hint);
+        else this.sessions.record(userKey, observedSessionId, hint);
+      }
       console.error(`[gateway] 处理 ${userKey} 消息失败:`, err);
       await progress;
       // 错误说明与正文同样要标出处 —— 后台回合报错时用户多半正在跟另一段对话
       // 说话,一句没头没尾的「处理出错了」会被当成当前对话的答复(这正是
       // labelIfDetached 存在的理由)。回合是抛错告终的,没有 reply 可问 sessionId:
-      // resume 的用 decide() 给的那个(SDK resume 不 fork,id 稳定),新会话的
-      // 则连 id 都还没有,只说清是后台的、切不回去。
+      // 出处优先用**实际观测到的** id:它从第一条 SDK 消息就有了。
+      // (这里从前写着"新会话的则连 id 都还没有" —— 那句是错的,id 一直都在,
+      // 只是没往外传。这个错误判断正是上面那个 bug 的来源。)
+      // 观测不到才退回 decide() 给的那个(SDK resume 不 fork,id 稳定)。
       await this.trySend(
         userKey,
         this.labelIfDetached(
           turn.ctx,
-          decision.isNew ? undefined : decision.resumeSessionId,
+          observedSessionId ?? (decision.isNew ? undefined : decision.resumeSessionId),
           turn.ctx.abort.signal.aborted
             // 分辨中止原因。光秃秃一句「已中断这一轮」在真机上被证明是不够的:
             // 用户按了 /取消、超时、崩了、内存看门狗动手 —— 四种措辞一模一样,

@@ -182,6 +182,15 @@ export interface AgentRunOptions {
    * 而那恰恰是最该让他知道的一类消息。
    */
   onNotice?: (text: string) => void;
+  /**
+   * 一拿到 sessionId 就喊一声(第一条 SDK 消息就带,远早于任何工具调用)。
+   *
+   * 存在的理由只有一个:**回合抛错时 `run()` 的返回值拿不到了**,而 sessionId
+   * 恰好是那时最需要的东西 —— 没有它,被中止的那段对话在盘上完好无损却再也没人
+   * 指得到,用户下一句话会开一个全新会话。真机上发生过:内存看门狗中止了某人
+   * 会话的**第一个**回合,他说"再试试",大脑答"我没有之前的上下文"。
+   */
+  onSessionId?: (id: string) => void;
 }
 
 /**
@@ -534,7 +543,11 @@ export class Agent {
       for await (const message of q) {
         // 每条消息都带 session_id;新会话时从这里捕获。
         if ("session_id" in message && message.session_id) {
-          sessionId = message.session_id;
+          if (message.session_id !== sessionId) {
+            sessionId = message.session_id;
+            // 只在变化时喊 —— 每条消息都带这个字段,无条件回调等于每条消息写一次盘。
+            opts.onSessionId?.(sessionId);
+          }
         }
 
         const line = describeSdkMessage(message);
