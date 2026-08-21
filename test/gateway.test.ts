@@ -954,7 +954,15 @@ test("/取消 中断在飞回合,用户收到交代", async () => {
 
   await channel.receive(U1, "/取消");
   await stuck; // abort 让回合抛错,由既有的错误分支收尾
-  assert.ok(channel.sent.some((m) => m.text === "已中断这一轮。"));
+  // 2026-08-21 起这句话按中止原因分岔:用户按 /取消 走"按你的要求"那一支,
+  // 内存看门狗动手走另一支。原来一律是「已中断这一轮。」,分不清是谁干的 ——
+  // 而这两种用户该做的事恰好相反(取消了就重发,内存中止重发还会死)。
+  const cancelMsg = channel.sent.find((m) => /中断这一轮|按你的要求/.test(m.text));
+  assert.ok(cancelMsg, "用户主动取消后要有交代");
+  assert.match(cancelMsg!.text, /按你的要求/, "别把用户主动取消说得像出了故障");
+  assert.doesNotMatch(cancelMsg!.text, /内存/, "这不是内存中止,别乱扣帽子");
+  // 每一种中止都要告诉用户会话还在 —— 否则他会重开会话,那才真的丢上下文。
+  assert.match(cancelMsg!.text, /会话没丢/);
 });
 
 test("/取消:没有在飞回合时如实说明", async () => {
