@@ -226,3 +226,26 @@ export function sessionContainerName(userKey: string, turnId: string): string {
 
 /** 附件不进容器 —— 它们是 SDK 侧内联进消息的,与容器无关。这里只是把类型钉住。 */
 export type _AttachmentsStayOutside = Attachment;
+
+/**
+ * 挑出该回收的孤儿会话容器。
+ *
+ * 会话容器带 `--rm`,正常退出时 docker 自己清掉。但**有两条路会留下孤儿**:
+ * catman 被换版本/杀掉时,那些 `docker run` 客户端一起没了,而容器不随客户端死
+ * (实测:SIGKILL 掉客户端,容器 Up 3s → Up 7s 照跑);dockerd 自己重启也一样。
+ *
+ * 这里唯一致命的错是**把还在跑的那个删掉** —— 症状是"助手忽然不回话了",
+ * 而且完全看不出跟回收有关。所以判据保守到两条同时成立:
+ *   ① 不在活跃名单里(catman 记得自己起了哪些)
+ *   ② 而且**足够老** —— 刚起来还没来得及登记的那个,不能碰
+ */
+export function orphanSessionContainers(
+  running: ReadonlyArray<{ name: string; startedMsAgo: number }>,
+  alive: ReadonlySet<string>,
+  minAgeMs: number = 10 * 60 * 1000,
+): string[] {
+  return running
+    .filter((c) => !alive.has(c.name))
+    .filter((c) => c.startedMsAgo > minAgeMs)
+    .map((c) => c.name);
+}

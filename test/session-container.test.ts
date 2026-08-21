@@ -7,6 +7,7 @@ import {
   buildSessionRunArgs,
   buildWrapperScript,
   claudePathIn,
+  orphanSessionContainers,
   sessionContainerName,
   staleWrappers,
   WRAPPER_TTL_MS,
@@ -225,4 +226,28 @@ test("清扫包装脚本:只删够老的,而且只认自己的前缀", () => {
 test("清扫的 TTL 要够长 —— 回合跑几小时是正常的", () => {
   // 短 TTL 会在长回合跑到一半时把它的脚本删掉。12 小时是刻意的余量。
   assert.ok(WRAPPER_TTL_MS >= 12 * 60 * 60 * 1000);
+});
+
+test("孤儿回收:不在名单里**而且**够老的才删", () => {
+  // 唯一致命的错是把还在跑的那个删掉 —— 症状是"助手忽然不回话了",
+  // 而且完全看不出跟回收有关。所以两条判据必须同时成立。
+  const got = orphanSessionContainers(
+    [
+      { name: "catman-session-a", startedMsAgo: 30 * 60_000 }, // 孤儿且老 → 删
+      { name: "catman-session-b", startedMsAgo: 30 * 60_000 }, // 在名单里 → 留
+      { name: "catman-session-c", startedMsAgo: 5_000 },       // 刚起来,可能还没登记 → 留
+    ],
+    new Set(["catman-session-b"]),
+  );
+  assert.deepEqual(got, ["catman-session-a"]);
+});
+
+test("孤儿回收:活跃名单为空时也不碰新起的", () => {
+  // catman 刚重启、名单还是空的那一刻最危险 —— 这时候"不在名单里"对所有容器
+  // 都成立,只剩年龄这一条防线。
+  const got = orphanSessionContainers(
+    [{ name: "catman-session-x", startedMsAgo: 5_000 }],
+    new Set(),
+  );
+  assert.deepEqual(got, []);
 });

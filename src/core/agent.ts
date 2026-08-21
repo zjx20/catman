@@ -253,6 +253,21 @@ export class InputChannel {
 }
 
 /**
+ * 已知无害、每回合都会出现的 stderr。
+ *
+ * stderr 是 SDK 报错的唯一去处,所以 agent.ts 无条件转发它 —— 那条设计依赖
+ * "正常回合一个字都不输出"。会话容器化之后 docker 每次都吐一句 swap 告警,
+ * 这条性质就没了:一条固定噪音会把真正的错误淹掉(与双 tini 那三行同一个坑)。
+ *
+ * 只滤**已知的这一条**,其余照旧放行 —— 宁可多看几行,不可把没见过的错误藏起来。
+ * (那句告警本身无害:宿主 SwapTotal=0,"只管 RAM"就等于管住一切,
+ * 实测内存炸弹照样 2 秒被 OOM 掉。)
+ */
+function isBenignStderr(line: string): boolean {
+  return /kernel does not support swap limit/i.test(line);
+}
+
+/**
  * 清扫过期的包装脚本。失败一律吞掉 —— 清理不该把回合带走。
  */
 function sweepStaleWrappers(tmpDir: string): void {
@@ -423,7 +438,8 @@ export class Agent {
         // 一旦有内容就正是要找的东西。
         stderr: (data: string) => {
           const line = data.trim();
-          if (line) console.warn(`${tag} stderr: ${line.slice(0, 2000)}`);
+          if (!line || isBenignStderr(line)) return;
+          console.warn(`${tag} stderr: ${line.slice(0, 2000)}`);
         },
       },
     });

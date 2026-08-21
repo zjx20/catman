@@ -38,7 +38,14 @@ import { SETTING_SCHEMA, USER_SETTING_KEYS } from "./settings.js";
 import { skillsFor } from "./skills.js";
 import { readVersion, shortSha, versionLine, type VersionInfo } from "./version.js";
 import type { DeployControl } from "./deploy.js";
-import { abortNoticeText, priorAbortPrefix, readMemAbort, type MemAbortInfo } from "./mem-watchdog.js";
+import {
+  abortNoticeText,
+  circuitTripText,
+  circuitTripped,
+  priorAbortPrefix,
+  readMemAbort,
+  type MemAbortInfo,
+} from "./mem-watchdog.js";
 import { formatDeployReport } from "./deploy-report.js";
 import { formatDeployProgress } from "./deploy-progress.js";
 import type { SendKind } from "../ipc/protocol.js";
@@ -528,6 +535,11 @@ export class Gateway {
    * 大脑不至于完全没线索。
    */
   private readonly lastMemAbort = new Map<string, MemAbortInfo>();
+  /**
+   * 同一会话**连续**被内存中止了几次。成功一次就清零 —— 断路器数的是连续,
+   * 不是累计;累计的话跑久了迟早误跳,而那时用户什么错都没犯。
+   */
+  private readonly memAbortStreak = new Map<string, number>();
   private readonly admission: AdmissionPolicy;
   private readonly sessionExists: ((userKey: string, sessionId: string) => boolean) | undefined;
   private readonly now: () => number;
@@ -1671,6 +1683,9 @@ export class Gateway {
       //   已被切走 → archiveTurn() 只更新 history —— 写 current 会把用户
       //     刚切过去的那段顶掉,而他正在跟它说话。
       this.lastTurn = { at: this.now(), isError: reply.isError };
+      // 回合跑到这儿就是没被内存中止 —— 断路器的连续计数清零。
+      // **不清零的话它只增不减**,跑久了迟早误跳,而那时用户什么错都没犯。
+      this.memAbortStreak.delete(userKey);
       if (turn.ctx.detached) this.sessions.archiveTurn(userKey, reply.sessionId, hint);
       else this.sessions.record(userKey, reply.sessionId, hint);
       await progress;
@@ -1684,7 +1699,10 @@ export class Gateway {
       // 用户主动中断不算"回合出错":把 /取消 记成失败会让观测数据长期偏红。
       if (!turn.ctx.abort.signal.aborted) this.lastTurn = { at: this.now(), isError: true };
       const memAbort = readMemAbort(turn.ctx.abort.signal.reason);
-      if (memAbort) this.lastMemAbort.set(userKey, memAbort);
+      if (memAbort) {
+        this.lastMemAbort.set(userKey, memAbort);
+        this.memAbortStreak.set(userKey, (this.memAbortStreak.get(userKey) ?? 0) + 1);
+      }
       console.error(`[gateway] 处理 ${userKey} 消息失败:`, err);
       await progress;
       // 错误说明与正文同样要标出处 —— 后台回合报错时用户多半正在跟另一段对话
@@ -1703,7 +1721,11 @@ export class Gateway {
             // 而该做的事完全不同。内存那种尤其要紧,因为默认反应"再发一遍"
             // 恰恰是错的。每一种都补一句「会话没丢」,否则用户会重开会话,
             // 而那才是真的把上下文丢了。
-            ? abortNoticeText(readMemAbort(turn.ctx.abort.signal.reason))
+            // 连续中止到达阈值就换一套话:单次那条说"换个问法再来",而这时候
+            // 已经证明换问法没用,问题在任务本身。
+            ? (memAbort && circuitTripped(this.memAbortStreak.get(userKey) ?? 0)
+                ? circuitTripText(this.memAbortStreak.get(userKey) ?? 0, memAbort.limit)
+                : abortNoticeText(memAbort))
             : `处理出错了:${(err as Error).message}`,
         ),
         "错误说明",

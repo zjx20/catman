@@ -147,7 +147,10 @@ export function warnText(ratio: number, limit: string, step: string | undefined)
   const pct = Math.round(ratio * 100);
   const what = step ? `当前正在跑:${step}。` : "";
   return (
-    `⚠️ 内存看门狗:这一回合的容器内存已用到上限的 ${pct}%(上限 ${limit})。${what}` +
+    // 同时给**档位名**和**实测值**:轮询 1 秒一次而分配可以很快,实测出现过
+    // 「anon 到 88%,喂警告」这种 —— 走的是 80% 那一档,但数字是 88,
+    // 看日志的人会以为逻辑错了。两个都给就不会误读。
+    `⚠️ 内存看门狗:越过 80% 档(实测 ${pct}%,上限 ${limit})。${what}` +
     `再涨到 90% 我会杀掉当前那条命令,95% 会中止整个回合。` +
     `请立刻换一个省内存的做法 —— 大文件走流式管道、别把几百 MB 的输出捞进内存。`
   );
@@ -165,7 +168,7 @@ export function killNoticeText(ratio: number, victim: string | undefined): strin
   const pct = Math.round(ratio * 100);
   const who = victim ? `(${victim})` : "";
   return (
-    `⛔ 内存看门狗:内存已到上限的 ${pct}%,我正在杀掉当前占用最大的那个进程${who}。` +
+    `⛔ 内存看门狗:越过 90% 档(实测 ${pct}%),我正在杀掉当前占用最大的那个进程${who}。` +
     `它会以 137 退出 —— 那不是命令本身出错,是被杀了。**不要原样重试**,换个省内存的做法。`
   );
 }
@@ -227,9 +230,9 @@ export function abortNoticeText(mem: MemAbortInfo | undefined): string {
 /** 80%/90% 两档给**用户**看的简短提示。跟喂给大脑的那条不同 —— 用户要的是"发生了什么"。 */
 export function userNoticeText(kind: "warn" | "kill-process", pct: number, victim?: string): string {
   if (kind === "warn") {
-    return `⚠️ 这一回合内存到了上限的 ${pct}%,我正在让它换个省内存的做法。回合继续。`;
+    return `⚠️ 这一回合内存越过 80% 档(实测 ${pct}%),我正在让它换个省内存的做法。回合继续。`;
   }
-  return `⛔ 内存到 ${pct}%,我杀掉了那条最吃内存的命令${victim ? `(${victim})` : ""}。回合继续。`;
+  return `⛔ 内存越过 90% 档(实测 ${pct}%),我杀掉了那条最吃内存的命令${victim ? `(${victim})` : ""}。回合继续。`;
 }
 
 /**
@@ -247,5 +250,38 @@ export function priorAbortPrefix(mem: MemAbortInfo): string {
   return (
     `(系统提示:上一回合因内存超限被中止 —— 用到了上限 ${mem.limit} 的 ${mem.pct}%${where}。` +
     `transcript 末尾那个没有结果的工具调用就是它。**同样的做法会再死一次**,换个省内存的路子。)\n\n`
+  );
+}
+
+/**
+ * 断路器:同一会话连续被内存中止几次就不再自动恢复。
+ *
+ * 为什么要有它:回合被中止后,用户很可能只回一句"继续"。前情注入能挡住一部分,
+ * 但挡不住"这件事本身就做不成"的情况 —— 比如他要的东西天生就得吃 2GB。
+ * 那样一来每一轮都是**中止 → 继续 → 再中止**,烧订阅额度、刷屏、而且永远出不来。
+ *
+ * 阈值取 2 而不是 3:第一次是意外,第二次就说明不是运气问题了。三次的代价
+ * (多烧一个回合、多等几分钟)换不来更多信息。
+ */
+export const CIRCUIT_TRIP_AT = 2;
+
+/** 断路器该不该跳闸。`consecutive` 是**连续**次数 —— 中间成功一次就得清零。 */
+export function circuitTripped(consecutive: number): boolean {
+  return consecutive >= CIRCUIT_TRIP_AT;
+}
+
+/**
+ * 跳闸时对用户说的话。
+ *
+ * 与单次中止的措辞刻意不同:那条说"换个问法再来",这条说"别再来了,先想清楚" ——
+ * 因为已经证明换个说法没用,问题在任务本身。
+ */
+export function circuitTripText(consecutive: number, limit: string): string {
+  return (
+    `🛑 这个会话连续 ${consecutive} 次因内存超限被中止(上限 ${limit})。` +
+    `再试大概率还是一样 —— 问题多半在任务本身,不在问法。\n\n` +
+    `建议换个思路:把大文件的处理拆成分段、或者让我起一个**独立容器**去跑那件重活` +
+    `(那样它有自己的内存上限,不占这个回合的额度)。` +
+    `**会话没丢**,想好了接着说就行。`
   );
 }
