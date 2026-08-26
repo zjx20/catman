@@ -8,6 +8,7 @@ import {
   handleNotifyApi,
   isNotifyApiPath,
   NotifyRateLimiter,
+  paginateNotify,
   type NotifyApiDeps,
 } from "../src/dashboard/api-notify.js";
 
@@ -92,12 +93,66 @@ test("只收 POST", async () => {
   assert.equal(r.status, 405);
 });
 
-test("超长正文截断而不是拒收 —— 目的是让消息到达", async () => {
+test("正文不长就一条,不加页码 —— 绝大多数推送是一句话", () => {
+  const pages = paginateNotify("跑完了");
+  assert.deepEqual(pages, ["跑完了"]);
+});
+
+test("超一页就分页,每页都装得下,且顺序发出去", async () => {
   const s = setup();
-  const r = await s.post({ text: "长".repeat(5000) }, s.mine);
+  // 2500 字符:一页装不下,两页绰绰有余。
+  const r = await s.post({ text: "长".repeat(2500) }, s.mine);
   assert.equal(r.status, 200);
-  assert.ok(s.sent[0]!.text.length < 2100);
-  assert.ok(s.sent[0]!.text.endsWith("(太长,后面截掉了)"));
+  assert.equal(r.body.pages, 2);
+  assert.equal(s.sent.length, 2);
+  for (const m of s.sent) assert.ok(m.text.length <= 2000, `这一页 ${m.text.length} 字符,超了`);
+  assert.ok(s.sent[0]!.text.endsWith("(第 1/2 页)"));
+  assert.ok(s.sent[1]!.text.endsWith("(第 2/2 页)"));
+  // 没有截断标记 —— 三页以内不该丢东西。
+  for (const m of s.sent) assert.ok(!m.text.includes("太长,后面截掉了"));
+});
+
+test("超过三页才截断,标记留在最后一页 —— 那句话外部在依赖", async () => {
+  const s = setup();
+  const r = await s.post({ text: "长".repeat(20000) }, s.mine);
+  assert.equal(r.status, 200);
+  assert.equal(r.body.pages, 3);
+  assert.equal(s.sent.length, 3);
+  for (const m of s.sent) assert.ok(m.text.length <= 2000, `这一页 ${m.text.length} 字符,超了`);
+  assert.ok(!s.sent[0]!.text.includes("太长,后面截掉了"));
+  assert.ok(s.sent[2]!.text.includes("(太长,后面截掉了)"));
+});
+
+test("按换行切页,不把一行劈成两半", () => {
+  // 每行 100 字符,共 40 行:切点应当落在换行处。
+  const line = "x".repeat(99);
+  const pages = paginateNotify(Array.from({ length: 40 }, () => line).join("\n"));
+  assert.ok(pages.length >= 2);
+  for (const p of pages) {
+    const body = p.replace(/\n\n\(第 \d+\/\d+ 页\)$/, "");
+    for (const l of body.split("\n")) {
+      assert.ok(l === "" || l.length === 99, `切出了半行(${l.length} 字符)`);
+    }
+  }
+});
+
+test("分页按页数计费,不是按调用次数 —— 否则分页就成了绕过限流的口子", async () => {
+  const s = setup(new NotifyRateLimiter(4, 60_000));
+  // 这一条要发 3 页,吃掉 3 格。
+  assert.equal((await s.post({ text: "长".repeat(20000) }, s.mine)).status, 200);
+  assert.equal(s.sent.length, 3);
+  // 还剩 1 格:一页的过得去。
+  assert.equal((await s.post({ text: "短" }, s.mine)).status, 200);
+  assert.equal((await s.post({ text: "再来" }, s.mine)).status, 429);
+});
+
+test("额度不够发完整篇就整条拒收,不做半截投递", async () => {
+  const s = setup(new NotifyRateLimiter(2, 60_000));
+  const r = await s.post({ text: "长".repeat(20000) }, s.mine);
+  assert.equal(r.status, 429);
+  assert.ok(String(r.body.error).includes("3 条"));
+  // 一页都不该漏出去 —— 收到前两页、第三页永远不来比全不来更难查。
+  assert.equal(s.sent.length, 0);
 });
 
 test("限流:超额之后挡住,且 429 正文里带上被丢掉的那条", async () => {
