@@ -7,6 +7,7 @@ import { FileStore, readJsonFile } from "./core/file-store.js";
 import { Gateway } from "./core/gateway.js";
 import { UserRegistry, listWorkspaceDirs } from "./core/users.js";
 import { adminBaseline, initialSharedClaudeMd } from "./core/persona.js";
+import { ensureCronDataDir } from "./core/cron-data.js";
 import { TokenAlerter, readTokenExpiry } from "./core/token-alert.js";
 import { allowAll, type AdmissionPolicy } from "./core/admission.js";
 import { GlobalSettings } from "./core/settings.js";
@@ -89,6 +90,7 @@ async function main(): Promise<void> {
   const configDir = process.env.CLAUDE_CONFIG_DIR;
   mkdirSync(config.workspaceDir, { recursive: true });
   mkdirSync(configDir, { recursive: true });
+  ensureCronDataDir(config);
 
   // 配置三层由外到内装配:全局层要先建,每用户层拿它当默认值,会话层拿它算超时。
   const settings = new GlobalSettings({

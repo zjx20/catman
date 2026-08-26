@@ -49,6 +49,17 @@ export interface Config {
   dataDir: string;
   /** 助手执行命令时的工作目录。 */
   workspaceDir: string;
+  /**
+   * **定时任务的地盘**:状态与临时文件都放这儿,一个任务一个子目录。
+   *
+   * 与 `$CATMAN_DATA_DIR/tmp/` 的分界在**归属**而不是寿命 —— 那边是会话里脱钩
+   * 长任务的地盘、随时可以清;定时任务无人值守,东西被误清了没人当场发现,
+   * 所以连它的临时文件也圈在这边。
+   *
+   * 权限放 0777:`script` 类定时任务跑在独立容器里,uid 未必是 10001,
+   * 挂进去还得写得动。
+   */
+  cronDataDir: string;
   /** 会话状态文件路径(userKey→session 映射)。 */
   statePath: string;
   /** 账号注册表路径(含 bot_token,以 0600 落盘)。 */
@@ -228,6 +239,9 @@ export function loadConfig(): Config {
   return {
     dataDir,
     workspaceDir: str("CATMAN_WORKSPACE_DIR", `${dataDir}/workspace`),
+    // 跟着 mainDataDir 走而不是 dataDir:守护人格的 /data 是只读的,
+    // 它没有定时任务,也就不该在自己那份沙箱里凭空长出一个写不进去的目录。
+    cronDataDir: str("CATMAN_CRON_DATA_DIR", `${mainDataDir}/cron_data`),
     statePath: str("CATMAN_STATE_PATH", `${dataDir}/state.json`),
     accountsPath: str("CATMAN_ACCOUNTS_PATH", `${dataDir}/accounts.json`),
     usersPath: str("CATMAN_USERS_PATH", `${dataDir}/users.json`),
