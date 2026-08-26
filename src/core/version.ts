@@ -93,3 +93,20 @@ export function versionLine(v: VersionInfo | undefined): string {
   const branch = v.branch ? ` ${v.branch}` : "";
   return `版本:${shortSha(v.sha)}${branch}${when}`;
 }
+
+/**
+ * 给助手自己看的那行版本提示(**不是给用户看的**,措辞是第二人称)。
+ *
+ * 助手从前没有任何带内途径知道自己跑的是哪一份代码:`readVersion()` 的结果只喂了
+ * 部署控制面与健康检查,系统提示词里一个字都没有。于是它只能 shell 出去
+ * `readlink releases/current`,而"不知道自己不知道"恰好是想不起来查的原因。
+ *
+ * **带上旧 sha** 是刻意的:只说新值的话,读的人分不清这是"刚刚升级了"还是
+ * "一直就是这个",而这两者该做的事不一样(前者要留意刚上线的改动)。
+ */
+export function releaseNote(cur: VersionInfo, prev: string | undefined): string {
+  const now = shortSha(cur.sha);
+  if (!prev) return `你现在跑的是 release ${now}。`;
+  if (prev === cur.sha) return `你现在跑的是 release ${now}。`;
+  return `你现在跑的是 release ${now} —— 上次告诉你的时候还是 ${shortSha(prev)},中间升级过。`;
+}

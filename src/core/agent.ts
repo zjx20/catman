@@ -191,6 +191,13 @@ export interface AgentRunOptions {
    * 会话的**第一个**回合,他说"再试试",大脑答"我没有之前的上下文"。
    */
   onSessionId?: (id: string) => void;
+  /**
+   * 环境信息,挂在**首条**消息的末尾当独立 block(见 buildUserMessage)。
+   *
+   * 只给首条 —— 回合中途的追加输入(tryFeed)不重复,那是同一个回合、
+   * 同一份上下文,说第二遍只是噪音。
+   */
+  ambient?: string;
 }
 
 /**
@@ -203,6 +210,7 @@ export interface AgentRunOptions {
 export function buildUserMessage(
   prompt: string,
   attachments: readonly Attachment[],
+  ambient?: string,
 ): SDKUserMessage {
   const content: SDKUserMessage["message"]["content"] = attachments.map((a) => ({
     type: "image" as const,
@@ -210,6 +218,16 @@ export function buildUserMessage(
   }));
   // 空 text block 会被模型侧拒绝,所以只在真有文字时才加。
   if (prompt.trim()) content.push({ type: "text", text: prompt });
+  // 环境信息(如版本变了)挂在**最后一个独立 block**,不拼进用户那句话里。
+  //
+  // 两个理由,都吃过亏才知道:
+  // ① 拼进 text 会污染命令解析 —— 用户那句可能是 `/发布 abc1234`。
+  // ② 单独发一条消息则会被读成"用户说了句他没说的话"(InputChannel.push 收的是
+  //    SDKUserMessage,身份就是用户)。同一条消息里的另一个 block 才是环境信息
+  //    该有的形态。
+  if (ambient?.trim()) {
+    content.push({ type: "text", text: `<system-reminder>\n${ambient.trim()}\n</system-reminder>` });
+  }
 
   return {
     type: "user",
@@ -421,7 +439,7 @@ export class Agent {
 
     // 输入一律走常开通道(不再按有无附件分叉):回合中途的追加输入只有流式输入下才收得进。
     const input = new InputChannel();
-    input.push(buildUserMessage(prompt, attachments));
+    input.push(buildUserMessage(prompt, attachments, opts.ambient));
 
     const cwd = opts.cwd ?? this.config.workspaceDir;
     const boxed = this.prepareContainer(tag, cwd, opts.logLabel);

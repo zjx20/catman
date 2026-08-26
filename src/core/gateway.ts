@@ -36,7 +36,7 @@ import {
 } from "./commands.js";
 import { SETTING_SCHEMA, USER_SETTING_KEYS } from "./settings.js";
 import { skillsFor } from "./skills.js";
-import { readVersion, shortSha, versionLine, type VersionInfo } from "./version.js";
+import { readVersion, releaseNote, shortSha, versionLine, type VersionInfo } from "./version.js";
 import type { DeployControl } from "./deploy.js";
 import {
   abortNoticeText,
@@ -1622,8 +1622,10 @@ export class Gateway {
       // 它只对紧接着的那一条有意义,留着会在几轮之后冒出来把人搞糊涂。
       const prior = this.lastMemAbort.get(userKey);
       if (prior) this.lastMemAbort.delete(userKey);
+      const ambient = this.releaseNoteFor(userKey, decision.isNew);
       const reply = await this.agent.run(prior ? priorAbortPrefix(prior) + text : text, {
         cwd: pre.cwd,
+        ...(ambient ? { ambient } : {}),
         resumeSessionId: decision.isNew ? undefined : decision.resumeSessionId,
         ...(prefs.model ? { model: prefs.model } : {}),
         env: this.childEnv(isAdmin, turn.token, userKey),
@@ -1888,6 +1890,39 @@ export class Gateway {
    */
   async push(userKey: string, text: string, kind: SendKind): Promise<void> {
     await this.trySend(userKey, text, "定时任务播报", kind);
+  }
+
+  /**
+   * 该不该在这一回合告诉助手它跑的是哪个版本 —— **懒注入**。
+   *
+   * ## 为什么不推而是等
+   *
+   * 版本这条信息有两个"看起来更直接"的放法,都更糟:
+   *
+   * - **写进系统提示词**:那是缓存前缀。每次部署都改它,等于让所有会话各吃一次
+   *   cache miss —— 为一行元信息付这个价不值。(容器重启本身不破坏缓存:
+   *   前缀内容没变,哈希就没变。真正打掉缓存的是改前缀这个动作。)
+   * - **部署完成时主动推一条**:那就得回答"这个会话还活着吗""要不要为一句通告
+   *   开一个新会话"。后者尤其糟,助手醒在一个没有任何用户意图的会话里,
+   *   第一反应是"我为什么在这儿"。
+   *
+   * 等到下一回合再顺路带上,这两个问题都不存在:静默的会话压根不触发,
+   * 所以**根本不需要判断它是否静默** —— 省掉的不是几行代码,是一整类边界条件。
+   *
+   * ## 两种该说的情形
+   *
+   * - 版本变了(部署过)。
+   * - 会话是新的:那是一份全新的上下文,它同样不知道版本,而系统提示词里没有。
+   *
+   * 其余情况一律沉默 —— 绝大多数回合走的是这条,增量为零。
+   */
+  private releaseNoteFor(userKey: string, isNew: boolean): string | undefined {
+    const cur = this.version;
+    // 开发模式没有版本戳。编一个会让"跑的是哪份代码"这句话变成假话,不如不说。
+    if (!cur) return undefined;
+    if (!isNew && this.sessions.hasSeenRelease(userKey, cur.sha)) return undefined;
+    const prev = this.sessions.markReleaseSeen(userKey, cur.sha);
+    return releaseNote(cur, prev);
   }
 
   private async trySend(

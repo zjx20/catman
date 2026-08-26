@@ -36,6 +36,15 @@ export interface UserState {
   current?: SessionRef;
   /** 当前空闲周期内是否已推送过超时提醒。 */
   reminded: boolean;
+  /**
+   * 这个用户最近一次被告知过的 release sha(全长)。见 gateway 的懒注入。
+   *
+   * **可选字段,只增不改** —— 老版本的 `isUserState` 不认识它但也不拒绝多余字段,
+   * 所以回滚之后旧代码照样读得懂这份盘;而新代码遇到没有这个字段的旧盘,
+   * 当作"没告知过"、多注入一次,没有别的后果。这是自进化那条
+   * "新代码读得懂旧盘、旧代码也读得懂新盘"的硬约束在这里的落点。
+   */
+  seenReleaseSha?: string;
   /** 最近离开的会话,新→旧,不含 current。供「/切换会话」找回。 */
   history: SessionRef[];
 }
@@ -198,6 +207,36 @@ export class SessionManager {
     st.reminded = false;
     this.persist();
     return true;
+  }
+
+  /**
+   * 这个用户是否已经被告知过 `sha` 这个版本。
+   *
+   * 判据只看用户不看会话:标记存在 `UserState` 上,而 `current` 要等回合跑完
+   * `record()` 才有 —— 回合**开始**时新会话根本没有 SessionRef 可查。
+   * "新会话也该被告知"那一半由调用方用 `isNew` 判,不塞进这里,
+   * 免得这个方法既要认用户又要认会话。
+   */
+  hasSeenRelease(userKey: string, sha: string): boolean {
+    return this.states.get(userKey)?.seenReleaseSha === sha;
+  }
+
+  /**
+   * 记下"已告知过这个版本",返回**上一次**告知的是哪个(没有则 undefined)。
+   *
+   * 返回旧值是为了让提示能说成"现在跑的是 X,上一回合还是 Y" —— 只说新值的话,
+   * 读的人分不清这是"刚升级了"还是"一直就是这个"。
+   *
+   * 在回合**开始**时调用,不等回合成功。回合失败时这一条就白说了,但重复注入
+   * 一行字的代价,远小于"标记漏记导致每一轮都注入"。
+   */
+  markReleaseSeen(userKey: string, sha: string): string | undefined {
+    const st = this.states.get(userKey) ?? { reminded: false, history: [] };
+    const prev = st.seenReleaseSha;
+    st.seenReleaseSha = sha;
+    this.states.set(userKey, st);
+    this.persist();
+    return prev;
   }
 
   /**
