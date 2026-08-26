@@ -185,6 +185,16 @@ services:
       CATMAN_ROLE: courier
       # **跑 pinned 而不是 current**:这是"稳定面"三个字的全部含义。
       CATMAN_RELEASE_LINK: /data/releases/pinned
+      # 新生代从默认 16MB 收到 2MB。信使是低吞吐 IO 进程,minor GC 频一点毫无感觉,
+      # 但默认的三份半空间光预留就是几十 MB。实测同一段负载(8×2MB buffer + 20 万
+      # 短命对象)RSS 从 229MB 降到 172MB。
+      # ⚠️ 别往这里加 --optimize-for-size(还能再省 30MB):它**不在 NODE_OPTIONS
+      # 白名单里**,node 会直接拒绝启动(`is not allowed in NODE_OPTIONS`)。
+      # 要用它得改 docker/entrypoint.sh 里 exec node 那行。
+      NODE_OPTIONS: "--max-semi-space-size=2"
+      # glibc 给每个线程开自己的 malloc arena(libuv 线程池默认 4 个),碎片攒在
+      # 里面不还给 OS。信使的并发度用不上那么多 arena。
+      MALLOC_ARENA_MAX: "2"
       CATMAN_DATA_DIR: /data
       TZ: ${TZ:-UTC}
       CATMAN_ILINK_TRACE: ${CATMAN_ILINK_TRACE:-0}
@@ -201,6 +211,14 @@ services:
     volumes:
       - ./data:/data
       - ./data/releases:/data/releases:ro
+    # 这行**不是为了防信使吃爆内存,是为了让它自己收敛**。node 按 cgroup 限制推算
+    # V8 堆上限:不设 limit 就按整机算(3.8G 的机器上堆上限 1.5G),GC 在那个水位下
+    # 没有任何回收动机,于是信使跑几天稳定停在 148MB 匿名内存,而同样跑了几天、
+    # 啥也没干的两个人格(有 mem_limit,堆上限 774MB)只有 45MB。
+    # **这是配置遗漏不是泄漏**:堆里没有累积的对象,只是没人催它还。
+    # 512m 而不是 384m:两者算出来的堆上限都是 262MB(node 有下限钳位),
+    # 既然一样就取宽的 —— 信使 OOM 意味着两个人格一起聋。
+    mem_limit: ${CATMAN_COURIER_MEM_LIMIT:-512m}
     # 信使**不需要** docker.sock:它不部署、不看容器。少挂一个就少一条把宿主 root
     # 交出去的路径,而它恰恰是那个直连外网、要解析陌生输入的进程。
 
@@ -253,6 +271,9 @@ services:
       - ${DOCKER_SOCK_PATH:-/var/run/docker.sock}:/var/run/docker.sock
     group_add:
       - "${DOCKER_GID:-0}"
+    # 同上:常驻 node 进程不设 limit,V8 就按整机算堆上限。守护人格平时只是空转,
+    # 但被唤醒时那颗救援大脑要跑完整的 agent 回合,所以跟主人格取同一个值。
+    mem_limit: ${CATMAN_MEM_LIMIT:-1500m}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
