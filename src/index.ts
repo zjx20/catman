@@ -29,6 +29,7 @@ import { Dashboard } from "./dashboard/server.js";
 import { cleanupOldSessionsAcross, encodeProjectDir, sessionFileExists } from "./core/transcript.js";
 import { installLogStamps, redirectConsoleToStderr } from "./core/log-stamp.js";
 import { readVersion, versionLine, type VersionInfo } from "./core/version.js";
+import { syncSrcRepoToRelease } from "./core/src-repo-sync.js";
 import { runSelfCheck } from "./core/selfcheck.js";
 import { ScriptDeployControl } from "./core/deploy.js";
 import { CronStore, DEFAULT_RUN_MAX_AGE_MS } from "./core/cron/store.js";
@@ -157,6 +158,21 @@ async function main(): Promise<void> {
   const pendingReport = deploy?.pendingReport();
   if (pendingReport) {
     console.warn(`[deploy] 有一条尚未播报的部署结果:${formatDeployReport(pendingReport)}`);
+  }
+
+  // 部署之后把源码仓库的主线拨到线上版本 —— deployer 干不了这件事(源码仓库属 10001,
+  // 它跑在 10002 下,`.git` 对它不可写),而 catman 每次部署后都会重启,启动这一刻
+  // 正好既知道自己是哪个 sha、又拥有那个仓库。不做的话下次开分支的基线天生陈旧,
+  // 分叉就成了默认结果。守护人格不参与:它跑 pinned、且 /data 对它只读。
+  //
+  // **不 await**:这是省事用的,不值得让启动为它多等一毫秒,更不该被它拖垮。
+  if (config.persona !== "rescue" && version) {
+    void syncSrcRepoToRelease({ srcDir: config.srcDir, sha: version.sha, branch: version.branch })
+      .then((r) => {
+        if (r.detail) console.info(`[deploy] ${r.detail}`);
+        if (r.dropped.length) console.info(`[deploy] 顺手删掉已合入的分支:${r.dropped.join(" ")}`);
+      })
+      .catch((err) => console.warn(`[deploy] 同步源码仓库失败(不影响运行):${err}`));
   }
 
   // 聊天记录落盘:网页没有本地记录,不存的话重启后页面空白、而助手那边的会话还在。

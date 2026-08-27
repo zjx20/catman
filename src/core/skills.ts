@@ -440,6 +440,10 @@ git log --oneline "$(readlink ${paths.releasesDir}/current)"..main   # ④ 差�
 拉不动而且报 \`Permission denied (publickey)\` 的话,是缺了给你用的那把只读部署密钥
 (见 README「部署密钥」),**告诉管理员,不要自己去找钥匙或改 ssh 配置**。
 
+**②′ 别把"main 落后"读成"上次没合并"。** deployer 推的是**远端**(refspec 直推 URL,
+碰不到这个仓库),而本地 main 由 catman 在启动时快进 —— 两条路都不经过你。真要落后
+多半只是还没 pull。**先跑完 ② 再下结论**,别拿 \`git log\` 比完分支就断言上次流程漏了步。
+
 ④ 有差异不一定是坏事 —— 可能就是刚拉下来、等着上线的东西。但**必须弄清它们是什么**:
 另一种可能是上一次部署失败被回滚了,而那个提交还留在 \`main\` 上,直接往下改就会把
 一个已经判定为坏的改动一起带上线。发 \`${canonicalOf("upgradeStatus")}\` 看上次部署的结果就知道是哪种。
