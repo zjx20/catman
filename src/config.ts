@@ -162,6 +162,13 @@ export interface Config {
    * 默认值必须与 `scripts/evolve/lib.sh` 的 `SRC_DIR` 一致(两边读同一个 env)。
    */
   srcDir: string;
+  /**
+   * 主线分支名。**不是**制备时所在的那个分支 —— 那个每次都不一样(evolve/xxx),
+   * 拿它当主线的话"把主线拨到线上版本"会变成"把刚制备完的临时分支拨到它自己",
+   * 一个静默的空操作。默认值必须与 `scripts/evolve/lib.sh` 的
+   * `CATMAN_UPSTREAM_BRANCH` 一致(两边读同一个 env)。
+   */
+  upstreamBranch: string;
   /** 部署结果"已播报"的标记。catman 自己写,所以必须在可写区,不能放 deployDir。 */
   deploySeenPath: string;
   /** 部署里程碑"已播报"的标记。同上,catman 自己写。 */
@@ -268,6 +275,7 @@ export function loadConfig(): Config {
     deployDir: str("CATMAN_DEPLOY_DIR", `${mainDataDir}/deploy`),
     releasesDir: str("CATMAN_RELEASES_DIR", `${mainDataDir}/releases`),
     srcDir: str("CATMAN_SRC_DIR", `${dataDir}/src/catman`),
+    upstreamBranch: str("CATMAN_UPSTREAM_BRANCH", "main"),
     deploySeenPath: str("CATMAN_DEPLOY_SEEN_PATH", `${dataDir}/deploy-seen.json`),
     // 里程碑的已播报标记。**与部署结果的那份分开两个文件**:结果只有一条、里程碑
     // 是一串,合在一起就得在同一份 JSON 里同时维护两种形状,而写它的是两条独立的

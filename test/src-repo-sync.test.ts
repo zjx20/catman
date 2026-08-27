@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { syncSrcRepoToRelease } from "../src/core/src-repo-sync.js";
 
@@ -151,4 +152,29 @@ test("同步:目录不是 git 仓库 —— 静默返回,绝不让启动出声",
     const r = await syncSrcRepoToRelease({ srcDir: plain, sha: "a".repeat(40) });
     assert.deepEqual(r, { moved: false, detail: "", dropped: [] });
   });
+});
+
+test("同步:传成制备时那个分支 —— 静默空转,这正是上线后才发现的那个坑", async () => {
+  await withRepo(async (dir) => {
+    const { repo, a, b, git } = repoWithAB(dir);
+    // VERSION 里记的 branch 是**制备时所在的分支**(这里是 evolve/x),它的尖端天然
+    // 就等于线上 sha。拿它当主线传进来,函数会认定"已经就位"然后一声不吭地返回 ——
+    // 不报错、不留日志,只有去看 main 才发现它根本没动。参数因此不叫 branch。
+    const r = await syncSrcRepoToRelease({ srcDir: repo, sha: b, mainline: "evolve/x" });
+    assert.equal(r.moved, false);
+    assert.equal(r.detail, "");
+    assert.equal(git("rev-parse refs/heads/main"), a, "main 原封不动 —— 这就是那次上线的症状");
+  });
+});
+
+test("接线:index.ts 传的是主线,不是 VERSION 里那个 branch", () => {
+  const src = readFileSync(fileURLToPath(new URL("../src/index.ts", import.meta.url)), "utf8");
+  const at = src.indexOf("syncSrcRepoToRelease({");
+  assert.ok(at > 0, "index.ts 必须真的调它");
+  const call = src.slice(at, at + 600);
+  assert.match(call, /mainline:\s*config\.upstreamBranch/, "主线要从配置来(与 lib.sh 同一个 env)");
+  assert.ok(
+    !/mainline:\s*version\.branch/.test(call),
+    "version.branch 是制备时那个 evolve/xxx,传它等于静默空转",
+  );
 });

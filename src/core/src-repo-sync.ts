@@ -69,11 +69,17 @@ export async function syncSrcRepoToRelease(opts: {
   srcDir: string;
   /** 线上正在跑的 sha。 */
   sha: string;
-  /** 主线分支名,与 `scripts/evolve/lib.sh` 的 `CATMAN_UPSTREAM_BRANCH` 同源。 */
-  branch?: string;
+  /**
+   * 主线分支名(与 `scripts/evolve/lib.sh` 的 `CATMAN_UPSTREAM_BRANCH` 同源)。
+   *
+   * ⚠️ **不是 VERSION 里那个 branch** —— 那是制备时所在的分支,每次都是新的
+   * `evolve/xxx`。传错了不会报错,只会静默空转:函数发现"这个分支已经就是线上
+   * sha 了",一声不吭地返回。上线过一次才发现,所以参数特意不叫 branch。
+   */
+  mainline?: string;
 }): Promise<SrcSyncResult> {
   const { srcDir, sha } = opts;
-  const branch = opts.branch || "main";
+  const branch = opts.mainline || "main";
   if (!sha || !existsSync(join(srcDir, ".git"))) return NOTHING;
 
   // 仓库属 10001 而进程也是 10001,但挂载方式变过好几轮 —— 与其假设,不如先问一句。

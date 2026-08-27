@@ -167,7 +167,13 @@ async function main(): Promise<void> {
   //
   // **不 await**:这是省事用的,不值得让启动为它多等一毫秒,更不该被它拖垮。
   if (config.persona !== "rescue" && version) {
-    void syncSrcRepoToRelease({ srcDir: config.srcDir, sha: version.sha, branch: version.branch })
+    void syncSrcRepoToRelease({
+      srcDir: config.srcDir,
+      sha: version.sha,
+      // **不能传 version.branch** —— 那是制备时所在的分支(evolve/xxx),不是主线。
+      // 传它的话这里会变成"把刚制备完的那个临时分支拨到它自己",静默空转。
+      mainline: config.upstreamBranch,
+    })
       .then((r) => {
         if (r.detail) console.info(`[deploy] ${r.detail}`);
         if (r.dropped.length) console.info(`[deploy] 顺手删掉已合入的分支:${r.dropped.join(" ")}`);
