@@ -64,6 +64,13 @@ AVAIL_MB="$(df -Pm "$RELEASES_DIR" | awk 'NR==2 {print $4}')"
 MIN_MB="${CATMAN_MIN_DISK_MB:-5120}"
 [ "$AVAIL_MB" -ge "$MIN_MB" ] || die "磁盘只剩 ${AVAIL_MB}MB(要求 ≥ ${MIN_MB}MB),拒绝制备"
 
+# 分叉闸。和磁盘门一样放在**跑容器之前** —— 这道闸不需要任何构建产物就能判,而一次
+# 制备要在一台 2 核软路由上跑好几分钟全量测试,判得出来的事没理由让人先等完。
+#
+# 基线取**正在跑的那个版本**,与下面的分级报告同一个基准:人关心的是"相对线上"。
+CURRENT_SHA="$(pointer_sha current)"
+diverge_check "$CURRENT_SHA" "$SHA" || die "拒绝制备:与线上版本分叉(上面列出了会被撤销的提交)"
+
 # 上一个 release 的 node_modules,用于 lockfile 未变时的硬链接复用。
 PREV_SHA="$(pointer_sha stable)"
 [ -n "$PREV_SHA" ] || PREV_SHA="$(pointer_sha current)"
@@ -178,7 +185,7 @@ log "制备完成:$SHA"
 
 # 分级报告。基线取**正在跑的那个版本**:人关心的是"相对线上多了什么",
 # 而不是相对某个分支点。打在 stderr —— stdout 是结果通道,调用方在捕获末行那个 sha。
-CURRENT_SHA="$(pointer_sha current)"
+# CURRENT_SHA 在上面的分叉闸那里就取过了,这里复用同一个值 —— 两处必须是同一个基准。
 if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" != "$SHA" ]; then
   tier_report "$CURRENT_SHA" "$SHA"
 fi

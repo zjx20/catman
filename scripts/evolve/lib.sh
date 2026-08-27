@@ -567,6 +567,52 @@ pick_demote_target() { # pick_demote_target <级数> → sha(找不到则空)
   return 1
 }
 
+# ── 分叉闸 ───────────────────────────────────────────────────────
+# 拦的是这一种:从**陈旧的 base** 开分支。线上是 B,而这次要制备的 C 派生自 B 之前的
+# A —— release 是按 sha 完整签出的树,切到 C 就等于把 B 的改动**静默撤销**掉。
+#
+# 这件事从前只有一个报警器,而且响得太晚:部署的最后一步推远端时,非快进被拒
+# (push_upstream)。那时 C 已经上线并过完观察期了,撤销早就发生。
+#
+# 为什么分叉不是小概率意外:deployer 推远端用的是 `<sha>:refs/heads/main` 这个
+# refspec,从 release 目录推、目标写的是 URL —— 源码仓库的本地 main 和 origin/main
+# 一个都不会动。于是下次 `git checkout main -b evolve/xxx` 切出来的 base 天生陈旧,
+# **分叉是默认结果而不是失误**,除非开工时先 pull 一次。
+#
+# ⚠️ 与 tier_of 同理,这道闸必须住在固化侧(bless 过的 scripts/evolve/)。它要是住在
+# 被自我进化改写的那棵树里,agent 顺手删一行就没了 —— 而它管的正是 agent 自己。
+#
+# 判不了就放行(基线为空、基线就是 head、基线不在这个仓库里),与 tier_report 同一取向:
+# 这道闸的价值在于抓真分叉,不在于在信息不足时制造假警报。
+diverge_check() { # diverge_check <base-sha> <head-sha> → 0 放行 / 1 分叉
+  local base="$1" head="$2" n
+  [ -n "$base" ] || return 0
+  if [ "$base" = "$head" ]; then return 0; fi
+  git_trust_repo "$SRC_DIR"
+  if ! git -C "$SRC_DIR" cat-file -e "${base}^{commit}" 2>/dev/null; then
+    log "分叉闸:基线 ${base:0:7} 不在这个仓库里,判不了,跳过"
+    return 0
+  fi
+  if git -C "$SRC_DIR" merge-base --is-ancestor "$base" "$head" 2>/dev/null; then
+    return 0
+  fi
+
+  n="$(git -C "$SRC_DIR" rev-list --count "$head..$base" 2>/dev/null || echo '?')"
+  log "分叉:${head:0:7} 不是线上 ${base:0:7} 的后代 —— 上线它会撤销线上这 $n 个提交:"
+  # -n 20 封住输出:分叉得离谱时(比如指错了 ref)这里可能有上百条,而人只需要看见
+  # 头几条就知道自己指错了。
+  git -C "$SRC_DIR" log --oneline --no-decorate -n 20 "$head..$base" 2>/dev/null | while read -r line; do
+    [ -n "$line" ] && log "    $line"
+  done || true
+  log "  → 想保留它们:先 git checkout main && git pull --ff-only,再把你的分支 rebase 上去"
+  log "  → 确实要撤销它们:CATMAN_ALLOW_DIVERGE=1 重跑一次制备"
+  if [ "${CATMAN_ALLOW_DIVERGE:-}" = "1" ]; then
+    log "分叉闸:CATMAN_ALLOW_DIVERGE=1 —— 放行,上面那些提交会被撤销"
+    return 0
+  fi
+  return 1
+}
+
 # ── 变更分级(Tier) ───────────────────────────────────────────────
 # 一次改动里有没有"光靠流水线上不了线"的东西。分级本身不拦任何事 —— 它拦不住,
 # 也不该拦:Tier 3 的东西**改了也不会自动生效**(部署脚本走 bless 固化副本、
@@ -748,9 +794,26 @@ push_upstream() { # push_upstream <sha>
     log "push:${sha:0:7} → $branch"
     drop_prepared_branch "$prepared_on" "$sha"
   else
-    # 只留末尾一段:git 的失败输出前面多半是无关的提示,原因在最后。
-    PUSH_DETAIL="推 $branch 失败:$(echo "$out" | tr '\n' ' ' | tail -c 200)"
-    log "push 失败(不影响本次部署,版本已经在跑了):$(echo "$out" | tr '\n' ' ')"
+    case "$out" in
+      # 非快进是**有具体含义**的失败,不是权限或网络问题:远端 $branch 与这次上线的
+      # 提交分叉了 —— 而人正是靠远端 $branch 判断"线上现在是什么"。只甩 git 的原始
+      # 报错会把人引到密钥和网络上去查,所以在这里把三件事说全:远端停在哪、线上其实
+      # 是哪个、要怎么补。
+      #
+      # ls-remote 只在这个分支里跑:走到这儿说明远端**答过话了**(它拒绝了我们),
+      # 网络是通的。别的失败原因(超时、密钥)不进这条路,不会在这里再挂一次。
+      *non-fast-forward* | *"fetch first"* | *"behind its remote"*)
+        local tip
+        tip="$(git -C "$dir" ls-remote "$url" "refs/heads/$branch" 2>/dev/null | awk '{print $1}')"
+        PUSH_DETAIL="远端 $branch 没动 —— 它停在 ${tip:0:7},与这次上线的 ${sha:0:7} 分叉了。线上跑的确实是 ${sha:0:7}(这点没问题),但远端 $branch 从现在起不再等于线上版本,要有人在开发机上把两边合一次。"
+        log "push:非快进被拒 —— 远端 $branch=${tip:0:7} vs 上线 ${sha:0:7}"
+        ;;
+      *)
+        # 只留末尾一段:git 的失败输出前面多半是无关的提示,原因在最后。
+        PUSH_DETAIL="推 $branch 失败:$(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        log "push 失败(不影响本次部署,版本已经在跑了):$(echo "$out" | tr '\n' ' ')"
+        ;;
+    esac
   fi
   return 0
 }

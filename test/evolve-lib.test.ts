@@ -776,6 +776,130 @@ test("分级报告:算不出差异时只说一句就跳过,绝不让制备失败
   });
 });
 
+// ── 分叉闸(diverge_check)─────────────────────────────────────────
+// 它拦的是"从陈旧的 base 开分支":线上是 B、要制备的 C 派生自 B 之前的 A。release 是
+// 按 sha 完整签出的树,所以上线 C 会把 B 的改动**静默撤销**掉 —— 而从前唯一的报警器
+// (推远端时非快进被拒)要等 C 上线并过完观察期才响,那时撤销早就发生了。
+
+/** 造一个 A → B(主线)、A → C1 → C2(分叉)的仓库,返回各个 sha。 */
+function divergeRepo(dir: string) {
+  const repo = join(dir, "src-repo");
+  mkdirSync(repo, { recursive: true });
+  const git = (args: string) =>
+    execFileSync("bash", ["-c", `cd "${repo}" && git ${args}`], { encoding: "utf8" }).trim();
+  git("init -q");
+  git("config user.email t@t");
+  git("config user.name t");
+  writeFileSync(join(repo, "f"), "A\n");
+  git("add -A && git commit -qm 'A: 基础'");
+  const a = git("rev-parse HEAD");
+  writeFileSync(join(repo, "f"), "B\n");
+  git("commit -qam 'B: 修了个要紧的 bug'");
+  const b = git("rev-parse HEAD");
+  git(`checkout -q -b other ${a}`);
+  writeFileSync(join(repo, "f"), "C\n");
+  git("commit -qam 'C: 另一个功能'");
+  writeFileSync(join(repo, "f"), "C2\n");
+  git("commit -qam 'C2: 接着改'");
+  const c = git("rev-parse HEAD");
+  return { repo, a, b, c };
+}
+
+/** 跑 diverge_check,返回退出码与合并后的输出(日志走 stderr)。 */
+function runDiverge(dir: string, repo: string, base: string, head: string, env = "") {
+  const r = execFileSync(
+    "bash",
+    [
+      "-c",
+      `set -uo pipefail; exec 2>&1; export CATMAN_RELEASES_DIR="${dir}"; export CATMAN_SRC_DIR="${repo}"; ` +
+        `export CATMAN_GIT_CONFIG="${dir}/gitconfig"; unset GIT_CONFIG_GLOBAL; ` +
+        `. "${LIB}"; rc=0; ${env} diverge_check "${base}" "${head}" || rc=$?; echo "退出码=$rc"`,
+    ],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  );
+  return r;
+}
+
+test("分叉闸:是线上版本的后代 —— 放行,一句话都不说", () => {
+  withDir((dir) => {
+    const { repo, a, b } = divergeRepo(dir);
+    const out = runDiverge(dir, repo, a, b);
+    assert.match(out, /退出码=0/);
+    assert.doesNotMatch(out, /分叉/, "正常路径上不该有任何噪音");
+  });
+});
+
+test("分叉闸:分叉时拒绝,并逐条点名会被撤销的线上提交", () => {
+  withDir((dir) => {
+    const { repo, b, c } = divergeRepo(dir);
+    // 线上是 B,要制备的 C 派生自 B 之前 —— 上线 C 等于撤销 B。
+    const out = runDiverge(dir, repo, b, c);
+    assert.match(out, /退出码=1/, "分叉必须拦下来,不能只是警告");
+    assert.match(out, /会撤销线上这 1 个提交/);
+    assert.match(
+      out,
+      /B: 修了个要紧的 bug/,
+      "必须把提交本身念出来 —— 只说'分叉了'的话,人无从判断代价有多大",
+    );
+    assert.match(out, /pull --ff-only/, "要给出怎么补");
+    assert.match(out, /CATMAN_ALLOW_DIVERGE=1/, "也要给出确实想撤销时怎么办");
+  });
+});
+
+test("分叉闸:CATMAN_ALLOW_DIVERGE=1 放行,但仍然把要撤销的东西列出来", () => {
+  withDir((dir) => {
+    const { repo, b, c } = divergeRepo(dir);
+    const out = runDiverge(dir, repo, b, c, "CATMAN_ALLOW_DIVERGE=1");
+    assert.match(out, /退出码=0/);
+    assert.match(out, /B: 修了个要紧的 bug/, "放行不等于闭嘴 —— 撤销了什么仍然要说");
+  });
+});
+
+test("分叉闸:判不了就放行(基线为空、基线就是 head、基线不在这个仓库里)", () => {
+  withDir((dir) => {
+    const { repo, c } = divergeRepo(dir);
+    // 首次制备:还没有 current 指针。
+    assert.match(runDiverge(dir, repo, "", c), /退出码=0/);
+    // 重新制备同一个 sha。
+    assert.match(runDiverge(dir, repo, c, c), /退出码=0/);
+    // 基线不是这个仓库制备的 —— 与 tier_report 同一取向:信息不足时不制造假警报。
+    const out = runDiverge(dir, repo, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", c);
+    assert.match(out, /退出码=0/);
+    assert.match(out, /判不了/);
+  });
+});
+
+test("分叉闸:prepare 在跑容器之前就拦(拦晚了等于白跑几分钟全量测试)", () => {
+  const src = readFileSync(
+    fileURLToPath(new URL("../scripts/evolve/prepare.sh", import.meta.url)),
+    "utf8",
+  );
+  const gate = src.indexOf("diverge_check");
+  const dockerRun = src.indexOf("docker run");
+  assert.ok(gate > 0, "prepare.sh 必须真的调 diverge_check —— 只写在 lib.sh 里不算数");
+  assert.ok(dockerRun > 0);
+  assert.ok(gate < dockerRun, "分叉闸要在 docker run 之前");
+  assert.match(src, /diverge_check[^\n]*\|\|[^\n]*die/, "判出分叉必须 die,不能只记一行日志");
+});
+
+test("推远端:非快进被拒时说清远端停在哪,而不是甩一段 git 报错", () => {
+  const lib = readFileSync(LIB, "utf8");
+  const fn = lib.slice(lib.indexOf("push_upstream() {"));
+  const body = fn.slice(0, fn.indexOf("\n}\n"));
+  assert.match(body, /non-fast-forward/, "要把非快进单独认出来");
+  assert.match(body, /ls-remote/, "要去问一句远端现在停在哪");
+  assert.match(body, /分叉了/);
+  // 只看真命令:这个函数的注释里正好有一句"绝不 --force",连注释一起搜必然自摆乌龙。
+  const code = body
+    .split("\n")
+    .filter((l) => !l.trim().startsWith("#"))
+    .join("\n");
+  assert.ok(
+    !/--force/.test(code),
+    "绝不 --force:无人值守的 deployer 强推 main 比分叉本身危险得多",
+  );
+});
+
 // ── 固化链路(bless → deployer-run)────────────────────────────────
 // `/回滚` 走的就是这条路。它是逃生门,组装错了不会有任何提示 —— 真机上的症状是
 // "起了容器却什么都没干"。所以拿一个假 docker 把参数原样接下来验。
