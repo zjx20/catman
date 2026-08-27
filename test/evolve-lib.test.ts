@@ -1291,78 +1291,23 @@ test("stable 还没立起来时 bless 不乱指 pinned,只报警", () => {
     assert.equal(existsSync(join(dataDir, "releases", "pinned")), false);
   });
 });
+// ── deployer 侧不许写源码仓库 ────────────────────────────────────
+// 这里从前有 drop_prepared_branch 和它的四道闸,四条单测全绿 —— 而那句 `git branch -D`
+// 在真机上**从来没成功过**:源码仓库属 uid 10001,这些脚本跑在 deployer(10002)下,
+// `.git` 对它不可写。测试跑在同一个 uid 下,摸不到那道墙,于是绿得毫无意义。
+//
+// 所以不再测"删对了没有"(那件事挪去了 src/core/src-repo-sync.ts,由拥有仓库的
+// catman 自己做),改成钉住那条**真正的边界**:lib.sh 里对 $SRC_DIR 只能做只读操作。
+// 动词白名单比"逐个用例验行为"弱,但它验的是那条在生产里真正成立的性质。
 
-// ── 推远端之后清理本地临时分支 ────────────────────────────────────
-// 常规流程是「开 evolve/xxx → 制备 → ff-merge 回 main → 删分支」,而从前 push 推的是
-// VERSION 里记的那个分支名 —— 于是每次上线都推到一个临时分支上,main 反而长期停在
-// 很早以前(真机上攒出过 5 个提交的差距,远端还多了一堆 evolve/* 残骸)。
-// 现在一律推主线,推成功之后把本地那个临时分支删掉。
-
-/** 建一个带一条提交的仓库,返回 (git 执行器, HEAD sha)。 */
-function repoWithCommit(dir: string): { git: (a: string) => string; head: string } {
-  const repo = join(dir, "src");
-  mkdirSync(repo, { recursive: true });
-  const git = (a: string): string =>
-    execFileSync("bash", ["-c", `cd "${repo}" && git ${a}`], { encoding: "utf8" });
-  git("init -q -b main");
-  git('config user.email t@t && git config user.name t');
-  writeFileSync(join(repo, "a.txt"), "1");
-  git("add -A && git commit -qm one");
-  return { git, head: git("rev-parse HEAD").trim() };
-}
-
-function dropBranch(dir: string, repo: string, branch: string, sha: string): string {
-  return execFileSync(
-    "bash",
-    [
-      "-c",
-      `set -euo pipefail; export CATMAN_RELEASES_DIR="${dir}"; export CATMAN_SRC_DIR="${repo}"; ` +
-        `export CATMAN_GIT_CONFIG="${dir}/gitconfig"; unset GIT_CONFIG_GLOBAL; ` +
-        `. "${LIB}"; drop_prepared_branch "${branch}" "${sha}" 2>&1`,
-    ],
-    { encoding: "utf8" },
-  );
-}
-
-test("清理:内容已经在上线的那个提交里,本地 evolve 分支就删掉", () => {
-  withDir((dir) => {
-    const { git, head } = repoWithCommit(dir);
-    git(`branch evolve/done ${head}`);
-    dropBranch(dir, join(dir, "src"), "evolve/done", head);
-    assert.equal(git("branch --list evolve/done").trim(), "", "该删的没删,下次开工又得逐个回想");
-  });
-});
-
-test("清理:分支上还有没上线的提交就不删 —— 那是在删代码", () => {
-  withDir((dir) => {
-    const { git, head } = repoWithCommit(dir);
-    git("checkout -q -b evolve/ahead");
-    writeFileSync(join(dir, "src", "b.txt"), "2");
-    git("add -A && git commit -qm two");
-    git("checkout -q main");
-    const out = dropBranch(dir, join(dir, "src"), "evolve/ahead", head);
-    assert.notEqual(git("branch --list evolve/ahead").trim(), "", "有未上线的提交就必须留着");
-    assert.match(out, /还有没上线的提交/);
-  });
-});
-
-test("清理:只碰 evolve/ 开头的,main 与手工分支一概不动", () => {
-  withDir((dir) => {
-    const { git, head } = repoWithCommit(dir);
-    git(`branch wip ${head}`);
-    dropBranch(dir, join(dir, "src"), "main", head);
-    dropBranch(dir, join(dir, "src"), "wip", head);
-    assert.notEqual(git("branch --list main").trim(), "", "main 绝不能删");
-    assert.notEqual(git("branch --list wip").trim(), "", "手工开的分支也不归它管");
-  });
-});
-
-test("清理:当前检出的那个不删 —— 否则工作区落到 detached HEAD 上", () => {
-  withDir((dir) => {
-    const { git, head } = repoWithCommit(dir);
-    git("checkout -q -b evolve/current");
-    const out = dropBranch(dir, join(dir, "src"), "evolve/current", head);
-    assert.notEqual(git("branch --list evolve/current").trim(), "");
-    assert.match(out, /当前检出/);
-  });
+test("lib.sh 对源码仓库只读 —— 写操作在 deployer 下必然失败,而失败是静默的", () => {
+  const lib = readFileSync(LIB, "utf8");
+  // git 的只读子命令。要加新的先想清楚:它在 uid 10002 下写得动吗?
+  const READ_ONLY = new Set([
+    "rev-parse", "rev-list", "merge-base", "cat-file", "log", "diff", "remote", "show", "for-each-ref",
+  ]);
+  const used = [...lib.matchAll(/git -C "\$SRC_DIR" ([a-z-]+)/g)].map((m) => m[1] ?? "");
+  assert.ok(used.length > 0, "一个都没匹配到的话,多半是写法变了、这条测试已经形同虚设");
+  const writes = [...new Set(used)].filter((v) => !READ_ONLY.has(v));
+  assert.deepEqual(writes, [], "这些动词会写 .git,而 deployer 写不了 —— 失败还不会报出来");
 });

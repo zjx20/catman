@@ -714,36 +714,19 @@ tier_report() { # tier_report <base-ref> <head-ref>
 # 结果**也要说给人听**:调用方读 `PUSH_OK` / `PUSH_DETAIL` 写一条里程碑。
 # "本地上线了但远端没有"是个下次开工才会踩到的事实(再从远端拉一次就把它拉丢了),
 # 只躺在 deployer 的容器日志里等于没人知道。
-# 推成功之后,把制备时用的那个本地临时分支删掉。
+
+# 制备时那个本地临时分支的清理**不在这里**,理由是权限:源码仓库属 uid 10001
+# (catman),而这些脚本跑在 deployer(10002)下 —— `.git` 及其子目录对它全部不可写。
+# 从前这儿有个 drop_prepared_branch,那句 `git branch -D` 于是**从来没成功过**,
+# 只是被"没删掉,留着不影响什么"那条分支吞掉了;残留的 evolve/* 让人每次开工都以为
+# "上次没合并"。它的四道闸有单测钉着、而且全绿 —— 测试跑在同一个 uid 下,摸不到
+# 生产里那道墙。第三次栽在"验证工具比要验的性质弱"上了。
 #
-# 它的内容此刻已经在远端的主线上了,留着只会让下次开工时 `git branch` 里堆一排
-# 早就上线过的 evolve/*,而人还得逐个回想哪些能删。
+# 现在这件事由 catman 自己在启动时做(src/core/src-repo-sync.ts):它每次部署后都会
+# 重启,而且正好拥有那个仓库。同一处还顺带把主线快进到线上版本。
 #
-# 四道闸,少一道都可能删掉不该删的东西:
-#   ① 只删 `evolve/` 开头的 —— main 与人手工开的分支一概不碰;
-#   ② 当前检出的那个不删(那会让工作区落到 detached HEAD 上);
-#   ③ **必须确认它的尖端已经包含在这次上线的提交里**(merge-base --is-ancestor)。
-#      这是唯一真正的安全依据:分支上还有没合进来的提交时,这一步会拦下来。
-#   ④ 删不掉只记一行日志,绝不影响部署结论 —— 部署早就成功了。
-drop_prepared_branch() { # drop_prepared_branch <branch> <sha>
-  local branch="$1" sha="$2" current
-  case "$branch" in evolve/*) ;; *) return 0 ;; esac
-  git_trust_repo "$SRC_DIR"
-  current="$(git -C "$SRC_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-  [ "$branch" = "$current" ] && { log "push:$branch 是当前检出的分支,不删"; return 0; }
-  git -C "$SRC_DIR" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null || return 0
-  if ! git -C "$SRC_DIR" merge-base --is-ancestor "$branch" "$sha" 2>/dev/null; then
-    log "push:$branch 上还有没上线的提交,不删"
-    return 0
-  fi
-  # -D 而不是 -d:安全性由上面那道 is-ancestor 保证,而 -d 判的是"合进当前 HEAD 没有",
-  # 那取决于 SRC_DIR 此刻检出的是什么,与我们要问的问题不是一回事。
-  if git -C "$SRC_DIR" branch -D "$branch" >/dev/null 2>&1; then
-    log "push:本地分支 $branch 已删(内容都在 ${sha:0:7} 里)"
-  else
-    log "push:本地分支 $branch 没删掉,留着不影响什么"
-  fi
-}
+# ⚠️ 所以**这个文件里不许出现任何会写 $SRC_DIR 的 git 命令**,只读的才行。
+# 有单测按动词白名单钉着这一条。
 
 PUSH_OK=0
 PUSH_DETAIL=""
@@ -773,9 +756,6 @@ push_upstream() { # push_upstream <sha>
   # 走到这一步的提交已经上线、过了观察期,主线本就该是它。快进不了(有人在 GitHub
   # 上也提交了)就失败,由下面那段如实报出来 —— 绝不 --force。
   branch="${CATMAN_UPSTREAM_BRANCH:-main}"
-  # 制备时所在的分支只用来做一件事:推成功之后把本地那个临时分支删掉(见下)。
-  local prepared_on
-  prepared_on="$(json_get "$dir/VERSION" 'd.branch')"
   # 先说清"有没有钥匙"。没有这一句的话,没配可写密钥的机器上每次部署都会在这里
   # 甩一段 ssh 的 Permission denied,看起来像部署出了问题,其实只是没打算推远端。
   case "$url" in
@@ -792,7 +772,6 @@ push_upstream() { # push_upstream <sha>
     PUSH_OK=1
     PUSH_DETAIL="分支 $branch 已指向这个提交。"
     log "push:${sha:0:7} → $branch"
-    drop_prepared_branch "$prepared_on" "$sha"
   else
     case "$out" in
       # 非快进是**有具体含义**的失败,不是权限或网络问题:远端 $branch 与这次上线的
