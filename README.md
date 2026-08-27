@@ -1142,6 +1142,39 @@ catman 起来后在你下一条消息时告诉你。
 分类表住在 `data/deploy/bin/lib.sh`(固化侧)而不是 `src/` 里 —— 它要是住在被自我进化
 改写的那棵树里,一行 case 就能把 Tier 3 报成 Tier 1。
 
+### 重新 bless(改了 Tier 3 之后)
+
+要 root —— `data/deploy/` 属 uid 10002,助手那个 uid(10001)写不进去,直接跑是
+Permission denied。所以起一个一次性容器,与上面初次部署的 ② 同一个套路:
+
+```sh
+DATA=/opt/services/catman/data                 # ← 换成你的绝对路径
+GID=$(stat -c '%g' /var/run/docker.sock)
+PIN=$(basename "$(readlink -f "$DATA/releases/pinned")")   # ← 维持现状;要挪就填新 sha
+
+docker run --rm -u 0:0 \
+  -v "$DATA:/data" -v /var/run/docker.sock:/var/run/docker.sock \
+  -e CATMAN_DATA_DIR=/data -e "CATMAN_HOST_DATA_DIR=$DATA" \
+  -e "DOCKER_GID=$GID" -e "CATMAN_PIN=$PIN" \
+  catman-env:1 /data/src/catman/scripts/evolve/bless.sh
+```
+
+在自己机器上把它包成一个小壳当然更省事,但**文档里不能只留壳名** —— 那个壳是某台
+机器上的私有文件,换个部署就不存在了,而上面这段到哪儿都能跑。
+
+三个点:
+
+- **`CATMAN_PIN` 不要省。** 不给的话 `bless.sh` 默认钦定当前 `stable`,而 `pinned` 是
+  信使与守护人格跑的那份:"出事时还活着的是哪份代码"不该被顺手改掉。上面那行 `PIN=`
+  取的就是当前值(维持现状);真要往前挪再填新 sha。包壳的话把它做成**必填参数**,
+  空值直接拒绝 —— 省一次手滑。
+- **固化的是"你从哪个目录跑它"的那份**(`bless.sh` 里是 `install "$HERE"/...`)。
+  上面这条命令跑的是 `/data/src/catman`,所以跑之前确认那儿工作区干净、且
+  `scripts/evolve/` 与 `releases/current` 里那份逐字节一致(`cmp` 一遍)——
+  否则固化进去的可能是一棵没人批准过的树,而固化的正是那道判卷子的门。
+- 跑完验四样:四个脚本 `cmp` 得上、`data/deploy/env` 一个字没变、`pinned` 是你要的
+  那个、`data/deploy/` 属主回到 10002。
+
 ### 几条不能改的纪律
 
 - **执法者自己取证**:自检由 deployer 亲自跑,健康门比对的 sha 由它亲自读。
@@ -1156,6 +1189,11 @@ catman 起来后在你下一条消息时告诉你。
   那份脚本。改了 `scripts/evolve/` 要重新 bless 才生效。门禁和逃生门是同一把锁,
   不能让一次改坏了部署逻辑的进化把它们一起毁掉。**`prepare.sh` 同属固化侧**:
   制备门(全量测试)就在它里面,跑 release 里那份等于让被考的人自己出卷子。
+- **bless 要管理员开口**:固化会把 `scripts/evolve/` 的当前内容变成"以后真正执行的那份",
+  包括那道判卷子的门自己。所以助手**不自动 bless** —— 制备完只汇报"这次是 Tier 3,
+  还欠一次 bless",什么时候固化由你决定。你授权之后它可以代跑,但固化源必须是**你批准
+  过的那棵树**(工作区干净,且与 `releases/current` 逐字节一致,跑之前 cmp 一遍)。
+  少了这一条,「你批准了哪棵树」和「固化了哪棵树」就脱钩了,而脱钩的那一头正是门本身。
 - **确认口令是硬指令**:`/发布 <前6位>` 由你亲手打、由网关按字面解析,是整条流水线里
   唯一一处把「你批准了什么」和「机器部署了什么」机械绑在一起的地方。交给助手转述的话,
   这把锁就挂在一个会看错字、而且正是被部署的那一方的环节上。网关也不替你补全或纠错 ——

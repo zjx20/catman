@@ -65,6 +65,23 @@ test("自进化 skill 明说不要自己起 deployer —— 确认权在人", ()
   assert.match(body, /不要自己起 deployer|绝不.*deployer/);
 });
 
+test("自进化 skill 明说 bless 要管理员开口 —— 固化的是判卷子的门本身", () => {
+  const body = evolveSkillBody(PATHS);
+  assert.match(body, /默认不自己 bless/);
+  // 授权之后代跑也有两条不能松,少哪条都会把「批准了哪棵树」和「固化了哪棵树」拆开。
+  assert.match(body, /releases\/current/, "要说清固化源必须是批准过的那棵树");
+  assert.match(body, /CATMAN_PIN/, "要说清 pinned 得显式传,别让它默认跟着 stable 走");
+});
+
+test("自进化 skill 正文不带某台机器专属的路径 —— 它随仓库走", () => {
+  // 真机上有个包好的 bless 壳(/opt/services/catman/bless.sh),写进正文很顺手,
+  // 但那是一台机器上的私有文件:换个部署它不存在,而正文照样在教人去跑它。
+  // 同理适用于任何 /opt/ 下的宿主路径 —— 要说"怎么跑"就把命令本身写全。
+  const body = evolveSkillBody(PATHS);
+  const hits = body.split("\n").filter((l) => l.includes("/opt/"));
+  assert.deepEqual(hits, [], "宿主专属路径要么写全命令,要么指向 README,不能直接留路径");
+});
+
 test("skill 正文里绝不出现令牌字面量,只写环境变量引用", () => {
   // Options.skills 不是沙箱:普通用户的 agent 看不到 catman-admin 的列表项,
   // 却照样能 Read 到那个文件。所以令牌只能以 $CATMAN_* 的形式出现。
