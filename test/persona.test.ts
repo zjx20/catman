@@ -134,6 +134,18 @@ test("共享 CLAUDE.md:主人格那份带省内存指引", () => {
   assert.doesNotMatch(s, /700m/);
 });
 
+/**
+ * 这条约定要**跟着代码走到新部署上**,而不是只留在这台机器的 CLAUDE.md 里。
+ * 聊天客户端按 markdown 渲染,裸贴日志会糊成一坨 —— 本机 2026-08-28 踩过一次
+ * (长任务通知),换台机器部署的人不该再踩一遍。
+ */
+test("共享 CLAUDE.md:两个人格都交代「发出去的文字是 markdown」", () => {
+  assert.match(initialSharedClaudeMd("primary"), /markdown/);
+  assert.match(initialSharedClaudeMd("primary"), /围栏/);
+  // 守护人格的活儿就是贴日志报状态,更需要这条。
+  assert.match(initialSharedClaudeMd("rescue"), /代码围栏/);
+});
+
 test("共享 CLAUDE.md:守护人格那份不带 —— 它不干重活,那份刻意只写风格", () => {
   assert.doesNotMatch(initialSharedClaudeMd("rescue"), /省内存/);
 });
