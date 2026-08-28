@@ -11,6 +11,7 @@ import {
   shortSessionId,
   ACK_TEXT,
   formatProgress,
+  formatProgressBatch,
   ProgressThrottle,
   MAX_FEEDS_PER_TURN,
   FEED_ACK_TEXT,
@@ -566,25 +567,59 @@ test("进度节流:间隔按 5/15/30/60 逐级拉长,最后一档保持", () => 
   assert.ok(at(170_000), "阶梯用完后保持最后一档");
 });
 
-test("进度节流:同一间隔内只发最新那条,丢掉的条数如实交代", () => {
-  // 进度是"现在在干什么"这个状态,不是必须完整送达的流水 —— 但丢了多少得说,
-  // 否则"卡在一件事上"和"飞快跑了 20 步"在用户眼里一模一样。
+test("进度节流:同一间隔内攒下的步骤拼进同一条消息,不再丢掉", () => {
+  // 旧行为是只发最新那条、其余丢掉,只留一个 (+N 步)。改掉是因为那笔账算错了:
+  // 攒下的步骤本来就是**拼进同一条消息**的,context_token 一分没多花 ——
+  // 省下的只是屏幕。而十步里只看得见一步,信息损失远大于省下的那几行。
   const t0 = 1_000_000;
   const th = new ProgressThrottle(t0);
 
   assert.ok(th.offer(t0 + 5_000, toolEv(1)));
   for (let i = 2; i <= 5; i += 1) {
-    assert.equal(th.offer(t0 + 5_000 + i, toolEv(i)), undefined);
+    assert.equal(th.offer(t0 + 5_000 + i, toolEv(i)), undefined, "没到点仍然不发");
   }
   const text = th.offer(t0 + 20_000, toolEv(6));
   assert.ok(text, "到点应当放行");
-  assert.ok(text.includes("T6"), `发的应是最新那条,实际:${text}`);
-  assert.ok(!text.includes("T2"), `不该补发旧事件:${text}`);
-  assert.ok(text.includes("+4 步"), `应交代丢了 4 条:${text}`);
+  // 摘要行是最新那步,而且在第一行 —— 用户扫一眼要先看到"现在在干什么"。
+  assert.ok(text.startsWith("🔧 T6"), `摘要行该是最新那步,实际:${text}`);
+  // 中间那几步一条都不能少,这正是这次改动要买的东西。
+  for (const n of [2, 3, 4, 5]) {
+    assert.ok(text.includes(`T${n}`), `T${n} 该出现在回顾里:${text}`);
+  }
+  assert.match(text, /前面 4 步:/);
+  // 列表前要有空行,否则 markdown 会把它跟摘要行黏成一段。
+  assert.match(text, /\n\n前面 4 步:\n\n- /);
 
-  // 计数在放行后归零,不会把上一轮的账算到下一轮头上。
+  // 放行后清空,不把上一轮的账算到下一轮头上。
   const next = th.offer(t0 + 50_000, toolEv(7));
-  assert.ok(next && !next.includes("步"), `不该重复计数:${next}`);
+  assert.ok(next && !next.includes("T6"), `上一轮的步骤不该重复出现:${next}`);
+});
+
+test("进度节流:攒太多只留最近几步,更早的报数量 —— 一条进度不该翻屏", () => {
+  // 折叠指望不上(微信不渲染 <details>),这些行实打实占屏幕,所以必须封顶。
+  const t0 = 1_000_000;
+  const th = new ProgressThrottle(t0);
+  assert.ok(th.offer(t0 + 5_000, toolEv(0)));
+  for (let i = 1; i <= 30; i += 1) th.offer(t0 + 5_000 + i, toolEv(i));
+  const text = th.offer(t0 + 20_000, toolEv(99));
+  assert.ok(text);
+  const bullets = text.split("\n").filter((l) => l.startsWith("- "));
+  assert.ok(bullets.length <= 8, `回顾行不该超过上限,实际 ${bullets.length} 行`);
+  assert.match(text, /更早的 \d+ 步略过/);
+  assert.ok(!text.includes("T1:"), "最老的那些该被挤掉");
+});
+
+test("进度批量:只有一步时就是一行,不摆一个空列表", () => {
+  assert.equal(formatProgressBatch(["🔧 A"]), "🔧 A");
+});
+
+test("进度批量:回顾行裁得比摘要行短 —— 它们是索引不是正文", () => {
+  const long = `🔧 T: ${"x".repeat(300)}`;
+  const text = formatProgressBatch([long, long]);
+  const [head, ...rest] = text.split("\n");
+  const bullet = rest.find((l) => l.startsWith("- "));
+  assert.ok(head && head.length > 150, "摘要行按 200 字裁");
+  assert.ok(bullet && bullet.length < 100, `回顾行该裁到 60 字上下,实际 ${bullet?.length}`);
 });
 
 test("进度节流:核心不再有总条数上限 —— 发多少条由渠道那边的额度说了算", () => {

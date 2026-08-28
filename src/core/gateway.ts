@@ -97,6 +97,24 @@ export const TURN_ERROR_PREFIX = "⚠️ 这一轮没能跑成,以下是 Claude 
 
 /** 进度消息里思考/工具参数摘要的截断长度。 */
 const PROGRESS_MAX_CHARS = 200;
+/**
+ * 回顾行裁得比摘要行短得多。它们是"刚才干了什么"的索引,不是正文 ——
+ * 而且**折叠指望不上**(微信不渲染 `<details>`,2026-08-28 实测),
+ * 这些行是实打实占屏幕的,长度就是唯一的预算。
+ */
+const PROGRESS_RECAP_CHARS = 60;
+/**
+ * 一条进度消息里最多列几步(含摘要行那一步)。再多只报数量。
+ *
+ * 8 是"一屏放得下"倒推的:折叠不可用,这些行全都实打实占屏幕,而进度是**扫一眼**
+ * 的东西,翻屏就失去意义了。十几步的回合会看到「更早的 N 步略过」,那正是它该
+ * 传达的意思 —— 干了很多,细节去日志里看。
+ *
+ * 上限同时是**缓冲上限** —— 节流器攒的是已经格式化裁剪过的字符串,超出就丢最老的。
+ * 长回合一个间隔内攒几百个事件是常事,全留着既费内存(这机器 700m)又没人会去看
+ * 一分钟前的第 87 步。
+ */
+const PROGRESS_MAX_STEPS = 8;
 
 /**
  * 部署进展多久去看一眼。
@@ -211,17 +229,62 @@ function sessionHint(text: string, hasAttachments: boolean): string {
  * `skipped` 是本条之前被节流掉的事件数,标出来是为了让"卡在一件事上"与
  * "一直在快速推进"看起来不一样 —— 否则用户只看到间隔变长,分不清是哪种。
  */
-export function formatProgress(ev: AgentProgressEvent, skipped = 0): string {
+export function formatProgress(
+  ev: AgentProgressEvent,
+  skipped = 0,
+  maxChars = PROGRESS_MAX_CHARS,
+): string {
   const body =
     ev.kind === "thinking"
-      ? `💭 ${truncate(ev.text.trim(), PROGRESS_MAX_CHARS)}`
+      ? `💭 ${truncate(ev.text.trim(), maxChars)}`
       : ev.kind === "text"
-        ? `💬 ${truncate(ev.text.trim(), PROGRESS_MAX_CHARS)}`
+        ? `💬 ${truncate(ev.text.trim(), maxChars)}`
         : (() => {
-            const summary = truncate(summarizeToolInput(ev.input), PROGRESS_MAX_CHARS);
+            const summary = truncate(summarizeToolInput(ev.input), maxChars);
             return summary ? `🔧 ${ev.name}: ${summary}` : `🔧 ${ev.name}`;
           })();
   return skipped ? `${body}(+${skipped} 步)` : body;
+}
+
+/**
+ * 把攒下的若干步拼成**一条**消息:最新那步当摘要,前面的收进折叠块。
+ *
+ * ## 为什么从"只发最新"改成"全带上"
+ *
+ * 原来的取舍是:进度是"现在在干什么"这个状态,不是必须完整送达的流水,所以
+ * 同一间隔内攒下的只发最新那条、其余丢掉,只留一个 `(+N 步)`。那个理由里有
+ * 两个成本,而它们的分量并不一样:
+ *
+ * - **多占一次发送额度** —— 这条**根本不存在**。攒下的步骤是拼进同一条消息的,
+ *   仍然只发一条,`context_token` 的账一分没多花。当年是把「补发」想成了「多发
+ *   一条」,那才是真正要躲的东西。
+ * - **旧事件把屏幕刷满** —— 这条是真的,所以留着上限:少列几步、每步裁短。
+ *
+ * 代价掂量清楚之后,剩下的就只有收益:十步里只看得见一步,那个信息损失没必要付。
+ *
+ * ## 为什么不是折叠块
+ *
+ * 试过 `<details>`,**微信不渲染它**(2026-08-28 真机确认)。所以这里是纯 markdown:
+ * 一行小标题 + 一个列表。既然藏不起来,就只能靠「少列几步 + 每步裁短」把它压进
+ * 一屏 —— 见 PROGRESS_MAX_STEPS 与 PROGRESS_RECAP_CHARS。
+ */
+export function formatProgressBatch(
+  steps: readonly string[],
+  dropped = 0,
+): string {
+  const head = steps[steps.length - 1] ?? "";
+  const earlier = steps.slice(0, -1);
+  if (!earlier.length && !dropped) return head;
+
+  // 只剩"更早的若干步"而没有可列的行时,退回旧写法 —— 空折叠块没有意义。
+  if (!earlier.length) return `${head}(+${dropped} 步)`;
+
+  const label =
+    dropped > 0
+      ? `前面 ${earlier.length + dropped} 步(更早的 ${dropped} 步略过):`
+      : `前面 ${earlier.length} 步:`;
+  // 列表前后都要空行,否则 markdown 会把它跟上一段黏成一坨(见共享人设那节)。
+  return [head, "", label, "", ...earlier.map((s) => `- ${truncate(s, PROGRESS_RECAP_CHARS)}`)].join("\n");
 }
 
 /**
@@ -272,8 +335,15 @@ export class ProgressThrottle {
   private nextAllowedAt: number;
   /** 已经放行几条 —— 决定用阶梯里的哪一档。 */
   private sent = 0;
-  /** 上次放行之后被丢掉几条。 */
-  private skipped = 0;
+  /**
+   * 攒着还没报出去的那些步(**已经格式化裁剪过的字符串**,不是原始事件)。
+   *
+   * 存字符串而不是事件,是因为工具参数可能是几 KB 的文件内容,原样挂在内存里
+   * 等一分钟不划算 —— 这机器只有 700m。裁过之后每条最多两百字。
+   */
+  private pending: string[] = [];
+  /** 攒不下而被挤掉的最老那些步。只报数量。 */
+  private dropped = 0;
 
   constructor(
     startedAt: number,
@@ -287,12 +357,18 @@ export class ProgressThrottle {
    * 时刻在**决定放行时**推进而不是发送完成后 —— 否则一次慢发送期间会漏过好几条。
    */
   offer(now: number, ev: AgentProgressEvent): string | undefined {
-    if (now < this.nextAllowedAt) {
-      this.skipped += 1;
-      return undefined;
+    // **先攒后判**:到不到点都要收下这一步。旧实现在这里直接丢,于是十步里
+    // 只有一步能被看见 —— 而它们本来可以拼进同一条消息,一分额度都不多花。
+    this.pending.push(formatProgress(ev));
+    while (this.pending.length > PROGRESS_MAX_STEPS) {
+      this.pending.shift();
+      this.dropped += 1;
     }
-    const text = formatProgress(ev, this.skipped);
-    this.skipped = 0;
+    if (now < this.nextAllowedAt) return undefined;
+
+    const text = formatProgressBatch(this.pending, this.dropped);
+    this.pending = [];
+    this.dropped = 0;
     this.sent += 1;
     // 第 n 条发完之后用第 n 档间隔;超出阶梯长度就一直用最后一档。
     this.nextAllowedAt = now + (this.intervals[Math.min(this.sent, this.intervals.length - 1)] ?? 0);
@@ -311,7 +387,8 @@ export class ProgressThrottle {
    */
   reset(now: number): void {
     this.sent = 0;
-    this.skipped = 0;
+    // pending 与 dropped **不清**:那几步还没报出去过,而用户刚开口正是最想知道
+    // "刚才干了什么"的时刻 —— 清掉等于把攒着的交代扔了。
     this.nextAllowedAt = now + (this.intervals[0] ?? 0);
   }
 }
