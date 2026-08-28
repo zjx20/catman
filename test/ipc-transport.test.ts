@@ -21,11 +21,16 @@ class FakeCourier implements CourierApi {
   acks: Array<{ persona: PersonaId; msgIds: readonly string[] }> = [];
   nacks: Array<{ persona: PersonaId; msgIds: readonly string[]; reason: string }> = [];
   sends: Array<{ persona: PersonaId; out: unknown }> = [];
+  typings: Array<{ persona: PersonaId; userKey: string }> = [];
   next: PullResponse = { schema: IPC_SCHEMA, controls: [], messages: [] };
   /** true 时 pull 一直挂着直到 signal 触发 —— 模拟真实的长轮询。 */
   hang = false;
   /** 进入 pull 那一刻 signal 是不是已经 aborted。**这是个陷阱的探针**,见用例。 */
   abortedOnEntry: boolean | undefined;
+
+  async typing(persona: PersonaId, userKey: string): Promise<void> {
+    this.typings.push({ persona, userKey });
+  }
 
   async pull(persona: PersonaId, _waitMs: number, signal: AbortSignal): Promise<PullResponse> {
     this.pulls.push(persona);

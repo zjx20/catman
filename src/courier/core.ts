@@ -22,6 +22,7 @@ import {
   switchedToRescueText,
 } from "./routing.js";
 import { fallbackText } from "./fallback.js";
+import { TypingKeeper } from "./typing-keeper.js";
 import { Outbox } from "./outbox.js";
 import type { SettingsView } from "./settings-view.js";
 
@@ -70,6 +71,13 @@ export interface CourierCoreOptions {
   settings: SettingsView;
   /** 真正把字节发出去(渠道)。**不要直接调它** —— 一切出站都过发件队列,见 `outbox`。 */
   send: CourierSend;
+  /**
+   * 往渠道打一次「对方正在输入」。省略 = 这套部署不支持,整个功能静默关闭。
+   *
+   * 与 `send` 分开注入,是因为它压根不走发件队列:typing 不占发送预算、
+   * 过期了也不值得补发(一个迟到的输入气泡毫无意义),排队反而有害。
+   */
+  typing?: (userKey: string, on: boolean) => Promise<void>;
   /** 见过谁的记录(greeting 判定)。 */
   greetedPath: string;
   /** 发件队列的落盘路径。省略 = 只在内存里(单测)。 */
@@ -95,6 +103,10 @@ export class CourierCore implements CourierApi {
   private readonly waiters = new Map<PersonaId, Array<() => void>>();
   /** 已经打过招呼的 userKey。落盘 —— 重启后重发欢迎语是白吃预算。 */
   private greeted: Set<string>;
+  /**
+   * 输入气泡的节流器。没配 `typing` 时是 undefined —— 那时所有相关调用都是空操作。
+   */
+  private readonly typingKeeper?: TypingKeeper;
   /** 上次给谁发过兜底,防刷屏。 */
   private readonly lastFallback = new Map<string, number>();
   /** 每人格投递失败(NACK)的累计条数。非零 = 契约漂移的红灯。 */
@@ -119,6 +131,14 @@ export class CourierCore implements CourierApi {
     // 必定触发一句"主人格没有响应"—— 而主人格可能正常得很,只是还没来得及拉第一次
     // (它要先起 dashboard、装配、连 socket)。用启动时刻打底之后,判据变成
     // "信使已经活了超过阈值,而这个人格一次都没来过",那才是真的不可达。
+    // typing 没注入就整个功能不存在(dashboard-only 的部署、单测)。
+    if (opts.typing) {
+      const typing = opts.typing;
+      this.typingKeeper = new TypingKeeper({
+        send: (userKey, on) => typing(userKey, on),
+        ...(opts.now ? { now: opts.now } : {}),
+      });
+    }
     const startedAt = this.now();
     for (const persona of opts.inboxes.keys()) this.lastPull.set(persona, startedAt);
     const raw = readJsonFile<{ greeted?: unknown }>(opts.greetedPath, {});
@@ -324,6 +344,11 @@ export class CourierCore implements CourierApi {
         reason: "这个用户已经切到别的人格了",
       };
     }
+    // 正文交出来了就说明这一轮说完了 —— 立刻熄灭,别让气泡跟答案一起挂在那儿。
+    // 进度不熄:那时还在干活,气泡该继续跳。不熄也不会永远亮着(人格一停推信号,
+    // keeper 十几秒后自己收摊),这一下只是让它跟答案同时到。
+    if (env.kind === "body") this.typingKeeper?.stop(env.userKey);
+
     try {
       // **发不出去不等于失败**:`submit` 要么当场发,要么排进队列等额度回来,
       // 两种都算收下了。所以这里回 ok —— 人格据此判断"这条交出去了",
@@ -344,6 +369,18 @@ export class CourierCore implements CourierApi {
         reason: String(err),
       };
     }
+  }
+
+  /**
+   * 人格报「这一轮还在动」。转成微信那边的输入气泡,频率由 `TypingKeeper` 定。
+   *
+   * **路由校验照做**:已经切到别的人格的用户,旧人格的活体信号不该再点亮气泡 ——
+   * 那会让他在跟守护人格说话时看到主人格在"打字"。
+   */
+  async typing(persona: PersonaId, userKey: string): Promise<void> {
+    if (!this.typingKeeper) return;
+    if (this.opts.routing.personaFor(userKey) !== persona) return;
+    this.typingKeeper.signal(userKey);
   }
 
   async admin(_persona: PersonaId, method: string, path: string, body: unknown): Promise<AdminResponse> {
@@ -384,6 +421,8 @@ export class CourierCore implements CourierApi {
 
   /** 关停:把在飞的那一轮排空等完。队列已落盘,没发完的下次起来接着发。 */
   async stop(): Promise<void> {
+    // 先把气泡都熄掉:进程要走了,留一个永远跳着的输入提示比什么都不做更糟。
+    this.typingKeeper?.stopAll();
     await this.outbox.stop();
   }
 

@@ -190,6 +190,14 @@ export class BridgeChannel implements Channel {
   }
 
   /**
+   * 「还在动」。转给信使,由它决定多久往微信打一次 —— 频率是渠道知识,
+   * 人格这边只管报事实,爱推多密推多密。
+   */
+  async typing(userKey: string): Promise<void> {
+    await this.opts.client.typing?.(userKey);
+  }
+
+  /**
    * 健康自述。`live` 要求**最近确实拉取成功过** —— 与 iLink 渠道那条同源:
    * "已启动"不等于"收得到消息",而部署的健康门正是靠这份自述判断新版本真的在服务。
    */

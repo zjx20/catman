@@ -9,11 +9,15 @@ import type { ReplyContexts } from "../../src/channels/ilink-connection.js";
  */
 export class FakeReplies implements ReplyContexts {
   readonly ctxs = new Map<string, { toUserId: string; contextToken: string; n: number }>();
+  /** 每个 userKey 的 typing ticket。用例据此验"换来信要换 ticket"。 */
+  readonly tickets = new Map<string, string>();
   /** 置 false 可模拟"预算用尽",验连接会不会照发。 */
   allow = true;
 
   remember(userKey: string, toUserId: string, contextToken: string): void {
     this.ctxs.set(userKey, { toUserId, contextToken, n: 0 });
+    // 跟真实现一致:换一条来信,上一轮的 ticket 一起作废。
+    this.tickets.delete(userKey);
   }
   begin(userKey: string): { allowed: boolean; reason?: string } {
     const c = this.ctxs.get(userKey);
@@ -23,6 +27,12 @@ export class FakeReplies implements ReplyContexts {
     return { allowed: true };
   }
   settle(): void {}
+  typingTicket(userKey: string): string | undefined {
+    return this.tickets.get(userKey);
+  }
+  rememberTypingTicket(userKey: string, ticket: string): void {
+    this.tickets.set(userKey, ticket);
+  }
   target(userKey: string): { toUserId: string; contextToken: string } | undefined {
     return this.ctxs.get(userKey);
   }

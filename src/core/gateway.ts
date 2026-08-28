@@ -70,6 +70,12 @@ export function reminderText(sessionShortId: string): string {
 }
 
 /** 收到消息后的即时回执文案。回复发出后,支持撤回的渠道会撤回这条回执。 */
+/**
+ * 人格多久往信使报一次「还在动」。**比信使的续命间隔(5 秒)短** ——
+ * 取一半是为了让信号别卡在两个 tick 中间断档,而不是为了更快点亮。
+ */
+const ALIVE_SIGNAL_INTERVAL_MS = 2_500;
+
 export const ACK_TEXT = "收到,正在处理中…";
 
 /**
@@ -1590,6 +1596,23 @@ export class Gateway {
     // **回调无条件挂上**,progressEnabled 只决定要不要推给用户。
     // 关掉进度推送的用户同样需要 /状态 答得出"现在在干什么" —— 把观测和
     // 推送绑在一起的话,一个纯粹的省流开关会顺手把可观测性也关掉。
+    // 「对方正在输入」。**与进度是并行的两条信道**:进度说"在做什么",
+    // 它说"还活着",谁也不替代谁 —— 所以这里不看 progressEnabled,也不占
+    // 发送预算(走渠道自己的 sendtyping 端点,见 channels/ilink-protocol.ts)。
+    //
+    // 这一侧只做粗节流:SDK 消息一个回合有几百条,每条都打一次 IPC 是白费。
+    // 真正的频率由信使定(TypingKeeper),它比这里更懂渠道要求多久续一次命。
+    // 间隔取得比信使的 tick 短,是为了让信号别在两个 tick 之间断档。
+    let lastAlive = 0;
+    const onAlive = (): void => {
+      const now = this.now();
+      if (now - lastAlive < ALIVE_SIGNAL_INTERVAL_MS) return;
+      lastAlive = now;
+      // 失败静默:老信使没有这个端点(它跑 pinned,版本天然更旧),
+      // 那时正确的行为就是什么都不做。
+      void this.channel.typing?.(userKey, true).catch(() => {});
+    };
+
     const onProgress = (ev: AgentProgressEvent) => {
       const snap = turn.ctx.progress;
       snap.steps += 1;
@@ -1642,6 +1665,7 @@ export class Gateway {
           observedSessionId = id;
         },
         onProgress,
+        onAlive,
         logLabel: userKey,
         ...(attachments.length ? { attachments } : {}),
         // agent 跑起来了才挂 feed:排队中的回合还没有 turn 可折,那时候

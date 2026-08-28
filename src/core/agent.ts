@@ -157,6 +157,14 @@ export interface AgentRunOptions {
   /** 中间过程回调(思考/工具调用)。回调应快速返回,耗时操作自行异步化。 */
   onProgress?: (ev: AgentProgressEvent) => void;
   /**
+   * 「还在动」。**每条 SDK 消息都调一次**,与 onProgress 透出的那两类无关。
+   *
+   * 这跟心跳用的是同一个判据(见下面 lastAt 那行):工具结果回填、API 重试
+   * 同样是活着的证据,只认 onProgress 会把一个正常推进、但半天没有新工具调用的
+   * 回合误判成没动静。调用方要节流自己节流 —— 这里给的是原始事实。
+   */
+  onAlive?: () => void;
+  /**
    * 日志里标识这是谁的回合(网关传 userKey)。多用户并发时,不带这个的话
    * 几个回合的日志会交织成一团分不开。
    */
@@ -574,6 +582,8 @@ export class Agent {
         }
         // 心跳的"上次动静"以任何一条 SDK 消息为准,与要不要打日志无关。
         lastAt = Date.now();
+        // 同一个判据也喂给输入气泡:它表达的正是"它刚刚还动过"。
+        opts.onAlive?.();
 
         if (message.type === "assistant") {
           // 攒着的那个 text 块留在 fan 里,回合结束时随它一起丢掉 ——

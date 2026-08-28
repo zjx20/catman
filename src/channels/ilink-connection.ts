@@ -8,6 +8,8 @@ import {
   LONG_POLL_PATH,
   LONG_POLL_TIMEOUT_MS,
   WECHAT_CHANNEL,
+  fetchTypingTicket,
+  sendTyping,
   type CdnMedia,
 } from "./ilink-protocol.js";
 import {
@@ -100,6 +102,10 @@ export interface ReplyContexts {
   settle(userKey: string, ok: boolean): void;
   /** 发给谁、用哪个 token。 */
   target(userKey: string): { toUserId: string; contextToken: string } | undefined;
+  /** 这一轮的 typing ticket;没取过时是 undefined。 */
+  typingTicket(userKey: string): string | undefined;
+  /** 存下新取的 ticket。它跟着 context_token 走,换一条来信就作废。 */
+  rememberTypingTicket(userKey: string, ticket: string): void;
   /** 诊断三量:第几次尝试、之前成功几条、这份上下文多老了。 */
   diag(userKey: string): { attempt: number; okBefore: number; ageMs: number };
 }
@@ -220,6 +226,8 @@ export class ILinkConnection {
   private loop?: Promise<void>;
   /** 会话过期(需重新扫码)后置位,供 dashboard 展示。 */
   private expired = false;
+  /** typing 出过错就整条连接停用 —— 见 typing() 的说明。 */
+  private typingBroken = false;
 
   /**
    * limits 传的是**函数不是值**:管理员在 dashboard 上改了上限,下一张图就按新值走,
@@ -329,7 +337,57 @@ export class ILinkConnection {
     }
   }
 
+  /**
+   * 「对方正在输入」的开关。**与 send 是两条信道**:走 sendtyping 端点、
+   * 靠 typing_ticket 认身份,不碰 context_token 的那 10 条预算,所以它跟文本进度
+   * 是并行的两件事 —— 进度说「在做什么」,它说「还活着」,谁也不替代谁。
+   *
+   * 全程不抛错:这是装饰,不该反过来把一个正常的回合搞挂。失败只记一行日志,
+   * 而且**首次失败就整条连接停用** —— 5 秒一次的失败会把日志刷爆,而刷爆的日志
+   * 比没有 typing 严重得多。
+   */
+  async typing(userKey: string, on: boolean): Promise<void> {
+    if (this.typingBroken) return;
+    try {
+      const target = this.replies.target(userKey);
+      if (!target) return; // 没有这一轮的上下文,本来也发不出任何东西
+
+      // ticket 跟 context_token 同生共死(见 fetchTypingTicket 的说明),所以这里
+      // 拿到的要么是这一轮取过的那份,要么就得现取 —— 绝不会是上一轮的。
+      let ticket = this.replies.typingTicket(userKey);
+      if (!ticket) {
+        // 熄灭时不值得为了发这一下专门去取一份 ticket:没取过就说明这一轮
+        // 压根没亮过,没有东西需要熄。
+        if (!on) return;
+        ticket = await fetchTypingTicket(target.toUserId, target.contextToken, this.postOpts());
+        if (!ticket) throw new Error(`getconfig 没给 typing_ticket`);
+        this.replies.rememberTypingTicket(userKey, ticket);
+      }
+
+      // ⚠️ ret 只表示「收下了」。参数残缺时它照样是 0 而客户端什么都不显示,
+      // 所以这里的检查抓不到「不亮」,只抓得到明确的报错。
+      const r = await sendTyping(target.toUserId, ticket, on, this.postOpts());
+      if (r.ret !== undefined && r.ret !== 0) {
+        throw new Error(`sendtyping ret=${r.ret} ${r.errmsg ?? ""}`);
+      }
+    } catch (err) {
+      this.typingBroken = true;
+      console.warn(
+        `[ilink:${this.accountId}] typing 失败,本连接不再尝试(不影响收发消息):${String(err)}`,
+      );
+    }
+  }
+
   // --- 内部 ---
+
+  /** post 的公共参数。typing 那两个端点是模块级函数,要显式把凭据递进去。 */
+  private postOpts(): { baseUrl: string; botToken: string; signal: AbortSignal } {
+    return {
+      baseUrl: this.account.baseUrl,
+      botToken: this.account.botToken,
+      signal: this.abort.signal,
+    };
+  }
 
   private async pollLoop(): Promise<void> {
     while (this.running) {

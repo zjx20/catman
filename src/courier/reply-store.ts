@@ -126,6 +126,16 @@ export interface ReplyContext {
   sent: number;
   /** 其中有几条是进度。进度的上限是保留额的实现方式。 */
   progress: number;
+  /**
+   * 「对方正在输入」用的 ticket(见 channels/ilink-protocol.ts 的 fetchTypingTicket)。
+   *
+   * **故意跟 contextToken 放在同一个对象里**:ticket 里编码了 context,换一条来信
+   * 就得换一份,拿旧的去发 typing 会「ret=0 但客户端不亮」。放这儿之后 remember()
+   * 重建 ctx 时它自然一起作废,没有单独的过期逻辑可以忘记写。
+   *
+   * 懒取:只有真要发 typing 时才去 getconfig 换一份填进来,没人发就一直是空的。
+   */
+  typingTicket?: string;
 }
 
 export interface SendPermit {
@@ -255,6 +265,23 @@ export class ReplyStore {
     this.flush();
   }
 
+  /**
+   * 这一轮的 typing ticket。**没有就是没有** —— 调用方负责去 getconfig 取一份
+   * 回来交给 rememberTypingTicket,而不是在这里同步取:取 ticket 要发 HTTP,
+   * 而这个类是纯记账的、还要被单测拿假时钟驱动。
+   */
+  typingTicket(userKey: string): string | undefined {
+    return this.ctxs.get(userKey)?.typingTicket;
+  }
+
+  /** 收下一份新取的 ticket。上下文已经被换掉时直接丢弃 —— 它属于上一条来信。 */
+  rememberTypingTicket(userKey: string, ticket: string): void {
+    const c = this.ctxs.get(userKey);
+    if (!c || c.typingTicket === ticket) return;
+    c.typingTicket = ticket;
+    this.flush();
+  }
+
   /** 诊断行要用的三个量:第几次尝试、之前成功几条、这份上下文多老了。 */
   diag(userKey: string): { attempt: number; okBefore: number; ageMs: number } {
     const c = this.ctxs.get(userKey);
@@ -295,5 +322,11 @@ function parseCtx(v: unknown): ReplyContext | undefined {
     attempts: typeof r["attempts"] === "number" ? num("attempts") : SEND_BUDGET,
     sent: num("sent"),
     progress: typeof r["progress"] === "number" ? num("progress") : MAX_PROGRESS_PER_TOKEN,
+    // 旧盘上没有这个字段,读出来是 undefined —— 那只是「还没取过 ticket」,
+    // 下次要发 typing 时自然会去取一份。反过来旧代码读到带这个字段的新盘也无妨:
+    // 它按白名单构造,多出来的键直接忽略。回滚安全。
+    ...(typeof r["typingTicket"] === "string" && r["typingTicket"]
+      ? { typingTicket: r["typingTicket"] }
+      : {}),
   };
 }

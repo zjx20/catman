@@ -31,9 +31,19 @@ export class CompositeChannel implements Channel {
         await target.recall(userKey, messageId);
       };
     }
+    // typing 同理:任一子渠道支持就对外声明支持。**两个形参都要原样转下去** ——
+    // 这里正是 send 当年把 kind 弄丢的那个位置,TypeScript 拦不住少写形参。
+    if (channels.some((c) => c.typing)) {
+      this.typing = async (userKey, on) => {
+        const target = this.route(userKey);
+        if (!target.typing) return;
+        await target.typing(userKey, on);
+      };
+    }
   }
 
   recall?: (userKey: string, messageId: string) => Promise<void>;
+  typing?: (userKey: string, on: boolean) => Promise<void>;
 
   onMessage(handler: MessageHandler): void {
     for (const c of this.byName.values()) c.onMessage(handler);

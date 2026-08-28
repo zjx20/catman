@@ -117,6 +117,18 @@ export interface Channel {
   send(userKey: string, text: string, kind?: SendKind): Promise<string | void>;
 
   /**
+   * 可选:告诉用户「对方正在输入」。`on=false` 熄灭。
+   *
+   * **与 send 是两条独立的信道**,故意不做成 send 的一种 kind:kind 是发送预算的
+   * 记账依据,而 typing 压根不占预算;更要紧的是信使跑 pinned、版本天然比人格老,
+   * 它认不出的 kind 会让**整个出站信封读不懂**(见 ipc/protocol.ts 的 parseSendKind),
+   * 那等于用一个装饰功能去冒险丢正文。
+   *
+   * 不支持的渠道不实现;调用方**必须容忍失败**,一次都不该影响消息收发。
+   */
+  typing?(userKey: string, on: boolean): Promise<void>;
+
+  /**
    * 可选:撤回本渠道之前 send() 返回过 id 的消息。
    * 不支持撤回的渠道不实现该方法;上层须在调用前判断其存在,失败也应容忍。
    */

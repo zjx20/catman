@@ -321,6 +321,27 @@ export function parseAck(v: unknown): AckEnvelope | undefined {
 }
 
 /**
+ * 「我还活着」的信号。人格推,信使转成微信那边的「对方正在输入」。
+ *
+ * **故意不是 SendKind 的一种。** 出站信封里出现信使认不出的 kind,会让
+ * `parseOutbound` 整个返回 undefined —— 而信使跑 pinned、版本天然比人格老,
+ * 那意味着新人格发的每条消息在老信使那儿都读不懂。走独立端点则最坏是 404,
+ * 人格吞掉,正文那条信道一个字节都不受影响。
+ */
+export interface TypingEnvelope {
+  readonly schema: number;
+  readonly userKey: string;
+}
+
+export function parseTyping(v: unknown): TypingEnvelope | undefined {
+  const r = obj(v);
+  if (!r) return undefined;
+  const userKey = str(r, "userKey");
+  if (!userKey) return undefined;
+  return { schema: typeof r["schema"] === "number" ? r["schema"] : IPC_SCHEMA, userKey };
+}
+
+/**
  * 按 secret 反查人格身份。
  *
  * 纯函数,所以"伪造身份"这条路能被单测直接钉住。**空 secret 一律拒绝** ——

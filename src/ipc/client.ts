@@ -43,6 +43,8 @@ export interface CourierLink {
   ack(msgIds: readonly string[]): Promise<void>;
   nack(msgIds: readonly string[], reason: string): Promise<void>;
   send(userKey: string, text: string, kind: SendKind): Promise<SendResult>;
+  /** 报一次「还在动」。可选:没有它的实现只是不亮输入气泡,别的照常。 */
+  typing?(userKey: string): Promise<void>;
 }
 
 export interface IpcClientOptions {
@@ -94,6 +96,21 @@ export class IpcClient implements CourierLink {
     const parsed = parseSendResult(r.body);
     // 读不懂信使的回复时按"没发出去、也没有额度"处理:**宁可少发,不可超发**。
     return parsed ?? { schema: IPC_SCHEMA, ok: false, remainingProgress: 0, reason: "信使的回复读不懂" };
+  }
+
+  /**
+   * 报一次「还在动」。**失败一律吞掉,而且不重试。**
+   *
+   * 老信使(pinned 比人格旧)没有这个端点,回的是 404 —— 那时正确的行为就是
+   * 什么都不做:typing 是装饰,不值得为它打一行日志,更不值得让调用方看见异常。
+   * 独立端点的全部价值就在这里:它坏掉的时候,正文那条路毫发无损。
+   */
+  async typing(userKey: string): Promise<void> {
+    try {
+      await this.post("/typing", { schema: IPC_SCHEMA, userKey }, 5_000);
+    } catch {
+      // 静默
+    }
   }
 
   /** 代理 dashboard 的账号管理等控制面。 */

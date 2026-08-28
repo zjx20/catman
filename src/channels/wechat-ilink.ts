@@ -80,6 +80,16 @@ export class WechatILinkChannel implements Channel {
     await conn.send(userKey, text, kind);
   }
 
+  /**
+   * 「对方正在输入」。**静默失败**:没有连接就什么都不做 —— 它是装饰,
+   * 而 send 在同样的情况下必须抛错(那是真的没送到)。
+   */
+  async typing(userKey: string, on: boolean): Promise<void> {
+    const parts = parseUserKey(userKey);
+    if (!parts) return;
+    await this.connections.get(parts.accountId)?.typing(userKey, on);
+  }
+
   /** 各连接累计跳过的毒消息条数。非零说明有来信我们处理不了,状态页要显眼。 */
   poisonedCount(): number {
     let n = 0;

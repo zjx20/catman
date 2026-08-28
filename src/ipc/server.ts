@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import {
   IPC_SCHEMA,
   parseAck,
+  parseTyping,
   parseOutbound,
   resolvePersona,
   type PersonaId,
@@ -36,6 +37,8 @@ export interface CourierApi {
   send(persona: PersonaId, out: unknown): Promise<SendResult>;
   /** 账号管理等控制面,供人格 dashboard 代理。 */
   admin(persona: PersonaId, method: string, path: string, body: unknown): Promise<AdminResponse>;
+  /** 人格报「这一轮还在动」。信使据此维持微信那边的输入气泡。 */
+  typing(persona: PersonaId, userKey: string): Promise<void>;
 }
 
 export interface AdminResponse {
@@ -114,6 +117,12 @@ export async function handleIpc(
         };
       }
       return { status: 200, body: await api.send(persona, out) };
+    }
+    case "POST /typing": {
+      const t = parseTyping(body);
+      // 读不懂也只回 200:这是装饰信道,人格不该因为它而走进任何错误分支。
+      if (t) await api.typing(persona, t.userKey);
+      return { status: 200, body: { schema: IPC_SCHEMA, ok: true } };
     }
     default:
       break;

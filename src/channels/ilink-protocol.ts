@@ -222,3 +222,72 @@ async function request<T>(url: string, init: RequestInitPlus): Promise<T> {
     init.signal?.removeEventListener("abort", onAbort);
   }
 }
+
+/**
+ * 「对方正在输入」。proto: TypingStatus。
+ *
+ * 这是一条**独立于 sendmessage 的信道**:请求走 `ilink/bot/sendtyping`,身份靠
+ * `typing_ticket` 而不是 `context_token`,所以它**不吃那 10 条发送预算**
+ * (2026-08-28 实测:一轮里打了 22 个 typing 请求,发件队列全程是空的,
+ * 一条正文都没被顶掉)。进度文本与它是并行的两件事,谁也不替代谁。
+ */
+export const TYPING_ON = 1;
+export const TYPING_OFF = 2;
+
+/**
+ * 取一份 typing_ticket。
+ *
+ * ⚠️ **`context_token` 必须带,而且 ticket 不能跨来信复用。**
+ *
+ * ticket 里编码了 context:同一个用户,带与不带 `context_token` 取回来的是两份
+ * **不同**的 ticket(长度都是 440,内容不同)。拿不带 context_token 的那份去发
+ * typing,服务端一路 `ret=0`,而客户端**什么都不显示** —— 2026-08-28 真机对照
+ * 实验确认过:同样的 sendtyping 参数,只换 ticket 的来源,一个亮一个不亮。
+ *
+ * 官方插件(openclaw-weixin 的 `config-cache.ts`)把 ticket 按用户缓存 24 小时,
+ * 那是错的:`context_token` 每条来信都换,缓存下来的 ticket 从第二轮起就已经失效。
+ * 它一直没被发现,正是因为失效的表现是「`ret=0` + 客户端安静」。我们把 ticket 挂在
+ * `ReplyContext` 上跟 `context_token` 同生共死,就是为了让它没有机会过期。
+ */
+export async function fetchTypingTicket(
+  ilinkUserId: string,
+  contextToken: string,
+  opts: PostOptions = {},
+): Promise<string | undefined> {
+  const resp = await ilinkPost<{ ret?: number; typing_ticket?: string }>(
+    "ilink/bot/getconfig",
+    { ilink_user_id: ilinkUserId, context_token: contextToken, base_info: baseInfo() },
+    opts,
+  );
+  return resp.typing_ticket || undefined;
+}
+
+/**
+ * 发一次 typing。`on=false` 是熄灭(status=2)。
+ *
+ * ⚠️ **返回值几乎没有信息量。** 这个端点在参数残缺时照样回 `ret=0` ——
+ * 第一次真机实验漏传了 `context_token`,服务端全程 `ret=0`,客户端一次都没亮。
+ * 所以 `ret=0` 只表示「收下了」,不表示「用户看见了」;这个协议里的新端点
+ * 一律得靠人眼验收,不能靠返回码。同样的毛病 sendmessage 也有(缺 context_token
+ * 时 HTTP 200 静默失败),见 ilink-connection.ts 顶部那段。
+ *
+ * 官方在 sendtyping 的 body 里还带了 `base_info`,我们照带 —— 对照实验表明它
+ * 与亮不亮无关,但它是自述身份用的,带上没有坏处。
+ */
+export async function sendTyping(
+  ilinkUserId: string,
+  ticket: string,
+  on: boolean,
+  opts: PostOptions = {},
+): Promise<{ ret?: number; errmsg?: string }> {
+  return ilinkPost<{ ret?: number; errmsg?: string }>(
+    "ilink/bot/sendtyping",
+    {
+      ilink_user_id: ilinkUserId,
+      typing_ticket: ticket,
+      status: on ? TYPING_ON : TYPING_OFF,
+      base_info: baseInfo(),
+    },
+    opts,
+  );
+}

@@ -96,6 +96,8 @@ async function main(): Promise<void> {
     // 出站积压落盘:信使重启时里面可能正躺着一条已经跑完却没送出去的答案。
     outboxPath: join(dir, "outbox.json"),
     send: (userKey, text, kind) => channel.send(userKey, text, kind),
+    // typing 走渠道自己那条独立信道,不经发件队列(见 CourierCoreOptions.typing)。
+    typing: (userKey, on) => channel.typing(userKey, on),
     ...(readBindPassphrase(join(dir, "bind-passphrase")) ?? {}),
     onForceBind: (userKey) => {
       const parts = parseUserKey(userKey);
