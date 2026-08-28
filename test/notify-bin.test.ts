@@ -159,6 +159,68 @@ test("run:失败时带 ❌ 与退出码 —— 静悄悄的失败是最坏的一
   assert.match(text, /出错了/);
 });
 
+/**
+ * 这条通知的读者是**聊天客户端的 markdown 渲染器**,不是终端。
+ *
+ * 裸贴日志的下场:markdown 吃掉单换行,几十行结构化输出连成一段;日志里的 `*`
+ * 变成强调;缩进四格的行各自变成代码块。真机上就是一坨看不懂的东西。
+ * 代码围栏一裹全都原样保留 —— 这条用例守的就是"围栏还在"。
+ */
+test("run:日志尾巴裹在代码围栏里,原样保留换行", async () => {
+  const r = await rig();
+  // 三行,而且带一个会被 markdown 吃掉的星号。
+  await run(r.bin, ["run", "-n", "多行", "--", "bash", "-c", "printf '第一行\\n*星号*\\n第三行\\n'"], r.env);
+  await waitFor(r.got, 1);
+  const text = String(r.got[0]!.text);
+  assert.match(text, /```[\s\S]*第一行[\s\S]*```/, "日志尾巴必须在围栏内");
+  assert.match(text, /第一行\n\*星号\*\n第三行/, "换行与星号都要原样留着");
+  // 标题与围栏之间要有空行,否则 markdown 会把它们黏成一段。
+  assert.match(text, /跑完了[^\n]*\n\n/);
+});
+
+/**
+ * 制备那条 `/发布 <sha>` 是要人原样复制的。埋在 1200 字日志尾巴里,既难找
+ * 又难点中 —— 单独拎出来自成一块,而且排在最前面。
+ */
+test("run:日志里的 /发布 口令单独成块,排在日志尾巴前面", async () => {
+  const r = await rig();
+  await run(
+    r.bin,
+    ["run", "-n", "制备", "--", "bash", "-c", "echo 别的输出; echo '确认发布:在微信里发「/发布 abc1234」'"],
+    r.env,
+  );
+  await waitFor(r.got, 1);
+  const text = String(r.got[0]!.text);
+  // 自成一块:围栏里**只有**这条口令,方便整块复制。
+  assert.match(text, /```\n\/发布 abc1234\n```/);
+  // 而且要在日志尾巴之前 —— 最该被点中的东西不该排在一屏日志后面。
+  assert.ok(
+    text.indexOf("/发布 abc1234\n```") < text.indexOf("别的输出"),
+    "口令块要排在日志尾巴前面",
+  );
+});
+
+/** 别的任务没有这行口令,那就不该凭空多出一个空块。 */
+test("run:没有 /发布 口令时不多出一个空块", async () => {
+  const r = await rig();
+  await run(r.bin, ["run", "-n", "普通活儿", "--", "bash", "-c", "echo 没有口令"], r.env);
+  await waitFor(r.got, 1);
+  const text = String(r.got[0]!.text);
+  assert.equal((text.match(/```/g) ?? []).length, 2, "只该有日志尾巴那一对围栏");
+});
+
+/**
+ * 日志里恰好出现三反引号时,消息会从那儿被劈成两半 —— 后半截连同"日志:"那行
+ * 一起漏到围栏外面,重新暴露给 markdown。围栏必须比正文里最长的那串更长。
+ */
+test("run:日志自己带反引号围栏时,外层围栏加长躲开它", async () => {
+  const r = await rig();
+  await run(r.bin, ["run", "-n", "带围栏", "--", "bash", "-c", "printf '```js\\nlet x=1\\n```\\n'"], r.env);
+  await waitFor(r.got, 1);
+  const text = String(r.got[0]!.text);
+  assert.match(text, /````\n[\s\S]*let x=1[\s\S]*\n````/, "外层要用四个反引号");
+});
+
 test("run:日志落在 $CATMAN_DATA_DIR/tmp,不是 /tmp(别的容器挂不到 /tmp)", async () => {
   const r = await rig();
   const res = await run(r.bin, ["run", "-n", "看路径", "--", "true"], r.env);

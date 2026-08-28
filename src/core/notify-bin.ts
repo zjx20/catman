@@ -125,7 +125,7 @@ cmd_child() {
   code=\$?
   end=\$(date +%s)
 
-  local head tail_text
+  local head tail_text fence pub
   if [ "\$code" -eq 0 ]; then
     head="✅ 「\$name」跑完了,\$(human_duration \$((end - start)))"
   else
@@ -133,7 +133,27 @@ cmd_child() {
   fi
   # 只带尾巴:结论几乎总在最后。1200 字够看清、又不至于刷满一屏。
   tail_text=\$(tail -c 1200 "\$log" 2>/dev/null || true)
-  printf '%s\\n%s\\n日志:%s' "\$head" "\$tail_text" "\$log" | post >/dev/null 2>&1
+
+  # **日志尾巴必须裹进代码围栏。** 聊天客户端按 markdown 渲染这条通知,裸贴的
+  # 后果是一屏结构化输出糊成一团:markdown 吃掉单换行,几十行日志连成一段;
+  # 日志里的 * 变成强调;缩进四格的行各自变成代码块。围栏一裹全都原样保留。
+  #
+  # 围栏长度要躲开正文 —— 日志里恰好出现三反引号时,消息会从那儿被劈成两半,
+  # 后半截连同"日志:"那行一起漏到围栏外面。
+  fence='\`\`\`'
+  case "\$tail_text" in *'\`\`\`'*) fence='\`\`\`\`' ;; esac
+
+  # 制备那条「/发布 <sha>」是要人原样复制的,埋在 1200 字日志尾巴里不好找也不好点。
+  # 单独拎到最前面自成一块。别的任务没有这行,那就没有这一段。
+  pub=\$(grep -oE '/发布 [0-9a-f]{7,}' "\$log" 2>/dev/null | tail -1 || true)
+
+  # 每段之间空一行:markdown 靠空行分段,少了它标题和正文会黏成一坨。
+  {
+    printf '%s\\n' "\$head"
+    if [ -n "\$pub" ]; then printf '\\n%s\\n%s\\n%s\\n' "\$fence" "\$pub" "\$fence"; fi
+    printf '\\n%s\\n%s\\n%s\\n' "\$fence" "\$tail_text" "\$fence"
+    printf '\\n日志:\`%s\`\\n' "\$log"
+  } | post >/dev/null 2>&1
 }
 
 cmd_run() {
