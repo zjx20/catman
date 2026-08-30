@@ -35,7 +35,7 @@ import {
   type ParsedCommand,
 } from "./commands.js";
 import { SETTING_SCHEMA, USER_SETTING_KEYS } from "./settings.js";
-import { skillsFor } from "./skills.js";
+import { skillsFor, skillsOnDisk } from "./skills.js";
 import { readVersion, releaseNote, shortSha, versionLine, type VersionInfo } from "./version.js";
 import type { DeployControl } from "./deploy.js";
 import {
@@ -181,6 +181,11 @@ export interface GatewayOptions {
    * 不传按主人格,与 stdin / dashboard 这类本地场景一致。
    */
   persona?: Persona;
+  /**
+   * CLAUDE_CONFIG_DIR。主人格靠扫它下面的 `skills/` 决定这一回合给哪些 skill ——
+   * 装进去就生效,不用改代码发版。不传则退回 skills.ts 里的硬编码兜底名单。
+   */
+  skillsDir?: string;
   /**
    * OAuth token 到期告警(core/token-alert.ts)。只发给管理员 —— 换发要人在宿主
    * 跑 setup-token,普通用户拿这条消息什么都做不了,只会吓一跳。
@@ -664,6 +669,7 @@ export class Gateway {
    */
   private readonly version: VersionInfo | undefined;
   private readonly persona: Persona;
+  private readonly skillsDir: string | undefined;
   private readonly tokenAlert: GatewayOptions["tokenAlert"];
   /**
    * 信使说过"这些人早就收过使用指引了"的那些 userKey。
@@ -699,6 +705,7 @@ export class Gateway {
     this.deployNewsIntervalMs = opts.deployNewsIntervalMs ?? DEPLOY_NEWS_INTERVAL_MS;
     this.version = opts.version ?? readVersion();
     this.persona = opts.persona ?? "primary";
+    this.skillsDir = opts.skillsDir;
     this.tokenAlert = opts.tokenAlert;
     this.deploy = opts.deploy;
     this.cron = opts.cron;
@@ -1729,7 +1736,7 @@ export class Gateway {
         resumeSessionId: decision.isNew ? undefined : decision.resumeSessionId,
         ...(prefs.model ? { model: prefs.model } : {}),
         env: this.childEnv(isAdmin, turn.token, userKey),
-        skills: skillsFor(this.persona, isAdmin),
+        skills: this.skillsFor(isAdmin),
         abortController: turn.ctx.abort,
         // 看门狗动手时给用户带外发一条。不走 onProgress —— 用户可能把进度关了,
         // 而"系统对这个回合做了什么"是不该被那个开关埋掉的。
@@ -1899,6 +1906,14 @@ export class Gateway {
    * 显式加回。这是管理员令牌下放到子进程的唯一出口。
    */
   /** 子进程环境。实现在 core/turn-env.ts —— 定时 agent 任务用的是同一份。 */
+  /** 这一回合给哪些 skill。磁盘现状 + 管理员禁用清单,规则在 skills.ts。 */
+  private skillsFor(isAdmin: boolean): string[] {
+    return skillsFor(this.persona, isAdmin, {
+      ...(this.skillsDir ? { onDisk: skillsOnDisk(this.skillsDir) } : {}),
+      disabled: this.settings.effective().disabledSkills,
+    });
+  }
+
   private childEnv(
     isAdmin: boolean,
     sessionToken: string,

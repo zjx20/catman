@@ -212,6 +212,7 @@ async function main(): Promise<void> {
     admission,
     version,
     persona: config.persona,
+    skillsDir: configDir,
     // token 到期告警的微信出口。过期时刻从凭据文件读(env 长效 token 没有这份信息,
     // 那时它安静地什么都不报 —— 绝不编)。记账落在本进程自己的可写区。
     tokenAlert: new TokenAlerter({
@@ -241,7 +242,14 @@ async function main(): Promise<void> {
   // 一次 `/救援` 期间两个进程会各自去点同一批火。
   const cron =
     config.persona === "primary"
-      ? createCron(config, settings, turns, gateway, { agent, users, prefs, notifyTokens, binDir })
+      ? createCron(config, settings, turns, gateway, {
+          agent,
+          users,
+          prefs,
+          notifyTokens,
+          binDir,
+          skillsDir: configDir,
+        })
       : undefined;
   cronRef = cron;
 
@@ -357,6 +365,7 @@ function createCron(
     prefs: PrefsStore;
     notifyTokens: NotifyTokens;
     binDir: string;
+    skillsDir: string;
   },
 ): { store: CronStore; scheduler: CronScheduler; api: CronApiDeps } {
   const store = new CronStore({
@@ -377,6 +386,7 @@ function createCron(
       turns,
       apiBase: config.apiBase,
       persona: config.persona,
+      skillsDir: deps.skillsDir,
       // 定时 agent 任务里的助手同样会起长任务,`catman-notify` 对它一样有用。
       notifyTokens: deps.notifyTokens,
       binDir: deps.binDir,

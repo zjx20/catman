@@ -1,19 +1,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
+  ADMIN_ONLY_SKILLS,
   ADMIN_SKILL,
   ADMIN_SKILLS,
   CRON_SKILL,
   EVOLVE_SKILL,
+  GENERATED_SKILLS,
   RESCUE_SKILL,
   USER_SKILL,
   USER_SKILLS,
   evolveSkillBody,
   rescueSkillBody,
   skillsFor,
+  skillsOnDisk,
   writeSkills,
 } from "../src/core/skills.js";
 import { COMMAND_TABLE, canonicalOf } from "../src/core/commands.js";
@@ -187,4 +191,174 @@ test("救援 skill 正文里也没有令牌字面量", () => {
   for (const forbidden of ["sk-", "CLAUDE_CODE_OAUTH_TOKEN", "id_ed25519"]) {
     assert.equal(body.includes(forbidden), false, `正文里不该出现 ${forbidden}`);
   }
+});
+
+// --- 主人格走黑名单:装进 skills/ 就生效 ---
+
+/** 在临时 configDir 下造一个 skill 目录。不传 declaredName 就让 frontmatter 与目录名一致。 */
+function plantSkill(configDir: string, dirName: string, declaredName = dirName): void {
+  const dir = join(configDir, "skills", dirName);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "SKILL.md"),
+    `---\nname: ${declaredName}\ndescription: 测试用\n---\n\n正文\n`,
+    "utf8",
+  );
+}
+
+function withConfigDir(fn: (dir: string) => void): void {
+  const dir = mkdtempSync(join(tmpdir(), "catman-skills-disk-"));
+  try {
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("主人格:手写 skill 装进目录就进上下文,不用在代码里登记", () => {
+  // 这条是这次改动的**本体**。旧版是白名单,于是三个手写 skill(mediacenter /
+  // publish / container-work)在盘上躺了十几天一直是哑的 —— 而共享人设的正文
+  // 还在点名让人去用它们。能往 skills/ 里写文件的只有管理员和 catman 自己,
+  // 装进去这个动作本身就是认可。
+  const got = skillsFor("primary", true, { onDisk: [...ADMIN_SKILLS, "catman-mediacenter"] });
+  assert.ok(got.includes("catman-mediacenter"));
+});
+
+test("主人格:非管理员回合仍然减掉 catman-admin / catman-evolve", () => {
+  // 黑名单换掉的是「存在性登记」,不是权限门。后者照旧 ——
+  // description 常驻上下文,列出来等于告诉每个用户有这条路。
+  const pool = [...ADMIN_SKILLS, "catman-mediacenter"];
+  const got = skillsFor("primary", false, { onDisk: pool });
+  for (const gated of ADMIN_ONLY_SKILLS) {
+    assert.equal(got.includes(gated), false, `${gated} 不该给普通用户`);
+  }
+  // 挡的只是那两个,别的照给。
+  assert.deepEqual(got, [USER_SKILL, CRON_SKILL, "catman-mediacenter"]);
+});
+
+test("主人格:disabledSkills 能临时关掉一个装好的 skill", () => {
+  // SDK 没有按名字禁用单个 skill 的开关(只有 disableBundledSkills 那种整批的),
+  // 所以这个开关必须由 catman 自己给 —— 否则"关掉它"只能靠把文件挪走。
+  const pool = [...ADMIN_SKILLS, "catman-mediacenter"];
+  const got = skillsFor("primary", true, { onDisk: pool, disabled: ["catman-mediacenter"] });
+  assert.equal(got.includes("catman-mediacenter"), false);
+  assert.ok(got.includes(EVOLVE_SKILL), "禁一个不该带走别的");
+});
+
+test("主人格:catman-rescue 就算躺在盘上也不给", () => {
+  // 它教的是「怎么把版本退回去」,而主人格正是被退的那一方 ——
+  // 何况退版本要先停容器,它就跑在那个容器里。
+  const got = skillsFor("primary", true, { onDisk: [...ADMIN_SKILLS, RESCUE_SKILL] });
+  assert.equal(got.includes(RESCUE_SKILL), false);
+});
+
+test("磁盘读不到时退回硬编码名单 —— 一次 readdir 失败不该让它连改配置都不会", () => {
+  // 与 settings.ts 开头那条「任何配置状态下 agent 都必须能起来」同一个考虑。
+  assert.deepEqual(skillsFor("primary", true, {}), [...ADMIN_SKILLS]);
+  assert.deepEqual(skillsFor("primary", true, { onDisk: [] }), [...ADMIN_SKILLS]);
+  assert.deepEqual(skillsFor("primary", false, { onDisk: [] }), [...USER_SKILLS]);
+});
+
+test("守护人格是白名单:磁盘现状与 disabledSkills 都动不了它", () => {
+  // 它的价值就是没有惊喜 —— 跑钉住的稳定版本,被叫来时人正在等它诊断。
+  // 尤其:一个手滑的禁用不该让救援手册在最需要它的时候消失,而解除禁用要走
+  // 主人格那边的配置接口,那时主人格多半正不好使。
+  const noisy = { onDisk: ["catman-mediacenter", EVOLVE_SKILL], disabled: [RESCUE_SKILL] };
+  assert.deepEqual(skillsFor("rescue", true, noisy), [USER_SKILL, ADMIN_SKILL, RESCUE_SKILL]);
+  assert.deepEqual(skillsFor("rescue", false, noisy), [USER_SKILL]);
+});
+
+// --- skillsOnDisk ---
+
+test("skillsOnDisk 取 frontmatter 的 name,不是目录名", () => {
+  // SDK 按 canonical name 匹配(类型注释:display names and aliases do not match)。
+  // 目录名与 name 不一致时报目录名等于没列 —— 而且是安静地没列。
+  withConfigDir((dir) => {
+    plantSkill(dir, "my-dir", "actual-name");
+    assert.deepEqual(skillsOnDisk(dir), ["actual-name"]);
+  });
+});
+
+test("skillsOnDisk 跳过没有 SKILL.md 的目录与点开头的目录", () => {
+  withConfigDir((dir) => {
+    plantSkill(dir, "good");
+    mkdirSync(join(dir, "skills", "not-a-skill"), { recursive: true });
+    plantSkill(dir, ".trash");
+    // synced/ 装的是一批 skill 而不是一个,没有顶层 SKILL.md。
+    mkdirSync(join(dir, "skills", "synced", "inner"), { recursive: true });
+    assert.deepEqual(skillsOnDisk(dir), ["good"]);
+  });
+});
+
+test("skillsOnDisk 读不到目录返回空数组,而不是抛错", () => {
+  // 抛错会把整个回合带走。空数组交给 skillsFor 退回兜底名单。
+  withConfigDir((dir) => {
+    assert.deepEqual(skillsOnDisk(join(dir, "根本不存在")), []);
+  });
+});
+
+// --- writeSkills 的清理 ---
+
+test("writeSkills 清掉这个人格不要的旧生成物 —— 否则黑名单会把它复活", () => {
+  // 真实残留:守护人格的 skills/ 下躺着一份 Aug 10 的 catman-evolve,名单里没有它
+  // 所以一直是哑的,但内容早就跟不上了。主人格改走黑名单之后,这种残留会自己
+  // 冒出来,那时它不是多占几个 token,而是在主动教错。
+  withConfigDir((dir) => {
+    writeSkills(dir, { modelAllowlist: ["opus"] }, PATHS, "primary");
+    assert.ok(existsSync(join(dir, "skills", EVOLVE_SKILL, "SKILL.md")));
+
+    writeSkills(dir, { modelAllowlist: ["opus"] }, PATHS, "rescue");
+    assert.equal(existsSync(join(dir, "skills", EVOLVE_SKILL)), false, "换人格后旧的要没了");
+    assert.equal(existsSync(join(dir, "skills", CRON_SKILL)), false, "守护人格那边没有调度器");
+    assert.ok(existsSync(join(dir, "skills", RESCUE_SKILL, "SKILL.md")));
+  });
+});
+
+test("writeSkills 只清自己生成过的那几个名字,手写 skill 一个都不碰", () => {
+  // 这是黑名单模型能成立的前提:清理若按"名单外一律删",第一次启动就会把
+  // 管理员手写的 skill 全部抹掉。
+  withConfigDir((dir) => {
+    plantSkill(dir, "catman-mediacenter");
+    plantSkill(dir, "catman-publish");
+    writeSkills(dir, { modelAllowlist: ["opus"] }, PATHS, "primary");
+    writeSkills(dir, { modelAllowlist: ["opus"] }, PATHS, "rescue");
+    assert.ok(existsSync(join(dir, "skills", "catman-mediacenter", "SKILL.md")));
+    assert.ok(existsSync(join(dir, "skills", "catman-publish", "SKILL.md")));
+  });
+});
+
+test("GENERATED_SKILLS 覆盖两个人格生成的全部名字 —— 漏一个就是漏清一个", () => {
+  withConfigDir((dir) => {
+    for (const persona of ["primary", "rescue"] as const) {
+      writeSkills(dir, { modelAllowlist: ["opus"] }, PATHS, persona);
+    }
+    // 清理只认 GENERATED_SKILLS;写出来却不在那份名单里的,换人格时会永远留下。
+    const planted = GENERATED_SKILLS.filter((n) => existsSync(join(dir, "skills", n)));
+    assert.deepEqual(planted.sort(), [ADMIN_SKILL, RESCUE_SKILL, USER_SKILL].sort());
+  });
+});
+
+test("index.ts 把 CLAUDE_CONFIG_DIR 交给了网关与定时任务 —— 不传就静默退回白名单", () => {
+  // skillsDir 是可选的(单测里的 Gateway 不需要它),于是漏传的表现是"功能安静地
+  // 没生效":手写 skill 又变回哑的,而且没有任何报错。用源码文本钉住这两处装配。
+  const index = readFileSync(
+    join(resolve(dirname(fileURLToPath(import.meta.url)), "..", "src"), "index.ts"),
+    "utf8",
+  );
+  assert.match(index, /skillsDir: configDir/, "网关那处");
+  assert.match(index, /skillsDir: deps\.skillsDir/, "定时任务那处");
+});
+
+test("catman-admin 正文讲清 skill 怎么开怎么关 —— 这是唯一的关闭开关", () => {
+  // SDK 只有"整批关掉内置 skill"那种开关,没有按名字禁用单个的。管理员要是不知道
+  // disabledSkills 存在,就只能去挪文件 —— 那是不可逆的手工操作。
+  withConfigDir((dir) => {
+    writeSkills(dir, { modelAllowlist: ["opus"] }, PATHS, "primary");
+    const body = readFileSync(join(dir, "skills", ADMIN_SKILL, "SKILL.md"), "utf8");
+    assert.match(body, /装进 .*skills\/<名字>/, "要说清装进目录就生效");
+    assert.match(body, /disabledSkills/, "要给出关闭的办法");
+    // 全局配置表由 SETTING_SCHEMA 生成,这一项漏进去就等于开关不存在。
+    assert.match(body, /禁用的 skill/);
+    assert.match(body, /守护人格.*白名单/s, "要说清它管不着守护人格");
+  });
 });

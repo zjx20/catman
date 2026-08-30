@@ -1,4 +1,5 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import type { Dirent } from "node:fs";
 import { join } from "node:path";
 import { canonicalOf } from "./commands.js";
 import { BUILTIN_ADMIN_USER_KEY } from "./identity.js";
@@ -31,22 +32,49 @@ export const EVOLVE_SKILL = "catman-evolve";
 export const RESCUE_SKILL = "catman-rescue";
 
 /**
- * 普通回合可见的 skill。
+ * 由 `writeSkills` 生成的那几个。
+ *
+ * 这份名单划的是**「归 writeSkills 管」的边界**:它按人格生成其中一部分,也只清理
+ * 其中一部分 —— 手写丢进 `skills/` 的那些一个都不碰。主人格走黑名单(见 `skillsFor`),
+ * 手写 skill 装进去就生效,这条边界是那个模型能成立的前提。
+ */
+export const GENERATED_SKILLS: readonly string[] = [
+  USER_SKILL,
+  CRON_SKILL,
+  ADMIN_SKILL,
+  EVOLVE_SKILL,
+  RESCUE_SKILL,
+];
+
+/**
+ * 主人格里**只给管理员**的。
+ *
+ * `catman-evolve`:改自己的代码并推上线是全局影响的事(一次部署把所有用户都换了
+ * 版本),与 `/发布` `/回滚` 的 adminOnly 是同一个决定。普通用户的回合里连这份说明
+ * 都不该出现 —— description 常驻上下文,列出来等于告诉每个人有这条路。
+ */
+export const ADMIN_ONLY_SKILLS: readonly string[] = [ADMIN_SKILL, EVOLVE_SKILL];
+
+/**
+ * 主人格里**谁都不给**的:守护人格那份诊断手册。
+ *
+ * 它教的是「怎么把版本退回去」,而主人格正是被退的那一方 —— 何况退版本要先停容器,
+ * 它就跑在那个容器里。正常情况下这个文件也不在主人格的 `skills/` 下(`writeSkills`
+ * 只给守护人格生成它),这里挡的是有人手工拷了一份过来。
+ */
+const PRIMARY_EXCLUDED: readonly string[] = [RESCUE_SKILL];
+
+/**
+ * 磁盘读不到时,普通回合的兜底名单。
  *
  * `catman-cron` 在这里而不是 admin 那边:定时任务是**每人自己的**,接口按回合
  * 令牌定身份,一个用户既看不见也动不了别人的任务 —— 与改自己的设置同一个模型。
  */
 export const USER_SKILLS: readonly string[] = [USER_SKILL, CRON_SKILL];
-/**
- * admin 回合可见的 skill。
- *
- * `catman-evolve` **只在这里**:改自己的代码并推上线是全局影响的事(一次部署把所有
- * 用户都换了版本),与 `/发布` `/回滚` 的 adminOnly 是同一个决定。普通用户的回合里
- * 连这份说明都不该出现 —— 它的 description 常驻上下文,列出来等于告诉每个人有这条路。
- */
+/** 磁盘读不到时,admin 回合的兜底名单。 */
 export const ADMIN_SKILLS: readonly string[] = [USER_SKILL, CRON_SKILL, ADMIN_SKILL, EVOLVE_SKILL];
 /**
- * 守护人格的 admin 回合可见的 skill。
+ * 守护人格的 admin 回合可见的 skill。**这一支是白名单,不是兜底** —— 见 `skillsFor`。
  *
  * 与主人格的区别有两处:`catman-evolve` 换成 `catman-rescue`(它跑的是钉住的稳定
  * 版本,改了代码也上不了线,而人正在等它诊断);以及**没有 `catman-cron`** ——
@@ -353,6 +381,30 @@ scope 为 user 的那几项(见 ${USER_SKILL})在这里设的是**全局默认�
 读取时会自动退到全局默认,再不行退到不指定模型。他的选择留在盘上,
 你把那个模型加回来时会自动恢复。所以不要为了"安全"先去查谁在用什么。
 
+## skill 的启用与禁用
+
+装进 \`$CLAUDE_CONFIG_DIR/skills/<名字>/SKILL.md\` 就生效,**不用改代码、不用发版**,
+下一回合就能用。能往那个目录写文件的只有管理员和 catman 自己 —— 装进去这个动作
+本身就是认可,所以没有第二道登记。
+
+要临时关掉一个,用上面的 PATCH 改 \`disabledSkills\`:
+
+\`\`\`bash
+curl -s -X PATCH -H "X-Catman-Token: $CATMAN_ADMIN_TOKEN" \\
+     -H 'content-type: application/json' \\
+     -d '{"disabledSkills":["catman-mediacenter"]}' "$CATMAN_API_BASE/api/settings"
+\`\`\`
+
+给 \`[]\` 解除全部禁用。**SDK 没有按名字禁用单个 skill 的开关**(只有"整批关掉内置的"
+那种),所以这一项是唯一的关闭方式 —— 把文件挪走当然也行,但那是不可逆的手工操作。
+
+两点它管不着:
+
+- 普通用户的回合本来就看不到 \`${ADMIN_SKILL}\` 与 \`${EVOLVE_SKILL}\`。那是权限门,
+  与"这个能力现在开不开"是两回事。
+- **守护人格走固定白名单,\`disabledSkills\` 对它无效。** 一个手滑的禁用不该让救援
+  手册在最需要它的时候消失 —— 而解除禁用要走这个接口,那时主人格多半正不好使。
+
 ## 别人的设置
 
 \`\`\`bash
@@ -645,7 +697,8 @@ docker restart catman
 }
 
 /**
- * 把 skill 写到 CLAUDE_CONFIG_DIR/skills/ 下。启动时调用一次。
+ * 把 skill 写到 CLAUDE_CONFIG_DIR/skills/ 下,并清掉这个人格不该有的旧生成物。
+ * 启动时调用一次。
  * 内容由 SETTING_SCHEMA、COMMAND_TABLE 与配置里的路径生成,所以那几处一改这里自动跟上。
  *
  * **按人格生成不同的一套。** 守护人格拿到的是 `catman-rescue` 而不是 `catman-evolve`:
@@ -672,22 +725,105 @@ export function writeSkills(
           [ADMIN_SKILL, adminSkillBody(ctx)],
           [EVOLVE_SKILL, evolveSkillBody(paths)],
         ];
+  const wanted = new Set(bodies.map(([name]) => name));
   for (const [name, body] of bodies) {
     const dir = join(configDir, "skills", name);
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "SKILL.md"), body, "utf8");
   }
+
+  // 清掉**这个人格不要、而且确实是我自己生成过**的那些目录。
+  //
+  // 以前只写不删,于是换人格分支时旧文件会留在盘上:守护人格那边就躺着一份
+  // Aug 10 的 catman-evolve —— 名单里没有它,所以一直是哑的,但内容早就跟不上了
+  // (连 /发布 要几位 sha 都写错)。主人格改走黑名单之后,这种残留会**自己复活**,
+  // 那时它不只是多占几个 token,而是在主动教错。
+  //
+  // 只认 GENERATED_SKILLS 里的名字:手写丢进来的一个都不碰,那正是黑名单模型的前提。
+  for (const name of GENERATED_SKILLS) {
+    if (wanted.has(name)) continue;
+    rmSync(join(configDir, "skills", name), { recursive: true, force: true });
+  }
+}
+
+/**
+ * 扫 `configDir/skills/`,返回每个 skill 的**声明名字**。
+ *
+ * 名字取 frontmatter 里的 `name:`,取不到才退回目录名 —— SDK 按 canonical name 匹配
+ * (类型注释原文:"matching the exact canonical name ... Display names and aliases do
+ * not match"),目录名与 `name` 不一致时列目录名等于没列,而且是**安静地**没列。
+ *
+ * 读不到目录就返回空数组,由 `skillsFor` 退回硬编码名单。
+ */
+export function skillsOnDisk(configDir: string): string[] {
+  const root = join(configDir, "skills");
+  const names = new Set<string>();
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  for (const e of entries) {
+    // 点开头的是 `.trash` 这类内部目录,不是 skill。`synced/` 装的是一批 skill
+    // 而不是一个,它没有顶层 SKILL.md,下面那道 try 会把它挡掉。
+    if (!e.isDirectory() || e.name.startsWith(".")) continue;
+    let text: string;
+    try {
+      text = readFileSync(join(root, e.name, "SKILL.md"), "utf8");
+    } catch {
+      continue;
+    }
+    const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
+    const declared = fm ? /^name:[ \t]*(\S+)/m.exec(fm[1] ?? "")?.[1] : undefined;
+    names.add(declared ?? e.name);
+  }
+  return [...names].sort();
+}
+
+/** `skillsFor` 的两个可选输入。都不给就退回硬编码名单(即改这版之前的行为)。 */
+export interface SkillFilter {
+  /** 磁盘上装了哪些(见 `skillsOnDisk`)。空 = 读不到,走兜底。 */
+  readonly onDisk?: readonly string[];
+  /** 管理员在 `disabledSkills` 里显式关掉的。 */
+  readonly disabled?: readonly string[];
 }
 
 /**
  * 这一回合该让哪些 skill 进上下文。
  *
- * 与 `writeSkills` 必须给出**一致**的人格分支 —— 列一个磁盘上没有的 skill,
- * SDK 那边只是安静地少一份说明,而它恰好是最需要的那份。有单测钉住两者对齐。
+ * ## 主人格:黑名单
+ *
+ * 默认**磁盘上装了什么就给什么**,只减三类:不属于这个人格的、非管理员回合里
+ * 该挡的、以及管理员显式禁用的。
+ *
+ * 之所以不再要一份代码里的白名单:能往 `skills/` 里写文件的只有管理员和 catman
+ * 自己,**装进去这个动作本身就是认可**。再要一次登记就只是摩擦 —— 登记表在代码里,
+ * 改它得发一次版,而漏登记的表现是那份说明*安静地不存在*。真实的代价:三个手写
+ * skill 就这么哑了十几天,期间共享人设的正文还在点名让人去用它们。
+ *
+ * `onDisk` 为空(目录读不到、或一个 SKILL.md 都没有)时退回硬编码名单。这条兜底
+ * 是必须的,与 settings.ts 开头那条「任何配置状态下 agent 都必须能起来」同一个考虑:
+ * 否则一次 readdir 失败就能让它连「怎么改自己的配置」都不知道。
+ *
+ * ## 守护人格:仍然是白名单
+ *
+ * 不跟着改,因为它的价值就是**没有惊喜**:跑钉住的稳定版本,被叫来时人正在等它诊断。
+ * 白名单让它显式声明自己要什么,而不是继承磁盘现状 —— 那个目录里躺着什么它不该关心。
+ *
+ * `disabled` 同样不作用于这一支:一个手滑的禁用不该让救援手册在最需要它的时候消失,
+ * 而解除禁用要走主人格那边的配置接口 —— 那时人找守护人格,多半正是因为主人格不好使。
  */
-export function skillsFor(persona: Persona, isAdmin: boolean): string[] {
+export function skillsFor(persona: Persona, isAdmin: boolean, filter: SkillFilter = {}): string[] {
   // 守护人格那边没有调度器,所以两条分支都要把 catman-cron 摘掉 ——
   // 普通用户这一支同样要摘,否则它会去调一个必然 404 的接口。
   if (persona === "rescue") return isAdmin ? [...RESCUE_SKILLS] : [USER_SKILL];
-  return isAdmin ? [...ADMIN_SKILLS] : [...USER_SKILLS];
+
+  const pool = filter.onDisk?.length ? filter.onDisk : isAdmin ? ADMIN_SKILLS : USER_SKILLS;
+  const denied = new Set<string>([
+    ...PRIMARY_EXCLUDED,
+    ...(isAdmin ? [] : ADMIN_ONLY_SKILLS),
+    ...(filter.disabled ?? []),
+  ]);
+  return pool.filter((name) => !denied.has(name));
 }

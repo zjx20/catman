@@ -4,7 +4,7 @@ import type { GlobalSettings } from "../settings.js";
 import type { UserRegistry } from "../users.js";
 import type { TurnTokens } from "../turn-tokens.js";
 import { buildTurnEnv } from "../turn-env.js";
-import { skillsFor } from "../skills.js";
+import { skillsFor, skillsOnDisk } from "../skills.js";
 import type { Persona } from "../../config.js";
 import type { AgentTask, CronJob } from "./types.js";
 
@@ -53,6 +53,8 @@ export interface RealAgentTaskRunnerOptions {
   readonly turns: TurnTokens;
   readonly apiBase: string;
   readonly persona: Persona;
+  /** CLAUDE_CONFIG_DIR。同网关:主人格按它下面 `skills/` 的现状决定给哪些 skill。 */
+  readonly skillsDir?: string;
   /** 推送令牌的发放处。定时任务里的助手同样会起长任务,它也需要 `catman-notify`。 */
   readonly notifyTokens?: { for(userKey: string): string };
   /** 挂进 PATH 的目录(`catman-notify` 住在那儿)。 */
@@ -99,7 +101,10 @@ export class RealAgentTaskRunner implements AgentTaskRunner {
           ...(o.notifyTokens ? { notifyToken: o.notifyTokens.for(job.userKey) } : {}),
           ...(o.binDir ? { binDir: o.binDir } : {}),
         }),
-        skills: skillsFor(o.persona, isAdmin),
+        skills: skillsFor(o.persona, isAdmin, {
+          ...(o.skillsDir ? { onDisk: skillsOnDisk(o.skillsDir) } : {}),
+          disabled: o.settings.effective().disabledSkills,
+        }),
         // 用调度器给的那个:超时与「任务被删了」都从它那边掐。
         abortController: req.abort,
         maxTurns: task.maxTurns,

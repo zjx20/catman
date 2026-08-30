@@ -57,6 +57,7 @@ export interface Settings {
   cronKeepRuns: number;
   cronCatchUpMs: number;
   cronMountAllowlist: string[];
+  disabledSkills: string[];
 }
 
 /** scope="user" 的那些项:全局可设默认值,每用户还能各自覆盖。 */
@@ -206,6 +207,23 @@ function parsePathList(raw: unknown): string[] | undefined {
   return out;
 }
 
+/**
+ * skill 名字列表。空数组合法(表示"一个都不禁"),坏值返回 undefined。
+ *
+ * 名字要么是 skill 目录名 / frontmatter 里的 `name`,要么是插件的 `plugin:skill`。
+ * 校验故意松:**不检查这个 skill 在不在磁盘上** —— 禁用一个还没装的 skill 应当合法
+ * (先禁再装),而交叉校验正是本文件开头那条「兜底优先于交叉校验」明确不做的事。
+ */
+function parseSkillNameList(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: string[] = [];
+  for (const v of raw) {
+    if (typeof v !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_:-]{0,63}$/.test(v)) return undefined;
+    if (!out.includes(v)) out.push(v);
+  }
+  return out;
+}
+
 // --- schema ---
 
 export const SETTING_SCHEMA: Schema = {
@@ -312,6 +330,21 @@ export const SETTING_SCHEMA: Schema = {
     // 与别的白名单不同:**空数组是合法值**,它表示"一个都不许挂"。
     // 复用 stringArrayDef 的话空数组会被当坏值退回默认,管理员就永远收不紧这一项。
     parse: (raw) => parsePathList(raw),
+  },
+  disabledSkills: {
+    scope: "global",
+    label: "禁用的 skill",
+    desc: "临时不让进上下文的 skill 名。装进 skills 目录的默认全部可用,这是唯一的关闭开关。",
+    floor: [],
+    hint: () => "skill 名字数组,如 [\"catman-mediacenter\"];空数组表示一个都不禁",
+    validate(raw) {
+      const v = parseSkillNameList(raw);
+      if (!v) throw new Error("禁用的 skill 需要一个数组,每一项是 skill 名(字母数字与 - _ :)");
+      return v;
+    },
+    // 与白名单相反:**空数组才是常态**,它表示"一个都不禁"。复用 stringArrayDef
+    // 会把空数组当坏值退回默认,于是管理员永远解除不掉最后一个禁用。
+    parse: (raw) => parseSkillNameList(raw),
   },
   adminUserKeys: stringArrayDef(
     "管理员",
@@ -443,7 +476,7 @@ export class GlobalSettings {
         // 所以"给了空的"与"没给"在行为上无从区分,当没给最省事也最不会出错。
         return this.env.adminUserKeys.length ? this.env.adminUserKeys : undefined;
       default:
-        // maxReplyChars 没有 env 基线,直接用 floor。
+        // maxReplyChars / disabledSkills 没有 env 基线,直接用 floor。
         return undefined;
     }
   }
@@ -479,6 +512,7 @@ export class GlobalSettings {
       cronKeepRuns: pick("cronKeepRuns"),
       cronCatchUpMs: pick("cronCatchUpMs"),
       cronMountAllowlist: pick("cronMountAllowlist"),
+      disabledSkills: pick("disabledSkills"),
     };
   }
 

@@ -212,3 +212,43 @@ test("容器名可以被环境覆盖 —— compose 改了名字得有地方改�
     Object.assign(process.env, saved);
   }
 });
+
+// --- disabledSkills ---
+
+test("disabledSkills 默认空 —— 装进 skills 目录的默认全都能用", () => {
+  const { s } = make();
+  assert.deepEqual(s.effective().disabledSkills, []);
+});
+
+test("disabledSkills 的空数组是合法值,不会被当坏值退回默认", () => {
+  // 与白名单相反:空数组才是它的常态。要是复用 stringArrayDef 的 parse,
+  // 空数组会被当坏值退到下一级 —— 管理员就永远解除不掉最后一个禁用。
+  const { s } = make();
+  s.set({ disabledSkills: ["catman-mediacenter"] });
+  assert.deepEqual(s.effective().disabledSkills, ["catman-mediacenter"]);
+  s.set({ disabledSkills: [] });
+  assert.deepEqual(s.effective().disabledSkills, [], "解除得掉");
+  assert.deepEqual(s.overrides().disabledSkills, [], "而且是显式覆盖,不是回到默认");
+});
+
+test("disabledSkills 不校验这个 skill 在不在盘上 —— 先禁再装是合法的", () => {
+  // 交叉校验正是 settings.ts 开头明确不做的事。
+  const { s } = make();
+  s.set({ disabledSkills: ["not-installed-yet"] });
+  assert.deepEqual(s.effective().disabledSkills, ["not-installed-yet"]);
+});
+
+test("disabledSkills 拒绝非法项,坏值不落盘", () => {
+  const { s } = make();
+  assert.throws(() => s.set({ disabledSkills: ["带 空格"] }), /禁用的 skill/);
+  assert.throws(() => s.set({ disabledSkills: ["a/b"] }), /禁用的 skill/);
+  assert.throws(() => s.set({ disabledSkills: "catman-cron" as unknown as string[] }), /禁用的 skill/);
+  assert.deepEqual(s.effective().disabledSkills, []);
+});
+
+test("settings.json 里 disabledSkills 是坏值时退回默认,不影响别的项", () => {
+  // effective() 永不抛错:整份配置坏掉也得让 agent 起得来。
+  const { s } = make({ disabledSkills: [42], maxConcurrentTurns: 5 });
+  assert.deepEqual(s.effective().disabledSkills, []);
+  assert.equal(s.effective().maxConcurrentTurns, 5);
+});
