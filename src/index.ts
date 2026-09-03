@@ -8,6 +8,7 @@ import { Gateway } from "./core/gateway.js";
 import { UserRegistry, listWorkspaceDirs } from "./core/users.js";
 import { adminBaseline, initialSharedClaudeMd } from "./core/persona.js";
 import { ensureCronDataDir } from "./core/cron-data.js";
+import { ensureUserPrivateDir } from "./core/user-private.js";
 import { TokenAlerter, readTokenExpiry } from "./core/token-alert.js";
 import { allowAll, type AdmissionPolicy } from "./core/admission.js";
 import { GlobalSettings } from "./core/settings.js";
@@ -209,6 +210,10 @@ async function main(): Promise<void> {
     apiBase: config.apiBase,
     notifyTokens,
     binDir,
+    // 每用户私有目录。**每回合现建一次**而不是启动时一次性建完:用户是陆续出现的,
+    // 而且盘满/权限被改这类事只有在真要用的那一刻才看得出来。守护人格与没配那条
+    // 挂载的机器上它一律返回 undefined,整个机制安静地不启用。见 core/user-private.ts。
+    userPrivate: (userKey) => ensureUserPrivateDir(config, userKey),
     admission,
     version,
     persona: config.persona,
@@ -390,6 +395,9 @@ function createCron(
       // 定时 agent 任务里的助手同样会起长任务,`catman-notify` 对它一样有用。
       notifyTokens: deps.notifyTokens,
       binDir: deps.binDir,
+      // 定时 agent 任务跑在同样的会话容器里,私有目录对它一样该在 —— 用户让它
+      // "每天早上收一遍邮件"时,它要读的正是那份凭据。
+      userPrivate: (userKey: string) => ensureUserPrivateDir(config, userKey),
     }),
     // 静默时段攒下来的结果。落盘 —— 部署很可能就发生在攒着的那几个小时里。
     notices: new NoticeSpool(`${config.dataDir}/cron/notices.json`),
@@ -407,6 +415,9 @@ function createCron(
     // 只给 HTTP_PROXY 的话,任务打内网地址会被送去代理然后收到一个 503,
     // 而那个 503 是代理说的,看起来完全像目标服务坏了。
     proxyEnv: collectProxyEnv(process.env),
+    // script 类任务容器也挂上归属者的私有目录 —— 它跑的是 `--user 10001:10001`,
+    // 与 catman 同一个 uid,所以 0700 的目录读得动。
+    userPrivate: (userKey: string) => ensureUserPrivateDir(config, userKey),
     notify: (userKey, text, kind) => gateway.push(userKey, text, kind),
   });
   const api: CronApiDeps = {

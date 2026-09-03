@@ -66,6 +66,10 @@ services:
       # ⚠️ 不能写 ${PWD}:那是 shell 变量,容器进程的环境里没有,compose 对未设变量
       # 只警告一句然后代入空串。要用自进化就在 .env 里写死绝对路径。
       CATMAN_HOST_DATA_DIR: ${CATMAN_HOST_DATA_DIR:-}
+      # 私有目录根在**宿主**上的路径,要与上面那条 volume 的左边一致。
+      # 不给的话代码从 CATMAN_HOST_DATA_DIR 的同级推(`…/catman_data` →
+      # `…/catman_userdata`),所以常态下这一行不必配 —— 只有换盘/换布局时才要。
+      CATMAN_HOST_USER_DATA_DIR: ${CATMAN_HOST_USER_DATA_DIR:-}
       # ── 会话容器与内存看门狗 ──────────────────────────────────
       # 默认**关**。打开之前必须先确认下面那个 cgroup 挂载已经生效
       # (改 volumes 要 `up -d`,`restart` 不会让新挂载生效 —— 你会看到
@@ -128,6 +132,19 @@ services:
       # DOCKER_API_VERSION: "1.43"
     volumes:
       - ./data:/data
+      # 每用户私有目录的根。**刻意是 ./data 的兄弟而不是它的子目录** ——
+      # 会话容器把整个 /data 读写挂进去,放里面就得再挂一个空目录去遮住别人那几份,
+      # 而那种遮罩漏了是"所有人的凭据一次性全部暴露"且悄无声息。放外面则相反:
+      # 漏挂只会让私有目录访问不到,功能立刻不工作,一眼看得见。详见 core/user-private.ts。
+      #
+      # 救援人格**没有**这一条:它的整个文件系统视图是"别人的状态一律只读、
+      # 自己只写 /data/rescue",给它挂上别人的私有目录与那条约定直接冲突。
+      #
+      # ⚠️ **这个目录必须事先在宿主上建好、属主 uid 10001**:
+      #     mkdir -p /mnt/usb/catman_userdata && chown 10001:10001 /mnt/usb/catman_userdata
+      # 不建的话 dockerd 会自动建一个 root 属主的空目录,catman 往里建子目录会
+      # EACCES —— 那时整个机制安静地降级(日志有一行 warn),不会崩,但也没生效。
+      - ${CATMAN_HOST_USER_DATA_DIR:-/mnt/usb/catman_userdata}:/userdata
       # release 目录**只读**挂载给主容器。它属 uid 10002(deployer),写入只发生在
       # deployer 系的一次性容器里。这不是洁癖:助手跑在 bypassPermissions 下、
       # 文件系统全开,一句"帮我清清磁盘"就足以让它把回滚目标 rm 掉(硬链接复用

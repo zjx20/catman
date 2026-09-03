@@ -1,3 +1,4 @@
+import { PRIVATE_MOUNT } from "./user-private.js";
 import type { Attachment } from "./attachments.js";
 
 /**
@@ -290,11 +291,26 @@ export function sessionMounts(opts: {
   readonly dataDir: string;
   /** 主数据目录在容器内的路径。两个人格都是 `/data`。 */
   readonly mainDataDir: string;
+  /**
+   * 本回合这个用户的私有目录在**宿主**上的路径。缺席就不挂。
+   *
+   * 它刻意**只挂这一个人的那一份**,而不是挂私有目录的根 —— 挂根就等于把所有人的
+   * 凭据又端进来了,那正是这个机制要解决的问题。而且它落在 `/private`(根下),
+   * 不在被整挂的 `/data` 里面,所以不依赖任何挂载覆盖顺序。见 core/user-private.ts。
+   */
+  readonly privateHostDir?: string;
 }): SessionMount[] {
   const h = opts.hostDataDir;
   const common: SessionMount[] = [
     { host: "/var/run/docker.sock", at: "/var/run/docker.sock" },
     { host: "/opt/services", at: "/opt/services" },
+    // 救援人格一条都不挂,**即使调用方传了** —— 它的整个文件系统视图是"别人的状态
+    // 一律只读、自己只写 /data/rescue",给它挂上别人的私有目录与那条约定直接冲突。
+    // 上游(`userPrivatePaths`)已经对它返回 undefined,这里是第二道:这种"谁能看见
+    // 什么"的判断,两处各自成立比一处成立要可靠。
+    ...(opts.persona === "primary" && opts.privateHostDir
+      ? [{ host: opts.privateHostDir, at: PRIVATE_MOUNT }]
+      : []),
   ];
   if (opts.persona === "rescue") {
     return [

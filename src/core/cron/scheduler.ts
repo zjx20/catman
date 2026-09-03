@@ -4,7 +4,8 @@ import { formatAt, nextAt as computeNextAt } from "./schedule.js";
 import { inQuietHours, mergeNotices, type NoticeSpool } from "./notices.js";
 import type { AgentTaskRunner } from "./agent-runner.js";
 import type { CronStore } from "./store.js";
-import type { CronJob, CronRun, CronTask, RunStatus, RunTrigger } from "./types.js";
+import type { CronJob, CronMount, CronRun, CronTask, RunStatus, RunTrigger } from "./types.js";
+import type { UserPrivatePaths } from "../user-private.js";
 
 /**
  * 调度器:到点了就跑,跑完了就记账、就报信。
@@ -57,6 +58,14 @@ export interface SchedulerOptions {
    * 受跑测试那台机器的环境影响。
    */
   readonly proxyEnv?: Readonly<Record<string, string>>;
+  /**
+   * 算出(并建好)任务归属者的私有目录。同网关与 agent 任务那两份。
+   *
+   * `script` 类容器跑的是 `--user 10001:10001`(与 catman 同一个 uid),
+   * 所以 0700 的私有目录它读得动 —— 这一点是查过 `RUN_AS` 才敢挂的,
+   * 换成镜像自带用户的话这条会静默失效(读不了,而任务照跑)。
+   */
+  readonly userPrivate?: (userKey: string) => UserPrivatePaths | undefined;
   readonly notify?: CronNotifier;
   readonly now?: () => number;
   readonly tickMs?: number;
@@ -457,14 +466,16 @@ export class CronScheduler {
       await this.push(job.userKey, renderStart(job, run), "reminder", job);
     }
 
+    // 与网关同源:挂载与环境变量要么一起在,要么一起不在。
+    const priv = this.opts.userPrivate?.(job.userKey);
     const r = await this.opts.runner.launch({
       container,
       jobId: job.id,
       image: job.task.image,
       cmd: job.task.cmd,
-      env: job.task.env,
+      env: priv ? { ...job.task.env, CATMAN_USER_PRIVATE_DIR: priv.at } : job.task.env,
       network: job.task.network,
-      mounts: job.task.mounts,
+      mounts: privMounts(job.task.mounts, priv),
       limits: job.task.limits,
       hostWorkDir: hostWork,
       tz: this.opts.tz,
@@ -580,4 +591,21 @@ export class CronScheduler {
       }
     }
   }
+}
+
+/**
+ * 把私有目录追加进任务自己声明的挂载表。
+ *
+ * **任务已经占了那个挂载点就不动它** —— 同一个 `at` 挂两次 docker 直接拒绝启动,
+ * 而症状是"这个任务忽然再也起不来了",跟私有目录八竿子打不着。任务作者显式写了
+ * `/private` 的话,那是他的选择,让他的赢。
+ */
+export function privMounts(
+  declared: readonly CronMount[],
+  priv: UserPrivatePaths | undefined,
+): readonly CronMount[] {
+  if (!priv) return declared;
+  if (declared.some((m) => m.at === priv.at)) return declared;
+  // ro: false —— 私有目录是**写**凭据的地方,只读挂上去等于这个机制白做。
+  return [...declared, { host: priv.host, at: priv.at, ro: false }];
 }

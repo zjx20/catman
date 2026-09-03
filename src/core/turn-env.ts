@@ -27,6 +27,14 @@ export interface TurnEnvOptions {
    * 而 skill 里写 `catman-notify run -- …` 比写一长串路径更不容易抄错。
    */
   readonly binDir?: string;
+  /**
+   * 这个用户的私有目录在**回合容器里**的路径(常量 `/private`)。
+   *
+   * 给了才注入 `CATMAN_USER_PRIVATE_DIR`。**没挂载就绝不能注入** ——
+   * 变量在而目录不在,脚本会往一个不存在的地方写凭据,或者更糟:往共享区写
+   * 却以为自己在私有区。见 core/user-private.ts。
+   */
+  readonly userPrivateDir?: string;
 }
 
 /**
@@ -51,6 +59,7 @@ export function buildTurnEnv(opts: TurnEnvOptions): Record<string, string | unde
     CATMAN_API_BASE: opts.apiBase,
     CATMAN_SESSION_TOKEN: opts.sessionToken,
     ...(opts.notifyToken ? { CATMAN_NOTIFY_TOKEN: opts.notifyToken } : {}),
+    ...(opts.userPrivateDir ? { CATMAN_USER_PRIVATE_DIR: opts.userPrivateDir } : {}),
     ...(opts.isAdmin ? { CATMAN_ADMIN_TOKEN } : {}),
   };
 }

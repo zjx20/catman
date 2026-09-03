@@ -1,3 +1,5 @@
+import { dirname, join } from "node:path";
+
 /**
  * 运行时配置。全部可用环境变量覆盖,便于容器化部署。
  * 时间相关的量以毫秒为单位,便于测试注入假时钟。
@@ -227,6 +229,21 @@ export interface Config {
    */
   hostDataDir: string | undefined;
   /**
+   * 每用户私有目录根,**catman 自己进程里**的路径。建目录时用。
+   *
+   * 它是一棵独立于 `/data` 的树,理由见 `core/user-private.ts` ——
+   * 一句话:会话容器整挂 `/data`,放里面就得靠遮罩才能藏住,而遮罩漏了是全开。
+   */
+  userDataDir: string;
+  /**
+   * 私有目录根在**宿主**上的绝对路径。缺席 = 这台机器还没配那条挂载。
+   *
+   * 缺席时整个机制降级(不挂、不注入、不建目录),而不是退回共享区 ——
+   * 退回共享区等于把凭据写到所有人都看得见的地方,却让调用方以为它是私有的。
+   * 默认从 `hostDataDir` 的同级推导,省掉一个必填配置项。
+   */
+  hostUserDataDir: string | undefined;
+  /**
    * 展示用时区(IANA 名)。容器不继承宿主时区,不设就是 UTC。
    * 定时任务的"每天 8 点"是谁的 8 点、通知里那句"下次 08-14 08:00"按哪儿算,
    * 都取决于它 —— 所以它是配置项而不是散落在各处的 `process.env.TZ`。
@@ -240,6 +257,7 @@ export function loadConfig(): Config {
   // 而部署报告、release 指针、信使队列都在主 /data 里,只读)。
   const mainDataDir = str("CATMAN_MAIN_DATA_DIR", dataDir);
   const dashboardPort = num("CATMAN_DASHBOARD_PORT", 8787);
+  const hostDataDir = process.env.CATMAN_HOST_DATA_DIR || undefined;
   const persona: Persona = process.env.CATMAN_PERSONA === "rescue" ? "rescue" : "primary";
   // 容器名默认按人格给 —— 与 compose 里的 container_name 一一对应。
   const containerName = str("CATMAN_CONTAINER_NAME", persona === "rescue" ? "catman-rescue" : "catman");
@@ -291,11 +309,30 @@ export function loadConfig(): Config {
     persona,
     adminUserKeys: list("CATMAN_ADMIN_USER_KEYS", []),
     mainDataDir,
-    hostDataDir: process.env.CATMAN_HOST_DATA_DIR || undefined,
+    hostDataDir,
+    userDataDir: str("CATMAN_USER_DATA_DIR", "/userdata"),
+    hostUserDataDir: hostUserDataDirOf(hostDataDir),
     tz: str("TZ", "UTC"),
     sessionContainer: bool("CATMAN_SESSION_CONTAINER", false),
     sessionMemoryLimit: str("CATMAN_SESSION_MEMORY", "700m"),
     sessionImage: str("CATMAN_SESSION_IMAGE", "catman-env:1"),
     cgroupRoot: str("CATMAN_CGROUP_ROOT", "/sys/fs/cgroup/docker"),
   };
+}
+
+/**
+ * 私有目录根在宿主上的位置。
+ *
+ * 默认取 `/data` 宿主路径的**同级兄弟**(`/mnt/usb/catman_data` →
+ * `/mnt/usb/catman_userdata`),这样只要 `CATMAN_HOST_DATA_DIR` 配对了,
+ * 这一项就不必再配一遍 —— 少一个必填项就少一处配错的机会。
+ *
+ * 显式给 `CATMAN_HOST_USER_DATA_DIR` 时以它为准(换盘、换布局时用)。
+ * `hostDataDir` 都没有的机器上返回 undefined,整个机制降级。
+ */
+function hostUserDataDirOf(hostDataDir: string | undefined): string | undefined {
+  const explicit = process.env.CATMAN_HOST_USER_DATA_DIR;
+  if (explicit) return explicit;
+  if (!hostDataDir) return undefined;
+  return join(dirname(hostDataDir), "catman_userdata");
 }

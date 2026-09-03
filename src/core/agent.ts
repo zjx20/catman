@@ -170,6 +170,14 @@ export interface AgentRunOptions {
    */
   logLabel?: string;
   /**
+   * 这个用户的私有目录在**宿主**上的路径,挂进会话容器的 `/private`。
+   *
+   * 由调用方算好传进来(`ensureUserPrivateDir`),而不是让 Agent 自己从 userKey 推 ——
+   * 与 `cwd` 同一条路子:Agent 收的是"挂哪儿",不是"这是谁"。缺席就不挂,
+   * 回合里没有 `/private`,脚本会自己退回共享区,见 core/user-private.ts。
+   */
+  privateHostDir?: string;
+  /**
    * 随本回合带上的图片。会作为 image content block **内联**进这一轮的用户消息,
    * 模型第一次推理就能看到 —— 而不是先落盘再让它自己去 Read(那要多一次
    * 工具往返,且模型可能压根不去读)。
@@ -352,6 +360,7 @@ export class Agent {
     tag: string,
     cwd: string,
     logLabel: string | undefined,
+    privateHostDir: string | undefined,
   ): { execPath: string; container: string } | undefined {
     if (!this.config.sessionContainer) return undefined;
     // -v 的左边永远是**宿主**路径。容器里的 /data 在宿主上是别的位置,
@@ -401,6 +410,7 @@ export class Agent {
         hostDataDir: host,
         dataDir: this.config.dataDir,
         mainDataDir: this.config.mainDataDir,
+        privateHostDir,
       }),
       cwd,
       tz: this.config.tz,
@@ -450,7 +460,7 @@ export class Agent {
     input.push(buildUserMessage(prompt, attachments, opts.ambient));
 
     const cwd = opts.cwd ?? this.config.workspaceDir;
-    const boxed = this.prepareContainer(tag, cwd, opts.logLabel);
+    const boxed = this.prepareContainer(tag, cwd, opts.logLabel, opts.privateHostDir);
     // 看门狗要能中止回合,所以 abortController 从"调用方给了才传"变成"没有就自己造"。
     // 只在关进容器时才这样 —— 本机执行那条路没有 cgroup 可读,造了也没人用。
     const abortController = opts.abortController ?? (boxed ? new AbortController() : undefined);

@@ -6,6 +6,7 @@ import type { TurnTokens } from "../turn-tokens.js";
 import { buildTurnEnv } from "../turn-env.js";
 import { skillsFor, skillsOnDisk } from "../skills.js";
 import type { Persona } from "../../config.js";
+import type { UserPrivatePaths } from "../user-private.js";
 import type { AgentTask, CronJob } from "./types.js";
 
 /**
@@ -59,6 +60,11 @@ export interface RealAgentTaskRunnerOptions {
   readonly notifyTokens?: { for(userKey: string): string };
   /** 挂进 PATH 的目录(`catman-notify` 住在那儿)。 */
   readonly binDir?: string;
+  /**
+   * 算出(并建好)任务归属者的私有目录。同网关那份 —— 定时任务里的助手要读的
+   * 凭据跟他本人回合里读的是同一份,不能因为换了触发方式就看不见。
+   */
+  readonly userPrivate?: (userKey: string) => UserPrivatePaths | undefined;
 }
 
 export class RealAgentTaskRunner implements AgentTaskRunner {
@@ -86,6 +92,8 @@ export class RealAgentTaskRunner implements AgentTaskRunner {
     // 模型:任务显式指定的优先,否则跟着这个用户当前的偏好走(他把自己换成
     // sonnet 之后,定时任务也该跟着换,而不是永远钉在建任务那天的选择上)。
     const model = task.model ?? o.prefs.effective(job.userKey).model;
+    // 挂载与环境变量共用同一个结果,理由同网关:变量在而挂载不在是最坏的情况。
+    const priv = o.userPrivate?.(job.userKey);
 
     try {
       const reply = await o.agent.run(task.prompt, {
@@ -100,7 +108,9 @@ export class RealAgentTaskRunner implements AgentTaskRunner {
           isAdmin,
           ...(o.notifyTokens ? { notifyToken: o.notifyTokens.for(job.userKey) } : {}),
           ...(o.binDir ? { binDir: o.binDir } : {}),
+          ...(priv ? { userPrivateDir: priv.at } : {}),
         }),
+        ...(priv ? { privateHostDir: priv.host } : {}),
         skills: skillsFor(o.persona, isAdmin, {
           ...(o.skillsDir ? { onDisk: skillsOnDisk(o.skillsDir) } : {}),
           disabled: o.settings.effective().disabledSkills,

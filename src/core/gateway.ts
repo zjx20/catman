@@ -50,6 +50,7 @@ import { formatDeployReport } from "./deploy-report.js";
 import { formatDeployProgress } from "./deploy-progress.js";
 import type { SendKind } from "../ipc/protocol.js";
 import type { Persona } from "../config.js";
+import type { UserPrivatePaths } from "./user-private.js";
 
 /** 会话 id 的展示形式:开头 8 位足够在 HISTORY_LIMIT 条内无歧义,也好在手机上打。 */
 export function shortSessionId(sessionId: string): string {
@@ -160,6 +161,14 @@ export interface GatewayOptions {
    * `catman-notify` 会明说"这不像是 catman 的回合环境"而不是安静地推不出去。
    */
   notifyTokens?: { for(userKey: string): string };
+  /**
+   * 算出(并建好)某个用户的私有目录。缺席 = 这台机器没有这个机制。
+   *
+   * 注入一个函数而不是把 Config 整个塞进来:网关一路都是依赖注入,
+   * 而且"私有目录建不建得出来"每回合都可能变(盘满、权限被改),
+   * 每回合现问一次比启动时算一次准。
+   */
+  userPrivate?: (userKey: string) => UserPrivatePaths | undefined;
   /** 挂进回合 PATH 的目录(`catman-notify` 住在那儿)。 */
   binDir?: string;
   /** 提醒轮询间隔(ms)。 */
@@ -687,6 +696,7 @@ export class Gateway {
   private readonly deploy: DeployControl | undefined;
   private readonly cron: CronView | undefined;
   private readonly notifyTokens: { for(userKey: string): string } | undefined;
+  private readonly userPrivate: ((userKey: string) => UserPrivatePaths | undefined) | undefined;
   private readonly binDir: string | undefined;
 
   constructor(opts: GatewayOptions) {
@@ -710,6 +720,7 @@ export class Gateway {
     this.deploy = opts.deploy;
     this.cron = opts.cron;
     this.notifyTokens = opts.notifyTokens;
+    this.userPrivate = opts.userPrivate;
     this.binDir = opts.binDir;
     this.semaphore = new Semaphore(this.settings.effective().maxConcurrentTurns);
     this.settings.onChange(() => {
@@ -1730,12 +1741,17 @@ export class Gateway {
       const prior = this.lastMemAbort.get(userKey);
       if (prior) this.lastMemAbort.delete(userKey);
       const ambient = this.releaseNoteFor(userKey, decision.isNew);
+      // 私有目录每回合现算一次:它同时喂给挂载(privateHostDir)和环境变量
+      // (CATMAN_USER_PRIVATE_DIR),两者**必须同源** —— 变量在而挂载不在的话,
+      // 脚本会往一个不存在的路径写凭据。
+      const priv = this.userPrivate?.(userKey);
       const reply = await this.agent.run(prior ? priorAbortPrefix(prior) + text : text, {
         cwd: pre.cwd,
         ...(ambient ? { ambient } : {}),
         resumeSessionId: decision.isNew ? undefined : decision.resumeSessionId,
         ...(prefs.model ? { model: prefs.model } : {}),
-        env: this.childEnv(isAdmin, turn.token, userKey),
+        env: this.childEnv(isAdmin, turn.token, userKey, priv),
+        ...(priv ? { privateHostDir: priv.host } : {}),
         skills: this.skillsFor(isAdmin),
         abortController: turn.ctx.abort,
         // 看门狗动手时给用户带外发一条。不走 onProgress —— 用户可能把进度关了,
@@ -1918,6 +1934,7 @@ export class Gateway {
     isAdmin: boolean,
     sessionToken: string,
     userKey: string,
+    priv?: UserPrivatePaths | undefined,
   ): Record<string, string | undefined> {
     const notifyToken = this.notifyTokens?.for(userKey);
     return buildTurnEnv({
@@ -1926,6 +1943,7 @@ export class Gateway {
       isAdmin,
       ...(notifyToken ? { notifyToken } : {}),
       ...(this.binDir ? { binDir: this.binDir } : {}),
+      ...(priv ? { userPrivateDir: priv.at } : {}),
     });
   }
 

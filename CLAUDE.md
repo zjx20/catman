@@ -140,6 +140,7 @@ Dashboard 与清理的扫描范围 = `listWorkspaceDirs(/data/workspace)` 算出
 |---|---|
 | `src/core/identity.ts` | userKey 编解码;**单射**的工作目录名派生;内置管理员常量 |
 | `src/core/users.ts` | UserRegistry;每用户 workspace;`listWorkspaceDirs` = 清理真相源 |
+| `src/core/user-private.ts` | 每用户私有目录:**独立于 `/data` 的一棵树**,只把本人那一份挂进回合容器的 `/private` |
 | `src/core/admission.ts` | 准入策略(TOFU 绑定 / 本地全放行),以函数注入网关 |
 | `src/core/settings.ts` | `SETTING_SCHEMA`:全部配置项的单一真相源 + 全局运行时层 |
 | `src/core/commands.ts` | `COMMAND_TABLE`:硬指令的单一真相源 |
@@ -227,6 +228,35 @@ Dashboard 与清理的扫描范围 = `listWorkspaceDirs(/data/workspace)` 算出
   多用户下它是**共享**人设,每人目录下还有一个自己的(首行 `@../CLAUDE.md` 显式 import ——
   不依赖「向上递归查找父目录」的隐式行为)。project settings(`.claude/settings.json`)
   **没有**继承机制,要全局共享得放 user settings。
+
+## 每用户私有目录
+
+放某个人的凭据、令牌这类**别人不该看见**的东西。实现在 `core/user-private.ts`,
+容器里固定是 `/private`,环境变量 `CATMAN_USER_PRIVATE_DIR`。
+
+- **它是 `/data` 的兄弟,不是子目录。** 会话容器把整个 `/data` 读写挂进去,
+  放里面就得再挂一个空目录去遮住别人那几份 —— 那条路走得通(挂载按目标路径深度排,
+  救援人格的只读挂载就是这么写的),但**坏的方向不对**:遮罩漏了是所有人的凭据
+  一次性全部暴露,而且悄无声息。放外面则相反:漏挂只会让私有目录访问不到,
+  功能立刻不工作,一眼看得见。**安全机制要往「坏了就用不了」的方向坏。**
+- **挂载与环境变量必须同源。** 三个装配处(网关、cron agent、cron script)都是
+  先算一次 `priv`,再同时喂给挂载和 env。变量在而挂载不在是最坏的一种:脚本会往
+  一个不存在的路径写凭据,或者更糟 —— 往共享区写却以为自己在私有区。
+- **没配置就整个降级,绝不退回共享区。** `hostUserDataDir` 缺席时
+  `userPrivatePaths` 返回 undefined,三处都当没有这个机制。退回共享区等于把凭据
+  写到所有人都看得见的地方,而调用方以为它是私有的。
+- **救援人格一律不参与**,两道:`userPrivatePaths` 对它返回 undefined,
+  `sessionMounts` 即使收到也不挂。它的文件系统视图是"别人的状态一律只读",
+  给它挂上别人的私有目录与那条约定直接冲突。
+- **隔离靠挂载不可见,不靠文件权限。** 所有回合容器都是同一个 uid(10001),
+  0700 只是万一挂载漏了时的第二层。`script` 类 cron 容器是 `--user 10001:10001`
+  (见 `cron/docker.ts` 的 `RUN_AS`),所以读得动 —— 换成镜像自带用户的话这条会
+  **静默失效**(读不了,而任务照跑)。
+- ⚠️ **这仍然是护栏不是安全边界。** 两个人格都挂着 docker.sock,起个 root 容器挂
+  宿主路径就什么都读得到。它挡的是"随手一读"和"写错路径串了用户"。
+- 宿主上那个根目录(`/mnt/usb/catman_userdata`)**要预先建好且属主 10001**。
+  不建的话 dockerd 会自动建一个 root 属主的空目录,catman 建子目录 EACCES,
+  机制安静降级(日志一行 warn)。
 
 ## 内存与会话容器
 
