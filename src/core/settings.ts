@@ -260,9 +260,13 @@ export const SETTING_SCHEMA: Schema = {
   modelAllowlist: stringArrayDef(
     "可用模型",
     "允许用户选择的模型。收窄它不需要管存量用户,读取侧会自动回退。",
-    ["opus", "sonnet", "haiku"],
+    // **用家族别名而不是带版本的 id**,这一条是有意的:SDK 把 `opus` 这类别名解析成
+    // 该家族的**当前版本**(它的类型注释原话:family aliases —— "opus" allows any
+    // opus version),所以模型出新版时这里一个字都不用改。要钉死某个版本才写
+    // `opus-4-5` 这种版本前缀,或者完整 id。
+    ["opus", "sonnet", "haiku", "fable"],
     (v) => v.length > 0 && v.length <= 64,
-    "是非空模型名(别名如 opus / sonnet / haiku,或完整 id)",
+    "是非空模型名(别名如 opus / sonnet / haiku / fable,或完整 id)",
   ),
   maxConcurrentTurns: intDef("global", "并发上限", "同时进行的 agent 回合数(跨用户)。", 2, 1, 16),
   retentionMs: intDef("global", "会话保留期", "超过这个时长的会话记录会被清理。", 30 * DAY, DAY, 365 * DAY, " 毫秒"),

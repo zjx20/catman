@@ -281,7 +281,7 @@ export function loadConfig(): Config {
     cleanupIntervalMs: num("CATMAN_CLEANUP_INTERVAL_MS", DAY),
     dashboardPort,
     model: process.env.CATMAN_MODEL || undefined,
-    modelAllowlist: list("CATMAN_MODEL_ALLOWLIST", ["opus", "sonnet", "haiku"]),
+    modelAllowlist: list("CATMAN_MODEL_ALLOWLIST", ["opus", "sonnet", "haiku", "fable"]),
     ackEnabled: bool("CATMAN_ACK", true),
     progressEnabled: bool("CATMAN_PROGRESS", true),
     // 默认按容器名寻址,不再用 127.0.0.1 —— 见 Config.apiBase 上面那段。

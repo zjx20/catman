@@ -35,7 +35,7 @@ test.after(() => {
 test("默认值来自 env 基线,未覆盖时 overrides 为空", () => {
   const { s } = make();
   const e = s.effective();
-  assert.deepEqual(e.modelAllowlist, ["opus", "sonnet", "haiku"]);
+  assert.deepEqual(e.modelAllowlist, ["opus", "sonnet", "haiku", "fable"]);
   assert.equal(e.maxConcurrentTurns, 2);
   assert.equal(e.model, undefined);
   assert.deepEqual(s.overrides(), {});
@@ -86,7 +86,7 @@ test("兜底:整个 settings.json 损坏时全部回落 env,不抛错", () => {
   const s = new GlobalSettings({ path, env: baseConfig() });
   const e = s.effective();
   assert.equal(e.maxConcurrentTurns, 2);
-  assert.deepEqual(e.modelAllowlist, ["opus", "sonnet", "haiku"]);
+  assert.deepEqual(e.modelAllowlist, ["opus", "sonnet", "haiku", "fable"]);
 });
 
 test("兜底:盘上是坏值时逐级回退到 floor,effective 永不抛", () => {
@@ -99,7 +99,7 @@ test("兜底:盘上是坏值时逐级回退到 floor,effective 永不抛", () =>
   });
   const e = s.effective();
   assert.equal(e.maxConcurrentTurns, 2, "坏值退到 env 基线");
-  assert.deepEqual(e.modelAllowlist, ["opus", "sonnet", "haiku"], "空白名单无意义,当坏值处理");
+  assert.deepEqual(e.modelAllowlist, ["opus", "sonnet", "haiku", "fable"], "空白名单无意义,当坏值处理");
   assert.equal(e.ackEnabled, true);
   assert.equal(e.retentionMs, 30 * 24 * 3600_000);
 });

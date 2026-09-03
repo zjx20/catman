@@ -580,7 +580,7 @@ docker compose exec catman node dist/src/scripts/ilink-login.js --rebind <账号
 
 | 项 | 取值 |
 |---|---|
-| 模型 | 全局白名单里的别名,默认 `opus` / `sonnet` / `haiku` |
+| 模型 | 全局白名单里的别名,默认 `opus` / `sonnet` / `haiku` / `fable`。别名跟着家族走最新版,要钉版本写 `opus-4-5` 这种前缀或完整 id |
 | 回执 | 开 / 关 |
 | 进度推送 | 开 / 关 |
 | 分段长度 | 200 ~ 5000 字 |
