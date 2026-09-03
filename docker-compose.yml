@@ -144,6 +144,12 @@ services:
       #     mkdir -p /mnt/usb/catman_userdata && chown 10001:10001 /mnt/usb/catman_userdata
       # 不建的话 dockerd 会自动建一个 root 属主的空目录,catman 往里建子目录会
       # EACCES —— 那时整个机制安静地降级(日志有一行 warn),不会崩,但也没生效。
+      #
+      # 「挂载是 dockerd 干的,catman 自己何必看得到?」—— 挂载那一层确实不必,
+      # 卡的是**每个用户的子目录得先存在且属 10001**:dockerd 自动建的挂载源是
+      # root:root 0755,**父目录属 10001 也不继承**(2026-09-03 实测),而会话容器
+      # 是 --user 10001,于是写不进去。得有人预先建,catman 挂一次最省。
+      # 完整推导见 src/core/user-private.ts。
       - ${CATMAN_HOST_USER_DATA_DIR:-/mnt/usb/catman_userdata}:/userdata
       # release 目录**只读**挂载给主容器。它属 uid 10002(deployer),写入只发生在
       # deployer 系的一次性容器里。这不是洁癖:助手跑在 bypassPermissions 下、

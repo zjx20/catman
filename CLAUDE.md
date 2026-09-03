@@ -257,6 +257,12 @@ Dashboard 与清理的扫描范围 = `listWorkspaceDirs(/data/workspace)` 算出
 - 宿主上那个根目录(`/mnt/usb/catman_userdata`)**要预先建好且属主 10001**。
   不建的话 dockerd 会自动建一个 root 属主的空目录,catman 建子目录 EACCES,
   机制安静降级(日志一行 warn)。
+- **为什么 catman 主进程也要挂 `/userdata`**(每次看到都会想省掉的那条):
+  挂载本身确实不用 —— `-v` 是宿主 dockerd 解析的。卡点是**每个用户的子目录
+  得先存在且属 10001**:dockerd 自动建的挂载源是 `root:root 0755`,
+  **父目录属 10001 也不继承**(2026-09-03 实测),而会话容器是 `--user 10001`,
+  于是写不进去。替代方案是每回合起个 root 容器 mkdir+chown,成本高得多,
+  而且 catman 从此看不见这棵树,清理/迁移/备份都无从下手。
 
 ## 内存与会话容器
 
