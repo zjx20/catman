@@ -75,7 +75,7 @@ services:
       # 但同级推导得到 /opt/services/catman/catman_userdata —— 跟这条 volume 指的
       # 不是同一棵树。后果极其安静:catman 在 A 建目录、成功;dockerd 按 B 建一个
       # root 属主的空目录挂进会话容器,于是 /private 存在却写不进去。
-      CATMAN_HOST_USER_DATA_DIR: ${CATMAN_HOST_USER_DATA_DIR:-/mnt/usb/catman_userdata}
+      CATMAN_HOST_USER_DATA_DIR: ${CATMAN_HOST_USER_DATA_DIR:-/opt/services/catman/userdata}
       # ── 会话容器与内存看门狗 ──────────────────────────────────
       # 默认**关**。打开之前必须先确认下面那个 cgroup 挂载已经生效
       # (改 volumes 要 `up -d`,`restart` 不会让新挂载生效 —— 你会看到
@@ -124,7 +124,7 @@ services:
       # 所以这里通常不需要动 —— 只在想改"出厂默认"时才设。
       # CATMAN_MODEL: opus
       # 允许用户选的模型。用别名而非完整 id:别名不随版本腐化。
-      # CATMAN_MODEL_ALLOWLIST: "opus,sonnet,haiku"
+      # CATMAN_MODEL_ALLOWLIST: "opus,sonnet,haiku,fable"
       # CATMAN_SESSION_TIMEOUT_MS: "3600000"
       # CATMAN_RETENTION_MS: "2592000000"
       # 同时进行的回合数上限(跨用户):软路由 CPU 与订阅限流的双重约束
@@ -146,8 +146,14 @@ services:
       # 救援人格**没有**这一条:它的整个文件系统视图是"别人的状态一律只读、
       # 自己只写 /data/rescue",给它挂上别人的私有目录与那条约定直接冲突。
       #
-      # ⚠️ **这个目录必须事先在宿主上建好、属主 uid 10001**:
+      # 默认值指向 `./userdata` 那条**软链**,与旁边的 `./data` 完全对称 ——
+      # 两者都是 `/opt/services/catman/` 下指向 U 盘的软链。dockerd 在宿主上跟随软链,
+      # 所以挂进去的仍是 /mnt/usb/catman_userdata。这么写的好处是
+      # **compose 里不再硬编码 /mnt/usb**:换盘、换布局时只改软链,配置一个字不动。
+      #
+      # ⚠️ **这两样必须事先在宿主上准备好**(目标目录属主 uid 10001):
       #     mkdir -p /mnt/usb/catman_userdata && chown 10001:10001 /mnt/usb/catman_userdata
+      #     ln -sfn /mnt/usb/catman_userdata /opt/services/catman/userdata
       # 不建的话 dockerd 会自动建一个 root 属主的空目录,catman 往里建子目录会
       # EACCES —— 那时整个机制安静地降级(日志有一行 warn),不会崩,但也没生效。
       #
@@ -156,7 +162,7 @@ services:
       # root:root 0755,**父目录属 10001 也不继承**(2026-09-03 实测),而会话容器
       # 是 --user 10001,于是写不进去。得有人预先建,catman 挂一次最省。
       # 完整推导见 src/core/user-private.ts。
-      - ${CATMAN_HOST_USER_DATA_DIR:-/mnt/usb/catman_userdata}:/userdata
+      - ${CATMAN_HOST_USER_DATA_DIR:-/opt/services/catman/userdata}:/userdata
       # release 目录**只读**挂载给主容器。它属 uid 10002(deployer),写入只发生在
       # deployer 系的一次性容器里。这不是洁癖:助手跑在 bypassPermissions 下、
       # 文件系统全开,一句"帮我清清磁盘"就足以让它把回滚目标 rm 掉(硬链接复用

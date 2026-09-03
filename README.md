@@ -444,7 +444,13 @@ catman 写不进去,机制会安静地降级(日志里一行 warn,功能退回�
 
 ```bash
 mkdir -p /mnt/usb/catman_userdata && chown 10001:10001 /mnt/usb/catman_userdata
+ln -sfn /mnt/usb/catman_userdata /opt/services/catman/userdata
 ```
+
+第二条软链与旁边的 `./data` 完全对称(两者都是部署目录下指向 U 盘的软链)。
+compose 的默认值指的就是它,好处是**配置里不再硬编码 `/mnt/usb`** ——
+换盘、换布局时只改软链,compose 一个字不动。dockerd 在宿主上跟随软链,
+所以挂进容器的仍是 U 盘上那棵树。
 
 ⚠️ **`CATMAN_HOST_USER_DATA_DIR` 必须显式配,而且要与那条 volume 的左边逐字一致**
 (compose 里两处引用同一个变量,照抄即可)。它**不会**从别的路径推 —— 推过一版,
