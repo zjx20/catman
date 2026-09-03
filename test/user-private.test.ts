@@ -238,3 +238,33 @@ test("没有 hostUserDataDir 时,userPrivatePaths 一律返回 undefined", () =>
     undefined,
   );
 });
+
+/**
+ * 私有目录的隔离**依赖一件挂载表这边的事**:会话容器挂不到私有目录根那棵树。
+ *
+ * 部署目录里有条 `catman/userdata` 软链指向 `/mnt/usb/catman_userdata`,而
+ * `/opt/services` 本来就在挂载表里 —— 现在读不到只是因为没挂 `/mnt/usb`,
+ * 那条软链在容器里是断的(2026-09-03 实测)。
+ *
+ * 于是"给会话容器加一条 /mnt/usb 挂载"这种看起来完全无关的改动,会让所有人的
+ * 凭据顺着软链一起进来,而且没有任何征兆。这条用例就是那个征兆。
+ */
+test("会话容器:挂载表里不能出现能通到私有目录根的宿主树", () => {
+  const mounts = sessionMounts({
+    persona: "primary",
+    hostDataDir: "/mnt/usb/catman_data",
+    dataDir: "/data",
+    mainDataDir: "/data",
+    privateHostDir: "/mnt/usb/catman_userdata/someone-abc",
+  });
+  for (const m of mounts) {
+    // 自己那一份当然要挂 —— 放行的只有它。
+    if (m.at === PRIVATE_MOUNT) continue;
+    assert.notEqual(m.host, "/mnt/usb", "挂了 /mnt/usb 就等于把所有人的私有目录端进来");
+    assert.notEqual(m.host, "/mnt/usb/catman_userdata", "更不能直接挂私有目录根");
+    assert.ok(
+      !"/mnt/usb/catman_userdata".startsWith(m.host.endsWith("/") ? m.host : `${m.host}/`),
+      `挂载 ${m.host} 是私有目录根的祖先,会把别人的凭据一起带进容器`,
+    );
+  }
+});

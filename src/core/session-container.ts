@@ -303,6 +303,14 @@ export function sessionMounts(opts: {
   const h = opts.hostDataDir;
   const common: SessionMount[] = [
     { host: "/var/run/docker.sock", at: "/var/run/docker.sock" },
+    // ⚠️ **往这张表里加宿主树之前先想一件事**:私有目录的隔离依赖"会话容器挂不到
+    // 私有目录根那棵树"。部署目录里有条 `catman/userdata` 软链指向
+    // `/mnt/usb/catman_userdata`,而 `/opt/services` 就在这张表里 —— 现在读不到,
+    // 只是因为**没挂 `/mnt/usb`**,那条软链在容器里是断的。
+    //
+    // 所以加一条 `/mnt/usb`(哪怕只是"让助手能读 U 盘")就会让所有人的凭据顺着
+    // 那条软链一起进来,**没有任何征兆**。真要加就先把私有目录挪出那棵树。
+    // 完整推导见 core/user-private.ts。
     { host: "/opt/services", at: "/opt/services" },
     // 救援人格一条都不挂,**即使调用方传了** —— 它的整个文件系统视图是"别人的状态
     // 一律只读、自己只写 /data/rescue",给它挂上别人的私有目录与那条约定直接冲突。

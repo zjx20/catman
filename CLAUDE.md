@@ -257,6 +257,16 @@ Dashboard 与清理的扫描范围 = `listWorkspaceDirs(/data/workspace)` 算出
 - 宿主上那个根目录(`/mnt/usb/catman_userdata`)**要预先建好且属主 10001**。
   不建的话 dockerd 会自动建一个 root 属主的空目录,catman 建子目录 EACCES,
   机制安静降级(日志一行 warn)。
+- ⚠️ **隔离依赖「会话容器挂不到私有目录根那棵树」,而那是挂载表那边的事。**
+  部署目录里有条 `catman/userdata` 软链指向 `/mnt/usb/catman_userdata`,而
+  `/opt/services` **本来就在挂载表里**。现在读不到,只是因为没挂 `/mnt/usb`,
+  那条软链在容器里是断的(实测)。所以**给会话容器加一条 `/mnt/usb`(哪怕只是
+  "让助手能读 U 盘")就会让所有人的凭据顺着软链一起进来,没有任何征兆**。
+  有一条用例钉着(「挂载表里不能出现能通到私有目录根的宿主树」)。
+- **`CATMAN_USER_PRIVATE_DIR` 在 `buildTurnEnv` 里被显式剔除后再按回合注入。**
+  它跟另外两个被剔除的不同 —— 不是密钥,而是**只对某一个回合成立的事实**。
+  继承下来的那个值属于别人、或属于一个压根没挂私有目录的场合,留着就成了
+  "变量在而挂载不在",脚本会拿它当私有区去写凭据。
 - **`CATMAN_HOST_USER_DATA_DIR` 必填,而且要与 compose 里那条 volume 的左边逐字
   一致**(两处引用同一个变量)。曾经让代码从 `CATMAN_HOST_DATA_DIR` 的同级推,
   真机上翻车:那台机器的 `CATMAN_HOST_DATA_DIR` 是 `/opt/services/catman/data` ——

@@ -40,7 +40,7 @@ export interface TurnEnvOptions {
 /**
  * 组装子进程环境。
  *
- * ⚠️ **两个变量必须剔除,而且 IPC secret 一条例外都没有**(管理员也拿不到)。
+ * ⚠️ **三个变量必须剔除,而且 IPC secret 一条例外都没有**(管理员也拿不到)。
  *
  * 拿到 IPC secret 就等于拿到信使的整个控制面:同容器、同 uid,一句
  * `curl --unix-socket /data/ipc/courier.sock` 就能 ① 冒充任何 userKey 发消息,
@@ -52,7 +52,16 @@ export interface TurnEnvOptions {
  * 管理员令牌还有"admin 回合加回"这一档,IPC secret 没有:回合不需要它,一次都不需要。
  */
 export function buildTurnEnv(opts: TurnEnvOptions): Record<string, string | undefined> {
-  const { CATMAN_ADMIN_TOKEN, CATMAN_IPC_SECRET: _ipc, ...rest } = process.env;
+  // CATMAN_USER_PRIVATE_DIR 也要先摘掉,理由跟上面两个不同:它不是密钥,而是
+  // **一个只对某一个回合成立的事实**。继承下来的那个值属于别人(或者属于一个
+  // 压根没挂私有目录的场合),留着就成了"变量在而挂载不在" —— 脚本会拿它当私有区
+  // 去写凭据。所以下面按 opts 显式给,不给就是不给。
+  const {
+    CATMAN_ADMIN_TOKEN,
+    CATMAN_IPC_SECRET: _ipc,
+    CATMAN_USER_PRIVATE_DIR: _priv,
+    ...rest
+  } = process.env;
   return {
     ...rest,
     ...(opts.binDir ? { PATH: prependPath(opts.binDir, rest.PATH) } : {}),

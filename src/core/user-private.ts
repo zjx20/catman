@@ -46,6 +46,23 @@ import type { Config } from "../config.js";
  * 而且 catman 从此看不见这棵树,将来的清理/迁移/备份都无从下手
  * (对照 `listWorkspaceDirs`:清理的真相源必须是看得见的那一份)。
  *
+ * ## ⚠️ 隔离依赖「会话容器挂不到那棵树」,而那是隔壁的事
+ *
+ * 私有目录根在宿主上是 `/mnt/usb/catman_userdata`,部署目录里还有一条软链
+ * `/opt/services/catman/userdata` 指向它(与 `data` 那条对称)。而
+ * **`/opt/services` 是挂进会话容器的**。
+ *
+ * 那为什么会话容器读不到别人的私有目录?因为它**没挂 `/mnt/usb`**,于是那条软链
+ * 在它眼里是断的(实测:`ls /opt/services/catman/userdata/` → No such file or
+ * directory)。隔离成立 —— 但成立的理由在 `sessionMounts` 那边,不在这个文件里。
+ *
+ * 也就是说:**谁哪天给会话容器加一条 `/mnt/usb` 挂载(比如"让助手能读 U 盘"),
+ * 这套隔离就当场失效,而且没有任何征兆** —— 所有人的凭据会顺着那条软链一起进来。
+ * 同理,把私有目录根直接放到 `/opt/services` 下面(不走 U 盘)也会破。
+ *
+ * 所以这条约束写在两处(这里和 `sessionMounts`),并且有一条用例钉着
+ * (`会话容器:挂载表里不能出现能通到私有目录根的宿主树`)。
+ *
  * ## 这仍然是护栏,不是安全边界
  *
  * 与 CLAUDE.md 里那句一致:两个人格都挂着 docker.sock,起一个 root 容器挂宿主路径
