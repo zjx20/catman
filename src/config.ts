@@ -1,5 +1,3 @@
-import { dirname, join } from "node:path";
-
 /**
  * 运行时配置。全部可用环境变量覆盖,便于容器化部署。
  * 时间相关的量以毫秒为单位,便于测试注入假时钟。
@@ -240,7 +238,9 @@ export interface Config {
    *
    * 缺席时整个机制降级(不挂、不注入、不建目录),而不是退回共享区 ——
    * 退回共享区等于把凭据写到所有人都看得见的地方,却让调用方以为它是私有的。
-   * 默认从 `hostDataDir` 的同级推导,省掉一个必填配置项。
+   *
+   * **必填,不从别的路径推。** 推过一版,在真机上因为 `hostDataDir` 是软链路径而
+   * 指到了另一棵树上,且完全无声 —— 完整教训见 `hostUserDataDirOf`。
    */
   hostUserDataDir: string | undefined;
   /**
@@ -311,7 +311,7 @@ export function loadConfig(): Config {
     mainDataDir,
     hostDataDir,
     userDataDir: str("CATMAN_USER_DATA_DIR", "/userdata"),
-    hostUserDataDir: hostUserDataDirOf(hostDataDir),
+    hostUserDataDir: hostUserDataDirOf(),
     tz: str("TZ", "UTC"),
     sessionContainer: bool("CATMAN_SESSION_CONTAINER", false),
     sessionMemoryLimit: str("CATMAN_SESSION_MEMORY", "700m"),
@@ -321,18 +321,31 @@ export function loadConfig(): Config {
 }
 
 /**
- * 私有目录根在宿主上的位置。
+ * 私有目录根在宿主上的位置。**必须显式给,不给就整个机制不启用。**
  *
- * 默认取 `/data` 宿主路径的**同级兄弟**(`/mnt/usb/catman_data` →
- * `/mnt/usb/catman_userdata`),这样只要 `CATMAN_HOST_DATA_DIR` 配对了,
- * 这一项就不必再配一遍 —— 少一个必填项就少一处配错的机会。
+ * ## 为什么不从 `hostDataDir` 推
  *
- * 显式给 `CATMAN_HOST_USER_DATA_DIR` 时以它为准(换盘、换布局时用)。
- * `hostDataDir` 都没有的机器上返回 undefined,整个机制降级。
+ * 上一版是推的:取 `/data` 宿主路径的同级兄弟(`/mnt/usb/catman_data` →
+ * `/mnt/usb/catman_userdata`),想的是"少一个必填项就少一处配错的机会"。
+ *
+ * 2026-09-03 真机上翻车了:那台机器的 `CATMAN_HOST_DATA_DIR` 是
+ * **`/opt/services/catman/data`** —— 一条**指向** `/mnt/usb/catman_data` 的软链。
+ * dockerd 挂载时会跟随软链,所以 `/data` 一直是对的;但同级推导拿到的是
+ * `/opt/services/catman/catman_userdata`,而 compose 里那条 volume 写的是
+ * `/mnt/usb/catman_userdata`。**两者指向完全不同的两棵树。**
+ *
+ * 而且它坏得极其安静:catman 在 A 建目录、建成功了;dockerd 按 B 挂,B 不存在就
+ * 自动建一个 root 属主的空目录挂进会话容器。于是 `CATMAN_USER_PRIVATE_DIR` 有值、
+ * `/private` 也存在 —— 只是写不进去(uid 10001 对 root:root 0755 没有写权限)。
+ * 这正是这套机制最想避免的"变量在而挂载不对"。
+ *
+ * 根子在于**推导假设了 `hostDataDir` 是真实路径**,而它只需要是"dockerd 解析得开
+ * 的路径"。这个假设没写在任何地方,也没有任何东西会在它不成立时喊一声。
+ *
+ * 所以改成必填:配了就一定和 volume 那条来自同一个变量(compose 里两处引用同一个
+ * `${CATMAN_HOST_USER_DATA_DIR}`),没配就返回 undefined、整个机制降级。
+ * **要么显式配对,要么不启用 —— 没有"看起来配好了其实指向别处"这个中间态。**
  */
-function hostUserDataDirOf(hostDataDir: string | undefined): string | undefined {
-  const explicit = process.env.CATMAN_HOST_USER_DATA_DIR;
-  if (explicit) return explicit;
-  if (!hostDataDir) return undefined;
-  return join(dirname(hostDataDir), "catman_userdata");
+function hostUserDataDirOf(): string | undefined {
+  return process.env.CATMAN_HOST_USER_DATA_DIR || undefined;
 }

@@ -200,3 +200,41 @@ test("script 类 cron:任务已经占了 /private 就不再追加", () => {
   assert.equal(out.length, 1);
   assert.equal(out[0]?.host, "/my/own");
 });
+
+/**
+ * 这几条盯的是 `hostUserDataDir` **必填、不推导**。
+ *
+ * 推导那一版在真机上翻过车:那台机器的 `CATMAN_HOST_DATA_DIR` 是
+ * `/opt/services/catman/data` —— 一条指向 `/mnt/usb/catman_data` 的软链。
+ * dockerd 跟随软链所以 `/data` 一直对,但同级推导得到的是另一棵树,
+ * 而症状是 `/private` 存在却写不进去,一声不吭。
+ */
+test("hostUserDataDir 只认显式配置,不从 hostDataDir 推", async () => {
+  const saved = { ...process.env };
+  for (const k of Object.keys(process.env)) if (k.startsWith("CATMAN_")) delete process.env[k];
+  try {
+    const { loadConfig } = await import("../src/config.js");
+
+    // 只给 hostDataDir(而且是那台真机上的软链路径),不给私有目录根。
+    process.env["CATMAN_HOST_DATA_DIR"] = "/opt/services/catman/data";
+    assert.equal(
+      loadConfig().hostUserDataDir,
+      undefined,
+      "不给就是不给 —— 推出一个 /opt/services/catman/catman_userdata 正是那次事故",
+    );
+
+    // 显式给了才有,而且原样取用。
+    process.env["CATMAN_HOST_USER_DATA_DIR"] = "/mnt/usb/catman_userdata";
+    assert.equal(loadConfig().hostUserDataDir, "/mnt/usb/catman_userdata");
+  } finally {
+    process.env = saved;
+  }
+});
+
+test("没有 hostUserDataDir 时,userPrivatePaths 一律返回 undefined", () => {
+  // 与上一条配套:配置层不给值,机制层就整个不启用(而不是退回共享区)。
+  assert.equal(
+    userPrivatePaths({ userDataDir: "/userdata", hostUserDataDir: undefined, persona: "primary" }, USER),
+    undefined,
+  );
+});

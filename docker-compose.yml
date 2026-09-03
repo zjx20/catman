@@ -66,10 +66,16 @@ services:
       # ⚠️ 不能写 ${PWD}:那是 shell 变量,容器进程的环境里没有,compose 对未设变量
       # 只警告一句然后代入空串。要用自进化就在 .env 里写死绝对路径。
       CATMAN_HOST_DATA_DIR: ${CATMAN_HOST_DATA_DIR:-}
-      # 私有目录根在**宿主**上的路径,要与上面那条 volume 的左边一致。
-      # 不给的话代码从 CATMAN_HOST_DATA_DIR 的同级推(`…/catman_data` →
-      # `…/catman_userdata`),所以常态下这一行不必配 —— 只有换盘/换布局时才要。
-      CATMAN_HOST_USER_DATA_DIR: ${CATMAN_HOST_USER_DATA_DIR:-}
+      # 私有目录根在**宿主**上的路径。**必须与上面那条 volume 的左边逐字一致** ——
+      # 所以两处都写成同一个 ${CATMAN_HOST_USER_DATA_DIR:-…},连默认值也一样。
+      #
+      # ⚠️ 别把这行删掉改成"让代码自己推"。推过一版(从 CATMAN_HOST_DATA_DIR 的同级),
+      # 在真机上翻了车:那台机器的 CATMAN_HOST_DATA_DIR 是 /opt/services/catman/data,
+      # 一条**指向** /mnt/usb/catman_data 的软链。dockerd 跟随软链所以 /data 一直对,
+      # 但同级推导得到 /opt/services/catman/catman_userdata —— 跟这条 volume 指的
+      # 不是同一棵树。后果极其安静:catman 在 A 建目录、成功;dockerd 按 B 建一个
+      # root 属主的空目录挂进会话容器,于是 /private 存在却写不进去。
+      CATMAN_HOST_USER_DATA_DIR: ${CATMAN_HOST_USER_DATA_DIR:-/mnt/usb/catman_userdata}
       # ── 会话容器与内存看门狗 ──────────────────────────────────
       # 默认**关**。打开之前必须先确认下面那个 cgroup 挂载已经生效
       # (改 volumes 要 `up -d`,`restart` 不会让新挂载生效 —— 你会看到

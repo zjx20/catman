@@ -446,6 +446,11 @@ catman 写不进去,机制会安静地降级(日志里一行 warn,功能退回�
 mkdir -p /mnt/usb/catman_userdata && chown 10001:10001 /mnt/usb/catman_userdata
 ```
 
+⚠️ **`CATMAN_HOST_USER_DATA_DIR` 必须显式配,而且要与那条 volume 的左边逐字一致**
+(compose 里两处引用同一个变量,照抄即可)。它**不会**从别的路径推 —— 推过一版,
+在真机上因为 `CATMAN_HOST_DATA_DIR` 是软链路径而指到了另一棵树上,
+症状是 `/private` 存在却写不进去,而且没有任何报错。
+
 ⚠️ **这是护栏,不是安全边界。** 回合容器里有 docker.sock,起个 root 容器挂宿主路径
 就什么都读得到。它挡的是"随手一读"和"写错路径串了用户",挡不住铁了心的 ——
 与本文档「安全说明」那节是同一句话。

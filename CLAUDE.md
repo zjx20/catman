@@ -257,6 +257,13 @@ Dashboard 与清理的扫描范围 = `listWorkspaceDirs(/data/workspace)` 算出
 - 宿主上那个根目录(`/mnt/usb/catman_userdata`)**要预先建好且属主 10001**。
   不建的话 dockerd 会自动建一个 root 属主的空目录,catman 建子目录 EACCES,
   机制安静降级(日志一行 warn)。
+- **`CATMAN_HOST_USER_DATA_DIR` 必填,而且要与 compose 里那条 volume 的左边逐字
+  一致**(两处引用同一个变量)。曾经让代码从 `CATMAN_HOST_DATA_DIR` 的同级推,
+  真机上翻车:那台机器的 `CATMAN_HOST_DATA_DIR` 是 `/opt/services/catman/data` ——
+  一条**指向** `/mnt/usb/catman_data` 的软链。dockerd 跟随软链所以 `/data` 一直对,
+  但推导得到的是另一棵树。坏得极安静:catman 在 A 建目录、成功;dockerd 按 B 建一个
+  root 属主的空目录挂进去,于是 `/private` 存在、变量也有值,**只是写不进去**。
+  教训:推导假设了"`hostDataDir` 是真实路径",而它只需要是"dockerd 解析得开的路径"。
 - **为什么 catman 主进程也要挂 `/userdata`**(每次看到都会想省掉的那条):
   挂载本身确实不用 —— `-v` 是宿主 dockerd 解析的。卡点是**每个用户的子目录
   得先存在且属 10001**:dockerd 自动建的挂载源是 `root:root 0755`,
