@@ -248,6 +248,8 @@ export function formatProgress(
   skipped = 0,
   maxChars = PROGRESS_MAX_CHARS,
 ): string {
+  // text 事件平时到不了这里:onProgress 在节流之前就把它择出去走正文路径了
+  // (整条发,不裁)。留着这个分支只是为了穷尽类型、以及万一漏进来别抛。
   const body =
     ev.kind === "thinking"
       ? `💭 ${truncate(ev.text.trim(), maxChars)}`
@@ -1713,6 +1715,24 @@ export class Gateway {
       snap.steps += 1;
       snap.lastAt = this.now();
       snap.last = describeProgress(ev);
+      // **中途说的话不是进度,是它在跟人交代事情**,与最终答复同等地位:整条发,
+      // 不裁、不攒批、不看 progressEnabled(那个开关关的是思考与工具调用的刷屏)。
+      // 从前它跟进度一起被裁到 200 字、同一间隔内还会被后一条顶掉 —— 用户只看得见
+      // 前半句,剩下的只在 transcript 里(2026-09-03 反馈)。
+      //
+      // 切到后台的回合也发:最终答复里不含这段话,不发就永远丢了;带上出处,
+      // 免得被当成他此刻正在聊的那段对话说的。
+      //
+      // 挂在同一条串行链上,与前后的进度保持顺序。kind 用 body:信使对它的策略是
+      // 排队、一条不丢、保序,而进度是只留最新一条 —— 这段话丢一条就是少一件事。
+      // 代价是每条占一格额度;按现在的规则没有谁给谁让位,用完了排队等 /nop。
+      if (ev.kind === "text") {
+        const said = ev.text.trim();
+        progress = progress.then(async () => {
+          await this.sendChunked(userKey, this.labelMidTurn(turn.ctx, said), prefs.maxReplyChars);
+        });
+        return;
+      }
       // 切到后台之后不再推进度:用户已经在跟别的会话说话了,这时候插播
       // 另一段对话的工具调用只会让他分不清是谁在说话。快照照旧更新 ——
       // /状态 还要靠它交代后台那几段跑到哪了。
@@ -1905,6 +1925,18 @@ export class Gateway {
    * 结果才存在)。那种情况下"这是后台那段说的话"仍然要讲,只是切回的指令给不出 ——
    * 与其为了凑齐格式而不标出处,不如少给一句提示。
    */
+  /**
+   * 后台回合**中途**说的话的出处标签。
+   *
+   * 与 `labelIfDetached` 分开:那个写着"结果"、还教怎么切回去,放在一段话说到一半
+   * 的地方是错的 —— 它不是结果,而且回合还没跑完、会话 id 未必已经有了。这里只标
+   * "这是后台那段说的",别的不说。
+   */
+  private labelMidTurn(ctx: TurnContext, text: string): string {
+    if (!ctx.detached) return text;
+    return `【后台对话说】\n${text}`;
+  }
+
   private labelIfDetached(ctx: TurnContext, sessionId: string | undefined, text: string): string {
     if (!ctx.detached) return text;
     if (sessionId === undefined) return `【后台对话的结果】\n${text}`;

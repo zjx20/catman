@@ -462,6 +462,86 @@ test("进度:progressEnabled=false 只停推送,回合快照照常更新", async
   assert.equal(snapshot?.steps, 0);
 });
 
+/**
+ * 中途说的话**不是进度**。它是模型在跟人交代事情,只是发生在回合中间 —— 与最终
+ * 答复意义相当。从前它跟思考、工具调用一起进节流器:裁到 200 字、同一间隔内攒成
+ * 一条、还会被后一条顶掉,用户只看得见前半句(2026-09-03 反馈)。
+ */
+test("中途正文:整条原样发、不裁不攒,顺序夹在前后进度之间", async () => {
+  let t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  const long = "这段话很长,远超进度那 200 字的上限。".repeat(30);
+  agent.progressEvents = [
+    { kind: "tool", name: "Read", input: { file_path: "/etc/hosts" } },
+    { kind: "text", text: long },
+    { kind: "tool", name: "Bash", input: { command: "free -m" } },
+  ];
+  agent.beforeProgress = () => {
+    t += 60_000;
+  };
+  await channel.receive(U1, "看看");
+  const msgs = afterGreeting(channel.sent);
+  assert.deepEqual(
+    msgs.map((m) => m.text),
+    [ACK_TEXT, "🔧 Read: /etc/hosts", long, "🔧 Bash: free -m", "echo:看看"],
+    "一个字不少,而且顺序不乱",
+  );
+  assert.equal(
+    channel.sent.find((m) => m.text === long)?.kind,
+    "body",
+    "走正文的类别:信使对它排队、不丢、保序",
+  );
+});
+
+test("中途正文:不受节流 —— 瞬间连说两句都发,夹在中间的工具调用照旧被节流掉", async () => {
+  const t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  agent.progressEvents = [
+    { kind: "tool", name: "T1", input: {} },
+    { kind: "text", text: "先看看日志" },
+    { kind: "tool", name: "T2", input: {} },
+    { kind: "text", text: "日志没问题,再查配置" },
+  ];
+  await channel.receive(U1, "查一下");
+  assert.deepEqual(
+    afterGreeting(channel.sent).map((m) => m.text),
+    [ACK_TEXT, "先看看日志", "日志没问题,再查配置", "echo:查一下"],
+  );
+});
+
+test("中途正文:超过分段长度时像最终答复一样分段,拼起来一个字不少", async () => {
+  let t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  const long = "甲".repeat(4_500);
+  agent.progressEvents = [
+    { kind: "text", text: long },
+    { kind: "tool", name: "Bash", input: { command: "ls" } },
+  ];
+  agent.beforeProgress = () => {
+    t += 60_000;
+  };
+  await channel.receive(U1, "来");
+  const msgs = afterGreeting(channel.sent);
+  const segs = msgs.filter((m) => m.text.startsWith("甲"));
+  assert.ok(segs.length > 1, "该分段");
+  assert.equal(segs.map((m) => m.text).join(""), long);
+  assert.equal(msgs.at(-1)!.text, "echo:来", "答复仍然排在最后");
+});
+
+test("中途正文:progressEnabled=false 也照发 —— 那个开关关的是刷屏,不是它说的话", async () => {
+  const t = 1_000_000;
+  const { channel, agent } = build(() => t, { settings: { progressEnabled: false } });
+  agent.progressEvents = [
+    { kind: "tool", name: "Bash", input: { command: "npm test" } },
+    { kind: "text", text: "测试全过了,接着改文档" },
+  ];
+  await channel.receive(U1, "你好");
+  assert.deepEqual(
+    afterGreeting(channel.sent).map((m) => m.text),
+    [ACK_TEXT, "测试全过了,接着改文档", "echo:你好"],
+  );
+});
+
 test("回合快照:步数与最后一步随事件推进,回合结束后清空", async () => {
   const t = 1_000_000;
   const { channel, agent, turns } = build(() => t);
@@ -538,9 +618,8 @@ test("formatProgress:超长内容截断,工具入参挑代表性字段", () => {
     "🔧 Read: /etc/hosts",
   );
   assert.equal(formatProgress({ kind: "tool", name: "Foo", input: { n: 1 } }), '🔧 Foo: {"n":1}');
-  // 中途说的话也推给用户 —— 大多数时候它埋头调工具,偶尔开口那几句正是最能
-  // 看出它在怎么干活的地方。前缀与 describeProgress 必须一致,两处各写各的就会
-  // 出现"/状态 里是 💬,推送里是别的"。
+  // text 平时到不了 formatProgress(onProgress 把它择出去整条发了),这个分支只是
+  // 兜底。前缀与 describeProgress 保持一致,免得"/状态 里是 💬,别处是别的"。
   assert.equal(formatProgress({ kind: "text", text: "先看看日志" }), "💬 先看看日志");
   assert.equal(formatProgress({ kind: "text", text: long }), `💬 ${"x".repeat(200)}…`);
 });
@@ -2047,6 +2126,27 @@ test("后台回合不推进度,前台的照推", async () => {
     !channel.sent.some((m) => m.text.startsWith("🔧")),
     `后台回合不该推进度,实际:${JSON.stringify(channel.sent.map((m) => m.text))}`,
   );
+});
+
+test("后台回合中途说的话照发,带出处 —— 最终答复里不含它,不发就丢了", async () => {
+  let t = 1_000_000;
+  const { channel, agent } = build(() => t);
+  agent.progressEvents = [
+    { kind: "text", text: "先看看日志" },
+    { kind: "tool", name: "Bash", input: { command: "npm test" } },
+  ];
+  agent.beforeProgress = () => (t += 60_000);
+  const open = stuckTurn(agent);
+  const stuck = channel.receive(U1, "长任务");
+  await waitUntil(() => agent.inFlight === 1, "回合进到 agent 里");
+
+  await channel.receive(U1, "/新会话"); // 切走 → 转后台
+  channel.sent.length = 0;
+  open();
+  await stuck;
+  const texts = channel.sent.map((m) => m.text);
+  assert.ok(texts.includes("【后台对话说】\n先看看日志"), `要带出处地发出来,实际:${JSON.stringify(texts)}`);
+  assert.ok(!texts.some((x) => x.startsWith("🔧")), "进度仍然不推");
 });
 
 test("/取消 只中断前台,后台那些继续跑", async () => {
