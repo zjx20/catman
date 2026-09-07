@@ -57,6 +57,8 @@ test("改状态的指令一律走队列,只读/中断的才 immediate", () => {
   // 就地执行会与投递并发,那句话就落到谁也说不清的会话里。走队列不再意味着
   // "卡在回合后面":分拣节点投递完就返回,不等回合(gateway.test 守着这半句)。
   // /回滚 同属这一类:它会重启进程,与 immediate 的"幂等只读"约束正相反。
+  // /模型 /思考 改的是**自己的偏好**而不是会话状态:幂等、不与消息投递抢先后,
+  // 而且正是助手卡住时最该使得上的 —— 所以它们是 immediate,不在这份名单里。
   const queued: string[] = ["continue", "switchSession", "newSession", "rollback", "publish"];
   for (const cmd of COMMAND_TABLE) {
     assert.equal(cmd.immediate, !queued.includes(cmd.name), `${cmd.canonical} 的 immediate 不对`);
@@ -107,6 +109,26 @@ test("/nop 由人格就地执行,而且人人可用 —— 它是额度耗尽时
   // 人格侧执行:信使把它消化掉的话,人格那边的节流器永远不知道额度回来了。
   assert.notEqual(parsed?.cmd.where, "courier");
   assert.equal(parseCommand("/noop")?.cmd.name, "nop");
+});
+
+test("/模型 与 /思考:带参与不带参都认,immediate,人人可用", () => {
+  // 换模型最需要的时刻是"当前这个不行了"——那时要排队的回合根本轮不上,
+  // 所以必须 immediate;而且不能只给管理员,每个人的模型是每个人自己的事。
+  for (const [text, name, arg] of [
+    ["/模型", "model", ""],
+    ["/模型 opus", "model", "opus"],
+    ["/model sonnet", "model", "sonnet"],
+    ["/思考", "effort", ""],
+    ["/思考 高", "effort", "高"],
+    ["/effort max", "effort", "max"],
+    ["/思考强度 low", "effort", "low"],
+  ] as const) {
+    const p = parseCommand(text);
+    assert.equal(p?.cmd.name, name, text);
+    assert.equal(p?.arg, arg, text);
+    assert.equal(p?.cmd.immediate, true, text);
+    assert.equal(p?.cmd.adminOnly, undefined, text);
+  }
 });
 
 test("帮助文案默认不列管理员指令,漏传 isAdmin 的后果是少显示而不是泄露", () => {

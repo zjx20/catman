@@ -65,6 +65,7 @@ export class PrefsStore {
 
     return {
       model: pick("model"),
+      effort: pick("effort"),
       ackEnabled: pick("ackEnabled"),
       progressEnabled: pick("progressEnabled"),
       maxReplyChars: pick("maxReplyChars"),

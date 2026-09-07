@@ -110,6 +110,7 @@ interface FakeCall {
   cwd?: string;
   hasProgress: boolean;
   model?: string;
+  effort?: string;
   skills?: string[];
   env?: Record<string, string | undefined>;
   attachments?: readonly Attachment[];
@@ -159,6 +160,7 @@ class FakeAgent {
       cwd: opts.cwd,
       hasProgress: !!opts.onProgress,
       model: opts.model,
+      effort: opts.effort,
       skills: opts.skills,
       env: opts.env,
       attachments: opts.attachments,
@@ -587,6 +589,82 @@ test("/状态 报告在飞回合:卡住时也答得出「在干什么」", async
   await channel.receive(U1, "/状态");
   const idle = afterGreeting(channel.sent).filter((m) => m.text.startsWith("📋")).at(-1)!;
   assert.match(idle.text, /当前:空闲/);
+});
+
+/**
+ * `/模型` 与 `/思考`:就地改自己的偏好,不进 LLM。
+ * 从前换模型要走 catman-settings skill,得花一个完整回合 —— 而"换个模型"最需要的
+ * 时刻恰恰是"当前这个不行了",那时一个要排队的回合根本轮不上。
+ */
+test("/模型 不带参数:报当前值与可选项,不起回合", async () => {
+  const { channel, agent } = build(() => 1_000_000);
+  await channel.receive(U1, "/模型");
+  const reply = afterGreeting(channel.sent).at(-1)!;
+  assert.match(reply.text, /^模型:.*\(默认\)/);
+  assert.match(reply.text, /可选:/);
+  assert.match(reply.text, /\/模型 默认/);
+  assert.equal(agent.calls.length, 0, "看一眼不该花一个回合");
+});
+
+test("/模型 <名字>:改完下一轮就带上新模型;不认的名字不改并列出可选", async () => {
+  const { channel, agent } = build(() => 1_000_000);
+  await channel.receive(U1, "/模型 sonnet");
+  assert.match(afterGreeting(channel.sent).at(-1)!.text, /模型已切到 sonnet,下一轮生效/);
+  await channel.receive(U1, "你好");
+  assert.equal(agent.calls.at(-1)!.model, "sonnet");
+
+  await channel.receive(U1, "/模型 不存在的");
+  const bad = afterGreeting(channel.sent).at(-1)!;
+  assert.match(bad.text, /模型没改:/);
+  assert.match(bad.text, /可选:/);
+  await channel.receive(U1, "再来");
+  assert.equal(agent.calls.at(-1)!.model, "sonnet", "坏值不该动已有的设置");
+
+  await channel.receive(U1, "/模型 默认");
+  assert.match(afterGreeting(channel.sent).at(-1)!.text, /模型已回到默认/);
+  await channel.receive(U1, "/模型");
+  assert.match(afterGreeting(channel.sent).at(-1)!.text, /\(默认\)/);
+});
+
+test("/思考 <档位>:中文档位归一成 SDK 取值传给 agent;「默认」清掉", async () => {
+  const { channel, agent } = build(() => 1_000_000);
+  await channel.receive(U1, "你好");
+  assert.equal(agent.calls.at(-1)!.effort, undefined, "没设过就不传,由 SDK 决定");
+
+  await channel.receive(U1, "/思考 高");
+  assert.match(afterGreeting(channel.sent).at(-1)!.text, /思考强度已切到 high,下一轮生效/);
+  await channel.receive(U1, "再来");
+  assert.equal(agent.calls.at(-1)!.effort, "high");
+
+  await channel.receive(U1, "/effort MAX");
+  await channel.receive(U1, "再来");
+  assert.equal(agent.calls.at(-1)!.effort, "max", "别名与大小写都认");
+
+  await channel.receive(U1, "/思考 超级高");
+  assert.match(afterGreeting(channel.sent).at(-1)!.text, /思考强度没改:.*可选/);
+
+  await channel.receive(U1, "/思考 默认");
+  await channel.receive(U1, "再来");
+  assert.equal(agent.calls.at(-1)!.effort, undefined);
+});
+
+test("/模型 在回合卡住时照样答 —— 换模型最需要的时刻正是当前这个不行了", async () => {
+  const { channel, agent } = build(() => 1_000_000);
+  let release!: () => void;
+  agent.gate = new Promise<void>((r) => (release = r));
+  const stuck = channel.receive(U1, "卡住的长任务");
+  await waitUntil(() => agent.inFlight === 1, "回合进到 agent 里挂住");
+
+  await channel.receive(U1, "/模型 haiku");
+  assert.match(
+    afterGreeting(channel.sent).at(-1)!.text,
+    /模型已切到 haiku/,
+    "不该排在卡住的回合后面",
+  );
+  release();
+  await stuck;
+  await channel.receive(U1, "下一轮");
+  assert.equal(agent.calls.at(-1)!.model, "haiku");
 });
 
 test("/状态 区分排队与真在跑:并发满时说排队", async () => {

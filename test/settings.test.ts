@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GlobalSettings } from "../src/core/settings.js";
+import { GlobalSettings, parseEffort } from "../src/core/settings.js";
 import { BUILTIN_ADMIN_USER_KEY } from "../src/core/identity.js";
 import { loadConfig, type Config } from "../src/config.js";
 
@@ -68,6 +68,27 @@ test("非数字/错类型在写入时抛错,错误文案能直接念给用户", 
 test("未知配置项被拒绝", () => {
   const { s } = make();
   assert.throws(() => s.set({ nope: 1 } as never), /未知配置项/);
+});
+
+test("思考强度:五档 + 中文别名都认,归一成 SDK 取值;不认的抛错并列出可选", () => {
+  const { s } = make();
+  // 值是从 JSON(dashboard PATCH / 硬指令)进来的原始字符串,类型上装成已归一的档位。
+  const raw = (v: Record<string, unknown>) => v as Parameters<typeof s.set>[0];
+  assert.equal(s.effective().effort, undefined, "不设就不传,由 SDK 按模型默认");
+  assert.equal(s.set(raw({ effort: "高" })).effort, "high");
+  assert.equal(s.set(raw({ effort: " XHigh " })).effort, "xhigh");
+  assert.equal(s.set(raw({ effort: "最大" })).effort, "max");
+  assert.throws(() => s.set(raw({ effort: "超级高" })), /可选:low \/ medium \/ high \/ xhigh \/ max/);
+  assert.equal(s.set({ effort: null }).effort, undefined);
+  // 盘上是坏值时读取侧退回 floor,不抛
+  const { s: bad } = make({ effort: 42 });
+  assert.equal(bad.effective().effort, undefined);
+  assert.deepEqual(
+    ["low", "medium", "high", "xhigh", "max"].map(parseEffort),
+    ["low", "medium", "high", "xhigh", "max"],
+  );
+  assert.equal(parseEffort("中"), "medium");
+  assert.equal(parseEffort(""), undefined);
 });
 
 test("同一次 PATCH 里既换白名单又换模型:按新白名单校验", () => {

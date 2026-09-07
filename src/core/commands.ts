@@ -32,6 +32,8 @@ export type CommandName =
   | "status"
   | "jobs"
   | "nop"
+  | "model"
+  | "effort"
   | "newSession"
   | "cancel"
   | "continue"
@@ -133,6 +135,28 @@ export const COMMAND_TABLE: readonly CommandDef[] = [
     // 刻意**不是 adminOnly**:任何用户都可能撞上额度耗尽,而进度的最后一条会把
     // 这个口令直接告诉他。
     immediate: true,
+  },
+  {
+    name: "model",
+    canonical: "/模型",
+    aliases: ["/model"],
+    desc: "看或切模型:不带参数列出可选项与当前值,带上模型名就切换(下一轮生效),「默认」清掉你的设置",
+    // immediate:只改自己的偏好、幂等,而且**正是"当前这个模型不行了"的时候最该使得上
+    // 的东西** —— 走队列就会被卡死的回合堵住,那这条指令的意义就没了。它不碰会话状态、
+    // 不与消息投递抢先后,所以不违背 immediate 的约束(见文件头)。
+    immediate: true,
+    takesArg: true,
+    argHint: "模型名",
+  },
+  {
+    name: "effort",
+    canonical: "/思考",
+    aliases: ["/effort", "/思考强度"],
+    desc: "看或切思考强度(low / medium / high / xhigh / max,也可写 低 / 中 / 高 / 极高 / 最大),下一轮生效",
+    // 与 /模型 同一个理由。
+    immediate: true,
+    takesArg: true,
+    argHint: "档位",
   },
   {
     name: "newSession",

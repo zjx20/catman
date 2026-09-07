@@ -804,7 +804,7 @@ export class Gateway {
     const parsed = attachments.length ? undefined : this.parseAllowed(userKey, text);
     // immediate 硬指令不进聚合窗口 —— 它们存在的全部理由就是"立刻",
     // 让救命的 /取消 先等 1.5 秒等于取消了这个理由。
-    if (parsed?.cmd.immediate) return this.runCommand(userKey, parsed.cmd);
+    if (parsed?.cmd.immediate) return this.runCommand(userKey, parsed.cmd, parsed.arg);
 
     // 到这里只可能是 /继续 /新会话 /切换会话:它们改会话状态,必须与消息投递
     // 保持先后,所以和普通文本一样进聚合窗口、再由分拣节点按到达顺序线性处理。
@@ -1077,7 +1077,7 @@ export class Gateway {
   }
 
   /** 执行一条 immediate 硬指令。与在飞回合并发,只做幂等操作。 */
-  private async runCommand(userKey: string, cmd: CommandDef): Promise<void> {
+  private async runCommand(userKey: string, cmd: CommandDef, arg = ""): Promise<void> {
     const pre = await this.prelude(userKey);
     if (!pre) return;
 
@@ -1103,6 +1103,11 @@ export class Gateway {
 
       case "jobs":
         await this.trySend(userKey, this.jobsText(userKey), "定时任务");
+        return;
+
+      case "model":
+      case "effort":
+        await this.trySend(userKey, this.switchPrefText(userKey, cmd, arg), cmd.desc);
         return;
 
       case "nop": {
@@ -1495,6 +1500,42 @@ export class Gateway {
     ];
   }
 
+  /**
+   * `/模型` 与 `/思考`:看或切一项自己的偏好。
+   *
+   * 走 immediate 路径,所以**不进 LLM、不花额度**,而且回合卡死时照样管用 ——
+   * "换个模型"最需要的时刻恰恰是"当前这个不行了",那时一个要排队的回合根本轮不上。
+   * 从前只能走 catman-settings skill,得花一个完整回合。
+   *
+   * 校验复用 SETTING_SCHEMA:不认的值给出"可选:…",与 dashboard / skill 那条路
+   * 同一份文案,不另写一套。**下一轮生效**是实话:在飞的回合已经带着旧值进了 SDK。
+   */
+  private switchPrefText(userKey: string, cmd: CommandDef, arg: string): string {
+    const key = cmd.name === "model" ? "model" : "effort";
+    const def = SETTING_SCHEMA[key];
+    const ctx = { modelAllowlist: this.settings.effective().modelAllowlist };
+    const show = (v: string | undefined): string => v ?? "由 SDK 决定";
+    if (!arg) {
+      const cur = this.prefs.effective(userKey)[key];
+      const own = this.prefs.get(userKey)[key] !== undefined;
+      return [
+        `${def.label}:${show(cur)}${own ? "(你设的)" : "(默认)"}`,
+        `可选:${def.hint(ctx)}`,
+        `发「${cmd.canonical} <${cmd.argHint ?? "值"}>」切换,「${cmd.canonical} 默认」回到默认。`,
+      ].join("\n");
+    }
+    if (arg === "默认" || arg.toLowerCase() === "default") {
+      const eff = this.prefs.set(userKey, { [key]: null });
+      return `${def.label}已回到默认:${show(eff[key])}。下一轮生效。`;
+    }
+    try {
+      const eff = this.prefs.set(userKey, { [key]: arg });
+      return `${def.label}已切到 ${show(eff[key])},下一轮生效。`;
+    } catch (err) {
+      return `${def.label}没改:${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
   /** /状态 的正文。纯后台生成,不花订阅额度 —— 配置错乱时唯一可靠的信息源。 */
   private statusText(userKey: string): string {
     const p = this.prefs.effective(userKey);
@@ -1508,7 +1549,8 @@ export class Gateway {
       "📋 当前状态",
       this.inFlightText(userKey),
       ...this.backgroundLines(userKey),
-      `模型:${p.model ?? "由 SDK 决定"}${own("model")}`,
+      `模型:${p.model ?? "由 SDK 决定"}${own("model")}  ` +
+        `思考:${p.effort ?? "由 SDK 决定"}${own("effort")}`,
       current === undefined || idle === undefined
         ? "会话:还没有进行中的对话,下一条消息开新的"
         : `会话:${shortSessionId(current.sessionId)},${humanDuration(idle)}前活动过,下一条消息${
@@ -1770,6 +1812,7 @@ export class Gateway {
         ...(ambient ? { ambient } : {}),
         resumeSessionId: decision.isNew ? undefined : decision.resumeSessionId,
         ...(prefs.model ? { model: prefs.model } : {}),
+        ...(prefs.effort ? { effort: prefs.effort } : {}),
         env: this.childEnv(isAdmin, turn.token, userKey, priv),
         ...(priv ? { privateHostDir: priv.host } : {}),
         skills: this.skillsFor(isAdmin),

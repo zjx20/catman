@@ -11,6 +11,7 @@ import {
 import { dirname } from "node:path";
 import { query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Config } from "../config.js";
+import type { EffortLevel } from "./settings.js";
 import type { Attachment } from "./attachments.js";
 import {
   AGENT_TRACE,
@@ -137,6 +138,11 @@ export interface AgentRunOptions {
    * 由它自己决定 —— 这是配置兜底链的末端,保证 agent 永远能起来。
    */
   model?: string;
+  /**
+   * 思考强度(SDK 的 effort)。不传就不给 SDK,由它按模型默认 —— 与 model 同一条
+   * 兜底原则:设置项坏了也不能让回合起不来。
+   */
+  effort?: EffortLevel;
   /**
    * 子进程环境变量。**SDK 会用它整体替换子进程环境**(不是合并),
    * 调用方必须自己展开 process.env,并对不该下放的变量做剔除。
@@ -450,7 +456,7 @@ export class Agent {
     const startedAt = Date.now();
     const model = opts.model ?? this.config.model;
     console.info(
-      `${tag} 回合开始 model=${model ?? "(交给 SDK)"} ` +
+      `${tag} 回合开始 model=${model ?? "(交给 SDK)"} effort=${opts.effort ?? "(交给 SDK)"} ` +
         `${opts.resumeSessionId ? `resume=${opts.resumeSessionId.slice(0, 8)}` : "新会话"} ` +
         `${prompt.length}字 图${attachments.length}`,
     );
@@ -489,6 +495,8 @@ export class Agent {
         cwd,
         // 两个都空就整个不传 model —— 兜底链的末端,交给 SDK 决定。
         ...(model ? { model } : {}),
+        // effort 同理:不传 = SDK 按模型默认。adaptive thinking 配合它决定想多深。
+        ...(opts.effort ? { effort: opts.effort } : {}),
         ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
         ...(opts.env ? { env: opts.env } : {}),
         ...(opts.skills ? { skills: opts.skills } : {}),

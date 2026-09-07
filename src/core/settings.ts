@@ -37,8 +37,36 @@ const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 
 /** 全部配置项的取值。model 为 undefined 表示不传给 SDK,由它自己决定。 */
+/**
+ * 思考强度的档位,与 SDK 的 `EffortLevel` 一一对应。**不做白名单**:它不像模型那样
+ * 有"这台机器买了哪些"的问题,五档对任何模型都合法(不支持的档位 SDK 自己降级),
+ * 管理员没有理由替用户关掉某一档。
+ */
+export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+/** 中文档位 → SDK 取值。用户在微信里打「/思考 高」比打 high 顺手。 */
+const EFFORT_ALIASES: Readonly<Record<string, EffortLevel>> = {
+  低: "low",
+  中: "medium",
+  高: "high",
+  极高: "xhigh",
+  最大: "max",
+  max: "max",
+};
+
+/** 把用户输入归一成档位;认不出返回 undefined。大小写与首尾空白不敏感。 */
+export function parseEffort(raw: unknown): EffortLevel | undefined {
+  if (typeof raw !== "string") return undefined;
+  const t = raw.trim().toLowerCase();
+  if ((EFFORT_LEVELS as readonly string[]).includes(t)) return t as EffortLevel;
+  return EFFORT_ALIASES[t];
+}
+
 export interface Settings {
   model: string | undefined;
+  /** 思考强度。undefined = 不传,由 SDK 按模型默认(目前是 high)。 */
+  effort: EffortLevel | undefined;
   ackEnabled: boolean;
   progressEnabled: boolean;
   maxReplyChars: number;
@@ -63,6 +91,7 @@ export interface Settings {
 /** scope="user" 的那些项:全局可设默认值,每用户还能各自覆盖。 */
 export type UserSettingKey =
   | "model"
+  | "effort"
   | "ackEnabled"
   | "progressEnabled"
   | "maxReplyChars"
@@ -70,6 +99,7 @@ export type UserSettingKey =
 
 export const USER_SETTING_KEYS: readonly UserSettingKey[] = [
   "model",
+  "effort",
   "ackEnabled",
   "progressEnabled",
   "maxReplyChars",
@@ -243,6 +273,26 @@ export const SETTING_SCHEMA: Schema = {
       // 白名单事后收窄时,这里会拒绝已经存下来的值 —— 调用方于是退到全局默认,
       // 再不行退到 env,最后退到「不传 model」。不改盘:白名单加回来时自动恢复。
       return typeof raw === "string" && ctx.modelAllowlist.includes(raw) ? raw : undefined;
+    },
+  },
+  effort: {
+    scope: "user",
+    label: "思考强度",
+    desc: "想多深再答:低了快、高了稳。改完下一轮生效。",
+    // 末端是「不传」:与 model 同理,兜底链的尽头必须永远可用,由 SDK 按模型默认。
+    floor: undefined,
+    hint: () => `${EFFORT_LEVELS.join(" / ")}(也可写 低 / 中 / 高 / 极高 / 最大)`,
+    validate(raw) {
+      const v = parseEffort(raw);
+      if (!v) {
+        throw new Error(
+          `不认识的思考强度 ${JSON.stringify(raw)},可选:${EFFORT_LEVELS.join(" / ")}(或 低 / 中 / 高 / 极高 / 最大)`,
+        );
+      }
+      return v;
+    },
+    parse(raw) {
+      return parseEffort(raw);
     },
   },
   ackEnabled: boolDef("user", "回执", "收到消息后先回一条「正在处理」。", true),
@@ -480,7 +530,7 @@ export class GlobalSettings {
         // 所以"给了空的"与"没给"在行为上无从区分,当没给最省事也最不会出错。
         return this.env.adminUserKeys.length ? this.env.adminUserKeys : undefined;
       default:
-        // maxReplyChars / disabledSkills 没有 env 基线,直接用 floor。
+        // maxReplyChars / disabledSkills / effort 没有 env 基线,直接用 floor。
         return undefined;
     }
   }
@@ -499,6 +549,7 @@ export class GlobalSettings {
     return {
       modelAllowlist,
       model: pick("model"),
+      effort: pick("effort"),
       ackEnabled: pick("ackEnabled"),
       progressEnabled: pick("progressEnabled"),
       maxReplyChars: pick("maxReplyChars"),
