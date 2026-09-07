@@ -1722,7 +1722,7 @@ export class Gateway {
       const text = throttle.offer(this.now(), ev);
       if (text === undefined) return;
       // 发不出去不是这里的事:渠道那边会排队,额度到头时也由它去说
-      // "进度就报到这儿,发 /nop 可以续上"(courier/outbox.ts)。
+      // "回信额度已用完,发 /nop 补充额度"(courier/outbox.ts)。
       progress = progress.then(async () => {
         await this.trySend(userKey, text, "进度", "progress");
       });

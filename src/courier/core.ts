@@ -335,6 +335,16 @@ export class CourierCore implements CourierApi {
     // **路由校验**:已经切到别的人格的用户,旧人格发来的正文不该再送出去 ——
     // 那会让用户在跟守护人格说话的中途收到主人格的答复,而且白吃一条预算。
     // 例外是 detach 之后的后台回合结果,它带着出处前缀、是用户主动要的,所以放行 body。
+    // `budget` 是信使自己那句额度提示,它是唯一能用保留格的类别 —— 人格发来的一律拒,
+    // 否则谁都能借这个名字拿走最后一格,"没有例外"就成了一句空话。
+    if (env.kind === "budget") {
+      return {
+        schema: IPC_SCHEMA,
+        ok: false,
+        remainingProgress: 0,
+        reason: "budget 这个类别只有信使自己能发",
+      };
+    }
     const routed = this.opts.routing.personaFor(env.userKey);
     if (routed !== persona && env.kind === "progress") {
       return {
@@ -357,15 +367,15 @@ export class CourierCore implements CourierApi {
       return {
         schema: IPC_SCHEMA,
         ok: true,
-        // 余量照实说。进度节流器据此收缩 —— 额度见底时**不该**再往队列里塞进度,
-        // 那只会让排空排的全是过期状态。
-        remainingProgress: this.opts.replies.remainingProgress(env.userKey),
+        // 余量照实说(字段名沿用 remainingProgress,老人格读得懂;进度没有单独的
+        // 额度了,它就是"还能发几条普通消息")。人格现在不看它,只是如实报。
+        remainingProgress: this.opts.replies.remainingSends(env.userKey),
       };
     } catch (err) {
       return {
         schema: IPC_SCHEMA,
         ok: false,
-        remainingProgress: this.opts.replies.remainingProgress(env.userKey),
+        remainingProgress: this.opts.replies.remainingSends(env.userKey),
         reason: String(err),
       };
     }

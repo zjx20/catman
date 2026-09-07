@@ -58,7 +58,9 @@ test("golden:契约版本号钉死为 1 —— 改它等于宣告破坏性变更
 });
 
 test("golden:人格标识与消息类别的字面取值", () => {
-  // 信使按这些字符串分 inbox、分预算。改名 = 老信使认不出新人格。
+  // 信使按这些字符串分 inbox、定排队策略。改名 = 老信使认不出新人格。
+  // 加一种 kind 也要过这里:老信使(跑 pinned)认不出的 kind 会让整个信封读不懂,
+  // 所以新 kind 要么只在信使内部用(如 `budget`),要么等 pinned 挪过去之后人格才能发。
   assert.deepEqual([...PERSONA_IDS], ["primary", "rescue"]);
   assert.deepEqual([...SEND_KINDS], [
     "ack",
@@ -67,6 +69,7 @@ test("golden:人格标识与消息类别的字面取值", () => {
     "reminder",
     "fallback",
     "announce",
+    "budget",
   ]);
 });
 

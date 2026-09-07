@@ -4,14 +4,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Inbox, inboundOf } from "../src/courier/inbox.js";
-import {
-  LIVE_TURN_SENDS,
-  MAX_PROGRESS_PER_TOKEN,
-  ReplyStore,
-  SEND_BUDGET,
-} from "../src/courier/reply-store.js";
+import { NOTICE_RESERVE, ReplyStore, SEND_BUDGET } from "../src/courier/reply-store.js";
 import { Spool } from "../src/courier/spool.js";
-import type { InboundEnvelope } from "../src/ipc/protocol.js";
+import { SEND_KINDS, type InboundEnvelope } from "../src/ipc/protocol.js";
 
 /**
  * 信使的持久层。三件东西各守一条"丢了就没救"的性质:
@@ -135,58 +130,94 @@ test("inbox:日志长度有界 —— 不能因为长期运行而无限增长", 
 
 // ── 发送预算 ──────────────────────────────────────────────────────
 
-test("预算:那笔账 —— 10 条总额,回执 1,保留 3,进度 6", () => {
-  // 保留额从 4 降到 2 又回到 3。降是因为有了发件队列:发不出去的消息进队列等
-  // 额度回来,"丢了"这件事本身没有了。回到 3 是因为**两句交代分不开**:
-  // "进度就报到这儿"许诺答案还会来,而正文分段超过一段时答案恰恰来不了,
-  // 那时用户需要的是"还有 N 条没发出去"。合用一格就必然有一次要撒谎,
-  // 而撒谎的代价是用户干等着 —— 真机上静默过 14 分钟和 2 小时 24 分。
-  //
+test("预算:那笔账钉死 —— 10 格,只留 1 格给额度提示", () => {
   // **10 是实测值,而且复测过**:2026-08-12 放宽到 20 试了一次,当天就撞回来 ——
   // 两次记录都是恰好 10 条成功,第 11 条起 ret=-2 且永不恢复。这里钉死它,
   // 再往上调是一次有代价的实验,不该被顺手改掉。
+  //
+  // 保留额只有 1 格,而且只给额度提示。从前是一张按类别的表(回执 1、进度上限 6、
+  // 正文与两句交代各 1),保留靠进度上限实现、规矩散在队列的策略表里 —— 于是没被
+  // 列进表的类别都是例外,2026-09-07 空闲提醒就这样吃掉了最后一格。
   assert.equal(SEND_BUDGET, 10);
-  assert.equal(MAX_PROGRESS_PER_TOKEN, 6);
-  // 排空的余地必须跟着这笔账走,不能各写各的。
-  assert.equal(LIVE_TURN_SENDS, SEND_BUDGET - MAX_PROGRESS_PER_TOKEN);
+  assert.equal(NOTICE_RESERVE, 1);
 });
 
-test("预算:进度撞上限之后,正文与那句续额提示仍然发得出去", () => {
-  // 进度把额度吃光的话,最不能丢的那两条就一定发不出去 —— 而它们恰恰是
-  // "答案"和"怎么把额度要回来"。别的类别不再各占一格:它们进发件队列,
-  // 一条都不会少(见 outbox.ts)。
+test("预算:没有例外 —— 任何类别都碰不到留给额度提示的那一格", () => {
+  // 这条守的是 2026-09-07 那个 bug 的根:规则挂在类别上就会有例外。
+  // 逐个类别试:9 格用完之后它必须被拒,而额度提示必须还发得出去;
+  // 提示说完之后它仍然被拒 —— 那时是真的没格了。
+  for (const kind of SEND_KINDS) {
+    if (kind === "budget") continue;
+    withDir((dir) => {
+      const store = new ReplyStore(join(dir, "ctx.json"), () => 1000);
+      store.remember("u", "raw-u", "tok-1");
+      for (let i = 0; i < SEND_BUDGET - NOTICE_RESERVE; i++) {
+        assert.equal(store.begin("u", "body").allowed, true, `第 ${i + 1} 条普通消息`);
+      }
+      const over = store.begin("u", kind);
+      assert.equal(over.allowed, false, `${kind} 不许碰最后一格`);
+      assert.match(over.reason ?? "", /额度提示/);
+      assert.equal(store.begin("u", "budget").allowed, true, "额度提示必须还发得出去");
+      assert.equal(store.begin("u", kind).allowed, false, `${kind}:提示说完也没格了`);
+    });
+  }
+});
+
+test("预算:进度没有单独的上限 —— 有额度就一直发,与别的类别同池", () => {
   withDir((dir) => {
     const store = new ReplyStore(join(dir, "ctx.json"), () => 1000);
     store.remember("u", "raw-u", "tok-1");
     assert.equal(store.begin("u", "ack").allowed, true);
-    for (let i = 0; i < MAX_PROGRESS_PER_TOKEN; i++) {
+    for (let i = 0; i < SEND_BUDGET - NOTICE_RESERVE - 1; i++) {
       assert.equal(store.begin("u", "progress").allowed, true, `第 ${i + 1} 条进度`);
     }
-    const over = store.begin("u", "progress");
-    assert.equal(over.allowed, false);
-    assert.match(over.reason ?? "", /进度额度/);
-
-    assert.equal(store.begin("u", "body").allowed, true, "正文必须还发得出去");
-    // 第二格:那句"进度报到头了,发 /nop 续上"的交代。它走 reminder 的额度 ——
-    // 新开一种 kind 会让老信使(跑 pinned,版本天然更老)读不懂整个信封。
-    assert.equal(store.begin("u", "reminder").allowed, true, "续额提示还有一格");
+    assert.equal(store.begin("u", "progress").allowed, false, "普通额度到头了");
+    assert.equal(store.remainingSends("u"), 0);
   });
 });
 
-test("预算:remainingSends 答的是「这个 token 还剩多少」,与进度余量分开", () => {
-  // 发件队列问的是这一个:它要决定排空停在哪儿,而那与"进度还能推几条"无关。
+test("预算:额度提示每份 token 只放行一次,而且跨重启记得", () => {
+  // 说过没有必须落盘:信使重启后忘掉它,要么重复说,要么以为说过了而不说 ——
+  // 后者正是那种"没发全却没人说"的静默。
+  withDir((dir) => {
+    const path = join(dir, "ctx.json");
+    const first = new ReplyStore(path);
+    first.remember("u", "raw-u", "tok-1");
+    assert.equal(first.noticePending("u"), true, "还没说过");
+    assert.equal(first.begin("u", "budget").allowed, true);
+    assert.equal(first.noticePending("u"), false, "说过了");
+    assert.equal(first.begin("u", "budget").allowed, false, "同一份 token 不说第二次");
+    assert.equal(first.remainingSends("u"), SEND_BUDGET - 1, "说完之后保留格释放给别人");
+
+    const second = new ReplyStore(path);
+    assert.equal(second.begin("u", "budget").allowed, false, "重启也不忘");
+    second.remember("u", "raw-u", "tok-2");
+    assert.equal(second.begin("u", "budget").allowed, true, "新来信新预算,提示也能再说");
+  });
+});
+
+test("预算:旧盘上没有 noticeSaid 字段,按「没说过」读", () => {
+  // 两种猜错的代价不对称:多说一次是一句废话,少说一次是一段静默。
+  withDir((dir) => {
+    const path = join(dir, "ctx.json");
+    writeFileSync(
+      path,
+      JSON.stringify({ u: { toUserId: "raw", contextToken: "tok", cachedAt: 1, attempts: 3, sent: 3 } }),
+    );
+    const store = new ReplyStore(path);
+    assert.equal(store.noticePending("u"), true);
+    assert.equal(store.remainingSends("u"), SEND_BUDGET - 3 - NOTICE_RESERVE);
+  });
+});
+
+test("预算:remainingSends 已经扣掉保留格 —— 队列据此判断当场发还是排队", () => {
   withDir((dir) => {
     const store = new ReplyStore(join(dir, "ctx.json"), () => 1000);
     assert.equal(store.remainingSends("u"), 0, "没有上下文时压根发不出去");
     store.remember("u", "raw-u", "tok-1");
-    assert.equal(store.remainingSends("u"), SEND_BUDGET);
-    for (let i = 0; i < MAX_PROGRESS_PER_TOKEN; i++) store.begin("u", "progress");
-    assert.equal(store.remainingProgress("u"), 0, "进度用完了");
-    assert.equal(
-      store.remainingSends("u"),
-      SEND_BUDGET - MAX_PROGRESS_PER_TOKEN,
-      "但总额还剩保留的那几条 —— 队列据此判断还能不能排空",
-    );
+    assert.equal(store.remainingSends("u"), SEND_BUDGET - NOTICE_RESERVE);
+    for (let i = 0; i < 4; i++) store.begin("u", "progress");
+    assert.equal(store.remainingSends("u"), SEND_BUDGET - NOTICE_RESERVE - 4);
   });
 });
 
@@ -194,7 +225,8 @@ test("预算:总额用尽之后连正文都拒绝 —— 那时再发只会撞�
   withDir((dir) => {
     const store = new ReplyStore(join(dir, "ctx.json"));
     store.remember("u", "raw-u", "tok-1");
-    for (let i = 0; i < SEND_BUDGET; i++) store.begin("u", "body");
+    for (let i = 0; i < SEND_BUDGET - NOTICE_RESERVE; i++) store.begin("u", "body");
+    assert.equal(store.begin("u", "budget").allowed, true, "最后一格给提示");
     const over = store.begin("u", "body");
     assert.equal(over.allowed, false);
     assert.match(over.reason ?? "", /预算/);
@@ -206,7 +238,7 @@ test("预算:没有回复上下文时如实说发不出去 —— iLink 不支�
     const store = new ReplyStore(join(dir, "ctx.json"));
     const p = store.begin("从没说过话的人", "reminder");
     assert.equal(p.allowed, false);
-    assert.equal(p.remainingProgress, 0);
+    assert.equal(p.remaining, 0);
   });
 });
 
@@ -214,10 +246,10 @@ test("预算:新来信换一份上下文并把计数归零", () => {
   withDir((dir) => {
     const store = new ReplyStore(join(dir, "ctx.json"));
     store.remember("u", "raw-u", "tok-1");
-    for (let i = 0; i < MAX_PROGRESS_PER_TOKEN; i++) store.begin("u", "progress");
-    assert.equal(store.remainingProgress("u"), 0);
+    for (let i = 0; i < SEND_BUDGET; i++) store.begin("u", "progress");
+    assert.equal(store.remainingSends("u"), 0);
     store.remember("u", "raw-u", "tok-2");
-    assert.equal(store.remainingProgress("u"), MAX_PROGRESS_PER_TOKEN, "新来信带来新预算");
+    assert.equal(store.remainingSends("u"), SEND_BUDGET - NOTICE_RESERVE, "新来信带来新预算");
   });
 });
 
@@ -229,7 +261,7 @@ test("预算:计数跨重启存活 —— 丢了就会超发,而超发不可恢�
     for (let i = 0; i < 4; i++) first.begin("u", "progress");
 
     const second = new ReplyStore(path);
-    assert.equal(second.remainingProgress("u"), MAX_PROGRESS_PER_TOKEN - 4);
+    assert.equal(second.remainingSends("u"), SEND_BUDGET - NOTICE_RESERVE - 4);
     assert.equal(second.get("u")?.contextToken, "tok-1", "上下文本身也要活下来");
   });
 });
@@ -244,8 +276,9 @@ test("预算:盘上计数坏掉时按「已用满」处理,不是按 0", () => {
       JSON.stringify({ u: { toUserId: "raw", contextToken: "tok", cachedAt: 1, sent: "坏的" } }),
     );
     const store = new ReplyStore(path);
-    assert.equal(store.remainingProgress("u"), 0);
+    assert.equal(store.remainingSends("u"), 0);
     assert.equal(store.begin("u", "body").allowed, false);
+    assert.equal(store.begin("u", "budget").allowed, false, "连提示都没格 —— 这条来信确实已经满了");
   });
 });
 
@@ -332,12 +365,12 @@ test("预算:同一个 token 再 remember 一次**不重置计数** —— 重�
     const store = new ReplyStore(join(dir, "ctx.json"));
     store.remember("u", "raw-u", "tok-1");
     for (let i = 0; i < 4; i++) store.begin("u", "progress");
-    assert.equal(store.remainingProgress("u"), MAX_PROGRESS_PER_TOKEN - 4);
+    assert.equal(store.remainingSends("u"), SEND_BUDGET - NOTICE_RESERVE - 4);
 
     store.remember("u", "raw-u", "tok-1"); // 重放
     assert.equal(
-      store.remainingProgress("u"),
-      MAX_PROGRESS_PER_TOKEN - 4,
+      store.remainingSends("u"),
+      SEND_BUDGET - NOTICE_RESERVE - 4,
       "同一个 token 就是同一条来信,账不该被清掉",
     );
   });
@@ -349,7 +382,7 @@ test("预算:换了 token 才重置 —— 新来信本来就带新预算", () =
     store.remember("u", "raw-u", "tok-1");
     for (let i = 0; i < 4; i++) store.begin("u", "progress");
     store.remember("u", "raw-u", "tok-2");
-    assert.equal(store.remainingProgress("u"), MAX_PROGRESS_PER_TOKEN);
+    assert.equal(store.remainingSends("u"), SEND_BUDGET - NOTICE_RESERVE);
   });
 });
 

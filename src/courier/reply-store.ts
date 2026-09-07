@@ -15,36 +15,39 @@ import type { SendKind } from "../ipc/protocol.js";
  * 也在往同一个 token 发东西,两边各按自己的数算就必然超发。预算必须有唯一权威。
  *
  *     SEND_BUDGET(10)
- *       − ack(1)                回执
- *       − 保留 3 条             正文 / "进度到头了" / "还有 N 条没发出去"
+ *       − 额度提示 1            「回信额度已用完,发 /nop 补充额度」
  *       ────────────────────
- *       = 进度上限 6 条
+ *       = 其余 9 条,谁先来谁用
  *
- * **保留就是靠进度的上限实现的**:进度撞到上限就再也发不出去,于是剩下的 2 条
- * 谁也抢不走。`fallback`(人格不可达时信使自己回的那句)与正文互斥,共用同一份保留额。
+ * **规则只有这一条,没有例外。** 回执、进度、正文、空闲提醒、部署播报、兜底说明 ——
+ * 全部走同一个计数,谁都不许碰最后一格;最后一格只给额度提示,而且每份 token 只说
+ * 一次(标记落盘)。发不出去的进发件队列(`outbox.ts`),下一条来信带来新 token
+ * 再排空。
  *
- * ⚠️ 整笔账都挂在 `kind` 上:kind 在半路丢掉,这里就只看得见 `body`,进度上限
- * 形同虚设,保留的 2 格会被进度吃光。真机上发生过一次,漏的地方是
- * `channels/composite.ts` 的 `send` 少写了一个形参(那里有详细记录)。
- * 所以这笔账对不上时,先查 kind 有没有活着走到这里,再怀疑这些常数。
+ * ### 为什么不再按类别预留
  *
- * 会话空闲提醒与部署结果播报**不再各占一格** —— 它们发不出去时进发件队列
- * (`outbox.ts`),一条都不会少。那也是保留额能从 4 降到 2 的唯一理由。
+ * 从前这里是一张表:回执 1、进度上限 6、正文 / 两句交代各留 1。保留靠"进度的上限"
+ * 实现,而"最后一格留给交代"这条规矩不在这里,散在 `outbox.ts` 的策略表里 ——
+ * 只拦正文那一类,进度靠自己的上限挡住,回执与提醒谁都不拦。于是每个没被列进去
+ * 的类别都是一个例外。2026-09-07 就这么撞上了:正文发完还剩 1 格,**会话空闲提醒**
+ * (`reminder`)不问保留额直接把它拿走;早上定时日报来时额度为 0,内容进了队列,
+ * 那句"发 /nop"却一格都申请不到,用户从 02:32 静默到 08:24,而且这条路上一行日志
+ * 都没有。
+ *
+ * 规则挂在类别上就会有例外;挂在预算本身上就没有。所以现在保留额只认一样东西:
+ * 那条提示自己的 kind(`budget`),其余一视同仁。进度的子上限也一并去掉 —— 它是
+ * 给正文留位置的时延旋钮,与"没发全一定有人说"无关;有进度就发,没额度就续。
  *
  * ## 额度花光了不是绝路,但得有人告诉他
  *
  * 用户随便发一句话就带来新的 `context_token`,计数跟着归零。`/nop` 就是为此存在的
- * 那句"随便的话":什么也不做,只把额度续上。
- *
- * 这句提示**单独占一格保留额**(`PROGRESS_CAP_NOTICE`,人格侧发),不附在最后一条
- * 进度的尾巴上 —— 它要是跟着进度走,就会跟进度一起被上限挤掉,而"进度用完了"
- * 正是它唯一该出现的时刻。占一格的代价是进度少一条,换来的是那段静默有个交代、
- * 而且交代里带着出路。
+ * 那句"随便的话":什么也不做,只把额度续上。那条提示的全部意义就是把这个口令
+ * 在**正确的时刻**送到他手里 —— 所以它必须有格可用,而且必须只由知道预算的这里放行。
  *
  * ## 为什么按"尝试"计数而不是"成功"
  *
  * 失败的那一次有没有消耗服务端的额度,协议没说。两种猜法的代价完全不对称:
- * 多算一次只是少发一条进度;少算一次则可能把正文顶出预算,那是整段对话静默。
+ * 多算一次只是少发一条;少算一次则可能把正文顶出预算,那是整段对话静默。
  * 所以按尝试计数,并把成功数单独记着 —— "第 4 次尝试但只成功过 1 条"这种形态
  * 是判断"到底是限流还是 token 死了"的关键,合成一个计数就看不出来了。
  *
@@ -52,8 +55,9 @@ import type { SendKind } from "../ipc/protocol.js";
  *
  * ① 计数丢了就会超发,而超发是不可恢复的;
  * ② replyCtx 本身持久化之后,**人格重启不再丢回信能力** —— 会话空闲提醒终于有机会
- *    送达(它的前提就是用户没再发消息,而 token 只在收到新消息时才更新)。
- *    这是信使架构送的礼物。
+ *    送达(它的前提就是用户没再发消息,而 token 只在收到新消息时才更新);
+ * ③ "这份 token 的额度提示说过没有"也在里面:信使重启后忘掉它,要么重复说,
+ *    要么(更糟)以为说过了而不说。
  */
 
 /**
@@ -74,44 +78,12 @@ import type { SendKind } from "../ipc/protocol.js";
  */
 export const SEND_BUDGET = 10;
 
-/** 回执占 1 条。 */
-const ACK_SENDS = 1;
-
 /**
- * 给非进度用途预留的条数:正文 + 额度提示。
+ * 留给额度提示的那一格。**这是整份预算里唯一的保留额。**
  *
- * **有了发件队列之后,保留额不再是安全机制。** 发不出去的消息现在进 `Outbox` 等额度
- * 回来,"丢了"这件事本身没有了 —— 而保留额存在的全部理由曾经就是给"丢了就没有第二次"
- * 的消息占位子。所以会话空闲提醒(`reminder`)与部署结果播报(`announce`)不再各占
- * 一格:它们排队,一条都不会少。
- *
- * 剩下这 3 格,一格是时延旋钮,两格是**说话的权利**:
- * ① 正文 —— 让常见的那种长回合仍然当场就把答案发出去,而不是排队等用户刷额度;
- * ② "进度就报到这儿,接下来直接等答案" —— 长回合中段那段静默得有个交代;
- * ③ "还有 N 条没发出去,发 /nop 我接着发" —— **这一句是队列排空的唯一开关**。
- *
- * ②③ 从前合用一格。合不了:②许诺答案还会来,而正文分段超过一段时答案恰恰来不了,
- * 那时用户需要的是③,却被②把格子占了、把锁也占了(`outbox.said`)。于是他收到
- * 一句"接下来直接等答案",然后再无下文 —— 真机上这样静默过 14 分钟和 2 小时 24 分。
- * 代价是进度从 7 条降到 6 条(阶梯跑满约 4 分钟),换回来的是"没发全一定有人说"。
- *
- * 交代走 `reminder` 而不新开一种 kind:**信使跑的是 pinned,版本天然比人格老**,
- * 而 `parseSendKind` 认不出的 kind 会让整个信封读不懂 —— 那句话于是恰好在最需要
- * 它的时候消失。
+ * 提示说过之后这一格就释放给别人 —— 留着只是浪费,而它要说的话已经说了。
  */
-const RESERVED_SENDS = 3;
-
-/** 一个回合里最多推几条进度。 */
-export const MAX_PROGRESS_PER_TOKEN = SEND_BUDGET - ACK_SENDS - RESERVED_SENDS;
-
-/**
- * 一轮对话最起码要占掉几条:回执 + 正文 + 那两句交代。
- *
- * 发件队列排空时**留的正是它** —— 用户刚发的那句话也要有得用,把新额度全拿去还旧账,
- * 等于让他每问一句都先替上一轮买单。写成从这笔账推出来的量而不是另一个常量:
- * 预算从 20 改回 10 时,排空的余地必须跟着变,两个数各写各的迟早对不上。
- */
-export const LIVE_TURN_SENDS = ACK_SENDS + RESERVED_SENDS;
+export const NOTICE_RESERVE = 1;
 
 /** 每用户一份回复上下文。字段名会落盘,改名要考虑旧盘上的数据。 */
 export interface ReplyContext {
@@ -124,8 +96,12 @@ export interface ReplyContext {
   attempts: number;
   /** 其中成功几条。与 attempts 分开记,见文件头。 */
   sent: number;
-  /** 其中有几条是进度。进度的上限是保留额的实现方式。 */
-  progress: number;
+  /**
+   * 这份 token 的额度提示说过没有。说过之后保留格释放,而且不再说第二次。
+   *
+   * 落盘的理由见文件头③。旧代码读到这个字段会忽略(它按白名单构造),回滚安全。
+   */
+  noticeSaid: boolean;
   /**
    * 「对方正在输入」用的 ticket(见 channels/ilink-protocol.ts 的 fetchTypingTicket)。
    *
@@ -140,8 +116,8 @@ export interface ReplyContext {
 
 export interface SendPermit {
   readonly allowed: boolean;
-  /** 还能再发几条**进度**。人格的节流器据此收缩。 */
-  readonly remainingProgress: number;
+  /** 放行之后这条来信还能再发几条**普通**消息(不含保留格)。 */
+  readonly remaining: number;
   readonly reason?: string;
 }
 
@@ -191,7 +167,7 @@ export class ReplyStore {
       cachedAt: this.now(),
       attempts: 0,
       sent: 0,
-      progress: 0,
+      noticeSaid: false,
     });
     this.flush();
   }
@@ -207,54 +183,65 @@ export class ReplyStore {
   }
 
   /**
-   * 这条来信总共还能发几条(不分类别)。没有上下文时是 0。
+   * 这条来信还能发几条**普通**消息 —— 已经扣掉留给额度提示的那一格。
+   * 没有上下文时是 0。
    *
-   * 发件队列据此决定"当场发还是排队",以及排空要停在哪儿。**它与
-   * `remainingProgress` 是两个问题**:那个答的是"进度还能推几条"(人格的节流器问),
-   * 这个答的是"这个 token 还剩多少"(队列问)。
+   * 发件队列据此决定"当场发还是排队",以及排空该不该停:它为 0 时普通消息一律
+   * 进队列,而那一刻正是该说提示的时刻(`noticePending`)。
    */
   remainingSends(userKey: string): number {
     const c = this.ctxs.get(userKey);
     if (!c) return 0;
-    return Math.max(0, SEND_BUDGET - c.attempts);
+    return Math.max(0, SEND_BUDGET - c.attempts - (c.noticeSaid ? 0 : NOTICE_RESERVE));
   }
 
-  /** 还能发几条进度。没有上下文时是 0(压根发不出去)。 */
-  remainingProgress(userKey: string): number {
+  /**
+   * 这份 token 的额度提示**还欠着**吗:有上下文、没说过、而且还有格说。
+   *
+   * 队列在把消息因额度塞进队列时问这个:是 → 立刻说;否 → 已经说过了(或压根
+   * 没有上下文),不必再说。
+   */
+  noticePending(userKey: string): boolean {
     const c = this.ctxs.get(userKey);
-    if (!c) return 0;
-    return Math.max(
-      0,
-      Math.min(MAX_PROGRESS_PER_TOKEN - c.progress, SEND_BUDGET - c.attempts),
-    );
+    return !!c && !c.noticeSaid && c.attempts < SEND_BUDGET;
   }
 
   /**
    * 申请发一条。**允许则当场记账**(attempts 自增),不等结果 ——
    * 并发进来的发送因此拿到不同的序号,而硬指令与在飞回合确实会同时发消息。
+   *
+   * `budget` 是那条额度提示:它是唯一能用保留格的,而且每份 token 只放行一次。
+   * 其余 kind 一律受保留格约束 —— **这里没有第二条分支,也不该有。**
    */
   begin(userKey: string, kind: SendKind): SendPermit {
     const c = this.ctxs.get(userKey);
     if (!c) {
       // iLink 协议**不支持主动推送**:没有这个用户最近一条来信的 context_token
       // 就真的发不出去。如实说,由调用方降级(网关对提醒本就是静默降级)。
-      return { allowed: false, remainingProgress: 0, reason: "没有这个用户的回复上下文" };
+      return { allowed: false, remaining: 0, reason: "没有这个用户的回复上下文" };
     }
-    if (c.attempts >= SEND_BUDGET) {
-      return { allowed: false, remainingProgress: 0, reason: "这条来信的发送预算已用尽" };
+    if (kind === "budget") {
+      if (c.noticeSaid) {
+        return { allowed: false, remaining: 0, reason: "这条来信的额度提示已经说过了" };
+      }
+      if (c.attempts >= SEND_BUDGET) {
+        return { allowed: false, remaining: 0, reason: "这条来信的发送预算已用尽" };
+      }
+      c.attempts += 1;
+      c.noticeSaid = true;
+      this.flush();
+      return { allowed: true, remaining: this.remainingSends(userKey) };
     }
-    if (kind === "progress" && c.progress >= MAX_PROGRESS_PER_TOKEN) {
-      // 进度撞上限**不是错误**:它正是保留额起作用的样子。
-      return {
-        allowed: false,
-        remainingProgress: 0,
-        reason: "进度额度已用尽(正文与提醒的额度受保护)",
-      };
+    if (this.remainingSends(userKey) <= 0) {
+      const reason =
+        c.attempts >= SEND_BUDGET
+          ? "这条来信的发送预算已用尽"
+          : "这条来信只剩留给额度提示的那一格";
+      return { allowed: false, remaining: 0, reason };
     }
     c.attempts += 1;
-    if (kind === "progress") c.progress += 1;
     this.flush();
-    return { allowed: true, remainingProgress: this.remainingProgress(userKey) };
+    return { allowed: true, remaining: this.remainingSends(userKey) };
   }
 
   /** 记一次结果。只影响诊断计数,不影响预算(预算在 begin 时就扣了)。 */
@@ -321,7 +308,9 @@ function parseCtx(v: unknown): ReplyContext | undefined {
     // 这时候乐观地从 0 开始就会超发,而超发是不可恢复的(连正文都发不出去)。
     attempts: typeof r["attempts"] === "number" ? num("attempts") : SEND_BUDGET,
     sent: num("sent"),
-    progress: typeof r["progress"] === "number" ? num("progress") : MAX_PROGRESS_PER_TOKEN,
+    // 旧盘上没有这个字段(旧代码把"说过没有"记在内存里)。读成"没说过"而不是
+    // "说过了":两种猜错的代价不对称 —— 多说一次是一句废话,少说一次是一段静默。
+    noticeSaid: r["noticeSaid"] === true,
     // 旧盘上没有这个字段,读出来是 undefined —— 那只是「还没取过 ticket」,
     // 下次要发 typing 时自然会去取一份。反过来旧代码读到带这个字段的新盘也无妨:
     // 它按白名单构造,多出来的键直接忽略。回滚安全。
