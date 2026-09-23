@@ -769,6 +769,17 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(只对**主人格
   `cp -al` 硬链接复用上一个 release 的 node_modules —— 若那棵树里没有 tsc/tsx,
   **最常见的那条路径必然失败**;补装又会就地写文件,透过硬链接污染上一个(可能正是
   stable)release 的字节。配套纪律:**复用之后对那棵树零 npm 写操作**。
+- **源码工作区的 `node_modules` 是指向 `releases/current` 的软链** ——
+  也就是正在跑的那个 release。所以在 `/data/src/catman` 里跑任何 npm 写操作
+  (`npm install`、`npm update`、顺手补一个包)都会**直接改到线上正在执行的字节**,
+  上一条那句"零 npm 写操作"在这里同样成立,而且更隐蔽:你以为在改自己的工作区,
+  `ls -ld node_modules` 才看得出它根本不是自己的目录。
+  升依赖的正确姿势是**只改 `package.json` + `package-lock.json`**,依赖交给
+  `prepare.sh` 在一次性容器里装。注意它跑的是 `npm ci` —— **严格照 lock,所以
+  lock 不更新等于没升**(`^0.3.259` 允许 0.3.280,`npm ci` 照样给你装 0.3.259)。
+  更新 lock 又不能就地跑 `npm install`,于是:把两个 package 文件复制到 `/tmp` 下的
+  空目录,在那里 `npm install --package-lock-only`(只重写 lock、不碰 node_modules),
+  再把 lock 拷回来。2026-09-23 升 Agent SDK 时就是这么做的。
 - **不用 `git worktree` 制备,用浅 clone**:worktree 的 `.git` 只是指向共享仓库的指针,
   清理时 `rm -rf` 会留下元数据残骸,导致**同一个 sha 无法再次 worktree add** ——
   恰好死在"回滚之后想重新制备旧版本"这条事故恢复路径上。
