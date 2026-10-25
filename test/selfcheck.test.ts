@@ -24,6 +24,11 @@ test("凭据/额度类归 auth(重试无用,要人去换发)", () => {
     "401 Unauthorized",
     "authentication_error: invalid x-api-key",
     "OAuth token has expired",
+    // 自检容器里一个凭据都没有时,Claude Code 真正吐的就是这句。它既没有
+    // 401 也没有 token 字样,以前一路掉到 `code` —— 报告把"配置没送到"说成了
+    // "这份代码坏了",排查方向直接跑偏。
+    "Not logged in · Please run /login",
+    "No API key found",
   ]) {
     assert.equal(classifyFailure(s), "auth", s);
   }
@@ -88,6 +93,51 @@ test("探测返回 isError 时按错误原文分类,而不是一律判死", asyn
   assert.equal(result.category, "ratelimit");
   // 原文照留:它是去查订阅/配置的唯一线索。
   assert.match(result.detail, /429/);
+});
+
+test("探测模型跟随线上配置 —— 第三方 provider 上写死的 haiku 可能不存在", async () => {
+  const realModel = process.env["CATMAN_MODEL"];
+  const realProbeModel = process.env["CATMAN_SELFCHECK_MODEL"];
+  process.env["CATMAN_MODEL"] = "deepseek-flash";
+  delete process.env["CATMAN_SELFCHECK_MODEL"];
+  let used = "";
+  try {
+    const result = await runSelfCheck({
+      runProbe: async (_agent, _cwd, model) => {
+        used = model;
+        return { text: "ok", isError: false };
+      },
+    });
+    assert.equal(result.ok, true);
+    assert.equal(used, "deepseek-flash");
+  } finally {
+    if (realModel === undefined) delete process.env["CATMAN_MODEL"];
+    else process.env["CATMAN_MODEL"] = realModel;
+    if (realProbeModel === undefined) delete process.env["CATMAN_SELFCHECK_MODEL"];
+    else process.env["CATMAN_SELFCHECK_MODEL"] = realProbeModel;
+  }
+});
+
+test("CATMAN_SELFCHECK_MODEL 显式覆盖线上模型", async () => {
+  const realModel = process.env["CATMAN_MODEL"];
+  const realProbeModel = process.env["CATMAN_SELFCHECK_MODEL"];
+  process.env["CATMAN_MODEL"] = "deepseek-flash";
+  process.env["CATMAN_SELFCHECK_MODEL"] = "cheap-probe-model";
+  let used = "";
+  try {
+    await runSelfCheck({
+      runProbe: async (_agent, _cwd, model) => {
+        used = model;
+        return { text: "ok", isError: false };
+      },
+    });
+    assert.equal(used, "cheap-probe-model");
+  } finally {
+    if (realModel === undefined) delete process.env["CATMAN_MODEL"];
+    else process.env["CATMAN_MODEL"] = realModel;
+    if (realProbeModel === undefined) delete process.env["CATMAN_SELFCHECK_MODEL"];
+    else process.env["CATMAN_SELFCHECK_MODEL"] = realProbeModel;
+  }
 });
 
 test("探测抛错也走分类", async () => {

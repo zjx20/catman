@@ -78,9 +78,9 @@ exec docker run -d \
   --restart no \
   --add-host host.docker.internal:host-gateway \
   "${PROXY_ENV[@]}" \
+  $(brain_env_args) \
   -e "TZ=${TZ:-UTC}" \
   -e "CATMAN_HOST_DATA_DIR=$HOST_DATA_DIR" \
-  -e "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}" \
   -e "CATMAN_IMAGE=$IMAGE" \
   -e "CATMAN_CONTAINER=${CATMAN_CONTAINER:-catman}" \
   -e "CATMAN_COURIER_CONTAINER=${CATMAN_COURIER_CONTAINER:-catman-courier}" \

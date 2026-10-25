@@ -113,13 +113,18 @@ smoke() { # smoke <sha>
     # 的读取端一律防御式:自检代码属 Tier 1、每周都在变,某次改动把一行日志漏回
     # stdout,后果是好版本被判死,而那种误判在日志里长得跟真故障一模一样。
     # stderr **不丢弃**,它进 deployer 的容器日志 —— 自检失败时的现场只在那里。
+    #
+    # 探测模型优先用显式覆盖,否则跟随线上配置。旧版自检把 haiku 写死,而第三方
+    # API 上那个模型名可能根本不存在 —— 由这里兜住,不依赖 release 里的自检代码
+    # 是否已经改过。
     out="$(docker run --rm \
       --user 10001:10001 \
       --memory "${CATMAN_SMOKE_MEMORY:-1000m}" \
       --add-host host.docker.internal:host-gateway \
       -e CATMAN_SELFCHECK=1 \
       -e "TZ=${TZ:-UTC}" \
-      -e "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}" \
+      $(brain_env_args) \
+      -e "CATMAN_SELFCHECK_MODEL=${CATMAN_SELFCHECK_MODEL:-${CATMAN_MODEL:-}}" \
       $(for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
           [ -n "${!v:-}" ] && printf -- '-e %s=%s ' "$v" "${!v}"
         done) \

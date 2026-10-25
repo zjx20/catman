@@ -973,6 +973,70 @@ test("固化链路:命令行上显式给的 CATMAN_IMAGE 赢过固化 env", () =
   });
 });
 
+test("大脑凭据按前缀转发,且值不进 argv", () => {
+  withDir((dir) => {
+    const dataDir = join(dir, "data");
+    mkdirSync(dataDir, { recursive: true });
+    const deployDir = blessTo(dataDir);
+    const out = execFileSync(
+      "bash",
+      ["-c", `. "${join(deployDir, "bin", "lib.sh")}"; brain_env_args`],
+      {
+        encoding: "utf8",
+        env: cleanEnv({
+          ANTHROPIC_BASE_URL: "http://llm.example/v1",
+          ANTHROPIC_AUTH_TOKEN: "secret-token-value",
+          CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+          CATMAN_MODEL: "deepseek-flash",
+          CATMAN_IPC_SECRET: "must-not-forward",
+        }),
+      },
+    );
+    for (const name of [
+      "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_AUTH_TOKEN",
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "CATMAN_MODEL",
+    ]) {
+      assert.ok(out.includes(`-e ${name}`), `${name} 必须被转发`);
+    }
+    assert.equal(out.includes("secret-token-value"), false, "值必须从环境取 —— 进了 argv 就等于进了宿主 ps");
+    assert.equal(out.includes("oauth-secret"), false);
+    assert.equal(out.includes("must-not-forward"), false);
+    assert.equal(/\bCATMAN_IPC_SECRET\b/.test(out), false, "IPC 密钥不是大脑凭据,不该被带进部署链路");
+  });
+});
+
+test("deployer-run 把大脑凭据转发进 deployer 容器 —— 少这一跳,自检容器里一个凭据都没有", () => {
+  withDir((dir) => {
+    const dataDir = join(dir, "data");
+    mkdirSync(dataDir, { recursive: true });
+    const deployDir = blessTo(dataDir);
+    const out = execFileSync("bash", [join(deployDir, "bin", "deployer-run.sh"), "status"], {
+      encoding: "utf8",
+      env: cleanEnv({
+        PATH: `${fakeDocker(dir)}:${process.env["PATH"]}`,
+        ANTHROPIC_BASE_URL: "http://llm.example/v1",
+        ANTHROPIC_AUTH_TOKEN: "secret-token-value",
+        CATMAN_MODEL: "deepseek-flash",
+      }),
+    });
+    assert.match(out, /-e ANTHROPIC_BASE_URL/);
+    assert.match(out, /-e ANTHROPIC_AUTH_TOKEN/);
+    assert.match(out, /-e CATMAN_MODEL/);
+    assert.equal(out.includes("secret-token-value"), false, "令牌不能出现在命令行上");
+  });
+});
+
+test("smoke 这一跳也转发凭据,并把探测模型拉回线上配置", () => {
+  const fn = deployerFn("smoke");
+  assert.match(fn, /brain_env_args/, "只修 deployer-run 那一跳,deployer 里仍然没有凭据转给自检");
+  assert.ok(
+    fn.includes("CATMAN_SELFCHECK_MODEL=${CATMAN_SELFCHECK_MODEL:-${CATMAN_MODEL:-}}"),
+    "旧版自检把 haiku 写死;第三方 API 上要靠这里把模型名送进去",
+  );
+});
+
 test("bless 不能原地覆写 —— 正在读那个文件的 deployer 必须继续读到旧内容", () => {
   // 观察期长达 30 分钟,人往往正是在等它的时候顺手跑一次 bless。bash 是**边读边执行**的:
   // `cp` 保留目标 inode、原地改写字节,那个正在执行的 bash 会从文件中间读到新内容,

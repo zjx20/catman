@@ -66,7 +66,11 @@ export interface SelfCheckResult {
 export function classifyFailure(text: string): Exclude<SelfCheckCategory, "ok"> {
   const t = text.toLowerCase();
   if (/rate.?limit|429|529|overloaded|too many requests|quota exceeded/.test(t)) return "ratelimit";
-  if (/credit balance|insufficient|401|403|unauthorized|authentication|invalid.{0,12}token|expired.{0,12}token|oauth/.test(t)) {
+  if (
+    /credit balance|insufficient|401|403|unauthorized|authentication|invalid.{0,12}token|expired.{0,12}token|oauth|not logged in|please run \/login|logged out|no api key|missing api key/.test(
+      t,
+    )
+  ) {
     return "auth";
   }
   if (
@@ -152,7 +156,10 @@ export async function runSelfCheck(opts: SelfCheckOptions = {}): Promise<SelfChe
     // 而 deployer 把「没有可解析的结论」判成代码问题 —— 一次上游卡顿就此废掉一个好版本。
     // finally 里会 clearTimeout,所以它最多把进程多留 timeoutMs,而那正是该活着的时候。
     const timer = setTimeout(() => abort.abort(), timeoutMs);
-    const model = process.env["CATMAN_SELFCHECK_MODEL"] || DEFAULT_PROBE_MODEL;
+    // 探测模型优先用线上配置的那个:自检要回答的是"**这份部署**的大脑通不通",
+    // 写死 haiku 只在 Anthropic 官方 API 上成立。第三方 provider(或改过默认模型
+    // 的部署)上,那个模型名可能不存在 —— 于是凭据明明没问题,自检却报模型错误。
+    const model = process.env["CATMAN_SELFCHECK_MODEL"] || config.model || DEFAULT_PROBE_MODEL;
     try {
       const probe = opts.runProbe ?? defaultProbe;
       const reply = await probe(agent, cwd, model, abort);

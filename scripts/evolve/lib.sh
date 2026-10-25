@@ -71,6 +71,24 @@ KEEP_VERIFIED="${CATMAN_KEEP_VERIFIED:-3}"
 log() { echo "[$(date -Is)] $*" >&2; }
 die() { log "错误:$*"; exit 1; }
 
+# ── 大脑凭据的转发参数 ─────────────────────────────────────────────
+# deployer 与 smoke 是**两次独立的 docker run**(catman → deployer → 自检容器),
+# 两次都得把凭据带过去。以前两处各自只写了 CLAUDE_CODE_OAUTH_TOKEN,于是换成
+# 第三方 API(ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN)之后,自检容器里一个
+# 凭据都没有,报 "Not logged in · Please run /login" 而中止部署。
+#
+# 按**前缀**转发而不是逐个列名字:会话容器那边已经栽过一次白名单的亏 ——
+# 漏一个变量的症状是"能跑,只是某个功能悄悄没了"。以后换 provider、加新变量,
+# 都不用再改这两处。
+#
+# 用 `-e NAME`(不带值):docker 从本进程环境取值,令牌不进 argv,宿主 ps 看不到。
+brain_env_args() {
+  local v
+  for v in $(env | sed -n 's/^\(ANTHROPIC_[A-Za-z0-9_]*\|CLAUDE_CODE_[A-Za-z0-9_]*\|CATMAN_MODEL\|CATMAN_MODEL_ALLOWLIST\)=.*/\1/p'); do
+    printf -- '-e %s ' "$v"
+  done
+}
+
 # ── JSON:用 node 而不是 sed ────────────────────────────────────────
 # 镜像里 node 本来就在,而用 sed/grep 拼 JSON 是这类脚本最经典的出错来源
 # (一个含特殊字符的 detail 就能写出一份让 catman 读不懂的报告)。
