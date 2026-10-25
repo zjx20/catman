@@ -48,7 +48,7 @@ esac
 command -v docker >/dev/null || { echo "需要 docker CLI" >&2; exit 1; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || {
   echo "镜像 $IMAGE 不存在,先构建:" >&2
-  echo "  docker build -t $IMAGE -f docker/Dockerfile ." >&2
+  echo "  docker build --pull -t $IMAGE -f docker/Dockerfile ." >&2
   exit 1
 }
 

@@ -43,7 +43,7 @@ CATMAN_SELFCHECK=1 node dist/src/index.js
 
 ```bash
 # 部署(首次三步;之后升级只走 prepare + deploy)
-docker build -t catman-env:1 -f docker/Dockerfile .      # 基底镜像,极少重建
+docker build --pull -t catman-env:1 -f docker/Dockerfile .  # 基底镜像,极少重建;--pull 必须带
 CATMAN_HOST_DATA_DIR=$PWD/data scripts/evolve/init.sh    # 首个 release + 指针
 scripts/evolve/bless.sh                                  # 固化部署机制
 docker compose up -d

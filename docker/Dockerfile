@@ -33,7 +33,7 @@
 # ⚠️ **大小写都要传。** apt 的 http 方法只读**小写**的 `http_proxy`/`https_proxy`
 # (二进制里没有大写那几个字符串),而 curl 只认大写的 `HTTPS_PROXY`。只传一种的
 # 症状是"GPG key 拉得下来、apt-get update 却连不上",看起来像镜像源本身的问题:
-#   docker build -t catman-env:1 -f docker/Dockerfile \
+#   docker build --pull -t catman-env:1 -f docker/Dockerfile \
 #     --build-arg HTTP_PROXY="$P" --build-arg HTTPS_PROXY="$P" \
 #     --build-arg http_proxy="$P" --build-arg https_proxy="$P" .
 #
@@ -43,7 +43,17 @@
 #
 # 完全不想配代理的话,用下面的 DOCKER_APT_MIRROR 换一个够得着的镜像源。
 
+# 基底用浮动的 `22-bookworm-slim`:每次**重建**镜像时取 22.x 最新补丁。
+# 注意浮动的生效时机是重建,不是运行 —— 这个镜像极少重建,所以重建后必须确认
+# `node -v`。CVE-2026-111497(Node2Shell / HTTP2Shell,Brotli 解码器越界写)的
+# 修复线是 22.23.4;当前浮动 tag 已指向 22.23.4。
+# 重建时**必须带 `--pull`**:不带的话 docker 会复用本地缓存的基底镜像,
+# 浮动 tag 就等于没浮动。
 FROM node:22-bookworm-slim
+
+# 把构建时的实际 Node 版本烙进镜像,方便事后审计"这个镜像是哪版"。
+# 构建日志里也会打印一次。
+RUN node -v > /etc/catman-node-version && cat /etc/catman-node-version
 
 # 运行时需要 git/ripgrep 等常用工具(助手在容器内执行命令时常用;
 # git 还是制备 release 的必需品 —— 每个 release 是一次浅 clone)。

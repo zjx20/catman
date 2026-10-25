@@ -207,7 +207,7 @@ export CATMAN_HOST_DATA_DIR="$PWD/data"
 echo "CATMAN_HOST_DATA_DIR=$CATMAN_HOST_DATA_DIR" >> .env
 
 # 1) 构建稳定基底镜像(此后极少重建 —— 升级换的是代码,不是镜像)
-docker build -t catman-env:1 -f docker/Dockerfile .
+docker build --pull -t catman-env:1 -f docker/Dockerfile .
 
 # 2) 初始化:clone 源码到数据卷、制备第一个 release、立起指针
 scripts/evolve/init.sh
@@ -1102,7 +1102,7 @@ stdin 通道支持 `/user <名字>` 切换身份,因此**多用户隔离可以�
 改它属于要人工介入的那一类变更(见 [自进化](#自进化) 的 Tier 分级)。
 
 ```bash
-docker build -t catman-env:1 -f docker/Dockerfile .
+docker build --pull -t catman-env:1 -f docker/Dockerfile .
 ```
 
 **构建期连不上 `download.docker.com` 时**(它是整个构建里唯一容易够不着的地方),两条路:
@@ -1113,12 +1113,12 @@ docker build -t catman-env:1 -f docker/Dockerfile .
 #    ⚠️ 地址不能写 host.docker.internal:那个名字靠 compose 的 extra_hosts 在**运行时**
 #    注入,构建期不存在。填代理机的内网 IP。
 P=http://192.168.1.2:7890
-docker build -t catman-env:1 -f docker/Dockerfile \
+docker build --pull -t catman-env:1 -f docker/Dockerfile \
   --build-arg HTTP_PROXY="$P"  --build-arg HTTPS_PROXY="$P" \
   --build-arg http_proxy="$P"  --build-arg https_proxy="$P" .
 
 # ② 不配代理,换一个够得着的镜像源(布局都是 <base>/linux/debian)
-docker build -t catman-env:1 -f docker/Dockerfile \
+docker build --pull -t catman-env:1 -f docker/Dockerfile \
   --build-arg DOCKER_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/docker-ce .
 ```
 
@@ -1132,8 +1132,21 @@ optionalDependencies(`@anthropic-ai/claude-agent-sdk-<os>-<arch>[-musl]`),npm �
 依赖天然就是对的架构,整套多架构构建流程随之消失。基底镜像本身不含 npm 依赖,
 在目标机上 `docker build` 就地构建即可;跨机器搬运时用 `docker save/load` 也行。
 
-基底是 `node:22-bookworm-slim`(glibc),因此选中的是 glibc 变体;换 alpine 基底会切到
+基底是浮动的 `node:22-bookworm-slim`(glibc),每次**重建镜像**时取 22.x 最新补丁;因此选中的是 glibc 变体,换 alpine 基底会切到
 musl 变体,需要重新验证。
+
+**浮动 tag 的补丁只在重建时生效。** 已经构建好的 `catman-env:1` 不会自己更新,
+所以遇到 Node 安全公告(例如 2026-10 的 CVE-2026-111497 / Node2Shell)时,
+真正的触发点是「重建镜像 + recreate 容器」。构建时**必须带 `--pull`** —— 不带的话
+docker 会优先复用本地缓存的基底镜像,浮动 tag 等于没浮动。构建时会把实际版本写进
+`/etc/catman-node-version`,构建日志里也会打印一次;重建后确认:
+
+```bash
+docker run --rm catman-env:1 cat /etc/catman-node-version
+docker compose exec catman node -v
+```
+
+重建前先给旧镜像打一个带版本的 tag(如 `catman-env:1-node22.23.2`)留作回滚。
 
 验证依赖架构对不对(这条仍然要看):
 
