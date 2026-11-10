@@ -145,6 +145,7 @@ Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/conte
 | `src/core/users.ts` | UserRegistry；用户资料与租户 home，不负责 session/cron 的 cwd |
 | `src/core/execution/contexts.ts` | owner、聊天/cron context、tenantId、独立路径和 SDK 会话注册表 |
 | `src/core/execution/runtime.ts` | 精确挂载、能力身份、worker 创建/认领、闲置预警与回收 |
+| `src/core/execution/artifacts.ts` | 实例投影与 wrapper 清理，不触碰用户持久数据；活动容器由 runtime 对账保护 |
 | `src/core/execution/task-supervisor.ts` | 同容器独立任务管理器；进程组、显式超时、任务状态与日志 |
 | `src/core/execution/sdk-session.ts` | 保持 SDK 输入连接、后台任务跟踪、按输入 UUID 关联结果 |
 | `src/core/execution/broker.ts` | 模型、公共 MCP 和 HTTP 服务的凭据代理 |
@@ -796,6 +797,9 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(只对**主人格
 - **bless 换文件必须换 inode**(用 `install` 而不是 `cp`):bash 边读边执行,`cp` 保留目标
   inode、原地覆写字节,会让正在跑的脚本从中间读到新内容 —— 而"正在跑的"最可能是一个处在
   30 分钟观察期里的 deployer。`install` 先 unlink 再新建,老 inode 活到那个进程读完。
+- **制备残骸只有持锁者能清理**：`prepare_workspace` 用 fd 9 持有全局 `flock`，清理历史
+  `<40位sha>.tmp` 后检查水位，并安装退出清理。不要删除 `.prepare.lock`，也不要在锁外
+  扫描删除其它构建目录。SIGKILL/OOM 不运行 trap，由下一次持锁制备清理。
 - **agent 的 git 身份在仓库级设**(`init.sh`):镜像里什么都没配,而 `git commit` 没有
   `user.name`/`user.email` 就直接失败 —— 自进化的第一步就是提交。写仓库级而不是 global,
   不依赖 HOME 可写,且这份配置随仓库走。

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import {
   mkdtempSync,
   mkdirSync,
@@ -88,6 +89,68 @@ function makeRelease(releasesDir: string, sha: string): void {
     `cd "${dir}" && find dist VERSION -type f -print0 | sort -z | xargs -0 sha256sum > MANIFEST`,
   ]);
 }
+
+test("制备失败与成功退出都清理工作目录,不改硬链接文件或就位 release", () => {
+  withDir(dir => {
+    const sha = "a".repeat(40), previous = "b".repeat(40);
+    makeRelease(dir, previous);
+    const dependency = join(dir, previous, "node_modules", "keep");
+    writeFileSync(dependency, "verified"); chmodSync(dependency, 0o444);
+    assert.throws(() => inLib(dir, `
+      prepare_workspace ${sha}
+      mkdir -p "$WORK"
+      cp -al "$RELEASES_DIR/${previous}/node_modules" "$WORK/node_modules"
+      chmod 555 "$WORK/node_modules"
+      exit 7
+    `), (error: unknown) => (error as { status?: number }).status === 7);
+    assert.equal(existsSync(join(dir, `${sha}.tmp`)), false);
+    assert.equal(readFileSync(dependency, "utf8"), "verified");
+    assert.equal(statSync(dependency).mode & 0o777, 0o444);
+    inLib(dir, `prepare_workspace ${sha}; mkdir "$WORK"; echo done > "$WORK/keep"; mv "$WORK" "$RELEASES_DIR/${sha}"`);
+    assert.equal(readFileSync(join(dir, sha, "keep"), "utf8").trim(), "done");
+  });
+});
+
+test("制备只回收合法历史临时目录,不跟随软链、不清理最终 release", () => {
+  withDir(dir => {
+    const old = join(dir, `${"a".repeat(40)}.tmp`), outside = join(dir, "outside");
+    mkdirSync(old); mkdirSync(outside); writeFileSync(join(outside, "keep"), "keep");
+    symlinkSync(outside, join(dir, `${"b".repeat(40)}.tmp`));
+    mkdirSync(join(dir, "unknown.tmp")); makeRelease(dir, "c".repeat(40));
+    inLib(dir, `prepare_workspace ${"d".repeat(40)}`);
+    assert.equal(existsSync(old), false);
+    assert.equal(readFileSync(join(outside, "keep"), "utf8"), "keep");
+    assert.ok(existsSync(join(dir, "unknown.tmp")));
+    assert.ok(existsSync(join(dir, "c".repeat(40), "VERSION")));
+    assert.throws(() => inLib(dir, `prepare_workspace ${"b".repeat(40)}`), /Command failed/);
+  });
+});
+
+test("并发制备不能清理仍被使用的目录;TERM 清理,SIGKILL 残骸在下次回收", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "catman-prepare-lock-"));
+  const sha = "a".repeat(40), next = "b".repeat(40);
+  const start = () => spawn("bash", ["-euo", "pipefail", "-c", `
+    source "${LIB}"
+    prepare_workspace ${sha}
+    mkdir "$WORK"
+    echo ready
+    read -r ignored
+  `], { env: cleanEnv({ CATMAN_RELEASES_DIR: dir, CATMAN_BLESSED_ENV: join(dir, "absent") }), stdio: ["pipe", "pipe", "pipe"] });
+  let child: ReturnType<typeof start> | undefined;
+  try {
+    child = start(); await once(child.stdout, "data");
+    assert.throws(() => inLib(dir, `prepare_workspace ${next}`));
+    assert.ok(existsSync(join(dir, `${sha}.tmp`)));
+    let exit = once(child, "exit"); child.kill("SIGTERM");
+    assert.equal((await exit)[0], 143);
+    assert.equal(existsSync(join(dir, `${sha}.tmp`)), false);
+    child = start(); await once(child.stdout, "data");
+    exit = once(child, "exit"); child.kill("SIGKILL"); await exit;
+    assert.ok(existsSync(join(dir, `${sha}.tmp`)));
+    inLib(dir, `prepare_workspace ${next}`);
+    assert.equal(existsSync(join(dir, `${sha}.tmp`)), false);
+  } finally { child?.kill("SIGKILL"); rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("指针:pointer_set 换指向,pointer_sha 读得回来", () => {
   withDir((dir) => {

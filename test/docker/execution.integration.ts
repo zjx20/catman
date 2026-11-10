@@ -209,6 +209,28 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
     assert.deepEqual(mcp.map(r => r.headers["mcp-session-id"]), [undefined, "upstream-1", undefined, "upstream-2"]);
     assert.ok(mcp.every(r => r.headers["x-provider-secret"] === "controller-mcp-secret"));
   });
+  await t.test("真实挂载回收：删除实例临时文件,保留 workspace 与未认领容器的挂载", async () => {
+    const c = contexts.chat("artifact-probe"), r = await runtimes.ensure(c), paths = contexts.paths(c);
+    const projection = join(root, "execution/projections", c.id, r.container.slice(-16));
+    const wrapper = runtimes.wrapper(c, r);
+    await exec(r, "import fs from 'node:fs';fs.writeFileSync('keep','persistent')");
+    await runtimes.stop(c.id, "test cleanup", true);
+    assert.equal(existsSync(projection), false); assert.equal(existsSync(wrapper), false);
+    assert.equal(readFileSync(join(paths.work, "keep"), "utf8"), "persistent");
+    const orphan = contexts.chat("orphan-artifact"), mounted = contexts.chat("external-artifact");
+    const old = join(root, "execution/projections", orphan.id, "a".repeat(16));
+    const bound = join(root, "execution/projections", mounted.id, "a".repeat(16));
+    mkdirSync(old, { recursive: true }); mkdirSync(bound, { recursive: true });
+    const name = `catman-artifact-test-${suffix}`;
+    await docker(["run", "-d", "--name", name, "--label", "catman.context=1", "--mount",
+      `type=bind,src=${join(config.hostDataDir, relative(root, bound))},dst=/projection,readonly`,
+      image, "node", "-e", "setInterval(()=>{},1000)"]);
+    try {
+      await runtimes.tick();
+      assert.equal(existsSync(old), false); assert.ok(existsSync(bound));
+      assert.ok(existsSync(join(root, "execution/projections", alice.id, a.container.slice(-16))));
+    } finally { await docker(["rm", "-f", name]); }
+  });
   await t.test("真实 CLI 发现和调用公共 MCP，协议会话和服务端凭据经过控制面", async () => {
     writeFileSync(join(aPaths.sdk, "settings.json"), JSON.stringify({ env: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" } }));
     modelTool = { name: "mcp__public_shared__probe", input: { value: "through-real-cli" } };

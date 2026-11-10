@@ -1,13 +1,14 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import type { Config } from "../../config.js";
 import { writeJsonFileAtomic } from "../file-store.js";
 import { skillsFor, skillsOnDisk } from "../skills.js";
 import { ContextStore, hostPath, readTenantFile, readExecutionState, type ExecutionContext } from "./contexts.js";
 import { MAX_TASK_MS, type TaskRecord } from "./task-supervisor.js";
 import { readScopedFile } from "../scoped-files.js";
+import { ExecutionArtifacts } from "./artifacts.js";
 
 export interface RuntimeRecord {
   contextId: string; userKey: string; container: string; token: string; admin: boolean;
@@ -59,6 +60,8 @@ export class RuntimeManager {
   private closed = false;
   private readonly path: string;
   private readonly eventPath: string;
+  private readonly artifacts: ExecutionArtifacts;
+  private nextArtifactSweep = 0;
   readonly docker: DockerCommand;
   constructor(readonly config: Config, readonly contexts: ContextStore, private readonly opts: {
     isAdmin: (userKey: string) => boolean;
@@ -67,6 +70,7 @@ export class RuntimeManager {
   }) {
     this.path = join(config.dataDir, "execution", "runtimes.json");
     this.eventPath = join(config.dataDir, "execution", "events.json");
+    this.artifacts = new ExecutionArtifacts(config.dataDir);
     this.records = readExecutionState<RuntimeRecord[]>(this.path, []);
     this.events = readExecutionState<RuntimeEvent[]>(this.eventPath, []);
     if (!Array.isArray(this.records) || !Array.isArray(this.events)) throw new Error("执行环境状态损坏");
@@ -107,36 +111,38 @@ export class RuntimeManager {
     const release = realpathSync(process.env.CATMAN_RELEASE_LINK || `${this.config.dataDir}/releases/current`);
     const binary = join(release, "node_modules/@anthropic-ai", sdkNativePackage, "claude");
     if (!existsSync(binary) || !existsSync(join(release, "dist/src/core/execution/worker.js"))) throw new Error("release 缺少执行运行时，请先构建");
-    const projection = this.project(context);
     const generation = randomBytes(8).toString("hex");
     const r: RuntimeRecord = { contextId: context.id, userKey: context.userKey, container: `catman-ctx-${context.id}-${generation}`,
       token: randomBytes(32).toString("hex"), admin: this.opts.isAdmin(context.userKey), createdAt: this.now(), lastInteractionAt: this.now(), extensionUntil: 0, tasks: [], sdkTasks: [] };
-    const uid = process.getuid?.() ?? 10001, gid = process.getgid?.() ?? 10001;
-    const args = ["run", "-d", "--name", r.container, "--init", "--label", "catman.context=1", "--label", `catman.context.id=${context.id}`,
-      "--user", `${uid}:${gid}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only", "--network", "mynet", "--add-host", "host.docker.internal:host-gateway",
-      "--memory", this.config.sessionMemoryLimit, "--memory-swap", this.config.sessionMemoryLimit, "--cpus", "1.5", "--pids-limit", "256",
-      "--tmpfs", `/tmp:rw,nosuid,nodev,uid=${uid},gid=${gid},size=128m`, "--log-driver", "json-file", "--log-opt", "max-size=8m", "--log-opt", "max-file=1"];
-    const mount = (local: string, at: string, readonly = false) => args.push("--mount", `type=bind,src=${hostPath(this.config.mainDataDir, this.config.hostDataDir!, local)},dst=${at}${readonly ? ",readonly" : ""}`);
-    mount(p.work, p.work); mount(p.sdk, p.sdk); mount(p.tasks, p.tasks); mount(p.home, "/user");
-    mount(join(release, "dist"), "/runtime/release/dist", true);
-    mount(join(release, "package.json"), "/runtime/release/package.json", true);
-    mount(dirname(binary), `/runtime/release/node_modules/@anthropic-ai/${sdkNativePackage}`, true);
-    mount(projection, "/runtime/bin", true);
-    mount(join(projection, "CLAUDE.md"), join(p.sdk, "CLAUDE.md"), true);
-    mount(join(p.home, "skills"), join(p.sdk, "skills"));
-    const shared = join(projection, "skills");
-    for (const name of readdirSync(shared)) mount(join(shared, name), join(p.sdk, "skills", name), true);
-    if (r.admin && this.config.persona === "primary") {
-      if (!existsSync(this.config.srcDir)) throw new Error("管理员源码目录不存在");
-      mount(this.config.srcDir, "/catman-src");
-    }
-    const env: NodeJS.ProcessEnv = { ...networkEnvironment(this.config.apiBase), PATH: "/runtime/bin:/usr/local/bin:/usr/bin:/bin", HOME: p.sdk, CLAUDE_CONFIG_DIR: p.sdk, CATMAN_CONTEXT_DIR: p.work, CATMAN_USER_PRIVATE_DIR: "/user", TINI_SUBREAPER: "1", CATMAN_TASKS_DIR: p.tasks,
-      CATMAN_API_BASE: this.config.apiBase, CATMAN_RUNTIME_TOKEN: r.token, TZ: this.config.tz };
-    for (const key of Object.keys(env)) args.push("-e", key);
-    args.push("-w", p.work, this.config.sessionImage, "node", "/runtime/release/dist/src/core/execution/worker.js");
-    // Persist before launch. A restart can adopt the same container and capability.
-    this.records.push(r); this.save();
+    let launchAttempted = false;
     try {
+      const projection = this.project(context, generation);
+      const uid = process.getuid?.() ?? 10001, gid = process.getgid?.() ?? 10001;
+      const args = ["run", "-d", "--name", r.container, "--init", "--label", "catman.context=1", "--label", `catman.context.id=${context.id}`,
+        "--user", `${uid}:${gid}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only", "--network", "mynet", "--add-host", "host.docker.internal:host-gateway",
+        "--memory", this.config.sessionMemoryLimit, "--memory-swap", this.config.sessionMemoryLimit, "--cpus", "1.5", "--pids-limit", "256",
+        "--tmpfs", `/tmp:rw,nosuid,nodev,uid=${uid},gid=${gid},size=128m`, "--log-driver", "json-file", "--log-opt", "max-size=8m", "--log-opt", "max-file=1"];
+      const mount = (local: string, at: string, readonly = false) => args.push("--mount", `type=bind,src=${hostPath(this.config.mainDataDir, this.config.hostDataDir!, local)},dst=${at}${readonly ? ",readonly" : ""}`);
+      mount(p.work, p.work); mount(p.sdk, p.sdk); mount(p.tasks, p.tasks); mount(p.home, "/user");
+      mount(join(release, "dist"), "/runtime/release/dist", true);
+      mount(join(release, "package.json"), "/runtime/release/package.json", true);
+      mount(dirname(binary), `/runtime/release/node_modules/@anthropic-ai/${sdkNativePackage}`, true);
+      mount(projection, "/runtime/bin", true);
+      mount(join(projection, "CLAUDE.md"), join(p.sdk, "CLAUDE.md"), true);
+      mount(join(p.home, "skills"), join(p.sdk, "skills"));
+      const shared = join(projection, "skills");
+      for (const name of readdirSync(shared)) mount(join(shared, name), join(p.sdk, "skills", name), true);
+      if (r.admin && this.config.persona === "primary") {
+        if (!existsSync(this.config.srcDir)) throw new Error("管理员源码目录不存在");
+        mount(this.config.srcDir, "/catman-src");
+      }
+      const env: NodeJS.ProcessEnv = { ...networkEnvironment(this.config.apiBase), PATH: "/runtime/bin:/usr/local/bin:/usr/bin:/bin", HOME: p.sdk, CLAUDE_CONFIG_DIR: p.sdk, CATMAN_CONTEXT_DIR: p.work, CATMAN_USER_PRIVATE_DIR: "/user", TINI_SUBREAPER: "1", CATMAN_TASKS_DIR: p.tasks,
+        CATMAN_API_BASE: this.config.apiBase, CATMAN_RUNTIME_TOKEN: r.token, TZ: this.config.tz };
+      for (const key of Object.keys(env)) args.push("-e", key);
+      args.push("-w", p.work, this.config.sessionImage, "node", "/runtime/release/dist/src/core/execution/worker.js");
+      // Persist before launch. A restart can adopt the same container and capability.
+      this.records.push(r); this.save();
+      launchAttempted = true;
       await this.docker(args, env);
       let ready = false;
       for (let attempt = 0; attempt < 20; attempt++) {
@@ -145,11 +151,20 @@ export class RuntimeManager {
       if (!ready) throw new Error("任务管理进程未就绪");
       this.owned.add(r.container);
       return structuredClone(r);
-    } catch (error) { try { await this.docker(["rm", "-f", r.container]); } catch {} await this.forget(r, "执行环境启动失败"); throw error; }
+    } catch (error) {
+      if (launchAttempted) {
+        try { await this.docker(["rm", "-f", r.container]); }
+        catch (removal) {
+          // 启动结果可能未知；不能丢掉仍可能挂载投影的容器身份。
+          if (!(removal instanceof DockerFailure && removal.missing)) throw error;
+        }
+      }
+      await this.forget(r, "执行环境启动失败"); throw error;
+    }
   }
-  private project(context: ExecutionContext): string {
+  private project(context: ExecutionContext, generation: string): string {
     const p = this.contexts.ensure(context);
-    const target = join(this.config.dataDir, "execution", "projections", context.id, randomBytes(8).toString("hex"));
+    const target = this.artifacts.projection(context.id, generation);
     mkdirSync(join(target, "skills"), { recursive: true, mode: 0o700 });
     const globalDir = process.env.CLAUDE_CONFIG_DIR || join(this.config.dataDir, "claude");
     const names = skillsFor(this.config.persona, this.opts.isAdmin(context.userKey), { onDisk: skillsOnDisk(globalDir) });
@@ -164,7 +179,7 @@ export class RuntimeManager {
     const globalInstructions = join(this.config.dataDir, "shared", "CLAUDE.md");
     const common = existsSync(globalInstructions) ? readFileSync(globalInstructions, "utf8") : "";
     const personal = readTenantFile(p.home, "CLAUDE.md") ?? "";
-    writeFileSync(join(target, "CLAUDE.md"), `${common}\n\n${personal}\n\n## 执行环境\n默认把产物写在当前 workspace。个人持久文件和 skill 放 /user。后台命令必须通过 catman-task run --timeout <秒> -- <命令> 登记；最长 86400 秒。长期服务需要部署。\n`, { mode: 0o600 });
+    writeFileSync(join(target, "CLAUDE.md"), `${common}\n\n${personal}\n\n## 执行环境\n任务产物与临时文件写在当前 workspace，临时中间文件可放 .tmp/。跨会话保留的产物放 /user/artifacts，个人项目放 /user/projects，skill 放 /user/skills。不要把共享目录或控制面数据目录当作工作区。后台命令必须通过 catman-task run --timeout <秒> -- <命令> 登记；最长 86400 秒。长期服务需要部署。\n`, { mode: 0o600 });
     const launcher = '#!/bin/sh\nexec node /runtime/release/dist/src/core/execution/task-cli.js "$@"\n';
     for (const name of ["catman-task", "catman-notify"]) writeFileSync(join(target, name), launcher, { mode: 0o755 });
     return target;
@@ -276,6 +291,39 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
     if (silent) console.info(`[runtime] ${r.contextId} 回收：${reason}`);
     else this.event(r, `执行环境 ${r.contextId} 已回收：${reason}。\n${r.tasks.filter(t => t.endedAt === undefined).map(t => `后台任务「${t.name}」已中断`).join("\n")}\n工作目录和会话记录保留。`);
     this.save();
+    try {
+      this.artifacts.removeProjection(r.contextId, r.container.slice(-16));
+      if (!this.records.some(item => item.contextId === r.contextId)) this.artifacts.removeWrapper(r.contextId);
+    } catch (error) { console.warn(`[runtime] ${r.contextId} 临时文件清理待重试：${String(error)}`); }
+  }
+  private async collectArtifacts(): Promise<void> {
+    if (this.now() < this.nextArtifactSweep || !this.config.hostDataDir) return;
+    if (!existsSync(this.artifacts.projections) && !existsSync(this.artifacts.wrappers)) return;
+    // 包含未被当前进程认领的容器；Docker 不可读时宁可暂缓清理。
+    const protectedContexts = new Set<string>();
+    const ids = (await this.docker(["ps", "-aq", "--filter", "label=catman.context=1"])).split(/\s+/).filter(Boolean);
+    if (ids.length) {
+      const mounts = await this.docker(["inspect", "--format", "{{json .Mounts}}", ...ids]);
+      const root = hostPath(this.config.mainDataDir, this.config.hostDataDir, this.artifacts.projections);
+      const lines = mounts.split("\n").filter(Boolean);
+      if (lines.length !== ids.length) throw new Error("容器挂载快照不完整");
+      for (const line of lines) {
+        const entries: unknown = JSON.parse(line);
+        if (!Array.isArray(entries)) throw new Error("无法确认运行容器的挂载");
+        for (const mount of entries) {
+          if (typeof mount?.Source !== "string") throw new Error("容器挂载记录无效");
+          const local = relative(root, mount.Source);
+          if (isAbsolute(local) || local === ".." || local.startsWith("../")) continue;
+          const id = local.split("/")[0];
+          if (id && /^c_[a-f0-9]{24}$/.test(id)) protectedContexts.add(id);
+        }
+      }
+    }
+    // inspect 期间可能有新的创建请求；直到同步删除前才读取当前记录与创建锁。
+    for (const record of this.records) protectedContexts.add(record.contextId);
+    for (const id of this.locks.keys()) protectedContexts.add(id);
+    this.artifacts.collect(protectedContexts);
+    this.nextArtifactSweep = this.now() + 5 * 60_000;
   }
   start(): void { this.timer = setInterval(() => { void this.tick().catch(e => console.error("[runtime]", String(e))); }, 15_000); this.timer.unref(); void this.tick().catch(e => console.error("[runtime]", String(e))); }
   close(): void { this.closed = true; if (this.timer) clearInterval(this.timer); }
@@ -304,7 +352,7 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
           if (!Array.isArray(snapshot.tasks) || !Array.isArray(snapshot.processes)) throw new Error("运行时状态无效");
         }
         catch {
-          try { if (await this.docker(["inspect", "-f", "{{.State.Running}}", r.container]) !== "true") { await this.forget(r, "容器异常退出"); continue; } }
+          try { if (await this.docker(["inspect", "-f", "{{.State.Running}}", r.container]) !== "true") { await this.stop(r.contextId, "容器异常退出"); continue; } }
           catch (error) { if (error instanceof DockerFailure && error.missing) { await this.forget(r, "执行容器已不存在"); continue; } }
           snapshot = { tasks: r.tasks, processes: ["运行时无响应，无法读取进程列表"] };
         }
@@ -332,6 +380,8 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
         }
         } catch (error) { console.warn(`[runtime] ${r.contextId} 检查失败，将重试：${String(error)}`); }
       }
+      try { await this.collectArtifacts(); }
+      catch (error) { console.warn(`[runtime] 临时文件对账待重试：${String(error)}`); }
       // Delivery can wait on a channel. It must never delay the next deadline sweep.
       void this.flushNotifications().catch(error => console.error("[runtime] 通知队列失败:", String(error)));
     } finally { this.ticking = false; }

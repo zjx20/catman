@@ -463,17 +463,17 @@ docker compose exec catman node dist/src/scripts/ilink-login.js --rebind <账号
 | | 隔离情况 |
 |---|---|
 | 会话上下文 | 各自独立,互不可见 |
-| 工作目录(cwd) | `/data/workspace/<每人一个子目录>` |
-| 个人偏好 | 各自目录下的 `CLAUDE.md`(自动生成,首行 `@../CLAUDE.md` 引入共享人设) |
+| 工作目录(cwd) | `/data/tenants/<tenantId>/contexts/<contextId>/work`，每个聊天/cron 独立 |
+| 个人偏好 | 本人 home 的 `CLAUDE.md`，worker 内为 `/user/CLAUDE.md` |
 | 运行配置 | `prefs.json` 里各自一份(模型、回执、进度、超时、分段长度) |
-| 共享人设 | `/data/workspace/CLAUDE.md`,所有人继承 |
+| 共享人设 | `/data/shared/CLAUDE.md`，控制面合并个人指令后生成只读投影 |
 
 新人的**第一条消息**会先收到一份使用指引(硬指令清单 + 能自助改哪些配置),然后才是对
 他那条消息的回答。指引只推一次;推送失败会留到下次重试。
 
-> **共享配置放哪**:`CLAUDE.md` 靠 `@` import 继承,而 **project settings
-> (`.claude/settings.json`)没有继承机制** —— 要让某项 setting 对所有人生效,
-> 得放到 user settings(`$CLAUDE_CONFIG_DIR/settings.json`,即 `./data/claude/settings.json`)。
+> 公共 skill 由控制面投影到各 worker；个人 skill 放 `/user/skills`。SDK 配置按 context
+> 隔离，共享指令由控制面合并，不依赖 `@` import。公共模型、MCP 和服务凭据由可信
+> broker 保管，不能通过共享 SDK settings 将控制面的凭据复制给 worker。
 
 移除账号只停止收发,**不会删除已有会话记录**(交给 30 天保留期自然清理)。
 
@@ -672,6 +672,8 @@ SDK 自己的后台工作通过任务快照/完成事件追踪。前台返回 re
 
 操作由控制服务处理，不经过 LLM。新的实际交互撤销旧倒计时；延长不自动修改已登记任务的硬超时。没有操作则按时销毁容器，留下回收原因并通知，保留 workspace 和会话记录。
 聊天路由超时、执行环境闲置期限、后台任务硬超时和数据保留期是四个独立参数。聊天上下文超过保留期且没有活跃环境时，才清理 workspace 与 SDK 文件。
+
+容器确认移除后，立即清理该实例的指令/skill 投影及 wrapper；用户 home、workspace、任务日志与 SDK 记录不在此清理范围。启动后及每五分钟对账历史孤儿，保护当前创建中的上下文和 Docker 中仍挂载投影的容器。Docker 状态无法确认时暂缓清理。
 
 ## Docker 控制权限
 
@@ -1025,6 +1027,8 @@ data/releases/
 | 切换 | deployer | 排水 → 停容器 → 换 current → 起容器 → 健康门(比对 `/health` 回报的 sha) |
 | 观察 | deployer | 30 分钟盯重启次数与健康;**这期间 stable 不动** |
 | 收尾 | deployer | 通过则前移 stable + 入清单 + GC + 推远端;不通过则退回并写报告 |
+
+制备容器先获取全局 `flock` 锁，再清理历史 `<sha>.tmp` 并检查磁盘水位，避免并发构建互相删除。失败、正常退出或 TERM 会清理自己的临时目录；SIGKILL/OOM 残留由下次制备收拾。清理只修改目录权限，不修改与已验证 release 硬链接的依赖文件。
 
 失败的最坏结果是"这次改进没上线",而不是"catman 下线了"。结果写进部署报告,
 catman 起来后在你下一条消息时告诉你。

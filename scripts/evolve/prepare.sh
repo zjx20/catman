@@ -58,13 +58,7 @@ if [ -d "$TARGET" ]; then
   die "release $SHA 已存在但校验不通过 —— 先人工确认再删掉 $TARGET"
 fi
 
-# 磁盘水位门。**放在最前面**:一次制备要几百 MB,磁盘满了之后 dockerd 会全面异常,
-# 那时连回滚都做不了。宁可这次不进化,不可赌一把。
-AVAIL_MB="$(df -Pm "$RELEASES_DIR" | awk 'NR==2 {print $4}')"
-MIN_MB="${CATMAN_MIN_DISK_MB:-5120}"
-[ "$AVAIL_MB" -ge "$MIN_MB" ] || die "磁盘只剩 ${AVAIL_MB}MB(要求 ≥ ${MIN_MB}MB),拒绝制备"
-
-# 分叉闸。和磁盘门一样放在**跑容器之前** —— 这道闸不需要任何构建产物就能判,而一次
+# 分叉闸放在**跑容器之前** —— 这道闸不需要任何构建产物就能判,而一次
 # 制备要在一台 2 核软路由上跑好几分钟全量测试,判得出来的事没理由让人先等完。
 #
 # 基线取**正在跑的那个版本**,与下面的分级报告同一个基准:人关心的是"相对线上"。
@@ -114,6 +108,7 @@ docker run --rm \
   -e "SHA=$SHA" -e "BRANCH=$BRANCH" -e "PREV_SHA=$PREV_SHA" \
   -e "CATMAN_SRC_DIR=$SRC_DIR" -e "CATMAN_RELEASES_DIR=$RELEASES_DIR" \
   -e "CATMAN_NPM_CACHE_DIR=$NPM_CACHE_DIR" -e "LIB=$HERE/lib.sh" \
+  -e "CATMAN_MIN_DISK_MB=${CATMAN_MIN_DISK_MB:-5120}" \
   -v "${CATMAN_HOST_DATA_DIR:?必须给出 /data 在宿主上的绝对路径}:/data" \
   "$CATMAN_IMAGE" \
   bash -euo pipefail -c '
@@ -123,9 +118,12 @@ docker run --rm \
     . "$LIB"
     git_trust_repo "$SRC_DIR"
 
-    WORK="$RELEASES_DIR/$SHA.tmp"
-    # 不是 `rm -rf` —— 上一次被中途杀掉留下的 $WORK 删不掉,见 lib.sh 里那段说明。
-    rm_release_tmp "$WORK"
+    # 全局互斥、历史残骸清理、失败退出清理,在碰工作目录前全部安装。
+    prepare_workspace "$SHA"
+    # 清完失败构建再检查水位,磁盘不足时仍然拒绝 clone/安装。
+    AVAIL_MB="$(df -Pm "$RELEASES_DIR" | awk "NR==2 {print \$4}")"
+    MIN_MB="$CATMAN_MIN_DISK_MB"
+    [ "$AVAIL_MB" -ge "$MIN_MB" ] || die "磁盘只剩 ${AVAIL_MB}MB(要求 ≥ ${MIN_MB}MB),拒绝制备"
     # clone 而不是 git worktree:worktree 的 .git 只是一个指向共享仓库的指针,
     # 清理时 rm -rf 会留下元数据残骸,导致**同一个 sha 无法再次 worktree add** ——
     # 那恰好死在"回滚之后想重新制备旧版本"这条事故恢复路径上。clone 出来的

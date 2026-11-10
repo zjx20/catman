@@ -169,6 +169,7 @@ test("纯计数类的流式增量不出行", () => {
   // 真机上一次模型往返来了 3 条 thinking_tokens,而它说不出任何"在干什么"。
   // 留着只会把有用的行挤出屏幕。
   assert.equal(describeSdkMessage(msg({ type: "thinking_tokens", tokens: 128 })), undefined);
+  assert.equal(describeSdkMessage(msg({ type: "system", subtype: "thinking_tokens", tokens: 128 })), undefined);
 });
 
 test("formatResetAt 秒与毫秒两种编码都认", () => {

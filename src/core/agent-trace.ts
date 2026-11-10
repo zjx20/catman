@@ -216,6 +216,7 @@ export function describeSdkMessage(msg: SDKMessage): TraceLine | undefined {
     }
 
     case "system":
+      if ((msg as { subtype: string }).subtype === "thinking_tokens") return undefined;
       switch (msg.subtype) {
         case "init":
           // 这一行是"三件套是否真的生效"的唯一事实来源:preset 系统提示词、

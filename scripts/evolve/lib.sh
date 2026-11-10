@@ -535,6 +535,36 @@ rm_release_tmp() { # rm_release_tmp <目录>
   rm -rf "$work"
 }
 
+# 所有制备进程先持有同一个内核锁,才能清理历史 <sha>.tmp。
+# 正常失败/TERM 即时清理;SIGKILL/OOM 后由下次制备清理。不能删除锁文件,
+# 否则新进程可能锁住另一个 inode。子进程继承 fd,仍在写时不会误判为无人使用。
+prepare_workspace() { # prepare_workspace <40位 sha>;设置 WORK 并持有 fd 9
+  local sha="$1" dir name
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "无效的制备版本号"
+  mkdir -p "$RELEASES_DIR"
+  command -v flock >/dev/null || die "制备环境缺少 flock"
+  exec 9>"$RELEASES_DIR/.prepare.lock"
+  flock -n 9 || die "另一个 release 正在制备,请等待它结束"
+  for dir in "$RELEASES_DIR"/*.tmp; do
+    [ ! -L "$dir" ] && [ -d "$dir" ] || continue
+    name="${dir##*/}"
+    [[ "$name" =~ ^[0-9a-f]{40}\.tmp$ ]] || continue
+    log "清理上次中断的制备目录 $name"
+    rm_release_tmp "$dir"
+  done
+  WORK="$RELEASES_DIR/$sha.tmp"
+  [ ! -e "$WORK" ] && [ ! -L "$WORK" ] || die "制备路径被非工作目录占用:$WORK"
+  trap prepare_cleanup EXIT
+  trap "exit 130" INT
+  trap "exit 143" TERM
+}
+prepare_cleanup() {
+  local status=$?
+  trap - EXIT
+  rm_release_tmp "$WORK" || log "制备目录清理失败,下次制备将重试:$WORK"
+  exit "$status"
+}
+
 # ── release 校验 ───────────────────────────────────────────────────
 release_verify() { # release_verify <sha>
   # ⚠️ 分两句写。`local a="$1" b="…$a"` 在 `set -u` 下会炸:local 先把两个名字都
