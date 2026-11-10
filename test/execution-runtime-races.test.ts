@@ -11,6 +11,27 @@ function gate() {
   return { promise, resolve };
 }
 
+test("缺失容器清理等待附属环境期间，重建必须等待清理完成再创建新 CLI", async () => {
+  const f = executionFixture(), entered = gate(), resume = gate(); let missing = false;
+  const manager = new RuntimeManager(f.config, f.contexts, { ...f.options, docker: async (args, env) => {
+    if (missing && args[0] === "exec") throw new Error("runtime missing");
+    if (missing && args[0] === "inspect") throw new DockerFailure("No such container", true);
+    return f.options.docker(args, env);
+  } });
+  let sweep: Promise<void> | undefined, replacement: Promise<unknown> | undefined;
+  try {
+    const context = f.contexts.chat("alice"); await manager.ensure(context);
+    manager.beforeRemove(async () => { entered.resolve(); await resume.promise; });
+    missing = true; sweep = manager.tick(); await entered.promise;
+    missing = false; replacement = manager.ensure(context);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.calls.filter(c => c.args[0] === "run").length, 1, "不能在附属清理结束前创建新实例");
+    resume.resolve(); await Promise.all([sweep, replacement]);
+    assert.equal(f.calls.filter(c => c.args[0] === "run").length, 2);
+    assert.equal(manager.all().length, 1);
+  } finally { resume.resolve(); await sweep?.catch(() => {}); await replacement?.catch(() => {}); manager.close(); f.cleanup(); }
+});
+
 test("巡检发生在 docker run 创建容器前,不能撤销身份或删除待挂载的投影", async () => {
   const f = executionFixture(), entered = gate(), resume = gate();
   let creating: Promise<unknown> | undefined;

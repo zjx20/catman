@@ -293,7 +293,9 @@ export class Dashboard {
         return;
       }
 
-      if (!this.auth.allowsRead(req, url) && !this.allowsAdmin(req)) {
+      // HTML 页面含独立 Dashboard 凭据，不能交给 agent 的委派身份读取。
+      // 管理员 worker 仍可使用明确的机器 API，不能把令牌换成人类入口权限。
+      if (!this.auth.allowsRead(req, url) && (!isApi || !this.allowsAdmin(req))) {
         return isApi ? jsonError(res, 401, "未授权") : loginPage(res);
       }
       // ?token= 命中:换成 Cookie 并跳转,免得 token 留在地址栏和访问日志里。
@@ -338,7 +340,7 @@ export class Dashboard {
 
       if (path === "/api/chat" && req.method === "POST") {
         // 发消息给管理员 agent 是最高权限的写操作 —— 只认请求头(见 auth.ts 的 CSRF 说明)。
-        if (!this.allowsAdmin(req)) {
+        if (!this.auth.allowsWrite(req)) {
           return jsonError(res, 403, "写操作需要 X-Catman-Token 请求头");
         }
         const body = await readJsonBody(req);
@@ -350,6 +352,7 @@ export class Dashboard {
       }
 
       if (path === "/api/chat/stream") {
+        if (!this.auth.allowsRead(req, url)) return jsonError(res, 401, "聊天流需要独立 Dashboard 认证");
         return this.streamChat(req, res, url);
       }
 

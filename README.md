@@ -43,8 +43,7 @@
 - **管理员聊天**:dashboard 自带一个聊天页,那里的对话有管理员权限,可以用大白话改全局配置
   ("把默认模型换成 opus""并发上限调到 5")。聊天记录存在服务端,刷新和重启都还在;
   页面上有一个「开新会话」按钮 —— 它只让助手忘掉上下文,**不清空聊天记录**
-- **操作宿主 Docker**:镜像内置 docker CLI + compose 插件,挂载宿主 socket 后可用微信指挥
-  "重启 xx 容器"、"看下哪个容器在吃内存"(见下面的 [操作宿主 Docker](#操作宿主-docker最高权限能力))
+- **宿主运维**:agent 申请、用户硬指令授权后，通过独立 SSH 运维容器探索部署指定的宿主目录；可选完整 Docker CLI/Compose 权限，主会话不重建（见[临时运维容器](#临时运维容器)）。
 
 ## 架构
 
@@ -678,10 +677,59 @@ SDK 自己的后台工作通过任务快照/完成事件追踪。前台返回 re
 
 ## Docker 控制权限
 
-Docker socket 仅挂载给可信的主人格、守护人格控制服务和部署执行器。其宿主 GID 仍由 Compose 的 `DOCKER_GID` 配置。
+Docker socket 默认仅挂载给可信的主人格、守护人格控制服务和部署执行器。管理员显式授权的临时运维容器可按部署配置获得此挂载；普通 worker 始终不继承。其宿主 GID 仍由 Compose 的 `DOCKER_GID` 配置。
 worker 固定非 root、丢弃 capabilities、禁止提权、根文件系统只读，并限制内存、CPU、PID、日志和 `/tmp` 大小。worker 不继承 Docker socket 或控制进程附加组。
 宿主 bind mount 的源路径由控制面从已登记上下文计算，使用 `--mount`，不存在就失败；普通用户接口不接受宿主路径。
 管理员源码挂在 `/catman-src`，制备通过 `POST /api/execution/prepare` 请求固定脚本。守护人格的诊断和恢复通过 `/api/execution/diagnostics`、`/api/execution/recover` 执行有限操作。
+
+### 临时运维容器
+
+管理员 agent 用 `catman-ops request <用途>` 申请，系统向用户展示部署指定的挂载、读写模式、Docker 权限和所属会话。用户发送完整的 `/授权 <申请ID>` 才会创建独立 SSH 容器。挂载清单不接受 agent 参数，不由 LLM 解释授权；`/运维` 查看清单，`/运维回收 <环境ID>` 手动回收。
+
+部署先构建工具镜像（业务 release 升级不会自动构建此镜像）：
+
+```bash
+docker build --build-arg CATMAN_BASE_IMAGE=catman-env:1 \
+  -t catman-ops:1 -f docker/Dockerfile.ops .
+```
+
+在部署 `.env` 设置，定制 Compose 需要显式把这些环境变量传给主控制服务：
+
+```dotenv
+CATMAN_OPS_ENABLED=true
+CATMAN_OPS_IMAGE=catman-ops:1
+CATMAN_OPS_MOUNTS=["/opt/services","/mnt/usb"]
+CATMAN_OPS_DOCKER_SOCKET=true
+CATMAN_OPS_MEMORY=512m
+CATMAN_OPS_MAX_ACTIVE=1
+```
+
+默认关闭，Docker socket 默认不挂载。`CATMAN_OPS_MOUNTS` 是 JSON 数组；字符串按宿主原路径可写挂载，也支持 `{"source":"/host/config","target":"/config","readOnly":true}`。源路径属于 Docker daemon 宿主，不要求控制服务能访问；不存在则授权启动失败，不自动创建空目录。目标不能覆盖系统目录、与其他目标嵌套或覆盖当前 workspace。软链接目标只有在额外挂载覆盖它时才可访问；`/opt/services` 与 `/mnt/usb` 同时挂载可覆盖常见的外置存储链接。
+
+内置 [`catman-ops` skill](skills/catman-ops/SKILL.md) 的正文在仓库中维护，SSH 封装实现在 [`ops-cli.ts`](src/core/execution/ops-cli.ts)。它们随 Git 版本和 release 一起发布；启动时从当前 release 安装手册到运行时 skill 目录，不要直接维护数据目录中的副本。Skill 只提供给主人格管理员，说明申请时机、等待用户硬指令、资源使用、连接方式与回收。授权成功后，系统直接回复容器镜像、实际目录映射及读写模式、Docker socket、共享 workspace、SSH 使用方式与回收规则，并把同一份清单送入原 agent 会话继续任务。运行 `catman-ops connect` 会将本次授权专属的 SSH 私钥、固定主机公钥与配置写入该 worker 的 `/tmp`，输出清单、封装工具用法、`ssh -F ... catman-ops` 登录命令和 `scp` 示例。私钥不进入工具输出、共享 credential、skill 或 workspace。
+
+自动操作用封装工具，不需要手写嵌套 SSH 命令：
+
+```bash
+catman-ops exec -- docker ps --format '{{.Names}} {{.Status}}'
+catman-ops run .tmp/inspect.sh /opt/services
+catman-ops run - /opt/services <<'SCRIPT'
+set -euo pipefail
+find "$1" -maxdepth 2 -name '*compose*' -print
+SCRIPT
+```
+
+`exec` 保留程序参数，不解释管道或重定向；多行 shell 逻辑用 `run` 传本地脚本或 stdin。工具每次核对本会话授权，固定 SSH 主机校验，保留标准输入输出和远端退出码，不自动重试命令；执行完清理本次临时连接材料。脚本与结果可放共享 workspace，无需在两个容器间复制。
+
+主 worker 不重建。两边共享原路径的 workspace；普通 Bash 仍在 worker，宿主运维显式通过 SSH 执行。运维容器以 root 运行，具备稳定工具镜像中的常用排查工具与 Docker CLI/Compose；SSH 只允许本次公钥，禁止密码和转发，仅监听专用内部网络地址，不发布宿主端口。额外连接 `bridge` 供运维访问外网，主 worker 的原默认路由不变。
+
+**不设运维独立时限，也没有续期。运维授权绑定原会话容器实例，同生共死。** 控制服务正常重启后，原父容器仍存在且运维配置不变则保留授权；原父容器回收、异常退出或重建，运维容器、SSH 连接及其进程一起回收，新父容器需要重新申请。待授权/已授权运维环境阻止 worker 的“无进程快速回收”；原会话的闲置预告、延长与最终回收规则继续有效。外部删除父容器、撤销管理员身份或修改/关闭部署运维配置时，巡检清理依附环境。普通用户和 cron 不能申请或继承授权。
+
+启用运维授权机制后，agent 调用自进化 `POST /api/execution/prepare` 也要求当前会话已获含 Docker socket 的授权，因为制备会执行 agent 可修改的仓库脚本。定时 agent 不自动继承此权限。用户持有的独立 Dashboard 凭据仍可直接发起制备；发布保持 `/发布` 硬指令确认。
+
+完整 Docker socket 相当于宿主机 root 授权；可写的大目录也可能包含其他用户数据和部署凭据。回收只终止系统管理的运维容器，不自动恢复宿主修改，也不会销毁 agent 通过宿主 Docker 另外部署的服务。控制面及固化部署机制仍是可信边界，自进化代码不能被当成安全沙箱。Dashboard 聊天和含登录凭据的页面只接受独立 Dashboard 用户认证，管理员 agent 的运行/回合令牌不能注入用户硬指令或领取 Dashboard 登录凭据。
+
+新 CLI 与指令投影在新建 worker 时提供；升级后使用新会话容器验证。真实回归需要同时准备 `catman-env:integration` 与 `catman-ops:integration`（或用 `CATMAN_DOCKER_IMAGE`、`CATMAN_OPS_TEST_IMAGE` 指定镜像）。
 
 ## M0 验证清单(首次部署务必先走一遍)
 

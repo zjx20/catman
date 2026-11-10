@@ -1,5 +1,6 @@
 import type { ContextStore } from "./execution/contexts.js";
 import type { RuntimeManager } from "./execution/runtime.js";
+import type { OpsManager } from "./execution/ops.js";
 import type { Accepted, Channel, IncomingMessage } from "../channels/types.js";
 import type { Agent, AgentProgressEvent } from "./agent.js";
 import type { Decision, SessionManager, SessionRef } from "./session.js";
@@ -144,7 +145,7 @@ const NEWS_MAX_ATTEMPTS = 3;
 const NEWS_RETRY_MS = 60_000;
 
 export interface GatewayOptions {
-  execution?: { contexts: ContextStore; runtimes: RuntimeManager };
+  execution?: { contexts: ContextStore; runtimes: RuntimeManager; ops?: OpsManager };
   channel: Channel;
   agent: Agent;
   sessions: SessionManager;
@@ -1080,6 +1081,24 @@ export class Gateway {
     if (!pre) return;
 
     switch (cmd.name) {
+      case "opsStatus":
+      case "revokeOps": {
+        try {
+          const ops = this.execution?.ops;
+          if (!ops) throw new Error("运维管理不可用");
+          if (cmd.name === "revokeOps") {
+            const record = ops.list(userKey).find(r => r.id === arg.trim());
+            await ops.revoke(userKey, arg.trim(), false);
+            const text = `运维环境 ${arg.trim()} 已回收，SSH 连接和远端进程已终止，主会话与 workspace 继续保留。`;
+            const delivered = await this.trySend(userKey, text, "运维回收");
+            if (record) this.execution!.runtimes.notifyUser(userKey, record.contextId, text, delivered);
+          } else {
+            const records = ops.list(userKey);
+            await this.trySend(userKey, records.map(r => ops.description(r)).join("\n\n") || (ops.enabled ? "没有运维申请或已授权环境。让 agent 使用 catman-ops request <用途> 申请。" : "部署未启用临时运维环境，需要配置 CATMAN_OPS_ENABLED 和挂载清单。"), "运维状态");
+          }
+        } catch (error) { await this.trySend(userKey, String(error), "运维操作"); }
+        return;
+      }
       case "help":
         // 刚推过 greeting 的话内容一模一样,不重复刷屏。
         if (!pre.justGreeted) {
@@ -1180,6 +1199,25 @@ export class Gateway {
     moreInputAfter: boolean,
   ): Promise<boolean> {
     switch (cmd.name) {
+      case "grantOps": {
+        try {
+          const execution = this.execution, ops = execution?.ops;
+          if (!ops) throw new Error("运维管理不可用");
+          const { record, newlyGranted } = await ops.grant(userKey, arg.trim());
+          const text = ops.description(record);
+          // 发给用户的清单与送入 agent 的清单使用同一份系统生成内容。
+          const delivered = await this.trySend(userKey, text, "运维授权");
+          execution!.runtimes.notifyUser(userKey, record.contextId, text, delivered);
+          const fg = this.turns.foregroundFor(userKey);
+          const current = this.sessions.currentOf(userKey);
+          const currentContext = current && execution!.contexts.bySession(userKey, current.sessionId);
+          if (newlyGranted && (fg?.contextId === record.contextId || (!fg && currentContext?.id === record.contextId))) {
+            this.sessions.touch(userKey);
+            void this.deliverInput(userKey, { kind: "input", text: `系统运维授权已生效：\n${text}\n请按上述方式连接并继续原任务。`, attachments: [] }, this.users.ensureWorkspace(userKey))?.catch(error => console.error(`[ops] 授权后续接失败：${String(error)}`));
+          }
+        } catch (error) { await this.trySend(userKey, String(error), "运维授权"); }
+        return true;
+      }
       case "newSession": {
         // 切走当前会话:它的在飞回合**不停**,转后台跑完再把结果送来。
         const detached = this.detachForeground(userKey);

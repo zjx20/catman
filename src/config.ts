@@ -10,6 +10,8 @@
  * 守护人格额外挂上的看门狗与状态页)。写两套装配的下场是它们慢慢走样,
  * 而守护人格恰恰是最不该在需要时才发现"它跟主人格不一样"的那个。
  */
+import { parseOpsMounts, type OpsConfig } from "./core/execution/ops-config.js";
+
 export type Persona = "primary" | "rescue";
 
 function num(name: string, fallback: number): number {
@@ -73,6 +75,8 @@ export interface Config {
   sessionMemoryLimit: string;
   /** 执行环境镜像，必须带 Node、glibc 与常用工具。 */
   sessionImage: string;
+  /** 部署指定的临时运维环境；仅经管理员硬指令授权后创建。 */
+  ops?: OpsConfig;
   cgroupRoot: string;
   /** 聊天路由闲置期限，决定下一条消息是否新建会话。 */
   sessionTimeoutMs: number;
@@ -168,6 +172,13 @@ export function loadConfig(): Config {
     runtimeIdleMs: boundedNum("CATMAN_RUNTIME_IDLE_MS", HOUR, 10 * 60_000, 7 * DAY),
     sessionMemoryLimit: str("CATMAN_SESSION_MEMORY", "700m"),
     sessionImage: str("CATMAN_SESSION_IMAGE", "catman-env:1"),
+    ...(bool("CATMAN_OPS_ENABLED", false) ? { ops: {
+      image: str("CATMAN_OPS_IMAGE", "catman-ops:1"),
+      mounts: parseOpsMounts(str("CATMAN_OPS_MOUNTS", "[]")),
+      dockerSocket: bool("CATMAN_OPS_DOCKER_SOCKET", false),
+      memory: str("CATMAN_OPS_MEMORY", "512m"),
+      maxActive: boundedNum("CATMAN_OPS_MAX_ACTIVE", 1, 1, 16),
+    } } : {}),
     cgroupRoot: str("CATMAN_CGROUP_ROOT", "/sys/fs/cgroup/docker"),
   };
 }

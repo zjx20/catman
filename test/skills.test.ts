@@ -10,6 +10,7 @@ import {
   ADMIN_SKILLS,
   CRON_SKILL,
   EVOLVE_SKILL,
+  OPS_SKILL,
   GENERATED_SKILLS,
   RESCUE_SKILL,
   USER_SKILL,
@@ -44,6 +45,19 @@ test("自进化 skill 只对管理员回合可见", () => {
   // 所以它在普通名单里 —— 与改自己的设置同一个模型。
   assert.deepEqual([...USER_SKILLS], [USER_SKILL, CRON_SKILL]);
   assert.equal(ADMIN_SKILLS.includes(ADMIN_SKILL), true);
+});
+
+test("运维 skill 安装后只进入主人格管理员的可见列表，切换救援人格时清理", () => {
+  withConfigDir(dir => {
+    writeSkills(dir, { modelAllowlist: ["opus"] }, PATHS, "primary");
+    assert.ok(existsSync(join(dir, "skills", OPS_SKILL, "SKILL.md")));
+    const onDisk = skillsOnDisk(dir);
+    assert.ok(skillsFor("primary", true, { onDisk }).includes(OPS_SKILL));
+    assert.ok(!skillsFor("primary", false, { onDisk }).includes(OPS_SKILL));
+    assert.ok(!skillsFor("rescue", true, { onDisk }).includes(OPS_SKILL));
+    writeSkills(dir, { modelAllowlist: ["opus"] }, PATHS, "rescue");
+    assert.ok(!existsSync(join(dir, "skills", OPS_SKILL)));
+  });
 });
 
 test("自进化 skill 的指令写法从 COMMAND_TABLE 取,不手写字面量", () => {
@@ -201,7 +215,7 @@ test("主人格:手写 skill 装进目录就进上下文,不用在代码里登�
   assert.ok(got.includes("catman-mediacenter"));
 });
 
-test("主人格:非管理员回合仍然减掉 catman-admin / catman-evolve", () => {
+test("主人格:非管理员回合仍然减掉管理员专用 skill", () => {
   // 黑名单换掉的是「存在性登记」,不是权限门。后者照旧 ——
   // description 常驻上下文,列出来等于告诉每个用户有这条路。
   const pool = [...ADMIN_SKILLS, "catman-mediacenter"];
@@ -209,7 +223,7 @@ test("主人格:非管理员回合仍然减掉 catman-admin / catman-evolve", ()
   for (const gated of ADMIN_ONLY_SKILLS) {
     assert.equal(got.includes(gated), false, `${gated} 不该给普通用户`);
   }
-  // 挡的只是那两个,别的照给。
+  // 挡的只是管理员专用能力，其他照给。
   assert.deepEqual(got, [USER_SKILL, CRON_SKILL, "catman-mediacenter"]);
 });
 

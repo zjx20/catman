@@ -31,7 +31,7 @@ export const VERSION_FILE = "VERSION";
  * 走上找而不是写死层数:编译产物在 `dist/src/core/`、源码直跑(tsx)在 `src/core/`,
  * 两者到根的距离不同,写死会在其中一种下悄悄读不到版本。
  */
-function findAppRoot(): string | undefined {
+export function findAppRoot(): string | undefined {
   let dir = dirname(fileURLToPath(import.meta.url));
   // 6 层足够覆盖上面两种布局,又不至于在异常情况下一路走到文件系统根。
   for (let i = 0; i < 6; i++) {

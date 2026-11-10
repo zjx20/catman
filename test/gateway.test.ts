@@ -26,6 +26,8 @@ import { PrefsStore } from "../src/core/prefs.js";
 import { TurnTokens } from "../src/core/turn-tokens.js";
 import { ADMIN_SKILL } from "../src/core/skills.js";
 import { BUILTIN_ADMIN_USER_KEY } from "../src/core/identity.js";
+import { executionFixture } from "./helpers/execution.js";
+import { OpsManager } from "../src/core/execution/ops.js";
 import { loadConfig, type Config } from "../src/config.js";
 import type { AdmissionPolicy } from "../src/core/admission.js";
 import type { Channel, MessageHandler } from "../src/channels/types.js";
@@ -199,6 +201,7 @@ class FakeAgent {
 }
 
 interface BuildOpts {
+  execution?: import("../src/core/gateway.js").GatewayOptions["execution"];
   failSend?: boolean;
   supportsRecall?: boolean;
   admission?: AdmissionPolicy;
@@ -301,6 +304,7 @@ function build(now: () => number, opts: BuildOpts = {}) {
   });
   const turns = new TurnTokens();
   const gw = new Gateway({
+    ...(opts.execution ? { execution: opts.execution } : {}),
     channel,
     agent: agent as unknown as Agent,
     sessions,
@@ -344,6 +348,32 @@ function afterGreeting(sent: Array<{ userKey: string; text: string }>) {
 
 test.after(() => {
   for (const d of tempDirs) rmSync(d, { recursive: true, force: true });
+});
+
+test("运维只有用户硬指令授权，清单自动续接原会话；重复授权不重复启动回合", async () => {
+  const f = executionFixture(true);
+  const config = { ...f.config, ops: { image: "catman-ops:test", mounts: [{ source: "/opt/services", target: "/opt/services", readOnly: false }], dockerSocket: true, memory: "256m", maxActive: 1 } };
+  const ops = new OpsManager(config, f.contexts, f.runtimes, { isAdmin: user => user === U1, notify: (user, context, text) => f.runtimes.notifyUser(user, context, text) });
+  const h = build(Date.now, { settings: { adminUserKeys: [U1] }, execution: { contexts: f.contexts, runtimes: f.runtimes, ops } });
+  try {
+    await h.channel.receive(U1, "检查服务");
+    const context = f.contexts.all(U1)[0]!;
+    // 假 agent 不操作 SDK 磁盘；补记生产 Agent 收到的 session_id。
+    f.contexts.started(context.id, h.sessions.currentOf(U1)!.sessionId);
+    const runtime = await f.runtimes.ensure(f.contexts.get(context.id)!);
+    const request = await ops.request(runtime, "排查服务");
+    assert.equal(h.agent.calls.length, 1);
+    await h.channel.receive(U1, `/授权 ${request.id}`);
+    await waitUntil(() => h.agent.calls.length === 2 && !h.turns.foregroundFor(U1), "授权后续接");
+    const continuation = h.agent.calls[1]!;
+    assert.equal(continuation.resume, h.agent.calls[0]!.resume ?? "sess-1");
+    assert.match(continuation.prompt, /\/opt\/services/); assert.match(continuation.prompt, /docker.sock/); assert.match(continuation.prompt, /catman-ops connect/);
+    const delivered = f.runtimes.pending(context.id).find(e => e.text.includes("已授权")); assert.equal(delivered?.delivered, true);
+    await h.channel.receive(U1, `/授权 ${request.id}`);
+    assert.equal(h.agent.calls.length, 2, "重投硬指令只确认现有授权");
+    await h.channel.receive(U1, `/运维回收 ${request.id}`);
+    assert.equal(ops.list(U1).length, 0); assert.equal(f.runtimes.all(U1).length, 1);
+  } finally { ops.close(); f.cleanup(); }
 });
 
 test("完整回合:准入 → decide → 回执 → agent → record → send", async () => {

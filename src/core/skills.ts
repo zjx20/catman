@@ -7,6 +7,7 @@ import { MIN_SHA_PREFIX } from "./releases.js";
 import type { Persona } from "../config.js";
 import { SETTING_SCHEMA, USER_SETTING_KEYS, type SettingContext, type SettingKey } from "./settings.js";
 import { readScopedFile } from "./scoped-files.js";
+import { findAppRoot } from "./version.js";
 
 /**
  * 把「怎么调自己的配置接口」做成 skill 而不是塞进系统提示词。
@@ -17,7 +18,8 @@ import { readScopedFile } from "./scoped-files.js";
  * ## 两个刻意的约束
  *
  * 1. **每次启动幂等覆盖。** 文件落在数据卷里(CLAUDE_CONFIG_DIR/skills/),用户能改能删。
- *    覆盖写让它永远跟代码同步 —— 接口说明的真相源是 SETTING_SCHEMA,不是磁盘。
+ *    接口说明从 SETTING_SCHEMA 等代码生成；运维手册从当前 release 的
+ *    skills/catman-ops/SKILL.md 安装。数据目录中的副本不是维护入口。
  *
  * 2. **正文里绝不能出现任何令牌。** Options.skills 是**上下文过滤而不是沙箱**
  *    (SDK 类型注释原文:"files remain on disk and are reachable via Read/Bash.
@@ -30,6 +32,7 @@ export const USER_SKILL = "catman-settings";
 export const CRON_SKILL = "catman-cron";
 export const ADMIN_SKILL = "catman-admin";
 export const EVOLVE_SKILL = "catman-evolve";
+export const OPS_SKILL = "catman-ops";
 export const RESCUE_SKILL = "catman-rescue";
 
 /**
@@ -44,6 +47,7 @@ export const GENERATED_SKILLS: readonly string[] = [
   CRON_SKILL,
   ADMIN_SKILL,
   EVOLVE_SKILL,
+  OPS_SKILL,
   RESCUE_SKILL,
 ];
 
@@ -54,7 +58,7 @@ export const GENERATED_SKILLS: readonly string[] = [
  * 版本),与 `/发布` `/回滚` 的 adminOnly 是同一个决定。普通用户的回合里连这份说明
  * 都不该出现 —— description 常驻上下文,列出来等于告诉每个人有这条路。
  */
-export const ADMIN_ONLY_SKILLS: readonly string[] = [ADMIN_SKILL, EVOLVE_SKILL];
+export const ADMIN_ONLY_SKILLS: readonly string[] = [ADMIN_SKILL, EVOLVE_SKILL, OPS_SKILL];
 
 /**
  * 主人格里**谁都不给**的:守护人格那份诊断手册。
@@ -73,7 +77,7 @@ const PRIMARY_EXCLUDED: readonly string[] = [RESCUE_SKILL];
  */
 export const USER_SKILLS: readonly string[] = [USER_SKILL, CRON_SKILL];
 /** 磁盘读不到时,admin 回合的兜底名单。 */
-export const ADMIN_SKILLS: readonly string[] = [USER_SKILL, CRON_SKILL, ADMIN_SKILL, EVOLVE_SKILL];
+export const ADMIN_SKILLS: readonly string[] = [USER_SKILL, CRON_SKILL, ADMIN_SKILL, EVOLVE_SKILL, OPS_SKILL];
 /**
  * 守护人格的 admin 回合可见的 skill。**这一支是白名单,不是兜底** —— 见 `skillsFor`。
  *
@@ -251,7 +255,7 @@ curl -s -X PATCH -H "X-Catman-Session: $CATMAN_SESSION_TOKEN" \\
 
 两点它管不着:
 
-- 普通用户的回合本来就看不到 \`${ADMIN_SKILL}\` 与 \`${EVOLVE_SKILL}\`。那是权限门,
+- 普通用户的回合本来就看不到 ${ADMIN_ONLY_SKILLS.map(name => `\`${name}\``).join("、")}。那是权限门,
   与"这个能力现在开不开"是两回事。
 - **守护人格走固定白名单,\`disabledSkills\` 对它无效。** 一个手滑的禁用不该让救援
   手册在最需要它的时候消失 —— 而解除禁用要走这个接口,那时主人格多半正不好使。
@@ -316,6 +320,8 @@ export function evolveSkillBody(_paths: SkillPaths): string {
 # Catman 自进化
 
 管理员的源码工作区挂在 /catman-src。先检查 git status，再开分支修改，并运行 npm run typecheck 与 npm test。
+若部署启用了运维授权，制备也需要本会话已获含 Docker socket 的授权（它会运行仓库脚本）。
+先按 ${OPS_SKILL} skill 申请并等待用户硬指令；遇到 403 不要尝试绕过授权。
 提交修改后，用下面的控制接口请求制备（固定制备脚本由控制面执行）：
 
 \`\`\`bash
@@ -326,6 +332,13 @@ curl --fail-with-body -s -X POST -H "X-Catman-Session: $CATMAN_SESSION_TOKEN" -H
 状态用 ${canonicalOf("upgradeStatus")}；回滚用 ${canonicalOf("rollback")}。
 不要自己起 deployer。不要直接修改发布指针或自行 bless；固定执行器和迁移后的运行环境不在普通 worker 的文件系统中。
 `;
+}
+
+export function opsSkillBody(): string {
+  // 从模块所属 release 读取，不能依赖控制服务启动时的 cwd 或可写源码工作区。
+  const root = findAppRoot();
+  if (!root) throw new Error("无法定位内置运维 skill 所属的 release");
+  return readFileSync(join(root, "skills", OPS_SKILL, "SKILL.md"), "utf8");
 }
 
 export function rescueSkillBody(_paths: SkillPaths): string {
@@ -369,6 +382,7 @@ export function writeSkills(
           [CRON_SKILL, cronSkillBody()],
           [ADMIN_SKILL, adminSkillBody(ctx)],
           [EVOLVE_SKILL, evolveSkillBody(paths)],
+          [OPS_SKILL, opsSkillBody()],
         ];
   const wanted = new Set(bodies.map(([name]) => name));
   for (const [name, body] of bodies) {

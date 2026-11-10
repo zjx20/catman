@@ -1,5 +1,6 @@
 import { ContextStore, requireExecutionLayout } from "./core/execution/contexts.js";
 import { RuntimeManager } from "./core/execution/runtime.js";
+import { OpsManager } from "./core/execution/ops.js";
 import { CapabilityBroker } from "./core/execution/broker.js";
 import { ContextScriptRunner } from "./core/execution/cron-runner.js";
 import { ExecutionApi } from "./dashboard/api-execution.js";
@@ -119,7 +120,11 @@ async function main(): Promise<void> {
     },
   });
   const broker = new CapabilityBroker(`${config.dataDir}/execution/shared-tools.json`, runtimes, userKey => settings.isAdmin(userKey));
-  const execution = { contexts, runtimes, broker };
+  const ops = new OpsManager(config, contexts, runtimes, {
+    isAdmin: userKey => settings.isAdmin(userKey),
+    notify: (userKey, contextId, text) => runtimes.notifyUser(userKey, contextId, text),
+  });
+  const execution = { contexts, runtimes, broker, ops };
   const agent = new Agent(config, execution);
   const sessions = new SessionManager({
     store: new FileStore(config.statePath),
@@ -296,7 +301,7 @@ async function main(): Promise<void> {
     ...(bridgeClient ? { accounts: new IpcAccountsProxy(bridgeClient) } : {}),
     chat,
     contexts,
-    executionApi: new ExecutionApi({ config, contexts, runtimes, broker, turns, isAdmin: userKey => settings.isAdmin(userKey) }),
+    executionApi: new ExecutionApi({ config, contexts, runtimes, broker, turns, ops, isAdmin: userKey => settings.isAdmin(userKey) }),
     selfApi: { turns, prefs, users, sessions, settings, configDir, contexts },
     notifyApi: {
       tokens: notifyTokens,
@@ -360,6 +365,7 @@ async function main(): Promise<void> {
     // 回来之后照常认领(见 cron/docker.ts 开头)。
     cron?.scheduler.stop();
     runtimes.close();
+    ops.close();
     agent.close();
     await broker.close();
     await gateway.stop();
@@ -379,6 +385,7 @@ async function main(): Promise<void> {
   // 渠道还没起来时那条结果只能石沉大海,而它恰恰是用户睡前定下、等着看的那一条。
   cron?.scheduler.start();
   runtimes.start();
+  ops.start();
 
   bootOk = true;
   console.info(`catman 已启动,渠道=${channel.name},${versionLine(version)}`);

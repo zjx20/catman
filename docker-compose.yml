@@ -71,6 +71,14 @@ services:
       CATMAN_RUNTIME_IDLE_MS: ${CATMAN_RUNTIME_IDLE_MS:-3600000}
       CATMAN_SESSION_MEMORY: ${CATMAN_SESSION_MEMORY:-700m}
       CATMAN_SESSION_IMAGE: ${CATMAN_SESSION_IMAGE:-catman-env:1}
+      # 运维环境默认关闭；目录来源是 Docker 宿主路径，不必挂给控制服务。
+      # .env 示例：CATMAN_OPS_MOUNTS=["/opt/services","/mnt/usb"]
+      CATMAN_OPS_ENABLED: ${CATMAN_OPS_ENABLED:-false}
+      CATMAN_OPS_MOUNTS: ${CATMAN_OPS_MOUNTS:-[]}
+      CATMAN_OPS_DOCKER_SOCKET: ${CATMAN_OPS_DOCKER_SOCKET:-false}
+      CATMAN_OPS_IMAGE: ${CATMAN_OPS_IMAGE:-catman-ops:1}
+      CATMAN_OPS_MEMORY: ${CATMAN_OPS_MEMORY:-512m}
+      CATMAN_OPS_MAX_ACTIVE: ${CATMAN_OPS_MAX_ACTIVE:-1}
       # 日志时间戳的时区。容器不会自动继承宿主时区,不设就是 UTC ——
       # 拿日志和微信里的消息时间对账时会差好几个小时。在 .env 里设 TZ=Asia/Shanghai。
       TZ: ${TZ:-UTC}

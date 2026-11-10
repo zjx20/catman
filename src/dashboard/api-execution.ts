@@ -7,6 +7,7 @@ import type { ContextStore } from "../core/execution/contexts.js";
 import type { RuntimeManager } from "../core/execution/runtime.js";
 import type { CapabilityBroker, SharedTools } from "../core/execution/broker.js";
 import type { TurnTokens } from "../core/turn-tokens.js";
+import type { OpsManager } from "../core/execution/ops.js";
 import { BUILTIN_ADMIN_USER_KEY } from "../core/identity.js";
 
 const json = (res: ServerResponse, status: number, body: unknown) => { res.writeHead(status, { "content-type": "application/json; charset=utf-8" }); res.end(JSON.stringify(body)); };
@@ -19,7 +20,7 @@ async function body(req: IncomingMessage): Promise<any> {
 export class ExecutionApi {
   private preparing = false;
   private readonly notifyHits = new Map<string, number[]>();
-  constructor(readonly opts: { config: Config; contexts: ContextStore; runtimes: RuntimeManager; broker: CapabilityBroker; turns: TurnTokens; isAdmin: (userKey: string) => boolean }) {}
+  constructor(readonly opts: { config: Config; contexts: ContextStore; runtimes: RuntimeManager; broker: CapabilityBroker; turns: TurnTokens; ops?: OpsManager; isAdmin: (userKey: string) => boolean }) {}
   async handle(req: IncomingMessage, res: ServerResponse, url: URL, staticAdmin: boolean): Promise<boolean> {
     const path = url.pathname;
     if (!path.startsWith("/api/runtime/") && path !== "/api/execution" && !path.startsWith("/api/execution/")) return false;
@@ -31,6 +32,26 @@ export class ExecutionApi {
     try {
       if (path.startsWith("/api/runtime/")) {
         if (!runtime) { json(res, 401, { error: "需要有效的运行环境身份" }); return true; }
+        if (path.startsWith("/api/runtime/ops/")) {
+          if (!this.opts.isAdmin(principal)) { json(res, 403, { error: "运维需要管理员权限" }); return true; }
+          const ops = this.opts.ops;
+          if (!ops) throw new Error("运维管理不可用");
+          if (path === "/api/runtime/ops/request" && req.method === "POST") {
+            const input = await body(req);
+            if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some(k => k !== "reason") || typeof input.reason !== "string") throw new Error("运维申请只接受 reason；挂载和 Docker 权限由部署指定");
+            const record = await ops.request(runtime, input.reason);
+            json(res, 200, { id: record.id, description: ops.description(record) }); return true;
+          }
+          if (path === "/api/runtime/ops/connection" && req.method === "GET") {
+            res.setHeader("cache-control", "no-store");
+            json(res, 200, await ops.connection(runtime)); return true;
+          }
+          if (path === "/api/runtime/ops/status" && req.method === "GET") {
+            const records = ops.list(principal).filter(r => r.parent === runtime.container);
+            json(res, 200, { description: ops.enabled ? records.map(r => ops.description(r)).join("\n\n") || "当前会话没有运维申请。使用 catman-ops request <用途> 申请。" : "部署未启用临时运维环境，需要部署管理员配置 CATMAN_OPS_ENABLED 和挂载清单。" }); return true;
+          }
+          json(res, 404, { error: "没有这个运维接口；授权和回收使用用户硬指令" }); return true;
+        }
         if (/^\/api\/runtime\/(model|mcp|services)\//.test(path)) {
           await this.opts.broker.proxy(req, res, runtime, path); return true;
         }
@@ -88,6 +109,13 @@ export class ExecutionApi {
       }
       if (path === "/api/execution/prepare" && req.method === "POST") {
         if (!this.opts.isAdmin(principal) || this.opts.config.persona !== "primary") { json(res, 403, { error: "需要主人格管理员权限" }); return true; }
+        // 制备会执行可由 agent 修改的仓库脚本，不能绕过用户的宿主权限授权。
+        if (this.opts.config.ops && !staticAdmin) {
+          try {
+            if (!runtime || !this.opts.ops) throw new Error("请先由用户硬指令批准当前会话的宿主机运维授权");
+            await this.opts.ops.requireHostAccess(runtime);
+          } catch (error) { json(res, 403, { error: String(error) }); return true; }
+        }
         const input = await body(req); const ref = input.ref;
         if (typeof ref !== "string" || !/^(HEAD|[a-f0-9]{7,40})$/.test(ref)) throw new Error("ref 必须是 HEAD 或提交 SHA");
         if (this.preparing) { json(res, 409, { error: "已有制备任务运行中" }); return true; }

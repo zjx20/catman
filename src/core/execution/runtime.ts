@@ -53,6 +53,8 @@ export class RuntimeManager {
   private readonly owned = new Set<string>();
   private readonly adoptions = new Map<string, Promise<void>>();
   private readonly listeners = new Map<string, () => void>();
+  private readonly removalHooks = new Set<(runtime: RuntimeRecord) => Promise<void>>();
+  private readonly retainers = new Set<(runtime: RuntimeRecord) => boolean>();
   private timer?: ReturnType<typeof setInterval>;
   private ticking = false;
   private notifying = false;
@@ -85,6 +87,12 @@ export class RuntimeManager {
     return r && structuredClone(r);
   }
   onStop(contextId: string, callback: () => void): void { this.listeners.set(contextId, callback); }
+  beforeRemove(callback: (runtime: RuntimeRecord) => Promise<void>): () => void {
+    this.removalHooks.add(callback); return () => { this.removalHooks.delete(callback); };
+  }
+  retainWhile(predicate: (runtime: RuntimeRecord) => boolean): () => void {
+    this.retainers.add(predicate); return () => { this.retainers.delete(predicate); };
+  }
   async ensure(context: ExecutionContext): Promise<RuntimeRecord> {
     return this.withContext(context.id, () => this.provision(context));
   }
@@ -184,6 +192,8 @@ export class RuntimeManager {
     writeFileSync(join(target, "CLAUDE.md"), `${common}\n\n${personal}\n\n## 执行环境\n任务产物与临时文件写在当前 workspace，临时中间文件可放 .tmp/。跨会话保留的产物放 /user/artifacts，个人项目放 /user/projects，skill 放 /user/skills。不要把共享目录或控制面数据目录当作工作区。后台命令必须通过 catman-task run --timeout <秒> -- <命令> 登记；最长 86400 秒。长期服务需要部署。\n`, { mode: 0o600 });
     const launcher = '#!/bin/sh\nexec node /runtime/release/dist/src/core/execution/task-cli.js "$@"\n';
     for (const name of ["catman-task", "catman-notify"]) writeFileSync(join(target, name), launcher, { mode: 0o755 });
+    writeFileSync(join(target, "catman-ops"), '#!/bin/sh\nexec node /runtime/release/dist/src/core/execution/ops-cli.js "$@"\n', { mode: 0o755 });
+    if (this.config.ops && this.opts.isAdmin(context.userKey)) writeFileSync(join(target, "CLAUDE.md"), "\n## 临时运维环境\n宿主维护按 catman-ops skill 申请用户硬指令授权，使用 catman-ops exec/run 执行；普通 Bash 仍在原 worker 中。\n", { flag: "a" });
     return target;
   }
   private async adopt(r: RuntimeRecord): Promise<void> {
@@ -269,8 +279,8 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
     const r = this.records.find(r => r.contextId === contextId);
     if (r) this.event(r, text, id);
   }
-  notifyUser(userKey: string, contextId: string, text: string): void {
-    this.events.push({ id: randomBytes(16).toString("hex"), userKey, contextId, text, delivered: false, at: this.now() }); this.save();
+  notifyUser(userKey: string, contextId: string, text: string, delivered = false): void {
+    this.events.push({ id: randomBytes(16).toString("hex"), userKey, contextId, text, delivered, at: this.now() }); this.save();
   }
   async stop(id: string, reason: string, silent = false): Promise<void> {
     // 创建、重建、主动回收共用上下文队列,不能在 docker run 尚未完成时 rm/forget。
@@ -281,12 +291,15 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
     this.reclaiming.add(id);
     // Invalidate callbacks/capabilities only after the daemon confirms removal.
     try {
+      for (const hook of this.removalHooks) await hook(r);
       try { await this.docker(["rm", "-f", r.container]); }
       catch (error) { if (!(error instanceof DockerFailure && error.missing)) throw error; }
       await this.forget(r, reason, silent);
     } finally { this.reclaiming.delete(id); }
   }
   private async forget(r: RuntimeRecord, reason: string, silent = false): Promise<void> {
+    // 缺失容器、异常退出、启动失败同样不能留下依附它的已授权环境。
+    for (const hook of this.removalHooks) await hook(r);
     this.records = this.records.filter(item => item.container !== r.container);
     this.owned.delete(r.container);
     this.listeners.get(r.contextId)?.(); this.listeners.delete(r.contextId);
@@ -371,7 +384,12 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
           }
           catch (error) {
             if (!this.canMonitor(r)) continue;
-            if (error instanceof DockerFailure && error.missing) { await this.forget(r, "执行容器已不存在"); continue; }
+            if (error instanceof DockerFailure && error.missing) {
+              await this.withContext(r.contextId, async () => {
+                if (this.records.includes(r)) await this.forget(r, "执行容器已不存在");
+              });
+              continue;
+            }
           }
           snapshot = { tasks: r.tasks, processes: ["运行时无响应，无法读取进程列表"] };
         }
@@ -387,7 +405,7 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
         const expired = r.tasks.find(t => !t.endedAt && this.now() >= t.deadlineAt + 5000);
         if (expired) { await this.stop(r.contextId, `后台任务「${expired.name}」超时且未退出`); continue; }
         const registeredUntil = Math.max(0, ...r.tasks.filter(t => t.status === "running").map(t => t.deadlineAt));
-        if (snapshot.agents?.length === 0 && snapshot.unmanaged?.length === 0 && !r.tasks.some(t => t.endedAt === undefined) && this.now() - r.lastInteractionAt >= 30_000) {
+        if (snapshot.agents?.length === 0 && snapshot.unmanaged?.length === 0 && !r.tasks.some(t => t.endedAt === undefined) && ![...this.retainers].some(retain => retain(r)) && this.now() - r.lastInteractionAt >= 30_000) {
           await this.stop(r.contextId, "没有活动进程，释放空闲执行环境", true); continue;
         }
         const deadline = Math.max(r.lastInteractionAt + this.config.runtimeIdleMs, r.extensionUntil, registeredUntil);

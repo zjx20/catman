@@ -1,0 +1,12 @@
+# 独立运维环境：沿用稳定工具镜像，只增加 SSH 服务，不运行第二个 LLM。
+ARG CATMAN_BASE_IMAGE=catman-env:1
+FROM ${CATMAN_BASE_IMAGE}
+USER root
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssh-server \
+  && rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_* \
+  && passwd -d root
+COPY docker/ops-entrypoint.sh /usr/local/bin/catman-ops-entrypoint
+COPY docker/ops-shell.sh /usr/local/bin/catman-ops-shell
+RUN chmod 0755 /usr/local/bin/catman-ops-entrypoint /usr/local/bin/catman-ops-shell
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/catman-ops-entrypoint"]

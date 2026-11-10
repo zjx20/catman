@@ -160,7 +160,7 @@ Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/conte
 | `src/core/commands.ts` | `COMMAND_TABLE`:硬指令的单一真相源 |
 | `src/core/turn-tokens.ts` | 回合级一次性令牌 + 在飞回合上下文(detached / abort / feed / done) |
 | `src/core/turn-env.ts` | 回合元数据；worker 凭据与目录环境由 Agent/RuntimeManager 按身份生成 |
-| `src/core/skills.ts` | 启动时**按人格**生成 SKILL.md(按需加载,不占系统提示词) |
+| `src/core/skills.ts` | 启动时**按人格**生成接口说明、安装仓库中的运维 skill(按需加载,不占系统提示词) |
 | `src/core/persona.ts` | 人格自述(进 `systemPrompt.append`)、共享人设占位、管理员名单跨命名空间继承 |
 | `src/core/agent.ts` | SDK 封装、context 身份、受限环境、技能/MCP 装配与持续连接 |
 | `src/core/session.ts` | 会话状态机(纯函数 decide + 注入时钟/store;current + history) |
@@ -245,6 +245,7 @@ Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/conte
 
 执行实现见 `src/core/execution/`，行为和人工数据迁移步骤以 README 为准。
 控制面保存 owner/context/runtime 注册表，worker 只挂当前 work、sdk、tasks 和 owner home。禁止整挂 /data、/opt/services 或 docker.sock。容器无法启动就报错，没有本机执行降级。
+管理员宿主运维使用单独的临时 SSH 容器，不扩大 worker 挂载。部署用 `CATMAN_OPS_MOUNTS` 指定宿主目录数组（如 `/opt/services`、`/mnt/usb`），`CATMAN_OPS_DOCKER_SOCKET` 单独控制完整 Docker 权限；默认不开启。管理员专用 `catman-ops` skill 的维护入口为 `skills/catman-ops/SKILL.md`，由 `src/core/skills.ts` 从模块所属 release 安装，禁止从 cwd 或可写源码工作区读取，数据目录中的副本会在启动时覆盖。agent 用 `catman-ops request <用途>` 申请，用户硬指令 `/授权 <ID>` 才创建环境；HTTP 没有授权接口。系统回复完整资源清单并续接原会话，agent 用 `catman-ops connect` 查看清单与 SSH 登录方法，以 `catman-ops exec -- <程序> [参数...]` 或 `catman-ops run <本地脚本或-> [参数...]` 操作，避免手写嵌套 SSH；封装每次校验授权、处理转义、传送 stdin、保留退出码和清理临时私钥。无独立运维时限或续期，授权绑定原 worker 实例；回收/重建必须先回收附属运维容器，新实例不能继承。控制服务重启保留原父容器授权。待授权/已授权运维环境阻止空 worker 快速回收，原闲置预告和回收仍有效。实现和镜像构建见 README「临时运维容器」。
 宿主存储统一位于 `<数据根>/tenants/<tenantId>/`：
 
 ```text
@@ -838,6 +839,8 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(只对**主人格
 
 权限取决于服务端角色和上下文归属，详见 README。所有 worker 都使用精确挂载、非 root 和资源限制；没有任意宿主挂载、Docker socket 或原始管理员/公共凭据。
 普通用户只修改自己的 home、workspace 和任务。公共 skill 只读，公共 MCP/服务通过 credential broker 使用。管理员操作通过现查身份的 HTTP 接口执行，源码仅对管理员挂载。
+临时运维容器是用户显式批准的特权环境；目录与 Docker socket 由部署配置固定，申请不能扩大它们。完整 socket 等价宿主 root，不能承诺授权期间仍隔离宿主或其他租户。授权与回收消息由控制面生成，不由 LLM 编写资源清单。Dashboard 聊天和 HTML 管理页必须使用独立用户认证，不能接受 agent 的委派身份，防止伪造 `/授权` 或泄露页面中的 Dashboard 凭据。
+启用 `CATMAN_OPS_ENABLED` 后，agent 的自进化制备也必须先取得同会话含 Docker socket 的授权，避免借可修改的仓库脚本绕过授权；cron 不自动继承。独立 Dashboard 用户凭据可直接制备，发布仍走硬指令。
 生产执行失败必须报错；禁止新增本机运行兜底。修改挂载时同时验证指令加载、SDK session 路径、resume、dashboard 和清理。
 
 ## 可观测性

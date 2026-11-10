@@ -14,6 +14,8 @@ import { RuntimeManager, dockerCommand, type RuntimeRecord } from "../../src/cor
 import type { TaskRecord } from "../../src/core/execution/task-supervisor.js";
 import { TurnTokens } from "../../src/core/turn-tokens.js";
 import { ExecutionApi } from "../../src/dashboard/api-execution.js";
+import { OpsManager } from "../../src/core/execution/ops.js";
+import { parseOpsMounts } from "../../src/core/execution/ops-config.js";
 
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until<T>(get: () => Promise<T>, ready: (value: T) => boolean, label: string, timeout = 15_000): Promise<T> {
@@ -420,5 +422,63 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
     assert.equal(readFileSync(join(paths.work, "keep"), "utf8"), "retained");
     await until(async () => notices, n => n.some(e => e.owner === "idle-probe" && e.text.includes("已回收")), "reclaim notice");
     now = Date.now();
+  });
+  await t.test("真实运维授权：多目录、SSH 主机校验、共享 workspace、Docker 和父子回收", { timeout: 60_000 }, async () => {
+    const services = join(root, "ops-host/services"), storage = join(root, "ops-host/storage");
+    mkdirSync(services, { recursive: true }); mkdirSync(storage, { recursive: true });
+    writeFileSync(join(services, "probe"), "services-probe"); writeFileSync(join(storage, "probe"), "storage-probe");
+    const opsConfig = { ...config, ops: { image: process.env.CATMAN_OPS_TEST_IMAGE || "catman-ops:integration", mounts: parseOpsMounts(JSON.stringify([
+      { source: join(hostRoot, relative(repo, services)), target: "/opt/services" },
+      { source: join(hostRoot, relative(repo, storage)), target: "/mnt/usb" },
+    ])), dockerSocket: true, memory: "256m", maxActive: 1 } };
+    const ops = new OpsManager(opsConfig, contexts, runtimes, { isAdmin: options.isAdmin, notify: (owner, _context, text) => { notices.push({ owner, text }); } });
+    api = new ExecutionApi({ config: opsConfig, contexts, runtimes, broker: broker!, turns: new TurnTokens(), isAdmin: options.isAdmin, ops });
+    const context = contexts.chat("admin"), parent = await runtimes.ensure(context);
+    const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
+    try {
+      const pending = await fetchIn(parent, "/api/runtime/ops/request", "POST", { "content-type": "application/json" }, { reason: "真实 Docker 运维验证" });
+      assert.equal(pending.status, 200); const id = JSON.parse(pending.text).id as string;
+      assert.notEqual((await fetchIn(parent, "/api/runtime/ops/connection")).status, 200);
+      await assert.rejects(docker(["exec", parent.container, "catman-ops", "exec", "--", "true"]), /尚未获得运维授权/);
+      const routesBefore = await docker(["exec", parent.container, "ip", "-j", "route", "show", "default"]);
+      const { record } = await ops.grant("admin", id);
+      assert.equal(await docker(["exec", parent.container, "ip", "-j", "route", "show", "default"]), routesBefore, "授权不改变原 worker 的默认路由");
+      const output = await docker(["exec", parent.container, "catman-ops", "connect"]);
+      const configPath = /SSH 登录：ssh -F (\S+) catman-ops/.exec(output)?.[1]; assert.ok(configPath);
+      assert.ok(output.includes("/opt/services")); assert.ok(output.includes("/mnt/usb")); assert.ok(output.includes("docker.sock")); assert.ok(!output.includes("BEGIN OPENSSH PRIVATE KEY"));
+      const ssh = (command: string) => docker(["exec", parent.container, "ssh", "-F", configPath, "catman-ops", command]);
+      const probe = "const fs=require('fs');console.log(fs.readFileSync('/opt/services/probe','utf8'),fs.readFileSync('/mnt/usb/probe','utf8'));fs.writeFileSync('ops-output','same-workspace');";
+      assert.equal(await ssh(`node -e ${quote(probe)}`), "services-probe storage-probe");
+      assert.equal(readFileSync(join(contexts.paths(context).work, "ops-output"), "utf8"), "same-workspace");
+      await docker(["exec", parent.container, "scp", "-F", configPath, "catman-ops:ops-output", "ops-downloaded"]);
+      assert.equal(readFileSync(join(contexts.paths(context).work, "ops-downloaded"), "utf8"), "same-workspace");
+      assert.match(await ssh("docker version --format '{{.Server.Version}}'"), /^\d+\./);
+      const trickyArgs = ["", "space here", "quote'\"", "line1\nline2", "$(exit 91)", "`exit 92`", "; exit 93", "$HOME", "*"];
+      const wrapped = await docker(["exec", parent.container, "catman-ops", "exec", "--", "node", "-e", "console.log(JSON.stringify(process.argv.slice(1)))", "--", ...trickyArgs]);
+      assert.deepEqual(JSON.parse(wrapped), trickyArgs, "真实 SSH 保留 argv，不把参数解释成 shell");
+      const scriptPath = join(contexts.paths(context).work, "script with quote'.sh");
+      writeFileSync(scriptPath, 'set -euo pipefail\nprintf "%s" "$1" > "wrapped result"\nprintf "%s" "$PWD"\n');
+      assert.equal(await docker(["exec", parent.container, "catman-ops", "run", scriptPath, "arg with quote' and $(exit 91)"]), contexts.paths(context).work);
+      assert.equal(readFileSync(join(contexts.paths(context).work, "wrapped result"), "utf8"), "arg with quote' and $(exit 91)");
+      // 从 Node 直传 stdin，不再引入本地 shell；检查 stderr、退出码与执行凭证清理。
+      const commandProbe = `const {spawnSync}=await import('node:child_process');const fs=await import('node:fs');const before=fs.readdirSync('/tmp').filter(n=>n.startsWith('catman-ops-')).sort();const result=spawnSync('catman-ops',${JSON.stringify(["run", "-", "space ' $()"] )},{input:${JSON.stringify('printf "%s" "$1"; printf "probe-error" >&2; exit 23\n')},encoding:'utf8'});const after=fs.readdirSync('/tmp').filter(n=>n.startsWith('catman-ops-')).sort();console.log(JSON.stringify({code:result.status,out:result.stdout,err:result.stderr,clean:JSON.stringify(before)===JSON.stringify(after)}));`;
+      assert.deepEqual(JSON.parse(await exec(parent, commandProbe)), { code: 23, out: "space ' $()", err: "probe-error", clean: true });
+      const inspect = JSON.parse(await docker(["inspect", record.container]))[0];
+      assert.equal(inspect.HostConfig.Privileged, false); assert.deepEqual(inspect.HostConfig.PortBindings, {});
+      assert.equal(inspect.Config.User, "0:0");
+      const badIdentity = `const {execFileSync}=await import('node:child_process');const key='/tmp/ops-wrong-identity';execFileSync('ssh-keygen',['-q','-t','ed25519','-N','','-f',key]);try{execFileSync('ssh',['-F','/dev/null','-i',key,'-p','2222','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o',${JSON.stringify(`UserKnownHostsFile=${configPath.replace(/ssh_config$/, "known_hosts")}`)},${JSON.stringify(`root@${record.container}`)},'true'],{stdio:'pipe'});throw new Error('wrong key accepted')}catch(e){if(e.status!==255||!String(e.stderr).includes('Permission denied'))throw e;console.log('wrong-key-denied')}`;
+      assert.equal(await exec(parent, badIdentity), "wrong-key-denied");
+      await ssh(`node -e ${quote("require('child_process').spawn('sleep',['120'],{detached:true,stdio:'ignore'}).unref()")}`);
+      now += 31_000; await runtimes.tick(); assert.ok(runtimes.all().some(r => r.container === parent.container), "远端仍有任务时不触发空 worker 快速回收");
+      await runtimes.stop(context.id, "运维父子回收验证", true);
+      await assert.rejects(docker(["inspect", record.container]), /No such/);
+      await assert.rejects(docker(["network", "inspect", record.network]), /not found|No such/);
+      assert.equal(ops.list("admin").length, 0);
+      const replacement = await runtimes.ensure(context);
+      assert.notEqual((await fetchIn(replacement, "/api/runtime/ops/connection")).status, 200);
+    } finally {
+      for (const record of ops.list("admin")) await ops.revoke("admin", record.id);
+      ops.close(); await runtimes.stop(context.id, "运维测试清理", true); now = Date.now();
+    }
   });
 });

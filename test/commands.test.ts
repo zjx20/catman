@@ -59,7 +59,7 @@ test("改状态的指令一律走队列,只读/中断的才 immediate", () => {
   // /回滚 同属这一类:它会重启进程,与 immediate 的"幂等只读"约束正相反。
   // /模型 /思考 改的是**自己的偏好**而不是会话状态:幂等、不与消息投递抢先后,
   // 而且正是助手卡住时最该使得上的 —— 所以它们是 immediate,不在这份名单里。
-  const queued: string[] = ["continue", "switchSession", "newSession", "rollback", "publish"];
+  const queued: string[] = ["continue", "switchSession", "newSession", "rollback", "publish", "grantOps"];
   for (const cmd of COMMAND_TABLE) {
     assert.equal(cmd.immediate, !queued.includes(cmd.name), `${cmd.canonical} 的 immediate 不对`);
   }
