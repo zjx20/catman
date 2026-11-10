@@ -130,8 +130,7 @@ async function main(): Promise<void> {
     path: config.usersPath,
     workspaceRoot: config.workspaceDir,
   });
-  // 共享人设缺席时补一份占位:每用户 CLAUDE.md 首行的 `@../CLAUDE.md` 否则悬空。
-  // 主人格那边人手写过、不会被碰;守护人格的 workspace 是新建的,一直是空的。
+  // 只在共享指令缺席时初始化；RuntimeManager 在创建 worker 时合并共享与个人指令。
   users.ensureSharedClaudeMd(initialSharedClaudeMd(config.persona));
   const turns = new TurnTokens();
   turns.runtimeResolver = token => {
@@ -326,8 +325,7 @@ async function main(): Promise<void> {
     },
   });
 
-  // 保留期清理:启动跑一次,之后按间隔跑;删除的会话同步从状态里出清死引用。
-  // 清理范围严格来自各用户的 workspace 目录 —— 不遍历 projects/ 树。
+  // 保留期清理以 ContextStore 为范围，跳过 cron 和活跃 runtime；删除后同步清理路由死引用。
   const runCleanup = () => {
     const deleted: string[] = [];
     const active = new Set(runtimes.all().map(runtime => runtime.contextId));

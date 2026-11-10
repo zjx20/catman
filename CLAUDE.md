@@ -32,12 +32,16 @@ CATMAN_SELFCHECK=1 node dist/src/index.js
 手工使用 stdin 通道时也必须配置 worker 的 release、宿主数据路径与 mynet 网络;
 使用独立测试数据,不要直接启动已按 /data 迁移的生产数据副本。详见 README「本地开发」。
 
-⚠️ 源码工作区**没有** `node_modules`(依赖只装在制备容器里)。本地跑测试前先
-`ln -s /data/releases/current/node_modules .`;`.gitignore` 里**带斜杠与不带斜杠的两条
-都要有** —— 带斜杠只匹配目录,不匹配这条软链,漏了它会被 `git add -A` 收进仓库,
-然后制备在 `cp` 阶段撞进硬链接复用的目录,只报一句 `Permission denied`,看不出跟软链有关。
+开发机使用自己安装的依赖。可信控制服务里的源码工作区若把 `node_modules` 链接到
+release，只能用于读取，禁止 npm 写操作。worker 不挂整个 release，不要在 worker 内
+建立指向不可见 `/data/releases/current` 的依赖链接；需要独立验证时，在自己的 workspace
+中复制源码并安装依赖，或通过制备 API 运行正式测试。`.gitignore` 必须同时排除
+`node_modules/` 和 `node_modules`，防止目录或软链被提交。
 
 ## 日常维护动作
+
+下面的 Docker 命令和宿主路径用于宿主或可信控制服务。agent worker 通过固定 HTTP 接口
+请求制备、诊断与恢复，不直接操作 Docker；管理员可写的源码挂在 `/catman-src`。
 
 ```bash
 # 部署(首次三步;之后升级只走 prepare + deploy)
@@ -127,7 +131,8 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 **配置三层**:`config.ts`(env 基线)→ `settings.json`(全局,管理员改)→
 `prefs.json`(每用户,自己改)。读取时逐级回退,见「兜底优先于交叉校验」。
 
-Dashboard 与清理的扫描范围 = `listWorkspaceDirs(/data/workspace)` 算出的那组 projectDir。
+Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/context，SDK project 路径由
+该 context 的独立 cwd 派生；用户 home 不是聊天或 cron 的 cwd。
 
 ## 关键文件
 
@@ -136,25 +141,28 @@ Dashboard 与清理的扫描范围 = `listWorkspaceDirs(/data/workspace)` 算出
 
 | 文件 | 职责 |
 |---|---|
-| `src/core/identity.ts` | userKey 编解码;**单射**的工作目录名派生;内置管理员常量 |
-| `src/core/users.ts` | UserRegistry;每用户 workspace;`listWorkspaceDirs` = 清理真相源 |
-| `src/core/user-private.ts` | 每用户私有目录:**独立于 `/data` 的一棵树**,只把本人那一份挂进回合容器的 `/private` |
+| `src/core/identity.ts` | userKey 编解码、内置管理员常量与旧目录名工具 |
+| `src/core/users.ts` | UserRegistry；用户资料与租户 home，不负责 session/cron 的 cwd |
+| `src/core/execution/contexts.ts` | owner、聊天/cron context、tenantId、独立路径和 SDK 会话注册表 |
+| `src/core/execution/runtime.ts` | 精确挂载、能力身份、worker 创建/认领、闲置预警与回收 |
+| `src/core/execution/task-supervisor.ts` | 同容器独立任务管理器；进程组、显式超时、任务状态与日志 |
+| `src/core/execution/sdk-session.ts` | 保持 SDK 输入连接、后台任务跟踪、按输入 UUID 关联结果 |
+| `src/core/execution/broker.ts` | 模型、公共 MCP 和 HTTP 服务的凭据代理 |
+| `src/core/scoped-files.ts` | 限定目录的文件描述符读取，拒绝越界软链、非普通文件与超大输入 |
+| `src/dashboard/api-execution.ts` | 执行身份鉴权、延长/回收、公共能力及固定管理员操作 |
 | `src/core/admission.ts` | 准入策略(TOFU 绑定 / 本地全放行),以函数注入网关 |
 | `src/core/settings.ts` | `SETTING_SCHEMA`:全部配置项的单一真相源 + 全局运行时层 |
 | `src/core/commands.ts` | `COMMAND_TABLE`:硬指令的单一真相源 |
 | `src/core/turn-tokens.ts` | 回合级一次性令牌 + 在飞回合上下文(detached / abort / feed / done) |
-| `src/core/turn-env.ts` | agent 子进程环境的**唯一**定义(用户回合与定时任务共用) |
+| `src/core/turn-env.ts` | 回合元数据；worker 凭据与目录环境由 Agent/RuntimeManager 按身份生成 |
 | `src/core/skills.ts` | 启动时**按人格**生成 SKILL.md(按需加载,不占系统提示词) |
 | `src/core/persona.ts` | 人格自述(进 `systemPrompt.append`)、共享人设占位、管理员名单跨命名空间继承 |
-| `src/core/agent.ts` | Agent SDK 封装;preset 三件套;常开输入通道支持回合中途追加;会话容器装配 |
-| `src/core/session-container.ts` | 会话容器的参数与包装脚本(纯函数,见「内存与会话容器」) |
-| `src/core/mem-watchdog.ts` | 内存看门狗的**决策层**(纯函数,不碰 docker 不看时钟) |
-| `src/core/mem-watchdog-runner.ts` | 看门狗的**执行层**:读 cgroup、动手、落事故记录 |
+| `src/core/agent.ts` | SDK 封装、context 身份、受限环境、技能/MCP 装配与持续连接 |
 | `src/core/session.ts` | 会话状态机(纯函数 decide + 注入时钟/store;current + history) |
 | `src/core/gateway.ts` | 串联各层;**分拣节点**;追加输入;每会话串行;并发信号量;greeting |
 | `src/core/agent-trace.ts` | LLM 侧可观测性:SDK 消息 → 一行日志(纯函数,分 always/trace 两级) |
 | `src/core/attachments.ts` | 图片附件的中立表示 + 格式嗅探 + 上限(不认识渠道也不认识 SDK) |
-| `src/core/transcript.ts` | JSONL 防御式解析、检索、**workspace 范围**清理 |
+| `src/core/transcript.ts` | JSONL 防御式解析与检索；生产扫描范围由 ContextStore 提供 |
 | `src/core/file-store.ts` | 状态原子写(tmp + rename) |
 | `src/core/version.ts` | 版本戳:读 release 根目录的 VERSION;**读不到返回 undefined,绝不编** |
 | `src/core/selfcheck.ts` | SELFCHECK 模式:临时目录装配一遍 + 探一次大脑;失败分类(限流/网络/凭据/代码) |
@@ -162,12 +170,13 @@ Dashboard 与清理的扫描范围 = `listWorkspaceDirs(/data/workspace)` 算出
 | `src/core/deploy-progress.ts` | 部署里程碑契约(JSONL 追加)+ 防御式解析 |
 | `src/core/releases.ts` | release 目录的**只读**视图 + `/发布` 的 sha 前缀解析 |
 | `src/core/token-alert.ts` | Claude token 到期播报(读不到就说未知,绝不编) |
-| `src/core/notify-bin.ts` | `catman-notify`:长任务脱钩跑在独立容器里,跑完推结果 |
+| `src/core/notify-bin.ts` | `catman-notify` 入口别名，转交同容器 task-cli，不另起容器 |
 | `src/core/cron/schedule.ts` | cron 解析 + 下次触发 + 频率下限。**纯函数**,自带时区换算 |
 | `src/core/cron/validate.ts` | 入口校验。调用方是 LLM,所以未知字段一律拒收、字段名自带单位 |
 | `src/core/cron/store.ts` | 任务表 + 执行记录 + 保留策略;**认不出的任务隔离不删**(回滚安全) |
 | `src/core/cron/scheduler.ts` | tick 调度:先收尸再点火;错过只补一次;agent 任务**不等它跑完** |
-| `src/core/cron/docker.ts` | 脚本任务的执行面:detached 一次性容器;**catman 重启不打断在跑的任务** |
+| `src/core/cron/runner.ts` | 脚本任务执行接口，句柄指向任务而非任意 Docker 资源 |
+| `src/core/execution/cron-runner.ts` | 使用 owner 的固定 cron context，调用同容器任务管理器 |
 | `src/core/cron/agent-runner.ts` | agent 任务的执行面。**必须把 turn 标成 detached** —— 否则会被当成用户的前台回合,他下一条消息要等它跑完 |
 | `src/dashboard/api-cron-admin.ts` | `/api/admin/cron`:页面上那几个按钮。**只让改 enabled** —— 别的改动必须走有完整校验的那条路 |
 | `src/dashboard/ui-cron.ts` | 定时任务的两个页面(纯函数产出 HTML)。**全站视图**,与 `/api/me/cron` 的每人视角刻意不同 |
@@ -222,16 +231,44 @@ Dashboard 与清理的扫描范围 = `listWorkspaceDirs(/data/workspace)` 算出
   (后者是排查时唯一的旋钮)。读不懂就当空、绝不抛:守护人格起不来比它少一个管理员糟得多。
 - **`Options.skills` 是上下文过滤不是沙箱**:未列出的 skill 文件仍能被 Read/Bash 读到
   (SDK 类型注释原文)。所以 **SKILL.md 里绝不能出现任何令牌**,只写环境变量引用。
-- **两个 CLAUDE.md**:本文件是开发指南;运行时 agent 加载的是 `/data/workspace/CLAUDE.md`。
-  多用户下它是**共享**人设,每人目录下还有一个自己的(首行 `@../CLAUDE.md` 显式 import ——
-  不依赖「向上递归查找父目录」的隐式行为)。project settings(`.claude/settings.json`)
-  **没有**继承机制,要全局共享得放 user settings。
+- **指令分层**：本文件是开发指南。运行时的共享指令在 `<数据根>/shared/CLAUDE.md`，
+  个人偏好在租户 `home/CLAUDE.md`。控制面创建 worker 时合并两者，并单文件只读挂到
+  当前 context 的 `$CLAUDE_CONFIG_DIR/CLAUDE.md`；workspace 的 Project memory 由 CLI
+  正常发现。不要恢复失效的 `@../CLAUDE.md`，也不要为指令继承整挂数据根。
 
 ## 多租户执行上下文 v2
 
 执行实现见 `src/core/execution/`，行为和人工数据迁移步骤以 README 为准。
 控制面保存 owner/context/runtime 注册表，worker 只挂当前 work、sdk、tasks 和 owner home。禁止整挂 /data、/opt/services 或 docker.sock。容器无法启动就报错，没有本机执行降级。
-用户个人空间是 /user，默认产物写当前 cwd。每个聊天 session 与每个 cron 有独立 workspace；cron 多次执行复用其目录。
+宿主存储统一位于 `<数据根>/tenants/<tenantId>/`：
+
+```text
+tenants/<tenantId>/
+  home/                         个人持久文件、skill、配置、个人凭据
+  contexts/<contextId>/
+    work/                       当前聊天或固定 cron 的 workspace
+    sdk/                        该 context 的 SDK 状态与会话记录
+    tasks/                      后台任务状态和日志
+```
+
+旧 `catman_userdata/<旧用户目录>` 已迁入 `home/`；生产数据根为 `/mnt/usb/catman_data`。
+旧 `catman_userdata` 只保留旧副本，不再是运行时依赖。以前把私人目录独立放在数据根外，
+是为了避开整挂 `/data` 的暴露；现在隔离依据是精确挂载，物理上放在同一数据根不会
+使其他租户或控制数据自动可见。
+
+| worker 可见内容 | 权限 |
+|---|---|
+| 当前 context 的 work、sdk、tasks | 可读写；cwd 为 work |
+| owner 的 home，映射为 `/user` | 可读写；个人 skill、MCP 和个人凭据属于这里 |
+| 共享/个人指令合并后的 CLAUDE.md、公共 skill、运行时代码 | 只读 |
+| `/catman-src` | 仅主人格管理员可读写源码 |
+
+即使某个挂载目标以 `/data/tenants/...` 开头，也只挂入了对应子目录；其他 context、
+其他用户、整棵 `/data` 以及 docker.sock 都不在 worker 中。主控制服务和信使需要访问
+控制数据，救援控制服务只读主数据并写自己的命名空间；这些权限不传给 agent worker。
+
+默认产物写当前 cwd。个人持久文件写 `/user`，跨上下文的最终产物写 `/user/artifacts`。
+每个聊天 session 与每个 cron 有独立 workspace；同一个 cron 的多次执行复用其目录。
 公共人格和 skill 只读装配；个人 skill 与 MCP 在 /user。原始公共凭据仅由控制面 broker 持有。管理员权限由 API 现查，不下发原始管理员 token。
 后台脚本使用 `catman-task run --timeout <秒> -- <命令>`，在当前容器里由独立任务管理进程执行。任务有硬超时，SDK 后台任务按事件追踪；只要 SDK 有任务就保留其 CLI。SDK 结果按输入 UUID 关联。
 未知后台进程由执行环境闲置回收兜底，提前十分钟通知，可 /延长 或 /回收。CLI/容器、聊天路由、数据保留分别管理。容器由 Docker cgroup 限制内存，agent 与后台任务共享限额。
@@ -288,24 +325,21 @@ Dashboard 与清理的扫描范围 = `listWorkspaceDirs(/data/workspace)` 算出
   **后台回合绝不能 `record()`** —— 那会把用户刚切过去的会话顶掉,而他正在跟它说话。
   `archiveTurn` 必须能"插入"而不只是"更新":新会话的第一轮被切走时,sessionId 要等
   回合跑完才存在。
-  代价说清楚:**前台与后台回合共享同一个 cwd**(每用户一个),等于用户自己开了两个终端。
-  每会话一个 cwd 更糟(切换会话就换了目录,文件不通)。`/取消` 只中断前台。
+  每个 session 使用自己的 cwd；切换到别的会话不会挂入原会话的文件。需要跨会话
+  使用的内容显式放到 owner 的 `/user`。`/取消` 中断前台 CLI；已登记的独立后台任务
+  由任务管理器继续按其期限运行。
 - **同一会话绝不并发 resume**(`gateway.deliverInput`)。串行的粒度是**每会话**,不是每用户。
   保证它的是两条:分拣节点串行且是唯一起回合的地方;前台回合还在时,新输入要么追加进去,
   要么**等 `turn.done` 再来一次**。追加失败就地另起一轮是错的,两个回合 resume 同一个
   sessionId 会把上下文撕坏 —— 有单测盯着 `peakInFlight`。
-- **清理严格限定在本程序自己建的 workspace 目录**(`transcript.ts` 全部函数都要 `projectDir`
-  参数)。**绝不遍历整个 projects/ 树** —— 否则 CLAUDE_CONFIG_DIR 指向共享 ~/.claude 时会
-  误删无关的 Claude Code 历史(有专门单测守护;曾真实踩过)。那组 projectDir 必须由
-  `listWorkspaceDirs(workspaceDir)` 算出,**不要改成 readdir(projects/)**。
-- **清理的真相源是 workspace 目录,不是 users.json / state.json**:后两者会因 history
-  被挤出/删账号丢条目,而 JSONL 还在磁盘上,只按它们清理会造成永久堆积。
-  反过来,清理删掉 JSONL 后要 `sessions.dropSessionIds()` 出清死引用,
-  否则 `/切换会话` 会把用户领到一段 resume 必然失败的会话上。
-- **`userDirName()` 必须保持单射**(可读前缀 + userKey 全文哈希后缀)。只用归一化后的
-  可读部分会让 `x/y` 与 `x-y` 撞到同一个目录 —— 两个用户共用 cwd,隔离直接失效。
-- **工作目录全路径必须远短于 200 字符**:超过后 SDK 会改用「截断 + djb2 哈希」编码 project
-  目录,与 `encodeProjectDir()` 的朴素替换分叉,会话就此读不到也删不掉。`ensureWorkspace()` 会拦。
+- **生产清理以 ContextStore 为真相源**：只处理已注册、超过保留期且没有活跃 runtime
+  的聊天 context；cron context 跟随任务生命周期。删除时清理整个 context 的 work、sdk、
+  tasks，并用 `sessions.dropSessionIds()` 移除路由死引用。不得遍历共享 Claude projects
+  目录或删除 owner home、别的应用的会话、未确认归属的迁移归档。
+- **用户目录使用 `tenantId(userKey)`**：从完整 userKey 稳定派生 32 位十六进制租户 ID，
+  不使用可读名称截断来分配存储。contextId 是独立生成的 `c_` 加 24 位十六进制字符。
+- **cwd 必须短于 SDK project 编码阈值**：`ContextStore.ensure()` 在 180 字符前拦截，
+  为 SDK 的 200 字符阈值保留余量；更改布局时同步验证编码、resume、检索和清理。
 
 ## 消息投递与聚合
 
@@ -470,11 +504,10 @@ Dashboard 与清理的扫描范围 = `listWorkspaceDirs(/data/workspace)` 算出
   白名单加回来时用户当初的选择要能自动恢复。静默改盘会把意图永久抹掉。
 - **加配置项只改 `SETTING_SCHEMA`**,加硬指令只改 `COMMAND_TABLE`。校验、`/api/*` 的
   schema 字段、两个 skill 的正文、帮助文案会自动跟上。
-- **数据向前兼容,不做迁移**:**日常升级与回滚都不动 `/data`**,回滚只换 `releases/current`
-  的指向。所以改动必须**能读盘上现有格式**,而且因为观察期内随时可能回滚,
-  **旧版本要能读新版本写的**。兜底靠既有的防御式解析(`parseUserKey()` 非法返回 null、
-  `SessionManager` 加载时丢弃、prefs 回落不改盘、`settings.effective()` 永不抛)——
-  那是解析器本就该有的防御,不是迁移分支。跨越不兼容格式才是清空 `./data` 重新扫码。
+- **数据升级必须区分格式版本**：同一布局内的日常升级保留兼容读取；执行上下文 v2
+  是显式、不兼容迁移，启动必须校验 `execution/schema.json` 及 containerRoot。由管理员
+  agent 在停机和完整备份后迁移并核验，不能删数据、清状态或重新扫码来绕过检查。
+  v1 回退必须连同数据、定制 compose 与旧指针一起恢复；不能仅切换 release。
 
 ## dashboard 与 HTTP
 
@@ -671,7 +704,7 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(只对**主人格
   `cp -al` 硬链接复用上一个 release 的 node_modules —— 若那棵树里没有 tsc/tsx,
   **最常见的那条路径必然失败**;补装又会就地写文件,透过硬链接污染上一个(可能正是
   stable)release 的字节。配套纪律:**复用之后对那棵树零 npm 写操作**。
-- **源码工作区的 `node_modules` 是指向 `releases/current` 的软链** ——
+- **源码工作区若用 `node_modules` 软链指向 `releases/current`，依赖就不是工作区私有的** ——
   也就是正在跑的那个 release。所以在 `/data/src/catman` 里跑任何 npm 写操作
   (`npm install`、`npm update`、顺手补一个包)都会**直接改到线上正在执行的字节**,
   上一条那句"零 npm 写操作"在这里同样成立,而且更隐蔽:你以为在改自己的工作区,
@@ -726,16 +759,12 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(只对**主人格
   被自我进化改写的那棵树里,agent 顺手改一行 case 就能把 Tier 3 报成 Tier 1 ——
   而人正是靠这份报告决定还欠什么(重新 bless / 重建镜像 / recreate 容器)。
   分级**不拦任何事**也拦不住;这里做的是**说出来**,免得人以为"部署成功 = 我要的都生效了"。
-- **部署密钥是两把不是一把**(`lib.sh` 的 `fetch_key_path` / `push_key_path`):ssh 对私钥有
-  属主检查(必须归当前用户或 root 且 0600),所以**一把钥匙只能服务一个 uid** —— 这是硬约束,
-  不是设计选择。`/data/ssh/fetch/id_ed25519`(10001,**只读** deploy key)给 agent 拉代码;
-  `/data/ssh/id_ed25519`(10002,可写)给 deployer 推远端。
-  **agent 的 pull 是主路径,不能省**:曾经把密钥整个归 10002,结果 agent 一行 `git pull`
-  都跑不了,而软路由宿主上连 git 都没有。「agent 改不了远端历史」这道闸因此从**文件属主**
-  上移到 **GitHub 侧的只读 deploy key**,而后者更强:属主挡不住挂了 docker.sock 的助手,
-  只读密钥挡得住。agent 那把写进**仓库配置**(`core.sshCommand`)而不是容器 env ——
-  env 要改 compose(Tier 3,每次都要人)。**`init.sh` 绝不 chown 密钥**:属主就是"这把给谁用"
-  的唯一声明。
+- **部署密钥保留两个槽位**(`fetch_key_path` / `push_key_path`)：
+  `/data/ssh/fetch/id_ed25519`(uid 10001、远端只读)用于可信控制服务拉取源码；
+  `/data/ssh/id_ed25519`(uid 10002、远端可写)用于部署器推送。两者均不挂给 worker。
+  宿主缺少 Git 时通过可信工具容器完成拉取，不要恢复给 agent 挂 Docker socket 的旧做法。
+  管理员 worker 在 `/catman-src` 改代码、提交，再请求制备 API；仓库配置里的密钥路径
+  不代表 worker 能读取该密钥。`init.sh` 不随意 chown 密钥，原属主决定使用槽位。
 - **远端只由 deployer 在部署成功、stable 前移之后推进**(`lib.sh` 的 `push_upstream`):
   GitHub 上出现的永远是真正上线过并活下来的提交(推得更早会让远端记录一堆从未运行过的
   东西,而人恰恰靠远端判断线上是什么)。推失败**只记日志,绝不反过来判部署失败**;
@@ -755,8 +784,8 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(只对**主人格
   的属组是**宿主**的事实(OpenWrt 多为 0,Debian 多为 999),镜像里无从得知。漏了的症状是
   `/回滚` 起了容器却什么都没干,日志里只有一句 permission denied。
 - **固化环境由 lib.sh 自己读**(`load_blessed_env`):谁 source 了 lib.sh 谁就自动拿到
-  `/data/deploy/env` 里的宿主路径、镜像名、docker.sock 属组。这是 agent 能直接跑
-  `prepare.sh` 的前提。**已经有值的一律不覆盖** —— 命令行上的显式覆盖是排查时唯一的旋钮。
+  `/data/deploy/env` 里的宿主路径、镜像名、docker.sock 属组。这是可信控制服务运行
+  `prepare.sh` 的前提；worker 通过固定 API 请求制备。**已经有值的一律不覆盖** —— 命令行上的显式覆盖是排查时唯一的旋钮。
 - **bless 换文件必须换 inode**(用 `install` 而不是 `cp`):bash 边读边执行,`cp` 保留目标
   inode、原地覆写字节,会让正在跑的脚本从中间读到新内容 —— 而"正在跑的"最可能是一个处在
   30 分钟观察期里的 deployer。`install` 先 unlink 再新建,老 inode 活到那个进程读完。

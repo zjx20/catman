@@ -9,8 +9,7 @@ import { canonicalOf } from "./commands.js";
  * 真机上踩到的:管理员发 `${/救援}` 切到守护人格,它张口就说"我现在跟你对话的就是
  * 主人格本身"。它没说谎 —— 三处身份来源当时全是人格无关的:preset 系统提示词两边
  * 一模一样、skill 是同一套、而**人设 CLAUDE.md 在它的命名空间下压根不存在**
- * (守护人格的 workspace 在 `/data/rescue/workspace`,人手写的那份共享人设在主
- * `/data/workspace`,而主 /data 对它是只读挂载)。于是它对"我是谁"的全部线索,
+ * (当时守护人格与主人格使用不同的 workspace，人设没有正确装配)。于是它对"我是谁"的全部线索,
  * 只剩 `catman-settings` skill 正文里那句"你跑在 catman 里"。
  *
  * 载体只能是系统提示词,三个候选各自的问题:
@@ -29,8 +28,7 @@ import { canonicalOf } from "./commands.js";
 /**
  * 拼一段给 SDK `systemPrompt.append` 的人格简介。两个人格都有 —— 见文件头。
  *
- * `memoryLimit` 给了就追加一段内存说明。**只在回合真的跑在受限容器里时才给** ——
- * 会话容器没开启时说"你有 700m 上限"是假话,而大脑没法验证它,只会白白畏手畏脚。
+ * `memoryLimit` 给了就追加当前 worker 的内存说明；隔离自检探针不传该值。
  */
 export function personaBriefing(persona: Persona, memoryLimit?: string): string {
   const base = persona === "rescue" ? RESCUE_BRIEFING : PRIMARY_BRIEFING;
@@ -142,9 +140,8 @@ export function adminBaseline(
 /**
  * 共享人设文件(`<workspaceRoot>/CLAUDE.md`)不存在时写入的初始内容。
  *
- * 每用户的 CLAUDE.md 首行是 `@../CLAUDE.md`,共享那份缺席时这个 import 悬空 ——
- * 主人格那边不会发生(人手写过),而守护人格的 workspace 是代码新建的,
- * 一直是空的。写一份占位让 import 有着落,顺便给人一个改人格风格的地方。
+ * 控制面为缺少 shared/CLAUDE.md 的人格提供初始指令。
+ * RuntimeManager 在创建 worker 时合并共享与个人指令，并只读挂到该 context 的 SDK 配置目录。
  *
  * **不覆盖已有文件**:它是人手维护的东西,启动时覆盖等于每次重启抹掉一次人设。
  * 与 skill 那种"每次启动幂等覆盖"刻意相反 —— skill 的真相源是代码,这个不是。
@@ -154,17 +151,19 @@ export function initialSharedClaudeMd(persona: Persona): string {
     return `# 守护人格的共享人设
 
 你是 catman 的守护人格。身份与硬性约束由系统提示词给出(改这个文件盖不掉它们),
-这里只写风格偏好。
+这里记录共享偏好和执行环境的使用说明。
 
 - 说话直接:先说结论(出了什么事 / 要不要退版本),再给证据。
 - 人来找你的时候多半正着急,别铺垫。
 - 贴日志、贴命令一律用代码围栏包起来 —— 聊天客户端按 markdown 渲染,
   裸贴会把几十行连成一段,日志里的星号还会变成强调。
+${EXECUTION_STORAGE_INSTRUCTIONS}
 `;
   }
   return `# 共享人设
 
 这份共享指令由管理员维护，运行环境按用户与上下文只读装配。
+${EXECUTION_STORAGE_INSTRUCTIONS}
 
 ## 文件与执行上下文
 
@@ -190,3 +189,22 @@ export function initialSharedClaudeMd(persona: Persona): string {
 采用流式处理和限制输出条数。后台任务共享当前容器内存，不提供额外的资源额度。
 `;
 }
+
+const EXECUTION_STORAGE_INSTRUCTIONS = `
+## 存储与挂载
+
+旧版独立的 catman_userdata 已迁入统一数据根的 tenants/<tenantId>/home；聊天与 cron 各自的数据在 tenants/<tenantId>/contexts/<contextId>/。宿主上合并存储不等于 worker 能访问整个数据根。
+
+| worker 中可见的位置 | 权限与用途 |
+|---|---|
+| 当前 cwd / CATMAN_CONTEXT_DIR | 当前聊天或当前 cron 的 workspace，可读写；默认产物写这里 |
+| /user | 仅 owner 的持久 home，可读写；个人 skill、配置与个人凭据放这里 |
+| CLAUDE_CONFIG_DIR | 仅当前 context 的 SDK 状态，可读写；装配的 CLAUDE.md 和公共 skill 只读 |
+| 当前 context 的 tasks 目录 | 后台任务状态和日志，可读写；由任务管理器维护 |
+| /runtime/bin/skills 与运行时代码 | 公共 skill、共享指令投影和运行时代码，只读 |
+| /catman-src | 仅主人格管理员获得的源码挂载，可读写 |
+
+worker 不整挂 /data、/opt/services、/mnt/usb 或 docker.sock，也看不到其他用户、其他聊天或其他 cron 的目录。路径以 /data 开头只说明这个具体子目录被挂入，不表示整个 /data 可见。只有可信控制服务访问完整控制数据并操作 Docker。
+跨上下文共享的最终产物放 /user/artifacts；个人 skill 放 /user/skills，个人 MCP 放 /user/mcp.json。共享模型和公共服务的原始凭据由控制面代理，个人凭据仍属于本用户的 /user。
+共享指令与 /user/CLAUDE.md 由控制面合并，新建 worker 时生成只读投影；不依赖 @../CLAUDE.md 导入。
+`;

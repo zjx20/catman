@@ -13,7 +13,7 @@ import { encodeProjectDir } from "./transcript.js";
 /** User registry and persistent personal homes. Session/cron ownership lives in ContextStore. */
 
 export interface UserRecord {
-  /** 工作目录名(workspaceRoot 下的一级子目录)。 */
+  /** tenantId，即租户根下的一级目录名；个人 home 位于其中。 */
   dirName: string;
   channel: string;
   accountId: string;
@@ -33,7 +33,7 @@ const DISPLAY_NAME_MAX = 64;
 
 export type UserMap = Record<string, UserRecord>;
 
-/** 新建用户 workspace 时写入的 CLAUDE.md 初始内容。 */
+/** 新建用户 home 时写入的 CLAUDE.md 初始内容。 */
 function initialUserClaudeMd(userKey: string): string {
   return `# 个人偏好
 
@@ -46,7 +46,7 @@ function initialUserClaudeMd(userKey: string): string {
 export interface UserRegistryOptions {
   /** users.json 路径。 */
   path: string;
-  /** 工作目录根,即各用户 cwd 的父目录。 */
+  /** 租户目录根；各用户的持久 home 与 contexts 位于其中。 */
   workspaceRoot: string;
   /** 时钟,默认 Date.now;测试可注入。 */
   now?: () => number;
@@ -68,10 +68,8 @@ export class UserRegistry {
   /**
    * 共享人设文件不存在就写一份。**已存在的绝不覆盖。**
    *
-   * 每用户的 CLAUDE.md 首行是 `@../CLAUDE.md`,共享那份缺席时这个 import 悬空。
-   * 主人格那边不会发生(人手写过),而守护人格的 workspace 是代码新建的、一直是空的 ——
-   * 真机上它因此连主人格那份人设都没有,只能靠 skill 正文里一句"你跑在 catman 里"
-   * 来猜自己是谁。
+   * RuntimeManager 把共享指令与个人 home/CLAUDE.md 合并，再只读装配到 context 的 SDK 配置目录。
+   * 这里不使用跨目录 import，也不依赖宿主目录的向上继承。
    *
    * 与 skill 那种「每次启动幂等覆盖」刻意相反:skill 的真相源是代码,这个是人。
    * 启动时覆盖等于每次重启抹掉一次人设。
@@ -83,13 +81,13 @@ export class UserRegistry {
     if (!existsSync(path)) writeFileSync(path, body, "utf8");
   }
 
-  /** 某用户的工作目录(cwd)绝对路径。不保证目录已存在。 */
+  /** 某用户持久 home 的绝对路径，不是聊天/cron 的 cwd。不保证目录已存在。 */
   workspaceDirOf(userKey: string): string {
     return join(this.workspaceRoot, tenantId(userKey), "home");
   }
 
   /**
-   * 确保该用户的工作目录存在并已注册,返回 cwd。
+   * 确保该用户的持久 home 存在并已注册，返回 home 路径。
    * 幂等:已存在的目录与 CLAUDE.md 都不覆盖(用户可能已经改过个人偏好)。
    */
   ensureWorkspace(userKey: string): string {
@@ -198,15 +196,8 @@ function assertPathFitsSdkLimit(dir: string): void {
 }
 
 /**
- * 扫描 workspaceRoot 下的一级子目录,返回各用户的目录名与对应的 project 目录名。
- *
- * **这是会话清理的真相源**,而不是 users.json 或 state.json:后两者会因为
- * history 被挤出/删账号而失去条目,但 JSONL 还躺在磁盘上,只按它们清理会造成永久堆积。
- * workspace 目录是本程序自己创建的、与用户一一对应且完备的。
- *
- * 同样重要的是它**只读自己的 workspaceRoot,完全不去遍历 projects/ 树** ——
- * 满足「绝不扫描整个 projects/」这条不变量(CLAUDE_CONFIG_DIR 可能指向共享的
- * ~/.claude,遍历它会误删无关的 Claude Code 历史)。
+ * 辅助列出租户 home；不遍历外部 Claude projects 目录。
+ * home 并非 session/cron cwd，生产会话路径、检索和清理范围必须来自 ContextStore。
  */
 export interface WorkspaceDirInfo {
   dirName: string;
