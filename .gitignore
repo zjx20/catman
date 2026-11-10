@@ -7,3 +7,5 @@ dist/
 data/
 *.log
 .env
+
+/.migration-backups/

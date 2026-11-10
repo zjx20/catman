@@ -16,9 +16,9 @@
       "integrity": "sha256:e8a39ceabdd2440d165b8228b53bab42c84aefc4dc67cf20f3bf2c811bf43e98"
     },
     "ghcr.io/zjx20/devcontainer-features/codex-yolo:1": {
-      "version": "1.0.1",
-      "resolved": "ghcr.io/zjx20/devcontainer-features/codex-yolo@sha256:38c0103ed14b8f02e8751fda8adec357aece3e314521fd33ed957ef45ba0506b",
-      "integrity": "sha256:38c0103ed14b8f02e8751fda8adec357aece3e314521fd33ed957ef45ba0506b"
+      "version": "1.0.2",
+      "resolved": "ghcr.io/zjx20/devcontainer-features/codex-yolo@sha256:0397c05550392a2e6e36c4d4e15eec2d45cf78021a077aff6c6be7964a95f4e1",
+      "integrity": "sha256:0397c05550392a2e6e36c4d4e15eec2d45cf78021a077aff6c6be7964a95f4e1"
     },
     "ghcr.io/zjx20/devcontainer-features/google-antigravity:1": {
       "version": "1.0.1",

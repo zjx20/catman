@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { ContextStore, hostPath } from "../execution/contexts.js";
 import { readJsonFile, writeJsonFileAtomic } from "../file-store.js";
 import type { CronJob, CronRun, RunStatus } from "./types.js";
 
@@ -43,6 +44,8 @@ interface JobsFile {
 }
 
 export interface CronStoreOptions {
+  readonly contexts?: ContextStore;
+  readonly hostDataRoot?: string;
   /** `<dataDir>/cron`。 */
   readonly dir: string;
   /**
@@ -58,6 +61,8 @@ export interface CronStoreOptions {
 }
 
 export class CronStore {
+  private readonly contexts?: ContextStore;
+  private readonly hostDataRoot?: string;
   private readonly dir: string;
   private readonly hostDir: string | undefined;
   private readonly jobsPath: string;
@@ -67,6 +72,8 @@ export class CronStore {
   private foreign: unknown[] = [];
 
   constructor(opts: CronStoreOptions) {
+    this.contexts = opts.contexts;
+    this.hostDataRoot = opts.hostDataRoot;
     this.dir = opts.dir;
     this.hostDir = opts.hostDir;
     this.jobsPath = join(opts.dir, "jobs.json");
@@ -126,11 +133,14 @@ export class CronStore {
   remove(id: string): boolean {
     const i = this.jobs.findIndex((j) => j.id === id);
     if (i < 0) return false;
+    const work = this.workDir(id);
+    const context = this.contexts?.all(this.jobs[i]!.userKey).find(c => c.jobId === id);
     this.jobs.splice(i, 1);
     this.save();
     // 记录跟着任务一起走。留着的话它们再也没有入口,只是在磁盘上慢慢堆着。
     rmSync(this.runsDir(id), { recursive: true, force: true });
-    rmSync(this.workDir(id), { recursive: true, force: true });
+    if (context) this.contexts!.remove(context.id);
+    else rmSync(work, { recursive: true, force: true });
     return true;
   }
 
@@ -146,6 +156,10 @@ export class CronStore {
 
   /** 任务的工作目录(容器里的 /work)。建出来并**归自己所有** —— 容器以同一个 uid 跑。 */
   workDir(jobId: string): string {
+    if (this.contexts) {
+      const job = this.get(jobId); if (!job) throw new Error("任务不存在");
+      return this.contexts.paths(this.contexts.cron(job.userKey, jobId)).work;
+    }
     return join(this.dir, "work", jobId);
   }
 
@@ -162,6 +176,7 @@ export class CronStore {
    * 空目录然后挂上 —— 任务照跑,但读写的是个谁也找不到的地方,宿主上还留着垃圾。
    */
   hostWorkDir(jobId: string): string | undefined {
+    if (this.contexts) return this.hostDataRoot ? hostPath(this.contexts.root, this.hostDataRoot, this.workDir(jobId)) : undefined;
     return this.hostDir ? join(this.hostDir, "work", jobId) : undefined;
   }
 

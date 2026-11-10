@@ -12,7 +12,7 @@ import {
 } from "../src/core/cron/scheduler.js";
 import { NoticeSpool } from "../src/core/cron/notices.js";
 import type { AgentTaskRunner } from "../src/core/cron/agent-runner.js";
-import type { LaunchSpec, PollResult, ScriptRunner } from "../src/core/cron/docker.js";
+import type { LaunchSpec, PollResult, ScriptRunner } from "../src/core/cron/runner.js";
 import type { CronJob } from "../src/core/cron/types.js";
 
 const dirs: string[] = [];
@@ -116,13 +116,9 @@ function harness(runtime: Partial<CronRuntime> = {}): Harness {
       schedule: { kind: "every", ms: 3600_000 },
       task: {
         kind: "script",
-        image: "catman-env:1",
         cmd: ["bash", "-lc", "df -h /"],
         env: { FOO: "bar" },
-        network: "none",
-        mounts: [],
-        limits: { memory: "512m", cpus: 0.5, pids: 128 },
-      },
+        },
       timeoutMs: 600_000,
       overlap: "skip",
       notify: { start: false, end: true, onlyFailure: false },
@@ -161,11 +157,11 @@ test("到点就起容器,而且隔离参数一个不少", async () => {
 
   assert.equal(h.runner.launched.length, 1);
   const spec = h.runner.launched[0]!;
-  assert.equal(spec.network, "none");
-  assert.deepEqual(spec.limits, { memory: "512m", cpus: 0.5, pids: 128 });
+  assert.equal(spec.userKey, "wechat:a:u1");
+  assert.equal(spec.timeoutMs, 600_000);
   // 工作目录必须换算成**宿主**路径 —— 传容器内路径进去,dockerd 会静默建个空目录。
-  assert.equal(spec.hostWorkDir, "/mnt/usb/catman_data/cron/work/j_1");
-  assert.match(spec.container, /^catman-cron-j_1-/);
+
+  assert.match(spec.container, /^cron-j_1-/);
   // 记录先落盘再起容器:反过来会留下没人认领的容器。
   assert.equal(h.store.listRuns("j_1")[0]?.status, "running");
   // 排期已经推到下一档了,不会同一档点两次火。
@@ -415,7 +411,7 @@ test("没配宿主 /data 路径:记 error,而不是挂一个永远收不了的 r
   store.put({
     id: "j_1", userKey: "wechat:a:u1", name: "x", enabled: true,
     schedule: { kind: "every", ms: 3600_000 },
-    task: { kind: "script", image: "catman-env:1", cmd: ["ls"], env: {}, network: "none", mounts: [], limits: { memory: "512m", cpus: 0.5, pids: 128 } },
+    task: { kind: "script", cmd: ["ls"], env: {}, },
     timeoutMs: 600_000, overlap: "skip", notify: { start: false, end: true, onlyFailure: false },
     keepRuns: 20, createdAt: clock, updatedAt: clock, nextAt: clock - 1, failStreak: 0,
   });
@@ -484,7 +480,7 @@ test("tick 不会因为通知抛错就死掉", async () => {
   store.put({
     id: "j_1", userKey: "wechat:a:u1", name: "x", enabled: true,
     schedule: { kind: "every", ms: 3600_000 },
-    task: { kind: "script", image: "i", cmd: ["ls"], env: {}, network: "none", mounts: [], limits: { memory: "512m", cpus: 0.5, pids: 128 } },
+    task: { kind: "script", cmd: ["ls"], env: {}, },
     timeoutMs: 600_000, overlap: "skip", notify: { start: true, end: true, onlyFailure: false },
     keepRuns: 20, createdAt: clock, updatedAt: clock, nextAt: clock - 1, failStreak: 0,
   });

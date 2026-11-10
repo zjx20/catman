@@ -21,7 +21,6 @@ function ctx(over: Partial<ValidateContext> = {}): ValidateContext {
     defaultTz: "Asia/Shanghai",
     minIntervalMs: 5 * 60_000,
     defaultKeepRuns: 20,
-    mountAllowlist: ["/opt/services"],
     hostDataDir: "/mnt/usb/catman_data",
     modelAllowlist: ["opus", "sonnet", "haiku"],
     now: NOW,
@@ -60,10 +59,6 @@ test("最小输入:默认值全部填满,而且是保守的那一端", () => {
   assert.equal(v.keepRuns, 20);
   assert.deepEqual(v.notify, { start: false, end: true, onlyFailure: false });
   assert.equal(v.task.kind, "script");
-  assert.equal(script(v.task).image, "catman-env:1");
-  assert.equal(script(v.task).network, "none", "默认必须断网");
-  assert.deepEqual(script(v.task).mounts, [], "默认不挂任何宿主目录");
-  assert.deepEqual(script(v.task).limits, { memory: "512m", cpus: 0.5, pids: 128 });
   assert.equal(v.nextAt, Date.parse("2026-08-14T08:00:00+08:00"));
 });
 
@@ -130,29 +125,10 @@ test("name 的边界", () => {
 
 // ── 隔离相关的闸门 ────────────────────────────────────────────────
 
-test("挂载必须落在白名单里,而且默认只读", () => {
-  const mount = (m: unknown) => input({ task: { cmd: ["ls"], mounts: [m] } });
-  const v = validateJobInput(mount({ host: "/opt/services/phonicsfun", at: "/svc" }), ctx());
-  assert.deepEqual(script(v.task).mounts[0], { host: "/opt/services/phonicsfun", at: "/svc", ro: true });
-
-  rejects(mount({ host: "/etc", at: "/etc2" }), /不在允许的范围内/);
-  // 前缀比较要按路径段,不能被 /opt/services-evil 这种蒙混过去
-  rejects(mount({ host: "/opt/services-evil", at: "/x" }), /不在允许的范围内/);
-  rejects(mount({ host: "/opt/services/../../etc", at: "/x" }), /不能含/);
-  rejects(mount({ host: "opt/services", at: "/x" }), /绝对路径/);
-  rejects(mount({ host: "/opt/services", at: "relative" }), /绝对路径/);
-  rejects(mount({ host: "/opt/services", at: "/work/sub" }), /不能占用 \/work/);
-  rejects(mount({ host: "/opt/services", at: "/x" }), /不允许任务挂载/, ctx({ mountAllowlist: [] }));
-});
-
-test("资源上限有量程,写错的值不会被悄悄夹到边界", () => {
-  const limits = (l: unknown) => input({ task: { cmd: ["ls"], limits: l } });
-  rejects(limits({ memory: "512" }), /形如 "512m"/);
-  rejects(limits({ memory: "16g" }), /应在 32m-4096m/);
-  rejects(limits({ cpus: 8 }), /应在 0.1-2 之间/);
-  rejects(limits({ pids: 100000 }), /应在 16-512 之间/);
-  const v = validateJobInput(limits({ memory: "1g", cpus: 1, pids: 256 }), ctx());
-  assert.deepEqual(script(v.task).limits, { memory: "1g", cpus: 1, pids: 256 });
+test("脚本任务不能选择宿主挂载、镜像、网络或资源参数", () => {
+  for (const field of ["mounts", "image", "network", "limits"]) {
+    rejects(input({ task: { cmd: ["true"], [field]: field === "mounts" ? [{ host: "/opt/services/catman/userdata", at: "/all-users", ro: false }] : "custom" } }), /不认识的字段/);
+  }
 });
 
 test("没配宿主 /data 路径时,脚本任务在创建这一步就被拒", () => {
@@ -160,8 +136,7 @@ test("没配宿主 /data 路径时,脚本任务在创建这一步就被拒", () 
 });
 
 test("network 与 env 的取值", () => {
-  assert.equal(script(validateJobInput(input({ task: { cmd: ["ls"], network: "mynet" } }), ctx()).task).network, "mynet");
-  rejects(input({ task: { cmd: ["ls"], network: "host" } }), /只能是 none \/ mynet/);
+  rejects(input({ task: { cmd: ["ls"], network: "host" } }), /不认识的字段/);
   rejects(input({ task: { cmd: ["ls"], env: { "BAD-KEY": "v" } } }), /不是合法环境变量名/);
   rejects(input({ task: { cmd: ["ls"], env: { OK: 1 } } }), /必须是字符串/);
 });

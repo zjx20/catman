@@ -1,3 +1,4 @@
+import { tenantId } from "../src/core/execution/contexts.js";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
@@ -18,14 +19,14 @@ function setup() {
   return { root, workspaceRoot, registry, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-test("ensureWorkspace 建目录并写入引入共享人设的 CLAUDE.md", () => {
+test("ensureWorkspace 创建个人 home，共享人设由运行环境装配", () => {
   const { workspaceRoot, registry, cleanup } = setup();
   try {
     const dir = registry.ensureWorkspace("wechat:acct:u1");
-    assert.equal(dir, join(workspaceRoot, userDirName("wechat:acct:u1")));
+    assert.equal(dir, join(workspaceRoot, tenantId("wechat:acct:u1"), "home"));
     const md = readFileSync(join(dir, "CLAUDE.md"), "utf8");
     // 共享人设靠显式 import 引入,不依赖向上递归查找。
-    assert.match(md, /@\.\.\/CLAUDE\.md/);
+    assert.doesNotMatch(md, /@\.\.\/CLAUDE\.md/);
     assert.match(md, /wechat:acct:u1/);
   } finally {
     cleanup();
@@ -64,7 +65,7 @@ test("注册表持久化并可反查 dirName → userKey", () => {
     const reloaded = new UserRegistry({ path: join(root, "users.json"), workspaceRoot });
     const snap = reloaded.snapshot();
     assert.ok(snap["wechat:acct:u1"]);
-    assert.equal(reloaded.userKeyOfDir(userDirName("wechat:acct:u1")), "wechat:acct:u1");
+    assert.equal(reloaded.userKeyOfDir(tenantId("wechat:acct:u1")), "wechat:acct:u1");
     assert.equal(reloaded.userKeyOfDir("不存在的目录"), undefined);
   } finally {
     cleanup();
@@ -110,7 +111,7 @@ test("listWorkspaceDirs 忽略共享 CLAUDE.md 与非本程序生成的目录", 
 
     const dirs = listWorkspaceDirs(workspaceRoot);
     assert.equal(dirs.length, 1);
-    assert.equal(dirs[0]!.dirName, userDirName("wechat:acct:u1"));
+    assert.equal(dirs[0]!.dirName, tenantId("wechat:acct:u1"));
   } finally {
     cleanup();
   }

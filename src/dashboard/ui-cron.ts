@@ -79,17 +79,8 @@ function taskLine(job: CronJob): string {
  * 危险标记。管理员一眼要看见的是「这台机器上有没有哪个定时任务能碰到宿主」——
  * 而那正是出事时最先要查的东西。
  */
-function dangerTags(job: CronJob): string {
-  if (job.task.kind !== "script") return "";
-  const tags: string[] = [];
-  const rw = job.task.mounts.filter((m) => !m.ro);
-  if (rw.length) {
-    tags.push(`<span class="tag bad">可写挂载 ${escapeHtml(rw.map((m) => m.host).join("、"))}</span>`);
-  }
-  const ro = job.task.mounts.filter((m) => m.ro);
-  if (ro.length) tags.push(`<span class="tag">只读挂载 ${ro.length} 条</span>`);
-  if (job.task.network !== "none") tags.push(`<span class="tag bad">联网 ${job.task.network}</span>`);
-  return tags.join(" ");
+function dangerTags(_job: CronJob): string {
+  return '<span class="tag">owner 执行上下文 · 独立 workspace</span>';
 }
 
 export function renderCronList(data: CronListPageData): string {
@@ -139,16 +130,7 @@ export function renderCronDetail(data: CronDetailPageData): string {
       ? `<pre>${escapeHtml(j.task.prompt)}</pre>
          <div class="meta">会话 ${j.task.session === "chain" ? "续上一次(chain)" : "每次干净起步(fresh)"} · 最多 ${j.task.maxTurns} 轮 · 模型 ${escapeHtml(j.task.model ?? "(跟用户偏好)")}</div>`
       : `<pre>${escapeHtml(j.task.cmd.join(" "))}</pre>
-         <div class="meta">镜像 ${escapeHtml(j.task.image)} · 网络 ${escapeHtml(j.task.network)} · ${escapeHtml(
-           j.task.limits.memory,
-         )} / ${j.task.limits.cpus} 核 / ${j.task.limits.pids} pid</div>
-         ${
-           j.task.mounts.length
-             ? `<div class="meta">挂载 ${j.task.mounts
-                 .map((m) => escapeHtml(`${m.host} → ${m.at}${m.ro ? "(只读)" : "(可写)"}`))
-                 .join("、")}</div>`
-             : ""
-         }`;
+         <div class="meta">使用归属用户的配置和该任务的持久 workspace；执行超时 ${Math.round(j.timeoutMs / 60_000)} 分钟</div>`;
 
   const runs = data.runs.length
     ? data.runs

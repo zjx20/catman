@@ -1,15 +1,15 @@
 # CLAUDE.md
 
 面向在本仓库开发 catman 的 Claude Code / 开发者。运行时的助手人设不在这里,而在
-`/data/workspace/CLAUDE.md`(数据卷里,由运行中的 agent 自己加载)。
+`/data/shared/CLAUDE.md`(控制面为各执行上下文生成只读指令投影)。
 
 ## 这是什么
 
 catman:跑在 OpenWrt / x86 软路由 Docker 里的个人 AI 助手。微信(iLink 协议)作为聊天入口,
-后端用 **Claude Agent SDK** 长驻,按 Claude 订阅计费,能在容器内执行任意命令
-(含用内置 docker CLI 操作宿主 Docker)。**多账号**:多人各自扫码接入,各自独立的会话与
+后端用 **Claude Agent SDK** 长驻,按 Claude 订阅计费,通过按 owner/context 隔离的
+worker 执行命令;Docker 操作由可信控制面负责。**多账号**:多人各自扫码接入,各自独立的会话与
 工作目录;dashboard 带鉴权,兼做扫码接入与账号管理。
-纯 TypeScript / ESM(NodeNext),运行时除 `@anthropic-ai/claude-agent-sdk` 外零依赖。
+纯 TypeScript / ESM(NodeNext),运行时依赖 `@anthropic-ai/claude-agent-sdk` 与 `undici`。
 
 **源码直跑**:镜像 `catman-env` 只是不含业务代码的运行环境,真正跑的是数据卷里的
 **release 目录**(`/data/releases/<sha>/` = 浅 clone + 自带 node_modules + dist),
@@ -21,18 +21,16 @@ catman:跑在 OpenWrt / x86 软路由 Docker 里的个人 AI 助手。微信(iLi
 npm run typecheck          # tsc --noEmit
 npm test                   # node:test + tsx,含假时钟单测
 npm run build              # tsc → dist/src/**
-
-# 本地端到端手测(终端直接聊,需 Claude token)。stdin 通道支持
-# "/user <名字>" 切身份、"/img <路径> [附言]" 送图 —— 多用户隔离与图片输入
-# 都不必真机扫码就能验,走的是与微信完全相同的下游链路。
-CATMAN_CHANNEL=stdin CATMAN_DATA_DIR=./data CATMAN_ADMIN_TOKEN=devtoken \
-  CLAUDE_CODE_OAUTH_TOKEN=<token> npm run dev
+docker build --pull -t catman-env:integration -f docker/Dockerfile .
+npm run test:docker         # 真实容器/CLI,本地模型与 MCP,使用独立临时数据
 
 # 自检(smoke)单独跑:不碰真实 /data,退出码即结论,stdout 一行 JSON
 CATMAN_SELFCHECK=1 node dist/src/index.js
 ```
 
 改完务必 `npm run typecheck && npm test`(strict + noUncheckedIndexedAccess 全开)。
+手工使用 stdin 通道时也必须配置 worker 的 release、宿主数据路径与 mynet 网络;
+使用独立测试数据,不要直接启动已按 /data 迁移的生产数据副本。详见 README「本地开发」。
 
 ⚠️ 源码工作区**没有** `node_modules`(依赖只装在制备容器里)。本地跑测试前先
 `ln -s /data/releases/current/node_modules .`;`.gitignore` 里**带斜杠与不带斜杠的两条
@@ -229,112 +227,16 @@ Dashboard 与清理的扫描范围 = `listWorkspaceDirs(/data/workspace)` 算出
   不依赖「向上递归查找父目录」的隐式行为)。project settings(`.claude/settings.json`)
   **没有**继承机制,要全局共享得放 user settings。
 
-## 每用户私有目录
+## 多租户执行上下文 v2
 
-放某个人的凭据、令牌这类**别人不该看见**的东西。实现在 `core/user-private.ts`,
-容器里固定是 `/private`,环境变量 `CATMAN_USER_PRIVATE_DIR`。
-
-- **它是 `/data` 的兄弟,不是子目录。** 会话容器把整个 `/data` 读写挂进去,
-  放里面就得再挂一个空目录去遮住别人那几份 —— 那条路走得通(挂载按目标路径深度排,
-  救援人格的只读挂载就是这么写的),但**坏的方向不对**:遮罩漏了是所有人的凭据
-  一次性全部暴露,而且悄无声息。放外面则相反:漏挂只会让私有目录访问不到,
-  功能立刻不工作,一眼看得见。**安全机制要往「坏了就用不了」的方向坏。**
-- **挂载与环境变量必须同源。** 三个装配处(网关、cron agent、cron script)都是
-  先算一次 `priv`,再同时喂给挂载和 env。变量在而挂载不在是最坏的一种:脚本会往
-  一个不存在的路径写凭据,或者更糟 —— 往共享区写却以为自己在私有区。
-- **没配置就整个降级,绝不退回共享区。** `hostUserDataDir` 缺席时
-  `userPrivatePaths` 返回 undefined,三处都当没有这个机制。退回共享区等于把凭据
-  写到所有人都看得见的地方,而调用方以为它是私有的。
-- **救援人格一律不参与**,两道:`userPrivatePaths` 对它返回 undefined,
-  `sessionMounts` 即使收到也不挂。它的文件系统视图是"别人的状态一律只读",
-  给它挂上别人的私有目录与那条约定直接冲突。
-- **隔离靠挂载不可见,不靠文件权限。** 所有回合容器都是同一个 uid(10001),
-  0700 只是万一挂载漏了时的第二层。`script` 类 cron 容器是 `--user 10001:10001`
-  (见 `cron/docker.ts` 的 `RUN_AS`),所以读得动 —— 换成镜像自带用户的话这条会
-  **静默失效**(读不了,而任务照跑)。
-- ⚠️ **这仍然是护栏不是安全边界。** 两个人格都挂着 docker.sock,起个 root 容器挂
-  宿主路径就什么都读得到。它挡的是"随手一读"和"写错路径串了用户"。
-- 宿主上那个根目录(`/mnt/usb/catman_userdata`)**要预先建好且属主 10001**。
-  不建的话 dockerd 会自动建一个 root 属主的空目录,catman 建子目录 EACCES,
-  机制安静降级(日志一行 warn)。
-- ⚠️ **隔离依赖「会话容器挂不到私有目录根那棵树」,而那是挂载表那边的事。**
-  部署目录里有条 `catman/userdata` 软链指向 `/mnt/usb/catman_userdata`,而
-  `/opt/services` **本来就在挂载表里**。现在读不到,只是因为没挂 `/mnt/usb`,
-  那条软链在容器里是断的(实测)。所以**给会话容器加一条 `/mnt/usb`(哪怕只是
-  "让助手能读 U 盘")就会让所有人的凭据顺着软链一起进来,没有任何征兆**。
-  有一条用例钉着(「挂载表里不能出现能通到私有目录根的宿主树」)。
-- **`CATMAN_USER_PRIVATE_DIR` 在 `buildTurnEnv` 里被显式剔除后再按回合注入。**
-  它跟另外两个被剔除的不同 —— 不是密钥,而是**只对某一个回合成立的事实**。
-  继承下来的那个值属于别人、或属于一个压根没挂私有目录的场合,留着就成了
-  "变量在而挂载不在",脚本会拿它当私有区去写凭据。
-- **`CATMAN_HOST_USER_DATA_DIR` 必填,而且要与 compose 里那条 volume 的左边逐字
-  一致**(两处引用同一个变量)。曾经让代码从 `CATMAN_HOST_DATA_DIR` 的同级推,
-  真机上翻车:那台机器的 `CATMAN_HOST_DATA_DIR` 是 `/opt/services/catman/data` ——
-  一条**指向** `/mnt/usb/catman_data` 的软链。dockerd 跟随软链所以 `/data` 一直对,
-  但推导得到的是另一棵树。坏得极安静:catman 在 A 建目录、成功;dockerd 按 B 建一个
-  root 属主的空目录挂进去,于是 `/private` 存在、变量也有值,**只是写不进去**。
-  教训:推导假设了"`hostDataDir` 是真实路径",而它只需要是"dockerd 解析得开的路径"。
-- **为什么 catman 主进程也要挂 `/userdata`**(每次看到都会想省掉的那条):
-  挂载本身确实不用 —— `-v` 是宿主 dockerd 解析的。卡点是**每个用户的子目录
-  得先存在且属 10001**:dockerd 自动建的挂载源是 `root:root 0755`,
-  **父目录属 10001 也不继承**(2026-09-03 实测),而会话容器是 `--user 10001`,
-  于是写不进去。替代方案是每回合起个 root 容器 mkdir+chown,成本高得多,
-  而且 catman 从此看不见这棵树,清理/迁移/备份都无从下手。
-
-## 内存与会话容器
-
-背景:2026-08-21 路由器被搞挂三次。会话吃光内存 → 宿主没 swap → 内核把包括可执行页在内的
-page cache 全逐出 → U 盘上的二进制反复重新缺页 → **回收活锁**,而 OOM killer 因为
-"回收有进展"永远不开火。表现是 ping 得通、ssh 连不上、WiFi SSID 搜得到连不上,只能断电。
-
-- **每个回合的大脑跑在一次性容器里**(`session-container.ts`):700m / 1.5 核 / 256 pid,
-  `--memory-swap` 与 `--memory` 相等,`AutoRemove`,一回合一个(约 1 秒开销)。
-  接法是 SDK 的 `pathToClaudeCodeExecutable` 指向一个生成的包装脚本。
-- **包装脚本有三条不能破的性质**(`buildWrapperScript`):
-  ① **绝不用 `set --`** —— 它会吃掉 SDK 传进来的位置参数(`--input-format stream-json` 那些),
-     症状是回合起来了但一句话都不说。单测钉着 `set --` 不许出现。
-  ② `"$@"` **必须在最后**,镜像与命令排在所有 flag 之后。
-  ③ 环境变量**运行时全量枚举转发**,不是白名单。白名单版本丢了 12 个变量(含 `PATH`、
-     两个 catman 令牌、以及全部代理变量)—— 少了代理,容器里打 api.anthropic.com 直接 403,
-     那是**全面停摆**。唯一的例外是 `CATMAN_IPC_SECRET`,一条都不下放。
-  ④ `docker run` 退 **125**(守护进程起不来容器)时退回本机执行。主人格可以没有这条,
-     救援人格不能没有 —— 它是最后一道防线。
-- **环境变量按名字传(`-e NAME`)不按值传(`-e NAME=value`)**:后者会让令牌出现在
-  `docker inspect` 和宿主的 `ps` 里。
-- **`--user` / `--group-add` 必须从当前进程推导**(`process.getuid()/getgid()/getgroups()`)。
-  漏了的话容器以 root 跑,产出 root 属主的文件,而且容器内的 `docker` 全部
-  permission denied(socket 是 `root:32768` 且 660)。
-- **看门狗盯 `anon`,不盯 `memory.current`**(`mem-watchdog.ts`):后者含 page cache,
-  实测 54% 是可回收的,照它开火会天天误杀。
-- **三级阶梯,阈值 80 / 90 / 95**(演练三档全部真机命中):
-  80% 往回合里塞一条警告**并给用户也发一条**(只喂给大脑的话,用户只看到助手忽然
-  改了做法,不知道发生了什么);90% 杀掉最大的**非大脑**进程,回合存活;
-  95% 中止整个回合。90% 那一级是**先喂消息再动手**,让大脑在同一次 LLM 交互里
-  既看到通知、又观察到工具失败。
-- **90% 的击杀必须排除 `claude|node`**:占用最大的通常就是大脑自己(常态 RSS 约 293MB),
-  杀了它等于杀掉整个回合 —— 而这一级存在的全部意义正是**保住回合**。
-  代价是"大脑自己在吃内存"那种场景只能靠 95%,那正是 95% 存在的理由。
-- **动手一律走 `docker kill`,`cgroup.kill` 是死路**:那个文件是 `--w------- root root`,
-  而 catman 跑在 uid 10001 上,**永远写不进去**。当初那次"端到端验证通过"是在一个没加
-  `--user` 的容器里以 root 跑的 —— **验证条件与生产条件不一致 = 没验**。
-  顾虑("事故时 dockerd 可能是废的")也已不成立:700m 上限消除的正是整机活锁,
-  会话撞的是自己的上限,那一刻宿主还剩好几个 G。
-- **系统提示词里要预教 exit 137**(`persona.ts` 的 `memoryBriefing`):不说的话大脑
-  会把被杀的命令当成写错了原样重试,于是再死一次。这段**只在真的容器化时才追加** ——
-  没开会话容器却说"你有 700m 上限"是假话,而大脑没法验证它,只会白白畏手畏脚。
-- **事故记录落 SSD**(`/opt/services/catman/mem-incidents.log`),不落 U 盘 —— 事故当下
-  U 盘正是被打满的那块(实测 ioticks 逼近 100%)。容器日志会轮转,而内存事故恰恰是
-  "几周后才有人回头查"的那类东西。写失败吞掉,不把中止流程带偏。
-- **`CATMAN_API_BASE` 必须按容器名寻址**,不能是 `127.0.0.1`:会话容器里的 127.0.0.1
-  是**它自己**。这条坏掉时 `catman-notify` 与 `catman-settings` / `catman-admin` /
-  `catman-cron` 三个 skill 全部静默失效。
-- **`catman-notify` 用 `docker run -d`,不用 `setsid nohup`**(`notify-bin.ts`):
-  `setsid` 脱得开会话、**脱不开容器**,而会话容器每回合即焚。故障模式特别坏:
-  它照常说"跑完推给你",然后静默失效。
-- ⚠️ **容器化会静默改掉三个隐含前提**:我在哪、我能活多久、localhost 是谁。
-  三个都各自产生过一次**静默**失败。加任何跨进程/跨容器的东西之前,把这三条各问一遍。
-- **内存看门狗与 `rescue/watchdog.ts` 是两个东西**:后者管**版本回退**(容器崩了退版本),
-  前者管**单个回合的内存**。别混用,职责会错乱。
+执行实现见 `src/core/execution/`，行为和人工数据迁移步骤以 README 为准。
+控制面保存 owner/context/runtime 注册表，worker 只挂当前 work、sdk、tasks 和 owner home。禁止整挂 /data、/opt/services 或 docker.sock。容器无法启动就报错，没有本机执行降级。
+用户个人空间是 /user，默认产物写当前 cwd。每个聊天 session 与每个 cron 有独立 workspace；cron 多次执行复用其目录。
+公共人格和 skill 只读装配；个人 skill 与 MCP 在 /user。原始公共凭据仅由控制面 broker 持有。管理员权限由 API 现查，不下发原始管理员 token。
+后台脚本使用 `catman-task run --timeout <秒> -- <命令>`，在当前容器里由独立任务管理进程执行。任务有硬超时，SDK 后台任务按事件追踪；只要 SDK 有任务就保留其 CLI。SDK 结果按输入 UUID 关联。
+未知后台进程由执行环境闲置回收兜底，提前十分钟通知，可 /延长 或 /回收。CLI/容器、聊天路由、数据保留分别管理。容器由 Docker cgroup 限制内存，agent 与后台任务共享限额。
+管理员源码在 /catman-src，通过固定制备 API 触发自进化；worker 不能直接运行宿主 Docker 或读部署凭据。
+本次允许不兼容升级，旧布局必须人工迁移并写 schema=2 标记，不能静默降级。原 session-container、user-private、cron-data 和 notify 独立容器实现已删除。
 
 ## 会话与回合
 
@@ -890,16 +792,9 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(只对**主人格
 
 ## 权限与隔离
 
-- **bypassPermissions 不能以 root 运行**;镜像里用 uid 10001 的 catman 用户。
-  镜像里还有 uid 10002 的 deployer:**`/data/releases` 属它所有,主容器只读挂载**。
-  助手文件系统全开,一句「帮我清清磁盘」就足以把回滚目标 rm 掉(硬链接复用还让每个
-  release 在 du 里都按全量计,看着最该删);只读挂载让那种误删直接 EACCES 暴露。
-- **宿主 Docker 访问靠运行时注入的组,不能写死进镜像**:镜像只预装 docker CLI(无 daemon),
-  `/var/run/docker.sock` 由 compose 挂载、访问权限由 `group_add: ${DOCKER_GID:-0}` 给。
-  该 GID 属于宿主,写进镜像会一换机器就 `permission denied`。
-  ⚠️ 挂了 socket 就等于把宿主 root 交给助手,**隔离边界从容器退化为对助手的信任** ——
-  README「安全说明」按这个口径写,别改回"容器即隔离边界"。同理,救援人格的 `/data` 只读
-  是**防手滑的护栏,不是安全边界**。
+权限取决于服务端角色和上下文归属，详见 README。所有 worker 都使用精确挂载、非 root 和资源限制；没有任意宿主挂载、Docker socket 或原始管理员/公共凭据。
+普通用户只修改自己的 home、workspace 和任务。公共 skill 只读，公共 MCP/服务通过 credential broker 使用。管理员操作通过现查身份的 HTTP 接口执行，源码仅对管理员挂载。
+生产执行失败必须报错；禁止新增本机运行兜底。修改挂载时同时验证指令加载、SDK session 路径、resume、dashboard 和清理。
 
 ## 可观测性
 

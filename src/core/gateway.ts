@@ -1,3 +1,5 @@
+import type { ContextStore } from "./execution/contexts.js";
+import type { RuntimeManager } from "./execution/runtime.js";
 import type { Accepted, Channel, IncomingMessage } from "../channels/types.js";
 import type { Agent, AgentProgressEvent } from "./agent.js";
 import type { Decision, SessionManager, SessionRef } from "./session.js";
@@ -50,7 +52,6 @@ import { formatDeployReport } from "./deploy-report.js";
 import { formatDeployProgress } from "./deploy-progress.js";
 import type { SendKind } from "../ipc/protocol.js";
 import type { Persona } from "../config.js";
-import type { UserPrivatePaths } from "./user-private.js";
 
 /** 会话 id 的展示形式:开头 8 位足够在 HISTORY_LIMIT 条内无歧义,也好在手机上打。 */
 export function shortSessionId(sessionId: string): string {
@@ -143,6 +144,7 @@ const NEWS_MAX_ATTEMPTS = 3;
 const NEWS_RETRY_MS = 60_000;
 
 export interface GatewayOptions {
+  execution?: { contexts: ContextStore; runtimes: RuntimeManager };
   channel: Channel;
   agent: Agent;
   sessions: SessionManager;
@@ -161,14 +163,6 @@ export interface GatewayOptions {
    * `catman-notify` 会明说"这不像是 catman 的回合环境"而不是安静地推不出去。
    */
   notifyTokens?: { for(userKey: string): string };
-  /**
-   * 算出(并建好)某个用户的私有目录。缺席 = 这台机器没有这个机制。
-   *
-   * 注入一个函数而不是把 Config 整个塞进来:网关一路都是依赖注入,
-   * 而且"私有目录建不建得出来"每回合都可能变(盘满、权限被改),
-   * 每回合现问一次比启动时算一次准。
-   */
-  userPrivate?: (userKey: string) => UserPrivatePaths | undefined;
   /** 挂进回合 PATH 的目录(`catman-notify` 住在那儿)。 */
   binDir?: string;
   /** 提醒轮询间隔(ms)。 */
@@ -698,10 +692,12 @@ export class Gateway {
   private readonly deploy: DeployControl | undefined;
   private readonly cron: CronView | undefined;
   private readonly notifyTokens: { for(userKey: string): string } | undefined;
-  private readonly userPrivate: ((userKey: string) => UserPrivatePaths | undefined) | undefined;
   private readonly binDir: string | undefined;
 
+  private readonly execution: GatewayOptions["execution"];
+
   constructor(opts: GatewayOptions) {
+    this.execution = opts.execution;
     this.channel = opts.channel;
     this.agent = opts.agent;
     this.sessions = opts.sessions;
@@ -722,7 +718,6 @@ export class Gateway {
     this.deploy = opts.deploy;
     this.cron = opts.cron;
     this.notifyTokens = opts.notifyTokens;
-    this.userPrivate = opts.userPrivate;
     this.binDir = opts.binDir;
     this.semaphore = new Semaphore(this.settings.effective().maxConcurrentTurns);
     this.settings.onChange(() => {
@@ -768,6 +763,9 @@ export class Gateway {
    * 收成一个方法之后两边共用同一份,想岔都岔不了。
    */
   onIncoming(msg: IncomingMessage): Accepted {
+    const current = this.sessions.currentOf(msg.userKey);
+    const context = current && this.execution?.contexts.bySession(msg.userKey, current.sessionId);
+    if (context) this.execution!.runtimes.activity(context.id);
     // 渠道知道他早收过指引就记一笔。只**抑制**不触发:缺席表示这个渠道没有这项知识
     // (stdin / dashboard),那时退回人格自己的记录判断。见 courierGreeted 的说明。
     if (msg.greeted) this.courierGreeted.add(msg.userKey);
@@ -1104,6 +1102,23 @@ export class Gateway {
       case "jobs":
         await this.trySend(userKey, this.jobsText(userKey), "定时任务");
         return;
+
+      case "extendRuntime":
+      case "reclaimRuntime": {
+        try {
+          if (!this.execution) throw new Error("运行环境管理不可用");
+          const [id, minutes] = (arg ?? "").trim().split(/\s+/);
+          if (!id) throw new Error("请提供通知里的执行环境 ID");
+          if (cmd.name === "extendRuntime") {
+            const deadline = this.execution.runtimes.extend(userKey, id, Number(minutes ?? 30));
+            await this.trySend(userKey, `执行环境 ${id} 已延长至 ${new Date(deadline).toISOString()}，任务各自的执行超时保持不变。`, "延长确认");
+          } else {
+            await this.execution.runtimes.reclaim(userKey, id);
+            await this.trySend(userKey, `执行环境 ${id} 已回收，工作目录保留。`, "回收确认");
+          }
+        } catch (error) { await this.trySend(userKey, String(error), "运行环境操作"); }
+        return;
+      }
 
       case "model":
       case "effort":
@@ -1564,6 +1579,9 @@ export class Gateway {
       `分段:${p.maxReplyChars} 字${own("maxReplyChars")}  ` +
         `超时:${humanDuration(p.sessionTimeoutMs)}${own("sessionTimeoutMs")}`,
       `身份:${userKey}${this.settings.isAdmin(userKey) ? "(管理员)" : ""}`,
+      ...(this.execution?.runtimes.all(userKey).map(r =>
+        `执行环境:${r.contextId} · 已登记后台任务 ${r.tasks.filter(t => t.status === "running").length} 个 · SDK 后台任务 ${r.sdkTasks.filter(t => !t.ambient).length} 个`,
+      ) ?? []),
       // 版本放最后:日常没人关心,但"我刚让它改的东西上线没有"只有这一行答得出,
       // 而那时用户手上多半只有微信。
       versionLine(this.version),
@@ -1589,6 +1607,13 @@ export class Gateway {
     }
 
     const sw = canonicalOf("switchSession");
+    // Context registration survives a controller crash even if the routing state was not saved.
+    const known = new Set([this.sessions.currentOf(userKey)?.sessionId, ...this.sessions.historyOf(userKey).map(ref => ref.sessionId)]);
+    for (const context of this.execution?.contexts.all(userKey) ?? []) {
+      if (context.kind === "chat" && context.sdkStarted && context.sdkSessionId.startsWith(idPrefix) && !known.has(context.sdkSessionId)) {
+        this.sessions.archiveTurn(userKey, context.sdkSessionId);
+      }
+    }
     const res = this.sessions.switchTo(userKey, idPrefix, (ref) =>
       this.sessionExists ? this.sessionExists(userKey, ref.sessionId) : true,
     );
@@ -1722,7 +1747,9 @@ export class Gateway {
     // 回合一开始就拿得到的 sessionId。**存在的全部理由是抛错那条路** ——
     // 成功时用 reply.sessionId 就够了,而抛错时 reply 根本不存在。
     let observedSessionId: string | undefined;
-    const pre = { cwd };
+    const context = this.execution?.contexts.chat(userKey, decision.isNew ? undefined : decision.resumeSessionId);
+    if (context) turn.ctx.contextId = context.id;
+    const pre = { cwd: context ? this.execution!.contexts.paths(context).work : cwd };
 
     // 进度消息串行链:保证按事件产生顺序逐条发送,最终回复排在链尾之后。
     // 节流从**回合开始**起算,而不是从第一个事件 —— 用户等待的是前者。
@@ -1803,18 +1830,14 @@ export class Gateway {
       const prior = this.lastMemAbort.get(userKey);
       if (prior) this.lastMemAbort.delete(userKey);
       const ambient = this.releaseNoteFor(userKey, decision.isNew);
-      // 私有目录每回合现算一次:它同时喂给挂载(privateHostDir)和环境变量
-      // (CATMAN_USER_PRIVATE_DIR),两者**必须同源** —— 变量在而挂载不在的话,
-      // 脚本会往一个不存在的路径写凭据。
-      const priv = this.userPrivate?.(userKey);
       const reply = await this.agent.run(prior ? priorAbortPrefix(prior) + text : text, {
         cwd: pre.cwd,
+        ...(context ? { context } : {}),
         ...(ambient ? { ambient } : {}),
         resumeSessionId: decision.isNew ? undefined : decision.resumeSessionId,
         ...(prefs.model ? { model: prefs.model } : {}),
         ...(prefs.effort ? { effort: prefs.effort } : {}),
-        env: this.childEnv(isAdmin, turn.token, userKey, priv),
-        ...(priv ? { privateHostDir: priv.host } : {}),
+        env: this.childEnv(isAdmin, turn.token, userKey),
         skills: this.skillsFor(isAdmin),
         abortController: turn.ctx.abort,
         // 看门狗动手时给用户带外发一条。不走 onProgress —— 用户可能把进度关了,
@@ -2009,7 +2032,6 @@ export class Gateway {
     isAdmin: boolean,
     sessionToken: string,
     userKey: string,
-    priv?: UserPrivatePaths | undefined,
   ): Record<string, string | undefined> {
     const notifyToken = this.notifyTokens?.for(userKey);
     return buildTurnEnv({
@@ -2018,7 +2040,6 @@ export class Gateway {
       isAdmin,
       ...(notifyToken ? { notifyToken } : {}),
       ...(this.binDir ? { binDir: this.binDir } : {}),
-      ...(priv ? { userPrivateDir: priv.at } : {}),
     });
   }
 
@@ -2098,7 +2119,7 @@ export class Gateway {
    * 整个信封读不懂,那条消息就恰好在最需要它的时候消失。
    */
   async push(userKey: string, text: string, kind: SendKind): Promise<void> {
-    await this.trySend(userKey, text, "定时任务播报", kind);
+    if (!(await this.trySend(userKey, text, "主动通知", kind))) throw new Error("消息未被渠道接受");
   }
 
   /**

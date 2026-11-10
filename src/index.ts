@@ -1,3 +1,8 @@
+import { ContextStore, requireExecutionLayout } from "./core/execution/contexts.js";
+import { RuntimeManager } from "./core/execution/runtime.js";
+import { CapabilityBroker } from "./core/execution/broker.js";
+import { ContextScriptRunner } from "./core/execution/cron-runner.js";
+import { ExecutionApi } from "./dashboard/api-execution.js";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { loadConfig, type Config } from "./config.js";
@@ -7,8 +12,6 @@ import { FileStore, readJsonFile } from "./core/file-store.js";
 import { Gateway } from "./core/gateway.js";
 import { UserRegistry, listWorkspaceDirs } from "./core/users.js";
 import { adminBaseline, initialSharedClaudeMd } from "./core/persona.js";
-import { ensureCronDataDir } from "./core/cron-data.js";
-import { ensureUserPrivateDir } from "./core/user-private.js";
 import { TokenAlerter, readTokenExpiry } from "./core/token-alert.js";
 import { allowAll, type AdmissionPolicy } from "./core/admission.js";
 import { GlobalSettings } from "./core/settings.js";
@@ -35,7 +38,6 @@ import { runSelfCheck } from "./core/selfcheck.js";
 import { ScriptDeployControl } from "./core/deploy.js";
 import { CronStore, DEFAULT_RUN_MAX_AGE_MS } from "./core/cron/store.js";
 import { CronScheduler } from "./core/cron/scheduler.js";
-import { collectProxyEnv, DockerScriptRunner } from "./core/cron/docker.js";
 import { RealAgentTaskRunner } from "./core/cron/agent-runner.js";
 import { NoticeSpool } from "./core/cron/notices.js";
 import type { CronApiDeps } from "./dashboard/api-cron.js";
@@ -85,6 +87,8 @@ async function main(): Promise<void> {
     }
   }
 
+  requireExecutionLayout(config.dataDir);
+
   // 让 Agent SDK 把会话 JSONL 存到数据卷里(而非镜像内的 HOME)。
   if (!process.env.CLAUDE_CONFIG_DIR) {
     process.env.CLAUDE_CONFIG_DIR = `${config.dataDir}/claude`;
@@ -92,7 +96,7 @@ async function main(): Promise<void> {
   const configDir = process.env.CLAUDE_CONFIG_DIR;
   mkdirSync(config.workspaceDir, { recursive: true });
   mkdirSync(configDir, { recursive: true });
-  ensureCronDataDir(config);
+
 
   // 配置三层由外到内装配:全局层要先建,每用户层拿它当默认值,会话层拿它算超时。
   const settings = new GlobalSettings({
@@ -105,7 +109,18 @@ async function main(): Promise<void> {
     defaults: () => settings.effective(),
   });
 
-  const agent = new Agent(config);
+  let gatewayRef: Gateway | undefined;
+  const contexts = new ContextStore(config.dataDir);
+  const runtimes = new RuntimeManager(config, contexts, {
+    isAdmin: userKey => settings.isAdmin(userKey),
+    notify: async (userKey, text) => {
+      if (!gatewayRef) throw new Error("渠道尚未启动");
+      await gatewayRef.push(userKey, text, "announce");
+    },
+  });
+  const broker = new CapabilityBroker(`${config.dataDir}/execution/shared-tools.json`, runtimes, userKey => settings.isAdmin(userKey));
+  const execution = { contexts, runtimes, broker };
+  const agent = new Agent(config, execution);
   const sessions = new SessionManager({
     store: new FileStore(config.statePath),
     timeoutMs: config.sessionTimeoutMs,
@@ -119,6 +134,15 @@ async function main(): Promise<void> {
   // 主人格那边人手写过、不会被碰;守护人格的 workspace 是新建的,一直是空的。
   users.ensureSharedClaudeMd(initialSharedClaudeMd(config.persona));
   const turns = new TurnTokens();
+  turns.runtimeResolver = token => {
+    const runtime = runtimes.resolve(token);
+    if (!runtime) return undefined;
+    return turns.allFor(runtime.userKey).find(turn => turn.contextId === runtime.contextId) ?? {
+      userKey: runtime.userKey, contextId: runtime.contextId, detached: true,
+      abort: new AbortController(), done: Promise.resolve(),
+      progress: { startedAt: runtime.createdAt, steps: 0, lastAt: runtime.lastInteractionAt, fed: 0 },
+    };
+  };
 
   // 接口说明做成 skill(按需加载,常态不占 token)。每次启动覆盖写,保证跟代码同步。
   // 按人格生成不同的一套 —— 守护人格拿 catman-rescue 而不是 catman-evolve。
@@ -188,7 +212,6 @@ async function main(): Promise<void> {
   // gateway 要在 createChannel 之后建,而 bridge 的 onDetach 要指向 gateway ——
   // 用一个后填的引用打破这个环。detach 帧在 gateway 装好之前不可能到达
   // (bridge 要等 start() 才开始拉取),所以这里的 undefined 窗口是安全的。
-  let gatewayRef: Gateway | undefined;
   let cronRef: { store: CronStore } | undefined;
   const { channel, admission, ipcClient: bridgeClient } = createChannel(
     config,
@@ -200,6 +223,7 @@ async function main(): Promise<void> {
     (userKey) => gatewayRef?.detachUser(userKey),
   );
   const gateway = new Gateway({
+    execution,
     channel,
     agent,
     sessions,
@@ -210,10 +234,6 @@ async function main(): Promise<void> {
     apiBase: config.apiBase,
     notifyTokens,
     binDir,
-    // 每用户私有目录。**每回合现建一次**而不是启动时一次性建完:用户是陆续出现的,
-    // 而且盘满/权限被改这类事只有在真要用的那一刻才看得出来。守护人格与没配那条
-    // 挂载的机器上它一律返回 undefined,整个机制安静地不启用。见 core/user-private.ts。
-    userPrivate: (userKey) => ensureUserPrivateDir(config, userKey),
     admission,
     version,
     persona: config.persona,
@@ -227,8 +247,12 @@ async function main(): Promise<void> {
     ...(deploy ? { deploy } : {}),
     // /切换会话 切换前确认目标的 JSONL 还在 —— 记录没了 resume 必然失败,
     // 提前给句人话并出清死引用,比让回合炸出原始报错友好得多。
-    sessionExists: (userKey, sessionId) =>
-      sessionFileExists(configDir, encodeProjectDir(users.workspaceDirOf(userKey)), sessionId),
+    sessionExists: (userKey, sessionId) => {
+      const context = contexts.bySession(userKey, sessionId);
+      if (!context) return false;
+      const p = contexts.paths(context);
+      return sessionFileExists(p.sdk, encodeProjectDir(p.work), sessionId);
+    },
     // 提醒轮询:取超时时长的 1/10,但不短于 1 分钟。
     reminderIntervalMs: Math.max(60_000, Math.floor(config.sessionTimeoutMs / 10)),
     // `/任务` 的数据源。任务表在 gateway 之后才建,用一个后填的引用打破这个环 ——
@@ -254,6 +278,7 @@ async function main(): Promise<void> {
           notifyTokens,
           binDir,
           skillsDir: configDir,
+          contexts, runtimes,
         })
       : undefined;
   cronRef = cron;
@@ -271,7 +296,9 @@ async function main(): Promise<void> {
     users,
     ...(bridgeClient ? { accounts: new IpcAccountsProxy(bridgeClient) } : {}),
     chat,
-    selfApi: { turns, prefs, users, sessions, settings, configDir },
+    contexts,
+    executionApi: new ExecutionApi({ config, contexts, runtimes, broker, turns, isAdmin: userKey => settings.isAdmin(userKey) }),
+    selfApi: { turns, prefs, users, sessions, settings, configDir, contexts },
     notifyApi: {
       tokens: notifyTokens,
       limiter: new NotifyRateLimiter(),
@@ -302,11 +329,13 @@ async function main(): Promise<void> {
   // 保留期清理:启动跑一次,之后按间隔跑;删除的会话同步从状态里出清死引用。
   // 清理范围严格来自各用户的 workspace 目录 —— 不遍历 projects/ 树。
   const runCleanup = () => {
-    const scopes = listWorkspaceDirs(config.workspaceDir).map((w) => ({
-      projectDir: w.projectDir,
-    }));
-    // 保留期每次现读,所以管理员改完下一轮清理就用新值,不必重建定时器。
-    const deleted = cleanupOldSessionsAcross(configDir, scopes, settings.effective().retentionMs);
+    const deleted: string[] = [];
+    const active = new Set(runtimes.all().map(runtime => runtime.contextId));
+    for (const context of contexts.all()) {
+      if (context.kind === "chat" && !active.has(context.id) && Date.now() - context.lastActivityAt > settings.effective().retentionMs) {
+        deleted.push(context.sdkSessionId); contexts.remove(context.id);
+      }
+    }
     // 当前会话与 /切换会话 的历史名单都要剔除死引用,否则会把用户领到
     // 一段 resume 必然失败的会话上。
     sessions.dropSessionIds(deleted);
@@ -332,6 +361,9 @@ async function main(): Promise<void> {
     // 只停轮询,**不碰在跑的容器**:它们是 detached 的,本来就该活过这次重启,
     // 回来之后照常认领(见 cron/docker.ts 开头)。
     cron?.scheduler.stop();
+    runtimes.close();
+    agent.close();
+    await broker.close();
     await gateway.stop();
     await dashboard.stop();
     await rescueRef?.stop();
@@ -348,6 +380,7 @@ async function main(): Promise<void> {
   // 调度器**排在渠道之后**起:它起来就会去收上一轮遗留的执行,而收完是要发通知的 ——
   // 渠道还没起来时那条结果只能石沉大海,而它恰恰是用户睡前定下、等着看的那一条。
   cron?.scheduler.start();
+  runtimes.start();
 
   bootOk = true;
   console.info(`catman 已启动,渠道=${channel.name},${versionLine(version)}`);
@@ -371,20 +404,34 @@ function createCron(
     notifyTokens: NotifyTokens;
     binDir: string;
     skillsDir: string;
+    contexts: ContextStore;
+    runtimes: RuntimeManager;
   },
 ): { store: CronStore; scheduler: CronScheduler; api: CronApiDeps } {
   const store = new CronStore({
     dir: `${config.dataDir}/cron`,
+    contexts: deps.contexts,
+    hostDataRoot: config.hostDataDir,
     // 宿主路径由**装配处**给出:只有这里同时知道容器内与宿主两个视角。
     ...(config.hostDataDir ? { hostDir: `${config.hostDataDir.replace(/\/$/, "")}/cron` } : {}),
   });
   const scheduler = new CronScheduler({
     store,
-    runner: new DockerScriptRunner(),
+    runner: new ContextScriptRunner(deps.contexts, deps.runtimes, store),
+    contextBusy: job => {
+      const context = deps.contexts.all(job.userKey).find(c => c.jobId === job.id);
+      const runtime = context && deps.runtimes.all(job.userKey).find(r => r.contextId === context.id);
+      return !!runtime && (runtime.tasks.some(t => t.status === "running") || runtime.sdkTasks.some(t => !t.ambient));
+    },
+    stopContext: async job => {
+      const context = deps.contexts.all(job.userKey).find(c => c.jobId === job.id);
+      if (context) await deps.runtimes.stop(context.id, "cron 任务停止或被替换");
+    },
     // agent 任务的执行面。它自己铸令牌、自己挑 skill —— 与用户回合共用同一份
     // 环境组装规则(core/turn-env.ts),抄两份迟早走样。
     agentRunner: new RealAgentTaskRunner({
       agent: deps.agent,
+      contexts: deps.contexts,
       users: deps.users,
       prefs: deps.prefs,
       settings,
@@ -397,7 +444,7 @@ function createCron(
       binDir: deps.binDir,
       // 定时 agent 任务跑在同样的会话容器里,私有目录对它一样该在 —— 用户让它
       // "每天早上收一遍邮件"时,它要读的正是那份凭据。
-      userPrivate: (userKey: string) => ensureUserPrivateDir(config, userKey),
+
     }),
     // 静默时段攒下来的结果。落盘 —— 部署很可能就发生在攒着的那几个小时里。
     notices: new NoticeSpool(`${config.dataDir}/cron/notices.json`),
@@ -411,14 +458,6 @@ function createCron(
       };
     },
     tz: config.tz,
-    // 联网的脚本任务跟着 catman 用同一套代理。**NO_PROXY 必须一起给** ——
-    // 只给 HTTP_PROXY 的话,任务打内网地址会被送去代理然后收到一个 503,
-    // 而那个 503 是代理说的,看起来完全像目标服务坏了。
-    proxyEnv: collectProxyEnv(process.env),
-    // script 类任务容器也挂上归属者的私有目录 —— 它跑的是 `--user 10001:10001`,
-    // 与 catman 同一个 uid,所以 0700 的目录读得动。
-    userPrivate: (userKey: string) => ensureUserPrivateDir(config, userKey),
-    notify: (userKey, text, kind) => gateway.push(userKey, text, kind),
   });
   const api: CronApiDeps = {
     turns,
@@ -430,7 +469,6 @@ function createCron(
         defaultTz: config.tz,
         minIntervalMs: s.cronMinIntervalMs,
         defaultKeepRuns: s.cronKeepRuns,
-        mountAllowlist: s.cronMountAllowlist,
         modelAllowlist: s.modelAllowlist,
         hostDataDir: config.hostDataDir,
         now: Date.now(),

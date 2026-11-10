@@ -20,6 +20,12 @@ function num(name: string, fallback: number): number {
   return v;
 }
 
+function boundedNum(name: string, fallback: number, min: number, max: number): number {
+  const value = num(name, fallback);
+  if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${name} 必须是 ${min}-${max} 之间的整数`);
+  return value;
+}
+
 function str(name: string, fallback: string): string {
   const raw = process.env[name];
   return raw === undefined || raw === "" ? fallback : raw;
@@ -45,209 +51,59 @@ const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
 
 export interface Config {
-  /** 持久化根目录,同时用作 CLAUDE_CONFIG_DIR 的父级。 */
+  /** 本人格的控制数据与租户数据根；worker 不整体挂载。 */
   dataDir: string;
-  /** 助手执行命令时的工作目录。 */
+  /** 租户目录根，个人 home 与执行上下文分别管理。 */
   workspaceDir: string;
-  /**
-   * **定时任务的地盘**:状态与临时文件都放这儿,一个任务一个子目录。
-   *
-   * 与 `$CATMAN_DATA_DIR/tmp/` 的分界在**归属**而不是寿命 —— 那边是会话里脱钩
-   * 长任务的地盘、随时可以清;定时任务无人值守,东西被误清了没人当场发现,
-   * 所以连它的临时文件也圈在这边。
-   *
-   * 权限放 0777:`script` 类定时任务跑在独立容器里,uid 未必是 10001,
-   * 挂进去还得写得动。
-   */
-  cronDataDir: string;
-  /** 会话状态文件路径(userKey→session 映射)。 */
   statePath: string;
-  /** 账号注册表路径(含 bot_token,以 0600 落盘)。 */
   accountsPath: string;
-  /** 用户注册表路径(userKey→工作目录等)。 */
   usersPath: string;
-  /** 全局运行时配置覆盖的落盘位置(管理员改的那一层)。 */
   settingsPath: string;
-  /** 每用户配置覆盖的落盘位置。 */
   prefsPath: string;
-  /** dashboard 聊天记录的落盘位置(网页没有本地聊天记录,只能服务端存)。 */
   chatLogPath: string;
-  /** dashboard 访问令牌;留空则启动时自动生成并写入 dashboardTokenPath。 */
   adminToken: string | undefined;
-  /** 自动生成的令牌落盘位置。 */
   dashboardTokenPath: string;
-  /** 同时进行的 agent 回合数上限(跨用户)。 */
+  /** 同时进行的前台 agent 回合数。 */
   maxConcurrentTurns: number;
-  /**
-   * 把每个回合的大脑关进它自己的容器(受内存上限与看门狗管束)。
-   *
-   * **默认关。** 它依赖两件本进程给不了自己的东西:compose 里 `/sys/fs/cgroup/docker`
-   * 的挂载(Tier 3,要管理员 `up -d`),以及宿主上存在 `sessionImage`。缺任一样就
-   * 只能退回原路,而"悄悄退回"比"没开"更糟 —— 所以做成显式开关,由管理员在
-   * 挂载就位之后再打开。
-   *
-   * ⚠️ 所有并发会话的上限之和必须小于宿主内存,否则两个会话同时失控照样拖垮宿主。
-   * 700m × maxConcurrentTurns 就是这条约束的实际形态。
-   */
-  sessionContainer: boolean;
-  /** 单个会话容器的内存上限,docker `--memory` 的写法。 */
+  /** 全部活跃上下文的容器数量上限，包含后台任务。 */
+  maxActiveRuntimes: number;
+  /** 无用户交互或助手响应的回收期限，提前十分钟预告。 */
+  runtimeIdleMs: number;
+  /** 每个上下文容器的内存上限。 */
   sessionMemoryLimit: string;
-  /** 会话容器用的镜像。必须自带 glibc(大脑二进制是 linux-x64 那个变体)。 */
+  /** 执行环境镜像，必须带 Node、glibc 与常用工具。 */
   sessionImage: string;
-  /** 宿主 cgroup 里 docker 子树的位置。看门狗从这里读 anon(只读,不写)。 */
   cgroupRoot: string;
-  /** 超过此空闲时长的新消息归入新会话。默认 1 小时。 */
+  /** 聊天路由闲置期限，决定下一条消息是否新建会话。 */
   sessionTimeoutMs: number;
-  /** 会话 JSONL 超过此保留期后清理。默认 30 天。 */
   retentionMs: number;
-  /** 清理任务的执行间隔。默认每天一次。 */
   cleanupIntervalMs: number;
-  /** dashboard HTTP 端口。 */
   dashboardPort: number;
-  /** 传给 Agent SDK 的模型;留空则用 SDK/账户默认。 */
   model: string | undefined;
-  /** 允许用户选择的模型。用别名而非完整 id —— 别名不随版本腐化。 */
   modelAllowlist: string[];
-  /** 收到消息后是否先回一条"处理中"回执。 */
   ackEnabled: boolean;
-  /** 是否把思考/工具调用过程转发给用户。 */
   progressEnabled: boolean;
-  /**
-   * 告诉 agent 怎么访问本进程的 HTTP 接口。
-   *
-   * ⚠️ **这个值的正确答案取决于 agent 跑在哪儿**,而 2026-08-21 会话容器化把它改了。
-   *
-   * 原来 agent 就在本进程里,所以 `127.0.0.1:<port>` 是对的。现在每个回合跑在
-   * **自己的容器**里,`127.0.0.1` 指向那个容器自己 —— 什么都没有。实测:
-   *
-   *     http://127.0.0.1:8787/api/health   → HTTP 000(连不上)
-   *     http://catman:8787/api/health      → HTTP 401(通了,401 是正常鉴权响应)
-   *
-   * 而且这**不只影响 catman-notify** —— `catman-settings`/`catman-admin`/`catman-cron`
-   * 这几个 skill 教着调的 `/api/me`、`/api/me/cron`、`/api/admin` 全都打在自己身上,
-   * 静默失败。因为那阵子只在做自我进化,没碰那些功能,所以一直没暴露。
-   *
-   * 所以默认值改成按**容器名**寻址(见 `containerName`):docker 的内嵌 DNS 在
-   * 用户自定义网络上解析容器名,而两个人格各自的容器名是确定的。容器名寻址在
-   * **本进程内部也通**(容器解析得了自己的名字),于是两种模式下同一个值都对。
-   */
+  /** worker 访问控制服务的地址，必须可从 mynet 网络访问。 */
   apiBase: string;
-  /**
-   * 本进程所在容器的名字。默认按人格给(`catman` / `catman-rescue`),与 compose
-   * 里的 `container_name` 对应。
-   *
-   * 单独一个配置项而不是写死:它是 `apiBase` 默认值的来源,而一旦这台机器的
-   * compose 改了容器名,症状是**所有 skill 的 API 调用静默失败** —— 那时候
-   * 要有一个地方能改回来,而不必去改代码。
-   */
   containerName: string;
-  /** 单张图片的原始字节上限,超过就拒收(不缩图 —— 运行时没有图像库)。 */
   maxImageBytes: number;
-  /** 一条消息最多内联几张图。 */
   maxImagesPerTurn: number;
-  /** 连续消息攒多久再一起处理(ms)。0 = 不聚合。 */
   messageAggregationMs: number;
-  /**
-   * 部署机制的固化目录(bless 时人工生成)。里面是 deployer 脚本、compose 副本、
-   * 以及 deployer 写的部署报告。catman 对它**只读** —— 部署机制属 Tier 3,
-   * 更新必须经人,不能被一次自我进化顺手改掉。
-   * 不存在 = 这台机器没配自进化,两条部署指令会明说。
-   */
   deployDir: string;
-  /** release 目录(deployer 写、catman 只读)。已验证版本清单也在里面。 */
   releasesDir: string;
-  /**
-   * 源码工作区 —— 自进化时 agent 在这上面开分支干活。属主是 catman(10001),
-   * 与只读的 release 目录是两回事:release 是从这里 clone 出去的、不可变的快照。
-   * 默认值必须与 `scripts/evolve/lib.sh` 的 `SRC_DIR` 一致(两边读同一个 env)。
-   */
   srcDir: string;
-  /**
-   * 主线分支名。**不是**制备时所在的那个分支 —— 那个每次都不一样(evolve/xxx),
-   * 拿它当主线的话"把主线拨到线上版本"会变成"把刚制备完的临时分支拨到它自己",
-   * 一个静默的空操作。默认值必须与 `scripts/evolve/lib.sh` 的
-   * `CATMAN_UPSTREAM_BRANCH` 一致(两边读同一个 env)。
-   */
   upstreamBranch: string;
-  /** 部署结果"已播报"的标记。catman 自己写,所以必须在可写区,不能放 deployDir。 */
   deploySeenPath: string;
-  /** 部署里程碑"已播报"的标记。同上,catman 自己写。 */
   deployProgressSeenPath: string;
-  /**
-   * 信使的状态目录(收件队列、回复上下文、路由表、附件 spool、游标)。
-   * **写者只有信使**;人格对它只读(只读 spool 里的附件字节)。
-   */
   courierDir: string;
-  /**
-   * IPC 的 unix socket。
-   *
-   * 单独一个目录而不是放在 courierDir 里:守护人格把主 `/data` 整个**只读**挂载,
-   * 而 unix socket 的 `connect()` 需要对 socket 文件的**写**权限 —— 放在只读区的
-   * 症状是"rescue 起来了但一条消息都收不到",而日志上只有一句 EACCES。
-   */
   ipcSocketPath: string;
-  /** 本进程(人格)的 IPC secret。信使按它反查身份。 */
   ipcSecret: string | undefined;
-  /** 本进程是哪个人格(见 Persona)。 */
   persona: Persona;
-  /**
-   * 管理员名单的 **env 基线**(`settings.json` 没覆盖时的默认值)。
-   *
-   * 存在的理由是守护人格:`isAdmin` 读的是**本进程数据目录**下的 settings.json,
-   * 而守护人格的是 `/data/rescue/settings.json` —— 一个全新的空文件。真机上的症状是
-   * 管理员一发 `/救援` 就被降级成普通用户:`catman-admin` 看不到、部署指令当不认识、
-   * 管理员令牌也拿不到,**而诊断与恢复恰好全是管理员的活**。
-   *
-   * 所以名单要能从进程外面给进来。守护人格由 index.ts 从主 settings.json 继承
-   * (主 /data 对它只读可读),别处则可用 `CATMAN_ADMIN_USER_KEYS` 显式指定。
-   */
   adminUserKeys: string[];
-  /**
-   * 守护人格的**无 LLM 状态页**端口。
-   *
-   * 与 dashboard 分开一个端口而不是共用:两者的可用前提不同 —— dashboard 要装配
-   * 起来(会话、agent、skill),状态页只读文件。磁盘满或 token 过期时前者可能起不来,
-   * 而后者恰恰是那时唯一还能用的东西。共用一个 server 就把它们绑成同生共死了。
-   */
   rescueStatusPort: number;
-  /**
-   * **主** /data 的位置。
-   *
-   * 守护人格的 `CATMAN_DATA_DIR` 指向它自己的命名空间(`/data/rescue`),
-   * 而它要读的部署报告、release 指针、信使队列都在主 /data 里 —— 两者必须分开表达,
-   * 否则它会去自己的小卷里找那些文件然后什么都读不到,而且**不报错**。
-   */
   mainDataDir: string;
-  /**
-   * /data 在**宿主**上的绝对路径。缺席 = 这台机器没配。
-   *
-   * 定时任务要用它把工作目录挂进一次性容器 —— docker 的 `-v` 只认宿主视角,
-   * 传容器内的路径进去,dockerd 会在宿主上静默建一个空目录然后挂上,症状是
-   * "任务跑了但什么都没有"。缺席时脚本任务在创建那一步就被拒,而不是每次都失败。
-   */
+  /** mainDataDir 在 Docker daemon 宿主上的绝对路径。 */
   hostDataDir: string | undefined;
-  /**
-   * 每用户私有目录根,**catman 自己进程里**的路径。建目录时用。
-   *
-   * 它是一棵独立于 `/data` 的树,理由见 `core/user-private.ts` ——
-   * 一句话:会话容器整挂 `/data`,放里面就得靠遮罩才能藏住,而遮罩漏了是全开。
-   */
-  userDataDir: string;
-  /**
-   * 私有目录根在**宿主**上的绝对路径。缺席 = 这台机器还没配那条挂载。
-   *
-   * 缺席时整个机制降级(不挂、不注入、不建目录),而不是退回共享区 ——
-   * 退回共享区等于把凭据写到所有人都看得见的地方,却让调用方以为它是私有的。
-   *
-   * **必填,不从别的路径推。** 推过一版,在真机上因为 `hostDataDir` 是软链路径而
-   * 指到了另一棵树上,且完全无声 —— 完整教训见 `hostUserDataDirOf`。
-   */
-  hostUserDataDir: string | undefined;
-  /**
-   * 展示用时区(IANA 名)。容器不继承宿主时区,不设就是 UTC。
-   * 定时任务的"每天 8 点"是谁的 8 点、通知里那句"下次 08-14 08:00"按哪儿算,
-   * 都取决于它 —— 所以它是配置项而不是散落在各处的 `process.env.TZ`。
-   */
   tz: string;
 }
 
@@ -263,10 +119,7 @@ export function loadConfig(): Config {
   const containerName = str("CATMAN_CONTAINER_NAME", persona === "rescue" ? "catman-rescue" : "catman");
   return {
     dataDir,
-    workspaceDir: str("CATMAN_WORKSPACE_DIR", `${dataDir}/workspace`),
-    // 跟着 mainDataDir 走而不是 dataDir:守护人格的 /data 是只读的,
-    // 它没有定时任务,也就不该在自己那份沙箱里凭空长出一个写不进去的目录。
-    cronDataDir: str("CATMAN_CRON_DATA_DIR", `${mainDataDir}/cron_data`),
+    workspaceDir: `${dataDir}/tenants`,
     statePath: str("CATMAN_STATE_PATH", `${dataDir}/state.json`),
     accountsPath: str("CATMAN_ACCOUNTS_PATH", `${dataDir}/accounts.json`),
     usersPath: str("CATMAN_USERS_PATH", `${dataDir}/users.json`),
@@ -310,42 +163,11 @@ export function loadConfig(): Config {
     adminUserKeys: list("CATMAN_ADMIN_USER_KEYS", []),
     mainDataDir,
     hostDataDir,
-    userDataDir: str("CATMAN_USER_DATA_DIR", "/userdata"),
-    hostUserDataDir: hostUserDataDirOf(),
     tz: str("TZ", "UTC"),
-    sessionContainer: bool("CATMAN_SESSION_CONTAINER", false),
+    maxActiveRuntimes: boundedNum("CATMAN_MAX_ACTIVE_RUNTIMES", persona === "rescue" ? 1 : 3, 1, 16),
+    runtimeIdleMs: boundedNum("CATMAN_RUNTIME_IDLE_MS", HOUR, 10 * 60_000, 7 * DAY),
     sessionMemoryLimit: str("CATMAN_SESSION_MEMORY", "700m"),
     sessionImage: str("CATMAN_SESSION_IMAGE", "catman-env:1"),
     cgroupRoot: str("CATMAN_CGROUP_ROOT", "/sys/fs/cgroup/docker"),
   };
-}
-
-/**
- * 私有目录根在宿主上的位置。**必须显式给,不给就整个机制不启用。**
- *
- * ## 为什么不从 `hostDataDir` 推
- *
- * 上一版是推的:取 `/data` 宿主路径的同级兄弟(`/mnt/usb/catman_data` →
- * `/mnt/usb/catman_userdata`),想的是"少一个必填项就少一处配错的机会"。
- *
- * 2026-09-03 真机上翻车了:那台机器的 `CATMAN_HOST_DATA_DIR` 是
- * **`/opt/services/catman/data`** —— 一条**指向** `/mnt/usb/catman_data` 的软链。
- * dockerd 挂载时会跟随软链,所以 `/data` 一直是对的;但同级推导拿到的是
- * `/opt/services/catman/catman_userdata`,而 compose 里那条 volume 写的是
- * `/mnt/usb/catman_userdata`。**两者指向完全不同的两棵树。**
- *
- * 而且它坏得极其安静:catman 在 A 建目录、建成功了;dockerd 按 B 挂,B 不存在就
- * 自动建一个 root 属主的空目录挂进会话容器。于是 `CATMAN_USER_PRIVATE_DIR` 有值、
- * `/private` 也存在 —— 只是写不进去(uid 10001 对 root:root 0755 没有写权限)。
- * 这正是这套机制最想避免的"变量在而挂载不对"。
- *
- * 根子在于**推导假设了 `hostDataDir` 是真实路径**,而它只需要是"dockerd 解析得开
- * 的路径"。这个假设没写在任何地方,也没有任何东西会在它不成立时喊一声。
- *
- * 所以改成必填:配了就一定和 volume 那条来自同一个变量(compose 里两处引用同一个
- * `${CATMAN_HOST_USER_DATA_DIR}`),没配就返回 undefined、整个机制降级。
- * **要么显式配对,要么不启用 —— 没有"看起来配好了其实指向别处"这个中间态。**
- */
-function hostUserDataDirOf(): string | undefined {
-  return process.env.CATMAN_HOST_USER_DATA_DIR || undefined;
 }

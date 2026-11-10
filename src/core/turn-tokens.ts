@@ -59,6 +59,7 @@ export interface TurnProgress {
 export type TurnFeed = (text: string, attachments: readonly Attachment[]) => boolean;
 
 export interface TurnContext {
+  contextId?: string;
   readonly userKey: string;
   /**
    * 本回合的会话已经不是前台了 —— 用户发了 `/新会话` 或 `/切换会话` 把它切走,
@@ -108,6 +109,7 @@ export interface MintedTurn {
 
 export class TurnTokens {
   private readonly byToken = new Map<string, TurnContext>();
+  runtimeResolver?: (token: string) => TurnContext | undefined;
   /**
    * 每用户所有在飞回合:至多一个前台 + 若干个被切走仍在后台跑的。
    *
@@ -154,7 +156,7 @@ export class TurnTokens {
 
   /** 令牌 → 回合上下文。无效令牌返回 undefined。 */
   resolve(token: string): TurnContext | undefined {
-    return this.byToken.get(token);
+    return this.byToken.get(token) ?? this.runtimeResolver?.(token);
   }
 
   /**

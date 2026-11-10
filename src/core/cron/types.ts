@@ -7,32 +7,12 @@ import type { CronSchedule } from "./schedule.js";
  * 反过来新版本读旧数据时,缺的字段必须有兜底。
  */
 
-/** 容器挂载。`host` 是**宿主**上的绝对路径 —— docker 的 -v 从来只认宿主视角。 */
-export interface CronMount {
-  readonly host: string;
-  readonly at: string;
-  readonly ro: boolean;
-}
-
-export interface CronLimits {
-  /** docker `--memory`,如 "512m"。 */
-  readonly memory: string;
-  /** docker `--cpus`。软路由只有 2 核,这个值直接决定它会不会把宿主拖垮。 */
-  readonly cpus: number;
-  /** docker `--pids-limit`。fork 炸弹的唯一一道闸。 */
-  readonly pids: number;
-}
-
 /** 脚本任务:在一次性容器里跑一条命令。 */
 export interface ScriptTask {
   readonly kind: "script";
-  readonly image: string;
   /** exec 形式,不过 shell。要 shell 就自己写 ["bash","-lc","…"]。 */
   readonly cmd: readonly string[];
   readonly env: Readonly<Record<string, string>>;
-  readonly network: "none" | "mynet";
-  readonly mounts: readonly CronMount[];
-  readonly limits: CronLimits;
 }
 
 /**

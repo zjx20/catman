@@ -1,11 +1,10 @@
-import { containerNameFor, type ScriptRunner } from "./docker.js";
+import { containerNameFor, type ScriptRunner } from "./runner.js";
 import { renderAutoDisabled, renderEnd, renderNextLine, renderStart } from "./notify.js";
 import { formatAt, nextAt as computeNextAt } from "./schedule.js";
 import { inQuietHours, mergeNotices, type NoticeSpool } from "./notices.js";
 import type { AgentTaskRunner } from "./agent-runner.js";
 import type { CronStore } from "./store.js";
-import type { CronJob, CronMount, CronRun, CronTask, RunStatus, RunTrigger } from "./types.js";
-import type { UserPrivatePaths } from "../user-private.js";
+import type { CronJob, CronRun, CronTask, RunStatus, RunTrigger } from "./types.js";
 
 /**
  * 调度器:到点了就跑,跑完了就记账、就报信。
@@ -38,6 +37,8 @@ export interface CronRuntime {
 }
 
 export interface SchedulerOptions {
+  contextBusy?: (job: CronJob) => boolean;
+  stopContext?: (job: CronJob) => Promise<void>;
   readonly store: CronStore;
   readonly runner: ScriptRunner;
   /**
@@ -51,21 +52,6 @@ export interface SchedulerOptions {
   readonly runtime: () => CronRuntime;
   /** 展示用时区。 */
   readonly tz: string;
-  /**
-   * 透传给**联网的**脚本任务的代理变量(`collectProxyEnv(process.env)`)。
-   *
-   * 由装配处给出:这台机器有没有代理是部署事实,调度器不该去猜,单测也不该
-   * 受跑测试那台机器的环境影响。
-   */
-  readonly proxyEnv?: Readonly<Record<string, string>>;
-  /**
-   * 算出(并建好)任务归属者的私有目录。同网关与 agent 任务那两份。
-   *
-   * `script` 类容器跑的是 `--user 10001:10001`(与 catman 同一个 uid),
-   * 所以 0700 的私有目录它读得动 —— 这一点是查过 `RUN_AS` 才敢挂的,
-   * 换成镜像自带用户的话这条会静默失效(读不了,而任务照跑)。
-   */
-  readonly userPrivate?: (userKey: string) => UserPrivatePaths | undefined;
   readonly notify?: CronNotifier;
   readonly now?: () => number;
   readonly tickMs?: number;
@@ -146,6 +132,8 @@ export class CronScheduler {
    * 不停的话那个容器会变成孤儿 —— 记录随任务一起删掉之后,再也没人认领得了它。
    */
   async cancelJob(jobId: string): Promise<void> {
+    const ownerJob = this.opts.store.get(jobId);
+    if (ownerJob) await this.opts.stopContext?.(ownerJob);
     for (const run of this.opts.store.listRuns(jobId, 5)) {
       if (run.status !== "running" || !run.container) continue;
       try {
@@ -407,6 +395,10 @@ export class CronScheduler {
 
   private async fire(job: CronJob, trigger: RunTrigger): Promise<CronRun | undefined> {
     const store = this.opts.store;
+    if (!this.activeRunOf(job.id) && this.opts.contextBusy?.(job)) {
+      if (job.overlap === "skip") { this.recordSkipped(job, trigger); return undefined; }
+      await this.opts.stopContext?.(job);
+    }
     // 到这儿还撞车的只剩两条路径:手动试跑,以及 overlap=replace。
     // 定时触发那一路已经在 fireDue 里判完了(它必须排在全局并发之前,见那里的说明)。
     const active = this.activeRunOf(job.id);
@@ -467,19 +459,13 @@ export class CronScheduler {
     }
 
     // 与网关同源:挂载与环境变量要么一起在,要么一起不在。
-    const priv = this.opts.userPrivate?.(job.userKey);
     const r = await this.opts.runner.launch({
       container,
       jobId: job.id,
-      image: job.task.image,
       cmd: job.task.cmd,
-      env: priv ? { ...job.task.env, CATMAN_USER_PRIVATE_DIR: priv.at } : job.task.env,
-      network: job.task.network,
-      mounts: privMounts(job.task.mounts, priv),
-      limits: job.task.limits,
-      hostWorkDir: hostWork,
-      tz: this.opts.tz,
-      ...(this.opts.proxyEnv ? { proxyEnv: this.opts.proxyEnv } : {}),
+      env: job.task.env,
+      userKey: job.userKey,
+      timeoutMs: job.timeoutMs,
     });
     if (!r.ok) {
       await this.settle(job, run, "error", undefined, `容器没起来:${r.error}`);
@@ -591,21 +577,4 @@ export class CronScheduler {
       }
     }
   }
-}
-
-/**
- * 把私有目录追加进任务自己声明的挂载表。
- *
- * **任务已经占了那个挂载点就不动它** —— 同一个 `at` 挂两次 docker 直接拒绝启动,
- * 而症状是"这个任务忽然再也起不来了",跟私有目录八竿子打不着。任务作者显式写了
- * `/private` 的话,那是他的选择,让他的赢。
- */
-export function privMounts(
-  declared: readonly CronMount[],
-  priv: UserPrivatePaths | undefined,
-): readonly CronMount[] {
-  if (!priv) return declared;
-  if (declared.some((m) => m.at === priv.at)) return declared;
-  // ro: false —— 私有目录是**写**凭据的地方,只读挂上去等于这个机制白做。
-  return [...declared, { host: priv.host, at: priv.at, ro: false }];
 }

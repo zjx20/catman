@@ -48,43 +48,41 @@
 
 ## 架构
 
-```
-微信 App(多人各自扫码)←→ 腾讯 iLink ←(每账号一条出站长轮询)→ catman 容器
-  channels/wechat-ilink  多账号连接管理,收发文本
-  core/identity          userKey = <渠道>:<账号>:<用户>,全局唯一身份
-  core/admission         准入:每个账号只服务绑定的那个人
-  core/users             每用户一个工作目录(cwd)
-  core/session           会话路由:1h 超时 / /继续 恢复 / /切换会话 历史(切走的回合转后台) / 30 天清理
-  core/settings          全局配置层(可运行时改)+ 全部配置项的 schema
-  core/prefs             每用户配置层,叠在全局默认之上
-  core/commands          硬指令表:不经 LLM 的后台直答(只读的就地执行,改状态的进分拣队列)
-  core/turn-tokens       回合级一次性令牌,agent 靠它读写自己的配置
-  core/notify-tokens     推送令牌:每人一枚、落盘、寿命与回合无关(长任务收尾靠它)
-  core/notify-bin        catman-notify:脱钩跑一条命令,跑完把结果推给用户
-  core/skills            把接口用法写成 skill(按需加载,常态不占 token)
-  core/agent             Claude Agent SDK(claude_code preset, bypassPermissions);回合中途可追加输入
-  core/gateway           分拣节点(按到达顺序线性处理,不等回合);每会话串行,跨会话并发有上限
-  channels/composite     多渠道复合,按 userKey 前缀路由
-  channels/dashboard     管理员聊天渠道(记录落盘 + SSE 推送)
-  dashboard              web:会话 / 检索 / 扫码接入 / 账号管理 / 用户与提权 / 管理员聊天(整站 token)
-  /data 卷               Claude 会话 JSONL + 网关状态 + 账号凭据 + 两层配置
+控制服务管理身份、授权、会话路由、调度、任务记录和通知。worker 的文件系统只包含当前上下文和 owner 的个人空间。
+
+```text
+用户消息 / cron → 控制服务 → owner + context → 常驻 worker
+                                              ├─ 任务管理进程
+                                              ├─ Claude CLI（按需启动，SDK 有后台任务时保留）
+                                              └─ 有明确超时的后台脚本
 ```
 
-**配置三层**,由外到内逐级覆盖:
+普通聊天每段 session 使用独立 workspace；每个 cron 使用固定 workspace，多次执行共享游标与台账。两者继承同一 owner 的个人配置和 skill。
+管理员可以通过受控接口修改全局设置、公共能力配置并触发自进化。worker 没有 Docker socket、整棵 `/data`、其他用户目录或原始管理员凭据。容器启动失败直接报错，不退回控制进程执行。控制服务重启后认领原容器与已登记任务；无法重连的旧 SDK stdio 连接会先停止，再恢复会话，防止两个 CLI 并发写同一会话。
 
+全局人格在 `/data/shared/CLAUDE.md`；公共 skill 保留在控制面的 `$CLAUDE_CONFIG_DIR/skills`，按角色只读投影。个人偏好在 `/user/CLAUDE.md`，个人 skill 在 `/user/skills/<名字>/SKILL.md`。
+公共模型凭据和公共 MCP/HTTP 服务凭据由控制服务持有，worker 通过限定的运行身份使用。个人 MCP 可在 `/user/mcp.json` 配置；公共 MCP 使用 HTTP 部署端点，私人 MCP 可使用 stdio。
+
+```text
+/data/
+  execution/
+    schema.json                  # 数据布局版本（2）
+    contexts.json                # 归属、session/cron、SDK session ID
+    runtimes.json                # 运行环境、身份、活动时间、任务截止时间
+    events.json                  # 完成、超时、回收和通知状态
+    shared-tools.json            # 公共 MCP/服务端点及凭据，0600
+  shared/CLAUDE.md
+  tenants/<tenantId>/
+    home/                        # 本用户的持久文件、个人 skill 和配置
+    contexts/<contextId>/
+      work/                      # 当前 workspace
+      sdk/                       # 此上下文的 SDK 会话与记忆
+      tasks/                     # 有限后台任务记录与日志
 ```
-环境变量        基线,重启才变
-  └─ settings.json   全局运行时覆盖   ← 管理员改
-       └─ prefs.json   每用户覆盖     ← 用户自己改
-```
 
-读取时逐级回退:某人选的模型不在白名单里 → 退到全局默认 → 再不行退到环境变量 →
-最后干脆不指定模型交给 SDK。**所以改配置不需要检查别处**:把某个模型移出白名单时不必去
-查谁在用它,读取侧会自己兜住,而那个人的选择留在盘上,模型加回来时自动恢复。
+tenantId 是 userKey 的 SHA-256 前 32 个十六进制字符。contextId 由服务端生成，SDK session ID 单独记录。控制面注册表是归属和清理的真相源。
 
-**身份与隔离**:每条消息都带一个 `userKey`(`<渠道>:<账号>:<用户>`)。带上账号这一段是必须的 ——
-两份不同的微信凭据下可能出现相同的用户标识,只按用户标识分会让两个人共用同一段上下文和同一个
-工作目录。每个 `userKey` 映射到 `/data/workspace/` 下自己的子目录,即该用户的 cwd。
+活跃环境数量受 `CATMAN_MAX_ACTIVE_RUNTIMES` 限制，主人格默认 3、守护人格默认 1；每个环境受 `CATMAN_SESSION_MEMORY` 限制，默认 700m。部署时要按主人格、守护人格、构建任务的总内存预算配置，不能只计算前台回合数。
 
 ## 前置:两项授权
 
@@ -104,7 +102,7 @@ CLAUDE_CODE_OAUTH_TOKEN=<token>
 
 ### 2. dashboard 访问令牌
 
-dashboard 上可以扫码把新用户接进来,而接入者拥有宿主 root 级别的能力,所以**整站需要令牌**
+dashboard 上可以扫码接入用户，并操作管理员控制面，所以**整站需要令牌**
 (会话记录本身也是敏感内容)。写进 `.env`:
 
 ```
@@ -184,10 +182,8 @@ curl http://catman-courier:8787/health → 503   容器名不在 NO_PROXY 里
 
 #### 定时任务的容器
 
-联网的脚本任务(`"network":"mynet"`)跟着 catman 用同一套代理,六个变量一起透传 ——
-**包括 `NO_PROXY`**。只给 `HTTP_PROXY` 的话就会掉进上面那个 503 陷阱,而任务是没人
-盯着的,那种失败要到第二天看执行记录才发现。断网的任务(默认)一个都不给:
-断网容器里摆一个代理地址不会让它更通,只会让排错多绕一圈。
+聊天与 cron 由同一执行计划配置网络，普通任务不能自选网络或宿主挂载。公共模型/MCP 凭据由控制面代理持有。
+worker 可继承不含凭据的 HTTP_PROXY/HTTPS_PROXY，NO_PROXY 额外包含控制服务地址。含凭据的代理应通过内部网关提供，避免原始共享密钥进入 worker。
 
 ### 构建镜像时的代理
 
@@ -430,38 +426,11 @@ docker logs catman-deployer            # 看这次到底发生了什么
 其发送者成为该账号的主人;之后其他人的来信一律拒绝并记录在账号页上。账号页会显示
 「已绑定 `<标识>`」供你核对 —— 如果绑错了人,点「解除绑定」后下一条来信会重新绑定。
 
-### 每个人自己的私有目录
+### 每个人自己的存储
 
-每个用户在回合容器里都有一个 `/private`,里面只有**他自己**的东西 ——
-第三方服务的 OAuth 凭据、API token 这类别人不该看见的都该放那儿。
-环境变量 `CATMAN_USER_PRIVATE_DIR` 指着它。
-
-它在宿主上是 `/mnt/usb/catman_userdata/<用户目录名>/`,**刻意与
-`catman_data` 平级而不是放在它下面**:回合容器把整个 `/data` 读写挂进去,
-放里面就得再挂个空目录去遮住别人那几份,而那种遮罩一旦漏了是全部暴露且没有征兆。
-放外面则漏挂只会让功能立刻不工作,一眼看得见。
-
-**首次部署要先把根目录建好**,否则 dockerd 会自动建一个 root 属主的空目录,
-catman 写不进去,机制会安静地降级(日志里一行 warn,功能退回原样):
-
-```bash
-mkdir -p /mnt/usb/catman_userdata && chown 10001:10001 /mnt/usb/catman_userdata
-ln -sfn /mnt/usb/catman_userdata /opt/services/catman/userdata
-```
-
-第二条软链与旁边的 `./data` 完全对称(两者都是部署目录下指向 U 盘的软链)。
-compose 的默认值指的就是它,好处是**配置里不再硬编码 `/mnt/usb`** ——
-换盘、换布局时只改软链,compose 一个字不动。dockerd 在宿主上跟随软链,
-所以挂进容器的仍是 U 盘上那棵树。
-
-⚠️ **`CATMAN_HOST_USER_DATA_DIR` 必须显式配,而且要与那条 volume 的左边逐字一致**
-(compose 里两处引用同一个变量,照抄即可)。它**不会**从别的路径推 —— 推过一版,
-在真机上因为 `CATMAN_HOST_DATA_DIR` 是软链路径而指到了另一棵树上,
-症状是 `/private` 存在却写不进去,而且没有任何报错。
-
-⚠️ **这是护栏,不是安全边界。** 回合容器里有 docker.sock,起个 root 容器挂宿主路径
-就什么都读得到。它挡的是"随手一读"和"写错路径串了用户",挡不住铁了心的 ——
-与本文档「安全说明」那节是同一句话。
+个人 home 是 `/data/tenants/<tenantId>/home`，在本人的 worker 中挂成 `/user`。聊天 session 与 cron 各自有独立 workspace，不挂整个租户根目录。
+默认把产物写当前 cwd。跨上下文保留的文件放 /user；个人 skill 放 /user/skills/<目录>/SKILL.md，个人偏好放 /user/CLAUDE.md，个人 MCP 配置放 /user/mcp.json。
+worker 不能访问其他用户、控制配置或 Docker socket。普通用户管理自己的配置和任务，管理员通过受控接口管理全局能力与自进化。
 
 ### 重新扫码(凭据失效 / 换手机)
 
@@ -516,6 +485,8 @@ docker compose exec catman node dist/src/scripts/ilink-login.js --rebind <账号
 > 它看不到脚本写的内容,并且下一次落盘会把脚本写的覆盖掉。**主进程在跑时请用 dashboard。**
 
 ## 硬指令
+
+执行环境还支持 `/延长 <contextId> [分钟]` 和 `/回收 <contextId>`，两者直接由控制服务处理，不经过 LLM。
 
 以 `/` 开头、且整条消息只有指令本身的,由后台直接响应,**不经过 LLM**:
 
@@ -644,221 +615,65 @@ token。文件每次启动覆盖写,所以内容永远跟代码同步 —— 别
 它的列表项,却仍能用 Read/Bash 读到那个文件。所以 skill 正文里没有任何令牌,只有
 `$CATMAN_ADMIN_TOKEN` 这样的环境变量引用 —— 而那个变量只注入管理员回合的子进程。
 
-### 手写 skill 装进目录就生效
+### 公共与个人 skill、MCP
 
-主人格给哪些 skill 是**黑名单**:扫 `$CLAUDE_CONFIG_DIR/skills/` 拿到装了什么,只减掉
-三类 —— 不属于这个人格的、非管理员回合该挡的(`catman-admin` / `catman-evolve`)、
-以及管理员在 `disabledSkills` 里显式关掉的。
+公共 skill 在控制面的 `$CLAUDE_CONFIG_DIR/skills/<目录>/SKILL.md`，按角色只读投影。个人 skill 放 `/user/skills/<目录>/SKILL.md`，系统生成的 catman skill 名称保留。
+个人 `/user/mcp.json` 是服务器名到 SDK MCP 配置的映射，支持 stdio/HTTP。公共 MCP 使用已部署的 HTTP 服务，由管理员通过 `GET/PUT /api/execution/shared` 配置：
 
-所以往那个目录里丢一个 SKILL.md,**下一回合就能用,不必改代码发版**。理由是能往那儿写
-文件的只有管理员和 catman 自己,装进去这个动作本身就是认可;再要一份代码里的登记表就
-只是摩擦,而漏登记的表现是那份说明**安静地不存在**（真实代价:三个手写 skill 就这么哑了
-十几天,期间共享人设的正文还在点名让人去用它们）。
+```json
+{"mcp":{"search":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer ..."}}},"services":{"weather":{"url":"https://api.example.com/weather","headers":{"X-API-Key":"..."},"methods":["GET"]}}}
+```
 
-两条配套的边界:
+请求头用 `X-Catman-Session: $CATMAN_SESSION_TOKEN`，服务端现查管理员身份。读取配置只返回 header 名称，不返回凭据。公共原始密钥不进入 worker 文件或环境变量。
+worker 公共 MCP 名称带 public_ 前缀，个人 MCP 带 user_ 前缀。HTTP 服务通过 `$CATMAN_API_BASE/api/runtime/services/<名字>` 和 `X-Catman-Runtime: $CATMAN_RUNTIME_TOKEN` 调用。
+授权公共服务表示可以使用它的共享权限；需要隔离数据的上游仍须实现租户鉴权。
 
-- **目录读不到时退回硬编码名单**(`USER_SKILLS` / `ADMIN_SKILLS`)。一次 readdir 失败不该
-  让助手连「怎么改自己的配置」都不知道 —— 与「任何配置状态下 agent 都必须能起来」同一个考虑。
-- **守护人格不跟着改,仍是白名单。** 它的价值就是没有惊喜:跑钉住的稳定版本,被叫来时
-  人正在等它诊断,不该继承磁盘现状。`disabledSkills` 同样不作用于它 —— 一个手滑的禁用
-  不该让救援手册在最需要它的时候消失,而解除禁用要走主人格那边的接口。
-
-`writeSkills` 除了写,还**清掉这个人格不要、且确实是它自己生成过**的那几个目录
-(只认 `GENERATED_SKILLS` 里的名字,手写的一个都不碰)。以前只写不删,于是守护人格那边
-留着一份换分支前的旧 `catman-evolve` —— 白名单时代它只是哑着,黑名单下会自己复活并开始
-教错东西。
+指令和公共 skill 是环境创建时的快照；新增配置在下一次 CLI/环境启动时装配。公共端点配置即时生效，新增 MCP 连接在下一次 CLI 启动时生效。个人文件不会在程序启动时被覆盖。
 
 ## 定时任务
 
-直接跟助手说「每天早上八点看一眼磁盘」就行 —— 它会调 `/api/me/cron` 建一个任务,
-到点在一个**一次性 docker 容器**里跑那条命令,跑完把结果推给你,并告诉你下次什么时候跑。
+`/api/me/cron` 根据调用身份管理本用户任务。脚本与 agent 使用统一的 owner 执行环境，每个 cron 有自己的持久 workspace。脚本 task 只接受 `kind`、`cmd`、`env`，不接受宿主路径、镜像、网络和资源参数。
 
-任务是**每个人自己的**:接口用回合令牌鉴权,身份由令牌决定,谁也看不见、动不了别人的。
-
-```
-✅ 「每天早八看一眼磁盘」跑完了,38 秒
-根分区 62%,/data 41%,没异常。
-下次:08-14 08:00 周五
+```json
+{"name":"每日检查","schedule":{"kind":"cron","expr":"0 8 * * *"},"task":{"kind":"script","cmd":["bash","-lc","./check.sh"]},"timeoutMinutes":10}
 ```
 
-三种周期:5 字段 cron(`0 8 * * *`,可带时区)、固定间隔(`每 30 分钟`)、
-一次性(带时区的 ISO 时刻,跑完自动停用)。
+agent task 使用 `{"kind":"agent","prompt":"检查状态","session":"chain","maxTurns":10}`。
+`chain` 续此任务的 SDK 会话；`fresh` 创建新的 SDK 会话，但保留同一 cron workspace。
+任务的后台工作也计入 overlap 判断。删除任务先停止其上下文，再删除该任务的文件。每次执行有硬超时；产出的后台任务另外登记自己的有限期限。
+调度状态、执行记录和通知仍由控制面保存，worker 不能直接改写别人的任务表。
 
-### 两种任务
+管理员页面 `/cron` 查看各用户任务，`/任务` 显示本人任务。调度频率、并发、历史保留和静默时段仍由全局设置与任务定义控制。
 
-**脚本任务**在一次性容器里跑一条命令 —— 备份、清理、看磁盘这类不需要判断的事。
-
-**agent 任务**到点叫醒助手本人去做一件要判断的事(「看看有没有异常,变化了才告诉我」)。
-它有**自己的会话**,不碰你正在聊的那段上下文;`session: "chain"` 时还能续上自己
-上一次的记忆,于是「跟昨天比有什么变化」这种话它答得出来。
-
-闸门比脚本更严,因为它花的是订阅额度而不是 CPU:最快 15 分钟一次(写死的)、
-默认 20 轮上限、跑飞了有超时掐、连续失败照样自动停用。**能用脚本就别用 agent。**
-
-### 它是怎么保证不把这台机器搞坏的
-
-| 闸门 | 默认 | 说明 |
-|---|---|---|
-| 全局并发 | 1 | 2 核软路由,再多就抢 agent 回合的 CPU |
-| 触发频率下限 | 5 分钟 | 创建时**真去算**相邻两次的间隔,`0,1 * * * *` 这种形状正常的也拦得住 |
-| 容器资源 | 512m / 0.5 核 / 128 pid | 一条写错的命令不至于把宿主拖到失去响应 |
-| 网络 | 断网 | 要联网得显式写 `"network":"mynet"` |
-| 挂载 | 禁止 | 只能挂 `cronMountAllowlist` 里的宿主路径前缀(默认 `/opt/services`),且**默认只读** |
-| 超时 | 10 分钟(不超过一个触发间隔) | 到点 `docker stop`,记一条 timeout |
-| 连续失败 | 3 次自动停用 | 并推一条说明。停用可逆,一直空转不可逆 |
-
-### 两件与别处不同的事
-
-**容器是 detached 的,catman 重启不打断它。** 与 deployer 同一个理由:自我进化每周都在部署,
-跑到一半的备份不该被劈断。进程回来之后靠容器名把它认领回来接着收结果 —— 走的是与平时
-**完全相同**的那条 tick 路径,不存在只在崩溃后才跑的代码。
-
-**错过的那一档只补一次,而且要在窗口内**(`cronCatchUpMs`,默认 15 分钟)。部署期间到点的
-任务确实会错过,补一次是对的;把过去 8 小时错过的 16 次全补上则是灾难。
-
-### 通知为什么默认只有一条
-
-主动推送花的是你**上一条来信**带来的发送预算(见「一个 context_token 的发送预算」)。
-半夜跑的任务,通知多半当场发不出去,而是进信使的发件队列,等你下次开口才补发。所以:
-
-- 默认**只在跑完时推一条**(带下次触发时刻 —— 你看到它的时间可能比实际执行晚很多)。
-- 开跑那条要显式打开(`notify.start`),它走 `reminder`,离线期间攒下的会自动塌缩成一条。
-- 巡检类任务建议 `notify.onlyFailure` —— 成功就闭嘴。
-- **静默时段**(`notify.quiet: "23:00-08:00"`,可跨零点):窗口里只记录不推送,
-  出窗口时把攒下的合并成一条摘要 ——「静默时段里跑了 3 次:2 次成功、1 次失败」
-  加最后一次的正文。攒着的东西**落盘**,因为部署很可能就发生在那几个小时里。
-  夜里会跑的任务都该设一个:不设也不会当场送达,只是会在你早上一开口时全砸过来。
-
-### 后台看得见
-
-dashboard 上多了一页 `定时任务`(导航里)。它是**全站视图** —— 列出这台机器上所有人的
-任务、归属、周期、下次触发、上次结果,并把**危险的那几项标红**:可写挂载了哪个宿主
-目录、有没有联网。出事时最先要查的就是这些。
-
-点进任务看最近 30 次执行记录:耗时、退出码、跳过/超时/中断的原因,点开某一次才
-拉那次的完整输出(几百 KB 全塞进页面会把列表拖垮)。页面上能直接启停和试跑。
-
-微信里也有一条只读硬指令 `/任务`:列出**你自己**的任务与下次触发时刻。它不进 LLM、
-不花额度,而且助手卡死时照样答得出来 —— 「那个半夜的备份到底还在不在」不该排在一个
-卡住的回合后面。
-
-### 执行记录
-
-每次执行都留一条记录 + 一份输出(单份上限 256 KB,超了掐头留尾)。
-**按次数保留**,每任务默认 20 条(`keepRuns` 可改,上限 200),另有一道 90 天的年龄闸。
-连"这一轮因为上一轮还在跑而跳过了"也记 —— 那是排查"为什么昨天没结果"时最要紧的线索。
-
-落盘在 `/data/cron/`:`jobs.json`(任务表)、`runs/<jobId>/`(记录与输出)、
-`work/<jobId>/`(任务自己的工作目录,挂进容器的 `/work`,跨次保留)。
-
-### 相关配置(管理员改,即时生效)
-
-`cronEnabled` 总开关、`cronMaxConcurrent` 并发、`cronMinIntervalMs` 频率下限、
-`cronKeepRuns` 默认记录条数、`cronCatchUpMs` 补跑窗口、`cronMountAllowlist` 可挂载目录。
-
-⚠️ **脚本任务要求 `.env` 里配了 `CATMAN_HOST_DATA_DIR`**(`/data` 在宿主上的绝对路径)。
-没配的话创建任务时就会被拒 —— docker 的 `-v` 只认宿主视角,传容器内路径进去 dockerd 会
-静默建一个空目录然后挂上,那种失败没有任何症状。
-
-## 长任务:跑完了它会说一声
-
-定时任务解决「到点跑」,长任务解决「跑完说一声」——「帮我把这个仓库重新构建一遍」
-不需要排期,但它要跑十分钟,而助手的回合活不了那么久。
-
-以前这里有一个**说了做不到**的洞:脱钩的进程(`setsid nohup`)确实活得过会话,
-但通知需要一个同样活得过会话的进程去发,而它不存在。于是助手只能说「你下次开口时
-我先去看日志」—— 一句没人喜欢的话。
-
-现在它可以直接说「跑完通知你」:
+## 后台任务与闲置回收
 
 ```bash
-catman-notify run -n 制备 -- /data/deploy/bin/prepare.sh HEAD
+catman-task run --timeout 3600 -n 下载资料 -- curl -o archive.zip https://example.com/archive.zip
+catman-task list
+catman-task stop <taskId>
+catman-notify send "资料已准备好"
 ```
 
-命令立刻返回日志路径,真正的活儿在脱钩进程里跑;跑完把**成败 + 耗时 + 日志尾巴**
-推给你,和定时任务的结果走同一条发送路径(你不在线就进发件队列,下次开口补发)。
+`catman-notify` 与 `catman-task` 使用同一任务客户端。后台任务在原容器中执行，保留调用 cwd、允许继承的环境和同一挂载视图。必须指定 `--timeout`（秒），范围 1–86400；到期先终止进程组，再强制杀死。未登记进程最终由容器回收清理。
+任务完成和超时事件先保存，再通知；通知失败会重试。下一次 agent 回合会收到尚未消费的任务结果。通知本身不保证自动启动新一轮推理。
 
-```
-✅ 「制备」跑完了,6 分 12 秒
-…
-新版本 9e58b3c
-日志:/data/tmp/制备-20260814-1002.log
-```
+SDK 自己的后台工作通过任务快照/完成事件追踪。前台返回 result 不关闭仍有原生后台任务的 CLI，新用户消息复用同一输入流。完全没有活动进程的环境在短暂空闲后自动释放，避免空容器占满环境配额。SDK 结果按用户消息 UUID 关联，后台完成不能冒充用户回复。无 SDK 工作时 CLI 可退出，已登记的独立后台任务继续运行。
 
-### 它凭什么发得出来
+`CATMAN_RUNTIME_IDLE_MS` 默认一小时，表示没有用户交互或助手响应的执行环境回收期限。已登记、未到期的有限任务保留其期限；SDK 进度、健康检查和进程日志不刷新闲置计时。
+截止前十分钟通知用户，附进程名称、SDK 任务和以下操作：
 
-靠一枚**推送令牌**(`/data/notify-tokens.json`,每人一枚、落盘、寿命与回合无关),
-配一个只做一件事的端点 `POST /api/me/notify`(请求头 `X-Catman-Notify`,与回合令牌
-**刻意不同名**)。这枚令牌的能力上限就是「给它自己那个 userKey 推一条文本」——
-助手在回合里本来就能给你说话,所以拿到它不构成任何提权,唯一的新增能力是
-**在回合之外**说话,而那正是我们要的。
+- `/延长 <contextId> [分钟]`：延长闲置期限，1–240 分钟，默认 30 分钟。
+- `/回收 <contextId>`：立即回收该运行环境。
 
-限流 20 条/小时:主动推送花的是你上一条来信的发送预算,一个写错的循环能把人
-打成永久静默,而定时任务靠最小间隔天然限住了,这个端点没有那道闸,只能自带一个。
+操作由控制服务处理，不经过 LLM。新的实际交互撤销旧倒计时；延长不自动修改已登记任务的硬超时。没有操作则按时销毁容器，留下回收原因并通知，保留 workspace 和会话记录。
+聊天路由超时、执行环境闲置期限、后台任务硬超时和数据保留期是四个独立参数。聊天上下文超过保留期且没有活跃环境时，才清理 workspace 与 SDK 文件。
 
-### 与一次性定时任务的分工
+## Docker 控制权限
 
-| | `catman-notify run` | cron 一次性任务 |
-|---|---|---|
-| 现场 | **本容器内**的脱钩进程 | 宿主上的独立容器 |
-| 起步 | 立刻 | 等下一次 tick(≤30 秒) |
-| catman 被重新部署 | 跟着死,通知发不出来 | 照跑不误,回来认领 |
-| docker.sock / 完整挂载 | 有(就是本容器) | 受限(默认断网、只读挂载、无 socket) |
-
-几分钟的事、或者要用本容器的现场(制备自己就要起容器)→ 前者;
-跑很久、横跨一次自我进化也不能丢 → 后者。
-
-脚本每次启动覆盖写到 `/data/bin/catman-notify`(真相源是 `core/notify-bin.ts`,
-与 skill 同一条规矩),并挂进回合的 `PATH`。它把几件**一次做对、每次重做必然做错**
-的事封在里面:`--noproxy '*'`(容器里 curl 默认走代理,打自己会 503)、
-日志写 `$CATMAN_DATA_DIR/tmp/` 而不是 `/tmp`(后者别的容器挂不到)、
-`setsid nohup … < /dev/null`(少一个就会跟着会话一起死)、任意文本的 JSON 转义。
-
-## 操作宿主 Docker(最高权限能力)
-
-镜像里预装了 **docker CLI 与 compose 插件**(只有客户端,没有 daemon);`docker-compose.yml`
-把宿主的 `/var/run/docker.sock` 挂进容器,助手便能操作**宿主的 Docker** —— 即
-docker-outside-of-docker,而不是在容器里再跑一个 daemon(那需要 `--privileged`,更危险也更慢)。
-
-### ⚠️ 先明白你交出了什么
-
-有了这个 socket,助手就能 `docker run -v /:/host ...` 挂载并读写**宿主整个文件系统**,
-等价于**宿主 root 权限**。开启后**容器不再是隔离边界**,只有"信任这台机器上的助手"这一条约束。
-自用软路由上这通常可以接受;不接受就删掉 compose 里那行 socket 挂载 —— 镜像里的 docker CLI
-拿不到 socket 就只是个摆设,不影响其它功能。
-
-### 配置:socket 的组 GID
-
-容器以非 root 的 `catman`(uid 10001)运行(`bypassPermissions` 的硬性要求),要读 socket
-就得给它一个匹配的**补充组**。该 GID 属于宿主、各机器不同,所以运行时注入而不写死进镜像:
-
-```bash
-stat -c '%g' /var/run/docker.sock     # 在宿主执行,拿到 GID
-echo "DOCKER_GID=<上一步的数字>" >> .env
-docker compose up -d --build
-```
-
-不设时默认用 `0`(root 组),适配 socket 属 `root:root` 的系统(OpenWrt 常见);
-Debian/Ubuntu 上一般是 `root:docker`(GID 多为 999/998),**必须显式设置**,否则容器内
-`docker` 报 `permission denied`。
-
-### 验证
-
-```bash
-docker compose exec catman docker ps        # 能列出宿主容器即通
-docker compose exec catman docker compose version
-```
-
-若报 `client version is too new`,说明宿主 dockerd 比容器内 CLI 老太多,
-用宿主 `docker version --format '{{.Server.APIVersion}}'` 的值设 `DOCKER_API_VERSION` 锁定协商版本。
-
-### 一个必然会踩的坑:`-v` 的路径是宿主的
-
-命令在容器里发出,**执行在宿主的 daemon 上**,所以 `-v`/`--mount` 左边的路径由宿主解析,
-与容器内看到的文件系统无关。助手在容器里看到 `/data/foo`,写 `docker run -v /data/foo:/x`
-挂到的是**宿主**的 `/data/foo`(多半不存在,Docker 还会默默建一个空目录)。
-要把 catman 自己的数据传给新容器,得用宿主侧的真实路径(本仓库的 `./data`),
-或者干脆用 `docker cp` / 命名卷绕开。这一条值得写进 `/data/workspace/CLAUDE.md` 提醒助手。
+Docker socket 仅挂载给可信的主人格、守护人格控制服务和部署执行器。其宿主 GID 仍由 Compose 的 `DOCKER_GID` 配置。
+worker 固定非 root、丢弃 capabilities、禁止提权、根文件系统只读，并限制内存、CPU、PID、日志和 `/tmp` 大小。worker 不继承 Docker socket 或控制进程附加组。
+宿主 bind mount 的源路径由控制面从已登记上下文计算，使用 `--mount`，不存在就失败；普通用户接口不接受宿主路径。
+管理员源码挂在 `/catman-src`，制备通过 `POST /api/execution/prepare` 请求固定脚本。守护人格的诊断和恢复通过 `/api/execution/diagnostics`、`/api/execution/recover` 执行有限操作。
 
 ## M0 验证清单(首次部署务必先走一遍)
 
@@ -1085,15 +900,24 @@ iLink 的 `iLink-App-Id` 在官方 openclaw-weixin 包里固定为 `"bot"`(所�
 ## 本地开发
 
 ```bash
-npm install
+npm ci
 npm run typecheck
-npm test                        # 身份 / 会话 / 网关 / 准入 / transcript / dashboard 单测
-CATMAN_CHANNEL=stdin CATMAN_DATA_DIR=./data CATMAN_ADMIN_TOKEN=devtoken \
-  CLAUDE_CODE_OAUTH_TOKEN=<token> npm run dev   # stdin 通道,终端直接聊
+npm test
+npm run build
 ```
 
-stdin 通道支持 `/user <名字>` 切换身份,因此**多用户隔离可以完全脱离微信在本地验证**:
-切到不同名字发消息,能看到各自独立的工作目录与会话。
+生产入口强制使用 Docker worker。运行时需要稳定镜像、已构建的 release、正确的 CATMAN_HOST_DATA_DIR，以及 mynet 网络；不再支持让租户 agent 回落到本机执行。
+无 Docker 环境可以运行测试：上下文/授权/回收测试使用可注入执行接口，任务管理器测试执行真实子进程，真实 CLI 测试使用本地假模型和临时目录，不调用付费模型服务。
+有 Docker socket 时可运行真实容器集成测试：
+
+```bash
+docker build --pull -t catman-env:integration -f docker/Dockerfile .
+npm run test:docker
+```
+
+集成测试使用独立临时数据、真实 worker/Claude CLI 和本地模型/MCP 服务，覆盖挂载与权限隔离、凭据代理、后台任务、取消、超时、cron 状态、重启认领和闲置回收；结束后清理测试容器与临时数据。可用 `CATMAN_DOCKER_IMAGE` 指定已有的基底镜像。在 devcontainer 内会自动从当前容器的挂载信息换算宿主路径；自动识别不了时，用 `CATMAN_DOCKER_HOST_ROOT` 指定仓库在 Docker 宿主上的绝对路径，必要时用 `CATMAN_DOCKER_CONTROLLER` 指定当前容器 ID。
+
+迁移报告中的 targetContainerRoot 决定 SDK project 编码；已迁移到 /data 的数据应通过相同容器路径使用。原生开发调试使用独立测试数据，避免混入生产会话。
 
 ## 基底镜像
 
@@ -1148,6 +972,11 @@ docker compose exec catman node -v
 
 重建前先给旧镜像打一个带版本的 tag(如 `catman-env:1-node22.23.2`)留作回滚。
 
+基底镜像不必经过 Docker Hub。已有兼容的 `catman-env:1` 时，业务升级只需在目标机
+制备 release；只有基底工具或 Node 版本需要更新时才重建镜像。资源充足的目标机可以
+直接构建；软路由上优先在构建机按目标架构构建，再用 `docker save` / `docker load`
+传入，避免构建挤占在线服务。依赖仍须在目标架构的运行环境中安装。
+
 验证依赖架构对不对(这条仍然要看):
 
 ```bash
@@ -1158,6 +987,8 @@ docker compose exec catman sh -c 'ls $(readlink -f /data/releases/current)/node_
 两者对不上就说明制备跑在了错误的架构下。
 
 ## 自进化
+
+agent 内通过 /catman-src 和 /api/execution/prepare 请求制备；下面的固定脚本命令供管理员在宿主或可信控制服务中操作。worker 不直接运行部署器。
 
 catman 可以自己改自己:管理员在微信里说一个改进想法,它改代码、跑测试、制备 release,
 汇报之后由你确认,再由**独立的 deployer 容器**完成切换与回滚。
@@ -1402,46 +1233,24 @@ chmod 600 data/courier/bind-passphrase
 
 ## 安全说明
 
-- 助手以 `bypassPermissions` 在容器内执行任意命令。**是否挂载 `/var/run/docker.sock` 决定了
-  隔离边界在哪**:不挂时边界是容器;挂了(默认配置)助手即拥有宿主 root 等价权限,
-  边界退化为"你对这台机器上的助手的信任"(详见 [操作宿主 Docker](#操作宿主-docker最高权限能力))。
-  其它敏感宿主目录/特权同理,按需再加。
-- **多账号的"隔离"不是安全边界。** 挂了 `docker.sock` 之后,任何一个接入者都能通过 docker
-  拿到宿主 root,从而读写其他用户的工作目录。每人独立 cwd 解决的是"别互相干扰、别看到对方的
-  文件",不是"互相防备"。**只把你信任的人接进来。**
-- dashboard 整站需要令牌(读写都要),写操作还额外要求 `X-Catman-Token` 请求头 —— Cookie
-  会被浏览器自动携带,只认 Cookie 的写接口能被外部页面诱导触发(CSRF)。仅监听内网,勿暴露公网。
-  **向管理员聊天发消息(`POST /api/chat`)是其中权限最高的一个写操作**,同样只认请求头。
-- **回合令牌防的是误操作,不是对抗。** 助手拿到的 `/api/me` 凭据只解析得出它自己那个用户,
-  接口也没有"改谁"这个参数 —— 正确路径就是安全路径,不存在填错对象的可能。但助手以
-  `bypassPermissions` 运行、与 `./data/dashboard-token`(0600)同一个 uid,真要绕开这个接口
-  是做得到的。这与上面 docker socket 的口径一致:**边界是对助手的信任,不是进程隔离**。
-- **给某个微信用户管理员权限,等于把管理员令牌和 dashboard 的全部写权限(含删账号)交给他。**
-  内置的 dashboard 管理员不在名单里也无法移除,是配置改坏后的恢复通道。
-- **skill 是上下文过滤而不是沙箱。** 管理员 skill 只对管理员回合出现在列表里,普通用户的助手
-  仍能 Read 到那个文件 —— 所以里面没有任何令牌,只有环境变量引用。
-- 账号凭据(`./data/accounts.json`,含 `bot_token`)以 0600 落盘;dashboard 的账号接口
-  只返回去掉凭据的视图。
-- 会话 JSONL 可能含敏感对话,`./data` 卷注意访问权限。
-- **清理范围严格限定在 catman 自己创建的 workspace 目录**:dashboard 与 30 天清理的扫描范围
-  由 `/data/workspace/` 下的一级子目录精确算出,**绝不遍历整个 `projects/` 树**。
-  因此即便有人把 `CLAUDE_CONFIG_DIR` 指向了共享的 `~/.claude`,catman 也不会误删其它项目的
-  Claude Code 会话历史(见 `src/core/transcript.ts` 的安全约束与对应单测)。
+控制服务和固化部署执行器是可信边界，持有 Docker 和模型/公共服务凭据；普通 worker 通过限定身份调用它们。运行身份不接受调用方提供 userKey，权限由服务端当前设置决定。
+worker 的挂载不能通过配置扩展到任意宿主路径。个人配置读取拒绝越出 home 的软链；目录与任务归属来自控制面注册表。管理员降权会回收其现有环境，防止旧源码挂载继续保留。
+公共能力以服务端凭据代理调用；公共 MCP 应独立部署为 HTTP 服务。个人 stdio MCP 在 worker 内运行，只能获得该 worker 已有的权限。
+请按全部控制服务、活跃 worker 和构建任务合计配置内存预算。数据、迁移备份与 shared-tools.json 都包含私有内容，不提交 Git。
 
-## 数据格式与升级
+## 数据格式与升级：执行上下文 v2
 
-**日常升级不动 `data/`。** 回滚只换代码(换 `releases/current` 的指向),数据一路向前 ——
-所以自动进化的改动必须**能读现有格式**,而且因为观察期内随时可能回滚,**旧版本也要能读
-新版本写的**。做不到的改动属于要人工介入的那一类,不走自动流水线。
+本次为显式、不兼容的数据布局升级。已有 users.json/state.json 而没有 `execution/schema.json` 时，启动会拒绝继续；不得通过删除状态绕过检查。
 
-兜底靠代码里本来就有的防御式解析:`parseUserKey()` 对非法 key 返回 null、`SessionManager`
-加载时丢弃坏条目、prefs 失效的覆盖只在读取时回退(不改盘)、`settings.effective()` 永不抛。
-这些不是为迁移准备的分支,是解析器本就该有的防御。
+迁移由管理员 agent 执行一次，不维护自动迁移脚本。主人格与守护人格的数据根分别迁移；守护人格的 containerRoot 通常为 /data/rescue：
 
-**跨越不兼容格式时**(比如从单账号版本升级),不提供迁移,清空 `./data` 重新扫码即可 ——
-为一次性场景写迁移代码,等于把旧格式的知识永久留在代码里。旧的 `state.json` 条目会被识别为
-非法格式并丢弃(日志有提示),旧的 `ilink-credentials.json` 不再被任何代码读取。
+1. 停止主人格与守护人格的调度、消息接入及旧 worker，保存完整数据目录和旧私有目录备份，记录校验值。信使的账号凭据和消息台账保持原归属。
+2. 根据 users.json 与旧 workspace 映射确定每个目录的 userKey。生成 tenantId，将个人偏好、个人 skill、原私有文件整理到该用户 home。旧 workspace 中跨 session 共用且无法细分的文件放本人 `home/legacy-workspace`，不猜测它们属于哪段聊天。
+3. 每段聊天建立独立 context，每个 cron 建立固定 context。保存 owner、kind、jobId（cron）、sdkSessionId、sdkStarted、createdAt、lastActivityAt。contextId 为 `c_` 加 24 位随机十六进制字符；旧 SDK session ID 可以保留。
+4. 将每段 JSONL 及其同名 subagent 目录迁到对应 `sdk/projects/<encodeProjectDir(新 cwd)>/`，核对条目数量和内容。cwd 使用目标部署的容器路径（通常 `/data/...`），不能误用迁移机器的宿主路径。SDK 会话元数据中的 cwd 随目录位置更新，历史消息正文保留。
+5. 把会话状态更新为 `{current:{sessionId,lastActive},history:[],reminded:false}`，补齐已确认归属的历史引用。users.json 的 dirName 更新为 tenantId。每个 cron 的工作文件归到 owner 的 cron context，删除 task 中旧的 image/network/mounts/limits，按新 workspace 修改脚本及提示词路径。
+6. 共享人格转到 shared/CLAUDE.md，去掉个人 `@../CLAUDE.md` 导入。公共模型凭据仅放控制服务环境；公共 MCP/服务凭据整理到受控 shared-tools.json，不复制进各 SDK 配置目录。公共 stdio MCP 如需共享，应先部署为 HTTP MCP 服务。
+7. 无法确认 owner 的文件与会话放控制面隔离归档，保留旧位置和校验值，不能分发给所有用户。核验账号、用户数、会话数、各自 resume/搜索，以及两个用户互不可见。目录属主必须匹配目标控制服务的 uid/gid；不要修改 release 与部署器的专用属主。
+8. 验证完成后最后写 `execution/schema.json` 为 `{"schema":2,"containerRoot":"/data"}`。本次还修改了 compose 的挂载和运行时配置，需要在维护窗口应用新版 compose、重建相应服务容器；仅切 release 链接或 restart 不会应用这些配置。启动新版本，分别验证聊天、cron、后台下载、超时、提前提醒、延长和重启认领。主人格、pinned 守护人格与固化部署执行器必须一起切到支持 v2 的版本，归档旧的回退候选，避免机械回退启动旧布局代码。回退到 v1 必须连同数据备份一起恢复，不能只换代码链接。备份保留到真实部署验收完成。
 
-⚠️ 如果保留旧 `./data` 不删,`data/claude/projects/-data-workspace/` 下的旧会话会**永久残留**:
-清理只在已知用户的目录内操作(上一条的安全约束),不会去收养这个孤儿目录。要么清空 `./data`,
-要么手动删掉那个目录。
+工作区 `data/` 的一次性迁移报告保存在 `data/execution/migration-report.json`，该目录包含私有数据，不提交 Git。生产宿主的数据需要在其实际目录中执行和验证。

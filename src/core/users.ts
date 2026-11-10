@@ -1,3 +1,4 @@
+import { tenantId } from "./execution/contexts.js";
 import { mkdirSync, readdirSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { readJsonFile, writeJsonFileAtomic } from "./file-store.js";
@@ -9,19 +10,7 @@ import {
 } from "./identity.js";
 import { encodeProjectDir } from "./transcript.js";
 
-/**
- * 每用户工作目录与用户注册表。
- *
- * 目录布局:
- *   <workspaceRoot>/CLAUDE.md            共享人设,所有用户继承
- *   <workspaceRoot>/<dirName>/           某个用户的 cwd
- *   <workspaceRoot>/<dirName>/CLAUDE.md  `@../CLAUDE.md` + 个人段落
- *
- * 共享人设走 CLAUDE.md 的 `@` import 语法显式引入,而不是依赖「向上递归查找父目录
- * CLAUDE.md」的隐式行为 —— 后者在 Agent SDK 的 preset 系统提示词下没有验证过。
- * 注意 project settings(`.claude/settings.json`)没有类似的继承机制:要让某项
- * setting 对所有用户生效,得放到 user settings($CLAUDE_CONFIG_DIR/settings.json)。
- */
+/** User registry and persistent personal homes. Session/cron ownership lives in ContextStore. */
 
 export interface UserRecord {
   /** 工作目录名(workspaceRoot 下的一级子目录)。 */
@@ -48,9 +37,7 @@ export type UserMap = Record<string, UserRecord>;
 function initialUserClaudeMd(userKey: string): string {
   return `# 个人偏好
 
-@../CLAUDE.md
-
-以上一行引入共享人设(workspace 根目录的 CLAUDE.md),下面写只对本用户生效的偏好。
+共享人设由运行环境只读装配，下面写只对本用户生效的偏好。
 
 - 用户标识:\`${userKey}\`
 `;
@@ -91,13 +78,14 @@ export class UserRegistry {
    */
   ensureSharedClaudeMd(body: string): void {
     mkdirSync(this.workspaceRoot, { recursive: true });
-    const path = join(this.workspaceRoot, "CLAUDE.md");
+    const path = join(this.workspaceRoot, "..", "shared", "CLAUDE.md");
+    mkdirSync(join(this.workspaceRoot, "..", "shared"), { recursive: true });
     if (!existsSync(path)) writeFileSync(path, body, "utf8");
   }
 
   /** 某用户的工作目录(cwd)绝对路径。不保证目录已存在。 */
   workspaceDirOf(userKey: string): string {
-    return join(this.workspaceRoot, userDirName(userKey));
+    return join(this.workspaceRoot, tenantId(userKey), "home");
   }
 
   /**
@@ -121,7 +109,7 @@ export class UserRegistry {
     } else {
       const parts = parseUserKey(userKey);
       this.users[userKey] = {
-        dirName: userDirName(userKey),
+        dirName: tenantId(userKey),
         channel: parts?.channel ?? "",
         accountId: parts?.accountId ?? "",
         displayName: defaultDisplayName(userKey),
@@ -237,9 +225,10 @@ export function listWorkspaceDirs(workspaceRoot: string): WorkspaceDirInfo[] {
   const out: WorkspaceDirInfo[] = [];
   for (const e of entries) {
     if (!e.isDirectory()) continue;
-    // 只认本程序生成的目录名形态,避免把用户手动放进来的目录当成某个人的 workspace。
-    if (!isUserDirName(e.name)) continue;
-    const path = join(workspaceRoot, e.name);
+    // 只认租户 ID 目录，读取其中的个人 home。
+    if (!/^[a-f0-9]{32}$/.test(e.name)) continue;
+    const path = join(workspaceRoot, e.name, "home");
+    if (!existsSync(path)) continue;
     out.push({ dirName: e.name, path, projectDir: encodeProjectDir(path) });
   }
   return out;

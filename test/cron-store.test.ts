@@ -26,7 +26,7 @@ function job(over: Partial<CronJob> = {}): CronJob {
     name: "备份",
     enabled: true,
     schedule: { kind: "every", ms: 3600_000 },
-    task: { kind: "script", image: "catman-env:1", cmd: ["ls"], env: {}, network: "none", mounts: [], limits: { memory: "512m", cpus: 0.5, pids: 128 } },
+    task: { kind: "script", cmd: ["ls"], env: {}, },
     timeoutMs: 600_000,
     overlap: "skip",
     notify: { start: false, end: true, onlyFailure: false },

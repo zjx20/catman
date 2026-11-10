@@ -27,7 +27,6 @@ function ctx(over: Partial<ValidateContext> = {}): ValidateContext {
     defaultTz: SH,
     minIntervalMs: 5 * 60_000,
     defaultKeepRuns: 20,
-    mountAllowlist: ["/opt/services"],
     hostDataDir: "/mnt/usb/catman_data",
     modelAllowlist: ["opus", "sonnet", "haiku"],
     now: NOW,

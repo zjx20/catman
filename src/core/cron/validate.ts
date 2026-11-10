@@ -1,5 +1,5 @@
 import { minGapMs, nextAt, parseCronExpr, type CronSchedule } from "./schedule.js";
-import type { CronJob, CronLimits, CronMount, CronNotify, CronTask, OverlapPolicy } from "./types.js";
+import type { CronJob, CronNotify, CronTask, OverlapPolicy } from "./types.js";
 
 /**
  * 创建/修改定时任务时的**入口校验**。
@@ -37,7 +37,6 @@ const fail = (msg: string): never => {
 };
 
 /** 一个任务最多几条挂载。 */
-export const MAX_MOUNTS = 4;
 /** 一个用户最多几个任务。 */
 export const MAX_JOBS_PER_USER = 50;
 export const MAX_NAME_CHARS = 64;
@@ -72,7 +71,6 @@ export interface ValidateContext {
   readonly minIntervalMs: number;
   readonly defaultKeepRuns: number;
   /** 允许挂载的**宿主**路径前缀。空数组 = 一条挂载都不许加。 */
-  readonly mountAllowlist: readonly string[];
   /**
    * /data 在宿主上的绝对路径。没有它就拼不出工作目录的 -v 参数,
    * 脚本任务在这台机器上根本跑不起来 —— 那就别让人建,而不是建完每次都失败。
@@ -230,51 +228,13 @@ function checkFrequency(schedule: CronSchedule, ctx: ValidateContext, isAgent: b
 const IMAGE_RE = /^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,199}$/;
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-function validateMounts(raw: unknown, ctx: ValidateContext): CronMount[] {
-  if (raw === undefined || raw === null) return [];
-  if (!Array.isArray(raw)) fail(`task.mounts 必须是数组,给的是 ${typeName(raw)}`);
-  const arr = raw as unknown[];
-  if (arr.length > MAX_MOUNTS) fail(`task.mounts 最多 ${MAX_MOUNTS} 条,给的是 ${arr.length} 条`);
-  return arr.map((item, i) => {
-    const where = `task.mounts[${i}]`;
-    if (!isObject(item)) fail(`${where} 必须是对象,给的是 ${typeName(item)}`);
-    const o = item as Record<string, unknown>;
-    noExtraKeys(o, ["host", "at", "ro"], where);
-    const host = reqString(o["host"], `${where}.host`, 300);
-    const at = reqString(o["at"], `${where}.at`, 200);
-    if (!host.startsWith("/") || host.includes("..")) {
-      fail(`${where}.host 要宿主上的绝对路径且不能含 ..(给的是 ${JSON.stringify(host)})`);
-    }
-    if (!at.startsWith("/") || at.includes("..") || at === "/") {
-      fail(`${where}.at 要容器内的绝对路径且不能是 / 或含 ..(给的是 ${JSON.stringify(at)})`);
-    }
-    if (at === "/work" || at.startsWith("/work/")) {
-      fail(`${where}.at 不能占用 /work —— 那是任务自己的工作目录`);
-    }
-    if (!ctx.mountAllowlist.length) {
-      fail(`这台机器不允许任务挂载宿主目录(mountAllowlist 是空的),${where} 去掉吧`);
-    }
-    if (!ctx.mountAllowlist.some((p) => underPrefix(host, p))) {
-      fail(
-        `${where}.host 不在允许的范围内。可挂载的是:${ctx.mountAllowlist.join("、")}` +
-          "(要放宽得让管理员改 cronMountAllowlist)",
-      );
-    }
-    // **默认只读**。可写要显式写 ro:false —— 一次挂错路径 + 一句 rm -rf 就是
-    // 不可逆的,让它至少需要两个字段同时写对。
-    return { host, at, ro: optBool(o["ro"], `${where}.ro`, true) };
-  });
-}
-
 function validateScriptTask(o: Record<string, unknown>, ctx: ValidateContext): CronTask {
-  noExtraKeys(o, ["kind", "image", "cmd", "env", "network", "mounts", "limits"], "task");
+  noExtraKeys(o, ["kind", "cmd", "env"], "task");
   if (!ctx.hostDataDir) {
     fail(
       "这台机器没配 CATMAN_HOST_DATA_DIR(/data 在宿主上的路径),脚本任务的工作目录挂不进容器,建了也跑不起来。",
     );
   }
-  const image = o["image"] === undefined ? DEFAULT_IMAGE : reqString(o["image"], "task.image", 200);
-  if (!IMAGE_RE.test(image)) fail(`task.image 不像个镜像名:${JSON.stringify(image)}`);
 
   const rawCmd = o["cmd"];
   if (!Array.isArray(rawCmd)) {
@@ -301,43 +261,12 @@ function validateScriptTask(o: Record<string, unknown>, ctx: ValidateContext): C
     }
   }
 
-  const limits = validateLimits(o["limits"]);
   return {
     kind: "script",
-    image,
     cmd,
     env,
     // 默认**断网**。要联网就显式说 —— 定时任务往外发请求是一类需要有人想过的事。
-    network: optEnum(o["network"], "task.network", ["none", "mynet"] as const, "none"),
-    mounts: validateMounts(o["mounts"], ctx),
-    limits,
   };
-}
-
-function validateLimits(raw: unknown): CronLimits {
-  if (raw === undefined || raw === null) return { ...DEFAULT_LIMITS };
-  if (!isObject(raw)) fail(`task.limits 必须是对象,给的是 ${typeName(raw)}`);
-  const o = raw as Record<string, unknown>;
-  noExtraKeys(o, ["memory", "cpus", "pids"], "task.limits");
-  let memory: string = DEFAULT_LIMITS.memory;
-  if (o["memory"] !== undefined) {
-    memory = reqString(o["memory"], "task.limits.memory", 16);
-    if (!/^\d{1,5}[mg]$/.test(memory)) {
-      fail(`task.limits.memory 要形如 "512m" 或 "2g",给的是 ${JSON.stringify(memory)}`);
-    }
-    const mb = memory.endsWith("g") ? Number(memory.slice(0, -1)) * 1024 : Number(memory.slice(0, -1));
-    if (mb < 32 || mb > 4096) fail(`task.limits.memory 应在 32m-4096m 之间,给的是 ${memory}`);
-  }
-  let cpus: number = DEFAULT_LIMITS.cpus;
-  if (o["cpus"] !== undefined) {
-    if (typeof o["cpus"] !== "number" || !Number.isFinite(o["cpus"])) {
-      fail(`task.limits.cpus 必须是数字,给的是 ${typeName(o["cpus"])}`);
-    }
-    cpus = Math.round((o["cpus"] as number) * 100) / 100;
-    if (cpus < 0.1 || cpus > 2) fail(`task.limits.cpus 应在 0.1-2 之间,给的是 ${cpus}`);
-  }
-  const pids = optInt(o["pids"], "task.limits.pids", 16, 512, DEFAULT_LIMITS.pids);
-  return { memory, cpus, pids };
 }
 
 /**
@@ -521,17 +450,7 @@ function taskToInput(t: CronTask): Record<string, unknown> {
   }
   return {
     kind: t.kind,
-    image: t.image,
     cmd: [...t.cmd],
     env: { ...t.env },
-    network: t.network,
-    mounts: t.mounts.map((m) => ({ ...m })),
-    limits: { ...t.limits },
   };
-}
-
-/** `/opt/services` 覆盖 `/opt/services/x`,但**不**覆盖 `/opt/services-evil`。 */
-function underPrefix(path: string, prefix: string): boolean {
-  const p = prefix.endsWith("/") ? prefix.slice(0, -1) : prefix;
-  return path === p || path.startsWith(`${p}/`);
 }

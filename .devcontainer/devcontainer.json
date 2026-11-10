@@ -19,7 +19,8 @@
     "source=go-mod-cache,target=/go/pkg/mod,type=volume",
     "source=go-sumdb-cache,target=/go/pkg/sumdb,type=volume",
     "source=go-build-cache,target=/go/build-cache,type=volume",
-    "source=npm-cache,target=/home/vscode/.npm,type=volume"
+    "source=npm-cache,target=/home/vscode/.npm,type=volume",
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
   ],
   "customizations": {
     "vscode": {
@@ -31,7 +32,31 @@
           "17872": {
             "onAutoForward": "ignore"
           }
-        }
+        },
+        "http.proxy": "http://localhost:8001",
+        "http.noProxy": [
+          "localhost",
+          "127.0.0.1",
+          "::1",
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "169.254.0.0/16",
+          "host.docker.internal",
+          "host.orb.internal",
+          "gateway.docker.internal",
+          "docker.orb.internal",
+          "*.local",
+          ".local",
+          "*.internal",
+          ".internal",
+          "*.lan",
+          "*.test",
+          "*.orb.local",
+          ".orb.local",
+          ".svc",
+          "*.cluster.local"
+        ]
       }
     }
   },
@@ -39,7 +64,13 @@
     "GOCACHE": "/go/build-cache",
     "CLAUDE_CONFIG_DIR": "${localEnv:HOME}/.claude",
     "CODEX_HOME": "/codex-home",
-    "CODEX_SQLITE_HOME": "/tmp/codex-sqlite"
+    "CODEX_SQLITE_HOME": "/tmp/codex-sqlite",
+    "HTTP_PROXY": "http://localhost:8001",
+    "http_proxy": "http://localhost:8001",
+    "HTTPS_PROXY": "http://localhost:8001",
+    "https_proxy": "http://localhost:8001",
+    "NO_PROXY": "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,host.docker.internal,host.orb.internal,gateway.docker.internal,docker.orb.internal,*.local,.local,*.internal,.internal,*.lan,*.test,*.orb.local,.orb.local,.svc,*.cluster.local",
+    "no_proxy": "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,host.docker.internal,host.orb.internal,gateway.docker.internal,docker.orb.internal,*.local,.local,*.internal,.internal,*.lan,*.test,*.orb.local,.orb.local,.svc,*.cluster.local"
   },
   "remoteEnv": {
     "FRUGALAI_API_TOKEN": "${localEnv:FRUGALAI_API_TOKEN}"

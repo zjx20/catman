@@ -1,3 +1,4 @@
+import type { ContextStore } from "../core/execution/contexts.js";
 import type { PrefsStore, UserPrefsPatch } from "../core/prefs.js";
 import type { SessionManager } from "../core/session.js";
 import type { GlobalSettings } from "../core/settings.js";
@@ -25,6 +26,7 @@ import { encodeProjectDir, listSessionsAcross } from "../core/transcript.js";
 export const SESSION_HEADER = "x-catman-session";
 
 export interface SelfApiDeps {
+  contexts?: ContextStore;
   turns: TurnTokens;
   prefs: PrefsStore;
   users: UserRegistry;
@@ -78,6 +80,7 @@ export function handleSelfApi(
   }
 
   if (path === "/api/me/sessions" && method === "GET") {
+    if (deps.contexts) return ok(deps.contexts.sessions(userKey));
     const projectDir = encodeProjectDir(deps.users.workspaceDirOf(userKey));
     return ok(listSessionsAcross(deps.configDir, [{ projectDir, userKey }]));
   }

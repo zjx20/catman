@@ -1,3 +1,5 @@
+import type { ExecutionApi } from "./api-execution.js";
+import type { ContextStore } from "../core/execution/contexts.js";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import {
   listSessionsAcross,
@@ -88,6 +90,8 @@ import { buildHealth, isHealthPath, type HealthDeps } from "./health.js";
  */
 
 export interface DashboardOptions {
+  contexts?: ContextStore;
+  executionApi?: ExecutionApi;
   /** CLAUDE_CONFIG_DIR。 */
   configDir: string;
   /** 各用户工作目录的父目录。 */
@@ -141,6 +145,14 @@ export class Dashboard {
       if (!this.server) return resolve();
       this.server.close(() => resolve());
     });
+  }
+
+  private allowsAdmin(req: IncomingMessage): boolean {
+    if (this.auth.allowsWrite(req)) return true;
+    const raw = req.headers[SESSION_HEADER];
+    const token = Array.isArray(raw) ? raw[0] : raw;
+    const userKey = token ? this.opts.selfApi.turns.resolve(token)?.userKey : undefined;
+    return !!userKey && this.opts.adminApi.settings.isAdmin(userKey);
   }
 
   /**
@@ -234,6 +246,7 @@ export class Dashboard {
     const isApi = path.startsWith("/api/");
 
     try {
+      if (await this.opts.executionApi?.handle(req, res, url, this.auth.allowsWrite(req))) return;
       // ⚠️ /health 与 /api/me 一样,必须排在 admin 读闸门**之前**。
       // deployer 与看门狗拿不到 admin token(那是用户的凭据,不该下放给部署机制),
       // 放到闸门后面会静默 401 —— 表现为"每次部署都在健康门超时",极难查。
@@ -280,7 +293,7 @@ export class Dashboard {
         return;
       }
 
-      if (!this.auth.allowsRead(req, url)) {
+      if (!this.auth.allowsRead(req, url) && !this.allowsAdmin(req)) {
         return isApi ? jsonError(res, 401, "未授权") : loginPage(res);
       }
       // ?token= 命中:换成 Cookie 并跳转,免得 token 留在地址栏和访问日志里。
@@ -301,7 +314,7 @@ export class Dashboard {
       // 读也一样要求 —— 它会列出所有人的任务(含命令与挂载),凭据强度按写操作对待。
       if (isCronAdminApiPath(path)) {
         if (!this.opts.cronAdmin) return jsonError(res, 503, "这台机器没有定时任务调度器");
-        if (!this.auth.allowsWrite(req)) {
+        if (!this.allowsAdmin(req)) {
           return jsonError(res, 403, "需要 X-Catman-Token 请求头");
         }
         const body = await readJsonBody(req);
@@ -313,7 +326,7 @@ export class Dashboard {
 
       if (isAdminApiPath(path)) {
         // 读也要求请求头:这两个接口会暴露全部用户的配置,凭据强度按写操作对待。
-        if (!this.auth.allowsWrite(req)) {
+        if (!this.allowsAdmin(req)) {
           return jsonError(res, 403, "需要 X-Catman-Token 请求头");
         }
         const body = await readJsonBody(req);
@@ -325,7 +338,7 @@ export class Dashboard {
 
       if (path === "/api/chat" && req.method === "POST") {
         // 发消息给管理员 agent 是最高权限的写操作 —— 只认请求头(见 auth.ts 的 CSRF 说明)。
-        if (!this.auth.allowsWrite(req)) {
+        if (!this.allowsAdmin(req)) {
           return jsonError(res, 403, "写操作需要 X-Catman-Token 请求头");
         }
         const body = await readJsonBody(req);
@@ -341,7 +354,7 @@ export class Dashboard {
       }
 
       if (path === "/api/sessions") {
-        return json(res, listSessionsAcross(this.opts.configDir, this.scopes()));
+        return json(res, (this.opts.contexts?.sessions() ?? listSessionsAcross(this.opts.configDir, this.scopes())));
       }
       if (path.startsWith("/api/session/")) {
         const id = decodeURIComponent(path.slice("/api/session/".length));
@@ -349,7 +362,7 @@ export class Dashboard {
       }
       if (path === "/api/search") {
         const q = url.searchParams.get("q") ?? "";
-        return json(res, searchAcross(this.opts.configDir, this.scopes(), q));
+        return json(res, (this.opts.contexts?.search(q) ?? searchAcross(this.opts.configDir, this.scopes(), q)));
       }
       if (path.startsWith("/session/")) {
         const id = decodeURIComponent(path.slice("/session/".length));
@@ -397,7 +410,7 @@ export class Dashboard {
         return html(
           res,
           renderPage("list", {
-            sessions: listSessionsAcross(this.opts.configDir, this.scopes()),
+            sessions: (this.opts.contexts?.sessions() ?? listSessionsAcross(this.opts.configDir, this.scopes())),
             users: this.opts.users.snapshot(),
           }),
         );
@@ -418,6 +431,7 @@ export class Dashboard {
    * 命中才使用,绝不直接当路径拼接(否则就是一个目录穿越入口)。
    */
   private readSessionAnywhere(sessionId: string, hint: string | null) {
+    if (this.opts.contexts) return this.opts.contexts.read(sessionId);
     const scopes = this.scopes();
     const ordered = hint ? scopes.filter((s) => s.projectDir === hint).concat(scopes) : scopes;
     for (const scope of ordered) {
@@ -474,7 +488,7 @@ export class Dashboard {
     path: string,
   ): Promise<void> {
     // 账号相关全是写操作,一律要求请求头(防 CSRF,见 auth.ts)。
-    if (!this.auth.allowsWrite(req)) {
+    if (!this.allowsAdmin(req)) {
       return jsonError(res, 403, "写操作需要 X-Catman-Token 请求头");
     }
 

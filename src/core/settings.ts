@@ -84,7 +84,6 @@ export interface Settings {
   cronMinIntervalMs: number;
   cronKeepRuns: number;
   cronCatchUpMs: number;
-  cronMountAllowlist: string[];
   disabledSkills: string[];
 }
 
@@ -370,21 +369,6 @@ export const SETTING_SCHEMA: Schema = {
     6 * HOUR,
     " 毫秒",
   ),
-  cronMountAllowlist: {
-    scope: "global",
-    label: "任务可挂载目录",
-    desc: "定时任务能挂进容器的宿主路径前缀。设成空数组 = 一个都不许挂。",
-    floor: ["/opt/services"],
-    hint: () => "宿主上的绝对路径前缀数组,如 [\"/opt/services\"];空数组表示全部禁止",
-    validate(raw) {
-      const v = parsePathList(raw);
-      if (!v) throw new Error("任务可挂载目录需要一个数组,每一项是宿主上的绝对路径(不含 ..)");
-      return v;
-    },
-    // 与别的白名单不同:**空数组是合法值**,它表示"一个都不许挂"。
-    // 复用 stringArrayDef 的话空数组会被当坏值退回默认,管理员就永远收不紧这一项。
-    parse: (raw) => parsePathList(raw),
-  },
   disabledSkills: {
     scope: "global",
     label: "禁用的 skill",
@@ -566,7 +550,6 @@ export class GlobalSettings {
       cronMinIntervalMs: pick("cronMinIntervalMs"),
       cronKeepRuns: pick("cronKeepRuns"),
       cronCatchUpMs: pick("cronCatchUpMs"),
-      cronMountAllowlist: pick("cronMountAllowlist"),
       disabledSkills: pick("disabledSkills"),
     };
   }

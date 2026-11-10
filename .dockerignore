@@ -4,6 +4,7 @@ dist/
 
 # 运行时数据与密钥 —— 绝不进镜像:含 bot_token、会话记录、Claude token
 data/
+.migration-backups/
 .env
 *.log
 

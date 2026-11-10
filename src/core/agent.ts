@@ -1,42 +1,16 @@
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  realpathSync,
-  statSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { dirname } from "node:path";
-import { query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+import { query, type SDKMessage, type SDKUserMessage, type McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { Config } from "../config.js";
 import type { EffortLevel } from "./settings.js";
 import type { Attachment } from "./attachments.js";
-import {
-  AGENT_TRACE,
-  HEARTBEAT_MS,
-  describeProgress,
-  describeSdkMessage,
-  formatHeartbeat,
-  shortMs,
-  shortNum,
-} from "./agent-trace.js";
+import { AGENT_TRACE, describeSdkMessage } from "./agent-trace.js";
 import { personaBriefing } from "./persona.js";
-import { incidentLine } from "./mem-watchdog.js";
-import { startTurnWatchdog } from "./mem-watchdog-runner.js";
-import {
-  DEFAULT_SESSION_LIMITS,
-  buildSessionImageArgs,
-  buildSessionRunArgs,
-  type SessionContainerSpec,
-  buildWrapperScript,
-  claudePathIn,
-  sessionContainerName,
-  sessionMounts,
-  staleWrappers,
-} from "./session-container.js";
-
+import { ContextStore, readTenantFile, type ExecutionContext } from "./execution/contexts.js";
+import { RuntimeManager, networkEnvironment } from "./execution/runtime.js";
+import { CapabilityBroker } from "./execution/broker.js";
+import { SdkSession } from "./execution/sdk-session.js";
+import { GENERATED_SKILLS, skillsOnDisk } from "./skills.js";
 /**
  * Agent SDK 封装。目标:尽量还原 Claude Code 的行为("脾气"),
  * 关键是三项非默认配置 —— 系统提示词 preset、加载 setting sources、启用 skills。
@@ -126,6 +100,7 @@ export class ProgressFan {
 export type AgentFeed = (prompt: string, attachments: readonly Attachment[]) => boolean;
 
 export interface AgentRunOptions {
+  context?: ExecutionContext;
   /** 传入则 resume 该会话;不传则开启新会话。 */
   resumeSessionId?: string;
   /**
@@ -143,10 +118,7 @@ export interface AgentRunOptions {
    * 兜底原则:设置项坏了也不能让回合起不来。
    */
   effort?: EffortLevel;
-  /**
-   * 子进程环境变量。**SDK 会用它整体替换子进程环境**(不是合并),
-   * 调用方必须自己展开 process.env,并对不该下放的变量做剔除。
-   */
+  /** 调用方提供的回合元数据；真实 worker 环境由执行计划统一生成。 */
   env?: Record<string, string | undefined>;
   /** 本回合可见的 skill 名单。注意这是上下文过滤而非沙箱,详见 skills.ts。 */
   skills?: string[];
@@ -175,14 +147,6 @@ export interface AgentRunOptions {
    * 几个回合的日志会交织成一团分不开。
    */
   logLabel?: string;
-  /**
-   * 这个用户的私有目录在**宿主**上的路径,挂进会话容器的 `/private`。
-   *
-   * 由调用方算好传进来(`ensureUserPrivateDir`),而不是让 Agent 自己从 userKey 推 ——
-   * 与 `cwd` 同一条路子:Agent 收的是"挂哪儿",不是"这是谁"。缺席就不挂,
-   * 回合里没有 `/private`,脚本会自己退回共享区,见 core/user-private.ts。
-   */
-  privateHostDir?: string;
   /**
    * 随本回合带上的图片。会作为 image content block **内联**进这一轮的用户消息,
    * 模型第一次推理就能看到 —— 而不是先落盘再让它自己去 Read(那要多一次
@@ -327,358 +291,116 @@ function isBenignStderr(line: string): boolean {
   return /kernel does not support swap limit/i.test(line);
 }
 
-/**
- * 清扫过期的包装脚本。失败一律吞掉 —— 清理不该把回合带走。
- */
-function sweepStaleWrappers(tmpDir: string): void {
-  try {
-    const entries = readdirSync(tmpDir).map((name) => {
-      try {
-        return { name, mtimeMs: statSync(`${tmpDir}/${name}`).mtimeMs };
-      } catch {
-        return { name, mtimeMs: Date.now() }; // 读不到就当它是新的,宁可不删
-      }
-    });
-    for (const name of staleWrappers(entries, Date.now())) {
-      try {
-        unlinkSync(`${tmpDir}/${name}`);
-      } catch {
-        /* 删不掉就算了,下次再说 */
-      }
-    }
-  } catch {
-    /* 目录不在等等,不是问题 */
-  }
-}
-
+/** SDK transport for owner-scoped execution contexts. */
 export class Agent {
-  constructor(private readonly config: Config) {}
+  private readonly live = new Map<string, { session: SdkSession; options: AgentRunOptions; model?: string; effort?: string }>();
+  constructor(private readonly config: Config, private readonly execution?: {
+    contexts: ContextStore; runtimes: RuntimeManager; broker: CapabilityBroker;
+  }, private readonly probe = false) {}
 
-  /**
-   * 把这一回合的大脑关进容器所需的那点准备:拼 `docker run` 参数、把包装脚本
-   * 落到盘上、返回给 SDK 的 `pathToClaudeCodeExecutable`。
-   *
-   * 任何一步不满足就返回 undefined 让回合**退回原路**(直接跑本机二进制)。
-   * 这里刻意不抛错:一次配置疏忽不该表现成"助手不回话了"。但每种退回都留一行
-   * 日志说清缺什么 —— 静默退回比不开更糟,那意味着你以为有防护而其实没有。
-   */
-  private prepareContainer(
-    tag: string,
-    cwd: string,
-    logLabel: string | undefined,
-    privateHostDir: string | undefined,
-  ): { execPath: string; container: string } | undefined {
-    if (!this.config.sessionContainer) return undefined;
-    // -v 的左边永远是**宿主**路径。容器里的 /data 在宿主上是别的位置,
-    // 不给 hostDataDir 的话 docker 会静默建一个空目录,而症状是"助手失忆"。
-    const host = this.config.hostDataDir;
-    if (!host) {
-      console.warn(`${tag} 会话容器已开启但缺 CATMAN_HOST_DATA_DIR —— 退回本机执行`);
-      return undefined;
-    }
-    // 大脑二进制在哪。**必须解开软链**:会话容器里要的是那条具体路径,
-    // 而 `current` 这个名字在它眼里随时可能指向别处(自我进化就在拨它)。
-    //
-    // ⚠️ 这里踩过一次:上一版我照着"应该有个 CATMAN_RELEASE_DIR"写,而部署根本
-    // 不提供那个变量 —— 于是开关打开了、日志喊了一句缺变量、防护整个是空的。
-    // 真实存在的是 `CATMAN_RELEASE_LINK`(entrypoint 注入,值是那条软链)。
-    // 教训不是"记住变量名",是**别信自己没在真机上查过的环境变量**。
-    const link = process.env.CATMAN_RELEASE_LINK || `${this.config.dataDir}/releases/current`;
-    let release: string;
-    try {
-      release = realpathSync(link);
-    } catch {
-      console.warn(`${tag} 会话容器已开启但解不开 release 软链(${link}) —— 退回本机执行`);
-      return undefined;
-    }
-    const claudePath = claudePathIn(release);
-    // 落地自检:路径拼错、二进制没跟着 release 一起制备,都在这里现形。
-    // 少了这一步,同一类错会表现成"容器起来了但立刻退出",而 SDK 那侧只报一句
-    // 含糊的子进程失败 —— 要从那里回溯到"路径少了一段"是很贵的。
-    if (!existsSync(claudePath)) {
-      console.warn(`${tag} 会话容器已开启但找不到大脑二进制(${claudePath}) —— 退回本机执行`);
-      return undefined;
-    }
-    const container = sessionContainerName(logLabel ?? "anon", String(process.hrtime.bigint()));
-    // 顺手扫掉过期的包装脚本。**不能只靠回合结束时删** —— 进程被 SIGKILL(内存
-    // 看门狗动手、或部署换版本)时 finally 根本不跑,那些文件就永远留下了。
-    // 真机上两小时攒了 14 个。放在这里是因为它天然随"新回合"触发,不必另接生命周期。
-    sweepStaleWrappers(`${this.config.dataDir}/tmp`);
-    const specIn = {
-      container,
-      image: this.config.sessionImage,
-      claudePath,
-      limits: { ...DEFAULT_SESSION_LIMITS, memory: this.config.sessionMemoryLimit },
-      // 挂载**按人格推导**。两个人格的文件系统视图刻意不同(救援人格的主 /data
-      // 是只读的),照抄一套会把那条护栏抹掉,而且不报错。见 sessionMounts。
-      mounts: sessionMounts({
-        persona: this.config.persona,
-        hostDataDir: host,
-        dataDir: this.config.dataDir,
-        mainDataDir: this.config.mainDataDir,
-        privateHostDir,
-      }),
-      cwd,
-      tz: this.config.tz,
-      // 身份从**自己的进程**读,不写死、也不再开配置项 —— 这一版三个 bug 全是
-      // "我假设了环境而没去查环境",而进程自己的 uid/组是唯一不会猜错的来源。
-      user: `${process.getuid?.() ?? 10001}:${process.getgid?.() ?? 10001}`,
-      // 主组已经在 --user 里了,附加组只留其余的(docker.sock 那个就在里面)。
-      groupAdd: (process.getgroups?.() ?? []).filter((g) => g !== process.getgid?.()),
-      addHosts: ["host.docker.internal:host-gateway"],
-    } satisfies SessionContainerSpec;
-    const execPath = `${this.config.dataDir}/tmp/session-exec-${container}.sh`;
-    try {
-      mkdirSync(dirname(execPath), { recursive: true });
-      // 兜底路径通过环境变量给包装脚本 —— 写进脚本正文的话,同一份脚本
-      // 换个 release 就指向一个已经被清理掉的目录。
-      process.env.CATMAN_FALLBACK_CLAUDE = claudePath;
-      writeFileSync(
-        execPath,
-        buildWrapperScript(buildSessionRunArgs(specIn), buildSessionImageArgs(specIn)),
-        { mode: 0o755 },
-      );
-    } catch (err) {
-      console.warn(`${tag} 包装脚本写不下去(${String(err)}) —— 退回本机执行`);
-      return undefined;
-    }
-    return { execPath, container };
-  }
+  static forProbe(config: Config): Agent { return new Agent(config, undefined, true); }
 
-  /**
-   * 处理一条用户消息,返回助手回复。
-   * 每条消息一次 query();通过 resume 维持多轮上下文,由 SDK 负责
-   * auto-compaction 与 JSONL 持久化。
-   */
   async run(prompt: string, opts: AgentRunOptions = {}): Promise<AgentReply> {
-    const attachments = opts.attachments ?? [];
-    const tag = `[agent${opts.logLabel ? ` ${opts.logLabel}` : ""}]`;
-    const startedAt = Date.now();
-    const model = opts.model ?? this.config.model;
-    console.info(
-      `${tag} 回合开始 model=${model ?? "(交给 SDK)"} effort=${opts.effort ?? "(交给 SDK)"} ` +
-        `${opts.resumeSessionId ? `resume=${opts.resumeSessionId.slice(0, 8)}` : "新会话"} ` +
-        `${prompt.length}字 图${attachments.length}`,
-    );
-
-    // 输入一律走常开通道(不再按有无附件分叉):回合中途的追加输入只有流式输入下才收得进。
-    const input = new InputChannel();
-    input.push(buildUserMessage(prompt, attachments, opts.ambient));
-
-    const cwd = opts.cwd ?? this.config.workspaceDir;
-    const boxed = this.prepareContainer(tag, cwd, opts.logLabel, opts.privateHostDir);
-    // 看门狗要能中止回合,所以 abortController 从"调用方给了才传"变成"没有就自己造"。
-    // 只在关进容器时才这样 —— 本机执行那条路没有 cgroup 可读,造了也没人用。
-    const abortController = opts.abortController ?? (boxed ? new AbortController() : undefined);
-
-    const q = query({
-      prompt: input,
-      options: {
-        ...(boxed ? { pathToClaudeCodeExecutable: boxed.execPath } : {}),
-        // append 是**唯一**无条件在场的身份出口:skill 正文按需加载(模型可能压根
-        // 不去读)、CLAUDE.md 住在数据卷里(用户能改能删),而"我是哪个人格"是装配
-        // 事实。守护人格真机上正是因为缺这一段,张口就自称主人格。见 persona.ts。
-        systemPrompt: {
-          type: "preset",
-          preset: "claude_code",
-          // 内存那一段**只在真的关进容器时才给** —— 没有上限却说有,是假话。
-          append: personaBriefing(
-            this.config.persona,
-            boxed ? this.config.sessionMemoryLimit : undefined,
-          ),
-        },
-        settingSources: ["user", "project", "local"],
-        permissionMode: "bypassPermissions",
-        // 当前模型的 API 默认 display="omitted":thinking 块存在但文本为空。
-        // 要向用户透出思考摘要必须显式开启 summarized。
-        thinking: { type: "adaptive", display: "summarized" },
-        cwd,
-        // 两个都空就整个不传 model —— 兜底链的末端,交给 SDK 决定。
-        ...(model ? { model } : {}),
-        // effort 同理:不传 = SDK 按模型默认。adaptive thinking 配合它决定想多深。
-        ...(opts.effort ? { effort: opts.effort } : {}),
-        ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
-        ...(opts.env ? { env: opts.env } : {}),
-        ...(opts.skills ? { skills: opts.skills } : {}),
-        ...(opts.maxTurns === undefined ? {} : { maxTurns: opts.maxTurns }),
-        ...(abortController ? { abortController } : {}),
-        // CLI 子进程的 stderr 是启动失败/鉴权报错的唯一去处,不接就彻底看不见。
-        // 无条件转发(不受 TRACE 开关约束):正常回合它一个字都不输出,
-        // 一旦有内容就正是要找的东西。
-        stderr: (data: string) => {
-          const line = data.trim();
-          if (!line || isBenignStderr(line)) return;
-          console.warn(`${tag} stderr: ${line.slice(0, 2000)}`);
-        },
-      },
-    });
-
-    let sessionId = opts.resumeSessionId ?? "";
-    let isError = false;
-    /** 各 result 的正文。正常回合只有一段;追加输入落在 turn 边界上时会多出几段。 */
-    const texts: string[] = [];
-
-    // 追加窗口。收到 result 就关,而 feed 本身是同步函数 —— JS 单线程保证两者
-    // 不会交错,不存在"判定通过之后窗口才关"的半开状态。窗口关了返回 false,
-    // 调用方据此回落去起新回合。
-    let accepting = true;
-    let fed = 0;
-    // 提成具名的 const:看门狗要用同一个句柄往回合里塞警告,而不是自己
-    // 再造一条通往 InputChannel 的路(两条路会各自漏掉"窗口已关"这个判断)。
-    const feed: AgentFeed = (feedPrompt, feedAttachments) => {
-      if (!accepting) return false;
-      input.push(buildUserMessage(feedPrompt, feedAttachments));
-      fed += 1;
-      console.info(
-        `${tag} 追加输入 #${fed} ${feedPrompt.length}字 图${feedAttachments.length}`,
-      );
-      return true;
-    };
-    opts.onFeedReady?.(feed);
-
-    // 心跳所需的状态。**覆盖所有 SDK 消息**而不只是 onProgress 透出的那两类:
-    // 工具结果回填、API 重试同样是"还在动"的证据,漏掉它们会把正常推进的回合
-    // 误报成卡住。计时器起在 query() 之后、紧挨着 finally 所在的 try ——
-    // 中间任何一步抛错都不会留下一个空转着打日志的定时器。
-    let steps = 0;
-    let lastAt = startedAt;
-    let lastStep: string | undefined;
-    // 内容块 → 进度事件。它替我们攒着最后那个 text 块(见 ProgressFan)。
-    const fan = new ProgressFan();
-    const heartbeat =
-      HEARTBEAT_MS > 0
-        ? setInterval(() => {
-            const now = Date.now();
-            console.info(
-              `${tag} ${formatHeartbeat(now - startedAt, now - lastAt, steps, lastStep)}`,
-            );
-          }, HEARTBEAT_MS)
-        : undefined;
-    // 心跳不该拖着进程不退出 —— 它是观测,不是工作。
-    heartbeat?.unref?.();
-
-    // 看门狗与心跳一样,起在 query() 之后、紧挨着 finally 所在的 try ——
-    // 中间任何一步抛错都不会留下一个空转着、还握着 feed 句柄的定时器。
-    const stopWatchdog =
-      boxed && abortController
-        ? startTurnWatchdog(this.config.cgroupRoot, boxed.container, this.config.sessionMemoryLimit, {
-            feed: (text) => void feed(text, []),
-            abortWith: (err) => abortController.abort(err),
-            notifyUser: (text) => opts.onNotice?.(text),
-            step: () => lastStep,
-            log: (line) => console.warn(`${tag} ${line}`),
-            recordIncident: (info, via) => {
-              // 落 **SSD**,不落 U 盘 —— 事故当下 U 盘正是被打满的那块盘
-              // (2026-08-21 实测 ioticks 逼近 100%),往它上面写可能一卡几十秒,
-              // 而那正是最该赶紧把现场留下来的时刻。/opt/services 在 SSD 上。
-              try {
-                appendFileSync(
-                  "/opt/services/catman/mem-incidents.log",
-                  incidentLine(new Date().toISOString(), opts.logLabel ?? "?", info, via) + "\n",
-                );
-              } catch {
-                // 写不下去不该把中止流程带偏 —— 容器日志里那一行仍然在。
-              }
-            },
-          })
-        : undefined;
-
-    try {
-      for await (const message of q) {
-        // 每条消息都带 session_id;新会话时从这里捕获。
-        if ("session_id" in message && message.session_id) {
-          if (message.session_id !== sessionId) {
-            sessionId = message.session_id;
-            // 只在变化时喊 —— 每条消息都带这个字段,无条件回调等于每条消息写一次盘。
-            opts.onSessionId?.(sessionId);
-          }
-        }
-
-        const line = describeSdkMessage(message);
-        if (line && (line.level === "always" || AGENT_TRACE)) {
-          console.info(`${tag} ${line.text}`);
-        }
-        // 心跳的"上次动静"以任何一条 SDK 消息为准,与要不要打日志无关。
-        lastAt = Date.now();
-        // 同一个判据也喂给输入气泡:它表达的正是"它刚刚还动过"。
-        opts.onAlive?.();
-
-        if (message.type === "assistant") {
-          // 攒着的那个 text 块留在 fan 里,回合结束时随它一起丢掉 ——
-          // 那就是最终答复,它会走正文那条路。
-          for (const ev of fan.take(message.message.content)) {
-            steps += 1;
-            lastStep = describeProgress(ev);
-            opts.onProgress?.(ev);
-          }
-        }
-
-        if (message.type === "result") {
-          // 先关追加窗口再 close 输入流。close **不会**丢掉已 push 的消息:
-          // 挤在 result 与 close 之间的那条(管道延迟造成的窄窗口)照样会跑,
-          // 只是自成一个 turn 并再吐一个 result —— 所以这里不 break,继续把
-          // 后续 result 的正文接在后面。就此收摊等于把用户那条话静默吞掉。
-          accepting = false;
-          input.close();
-          isError ||= message.is_error;
-          const body = message.subtype === "success" ? message.result : message.errors.join("\n");
-          if (body) texts.push(body);
-          this.logResult(tag, message, Date.now() - startedAt, steps);
-        }
-      }
-      if (texts.length > 1) {
-        console.info(
-          `${tag} 本回合产出 ${texts.length} 段正文 —— 有追加输入正好落在 turn 边界上,各自成了一轮`,
-        );
-      }
-    } catch (err) {
-      // 回合以异常告终(abort / SDK 内部错误)也要留一行:上层网关只会打
-      // 一句"处理失败",而这里能说清它跑了多久、走到第几步就断了。
-      console.error(
-        `${tag} 回合中断 ${shortMs(Date.now() - startedAt)} 第 ${steps} 步:${String(err)}`,
-      );
-      throw err;
-    } finally {
-      // 抛错(abort / SDK 内部错误)路径同样要关掉窗口与输入流:
-      // 窗口不关的话,已经收摊的回合还会对 feed 返回 true,那条消息就没人跑了。
-      accepting = false;
-      input.close();
-      if (heartbeat) clearInterval(heartbeat);
-      // 删掉本回合的包装脚本。正常路径靠这里,被 SIGKILL 时靠下一回合开头的清扫。
-      if (boxed) { try { unlinkSync(boxed.execPath); } catch { /* 已经没了就算了 */ } }
-      // 三条收尾路径(正常结束 / abort / SDK 内部抛错)都要停看门狗。
-      // 漏掉任一条都会留下一个每秒敲 dockerd、而且还握着 feed 的定时器。
-      stopWatchdog?.();
+    if (this.probe) return this.runProbe(prompt, opts);
+    const e = this.execution, context = opts.context;
+    if (!e || !context) throw new Error("agent 必须在有归属的执行上下文中运行");
+    e.runtimes.activity(context.id);
+    const runtime = await e.runtimes.ensure(context);
+    const paths = e.contexts.paths(context);
+    let entry = this.live.get(context.id);
+    if (entry && !entry.session.alive) { this.live.delete(context.id); entry = undefined; }
+    // A different SDK session (fresh cron) cannot attach to the previous CLI.
+    if (entry && (opts.resumeSessionId === undefined && context.sdkStarted === false)) {
+      entry.session.close(); this.live.delete(context.id); entry = undefined;
     }
-
-    return { text: joinReplyTexts(texts, isError), sessionId, isError };
+    if (entry && (entry.model !== opts.model || entry.effort !== opts.effort)) {
+      if (runtime.sdkTasks.length) throw new Error("此上下文仍有 SDK 后台任务；请先结束任务，再切换模型或思考设置");
+      entry.session.close(); this.live.delete(context.id); entry = undefined;
+    }
+    if (!entry) {
+      const agentId = randomUUID();
+      const env: Record<string, string | undefined> = {
+        ...networkEnvironment(this.config.apiBase),
+        PATH: "/runtime/bin:/usr/local/bin:/usr/bin:/bin", HOME: paths.sdk, TZ: this.config.tz,
+        CLAUDE_CONFIG_DIR: paths.sdk, ANTHROPIC_BASE_URL: `${this.config.apiBase}/api/runtime/model`,
+        ANTHROPIC_AUTH_TOKEN: runtime.token, CATMAN_API_BASE: this.config.apiBase,
+        CATMAN_SESSION_TOKEN: runtime.token, CATMAN_RUNTIME_TOKEN: runtime.token, CATMAN_AGENT_ID: agentId,
+        CATMAN_CONTEXT_ID: context.id, CATMAN_CONTEXT_DIR: paths.work, CATMAN_USER_PRIVATE_DIR: "/user",
+        ...(process.env.DOCKER_API_VERSION ? { DOCKER_API_VERSION: process.env.DOCKER_API_VERSION } : {}),
+      };
+      const personalMcp = readTenantFile(paths.home, "mcp.json");
+      const privateServers: Record<string, McpServerConfig> = personalMcp ? JSON.parse(personalMcp) : {};
+      for (const [name, server] of Object.entries(privateServers)) {
+        if (!/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(name) || !server || typeof server !== "object" || server.type === "sdk") throw new Error("个人 MCP 配置无效");
+      }
+      const mcpServers = {
+        ...Object.fromEntries(Object.entries(privateServers).map(([name, config]) => [`user_${name}`, config])),
+        ...Object.fromEntries(Object.entries(e.broker.mcpServers(runtime, this.config.apiBase)).map(([name, config]) => [`public_${name}`, config])),
+      };
+      const allSkills = [...new Set([...(opts.skills ?? []), ...skillsOnDisk(paths.home).filter(name => !(GENERATED_SKILLS as readonly string[]).includes(name))])];
+      const slot: { session: SdkSession; options: AgentRunOptions; model?: string; effort?: string } = {
+        session: undefined!, options: opts, model: opts.model, effort: opts.effort,
+      };
+      const session = new SdkSession(input => query({ prompt: input, options: {
+        pathToClaudeCodeExecutable: e.runtimes.wrapper(context, runtime),
+        cwd: paths.work, env, settingSources: ["user", "project", "local"], permissionMode: "bypassPermissions",
+        systemPrompt: { type: "preset", preset: "claude_code", append: personaBriefing(this.config.persona, this.config.sessionMemoryLimit) },
+        ...(context.sdkStarted ? { resume: context.sdkSessionId } : { sessionId: context.sdkSessionId }),
+        ...(opts.model ?? this.config.model ? { model: opts.model ?? this.config.model } : {}),
+        ...(opts.effort ? { effort: opts.effort } : {}), ...(opts.maxTurns ? { maxTurns: opts.maxTurns } : {}),
+        thinking: { type: "adaptive", display: "summarized" }, skills: allSkills, mcpServers,
+        perTaskStopAffordance: true,
+        stderr: data => { if (data.trim() && !isBenignStderr(data.trim())) console.warn(`[agent ${context.id}] ${data.slice(0, 2000)}`); },
+      } }), {
+        stopAgent: () => e.runtimes.rpc(runtime, `/agents/${agentId}`, "DELETE"),
+        onClose: () => {
+          if (this.live.get(context.id)?.session === slot.session) { this.live.delete(context.id); e.runtimes.sdkTasks(context.id, []); }
+        },
+        onBackground: message => {
+          if (message.type === "system" && message.subtype === "background_tasks_changed") e.runtimes.sdkTasks(context.id, message.tasks);
+          if (message.type === "system" && message.subtype === "task_notification") e.runtimes.report(context.id, `SDK 后台任务 ${message.task_id}：${message.status}\n${message.summary}`, message.uuid);
+          if (message.type === "result" && message.subtype === "success" && message.result) e.runtimes.report(context.id, message.result, message.uuid);
+        },
+      });
+      slot.session = session; entry = slot; this.live.set(context.id, slot);
+      e.runtimes.onStop(context.id, () => session.close(new Error("执行环境已回收")));
+    }
+    entry.options = opts;
+    e.runtimes.activity(context.id);
+    const fan = new ProgressFan();
+    opts.onFeedReady?.((text, attachments) => {
+      if (!entry!.session.feed(buildUserMessage(text, attachments))) return false;
+      e.runtimes.activity(context.id); return true;
+    });
+    const pendingEvents = e.runtimes.pending(context.id);
+    const events = pendingEvents.map(event => event.text).join("\n\n").slice(-12000);
+    const message = buildUserMessage(prompt, opts.attachments ?? [], [opts.ambient, events ? `后台任务记录：\n${events}` : ""].filter(Boolean).join("\n\n"));
+    const reply = await entry.session.run({ message, signal: opts.abortController?.signal, onMessage: message => {
+      if ("session_id" in message && message.session_id) { e.contexts.started(context.id, message.session_id); opts.onSessionId?.(message.session_id); }
+      const trace = describeSdkMessage(message);
+      if (trace && (trace.level === "always" || AGENT_TRACE)) console.info(`[agent ${context.id}] ${trace.text}`);
+      opts.onAlive?.();
+      if (message.type === "assistant") {
+        e.runtimes.activity(context.id);
+        for (const ev of fan.take(message.message.content)) opts.onProgress?.(ev);
+      }
+      if (message.type === "result") e.runtimes.activity(context.id);
+    } });
+    e.runtimes.acknowledge(pendingEvents.map(event => event.id));
+    return reply;
   }
 
-  /**
-   * 回合结束的那一行。**无条件打** —— 一个回合只有一条,而它回答的问题
-   * (成功没有、花了多久、几轮、多少 token)正是事后翻日志最先要看的。
-   */
-  private logResult(
-    tag: string,
-    msg: Extract<SDKMessage, { type: "result" }>,
-    wallMs: number,
-    steps: number,
-  ): void {
-    const u = msg.usage;
-    const usage = u
-      ? ` in=${shortNum(u.input_tokens)} out=${shortNum(u.output_tokens)}` +
-        ` 缓存读=${shortNum(u.cache_read_input_tokens ?? 0)}`
-      : "";
-    const body =
-      `${shortMs(wallMs)}(API ${shortMs(msg.duration_api_ms)}) 第${steps}步 ` +
-      `${msg.num_turns}轮 $${msg.total_cost_usd.toFixed(4)}${usage}`;
-    if (msg.subtype === "success" && !msg.is_error) {
-      console.info(`${tag} 回合完成 ${body}`);
-      return;
-    }
-    // is_error 以前被读出来却从没人看 —— SDK 报错(鉴权失败、超限、达到轮数上限)
-    // 时,错误文本被当成正文发给用户,日志里一个字都没有。
-    const detail = msg.subtype === "success" ? "" : ` errors=${msg.errors.map((e) => e).join(" | ")}`;
-    console.error(`${tag} 回合失败 subtype=${msg.subtype} ${body}${detail}`);
+  close(): void { for (const { session } of this.live.values()) session.close(); this.live.clear(); }
+
+  private async runProbe(prompt: string, opts: AgentRunOptions): Promise<AgentReply> {
+    const q = query({ prompt, options: {
+      cwd: opts.cwd, model: opts.model ?? this.config.model, maxTurns: 1,
+      abortController: opts.abortController, permissionMode: "bypassPermissions",
+      systemPrompt: { type: "preset", preset: "claude_code", append: personaBriefing(this.config.persona) },
+    } });
+    let text = "", sessionId = "", isError = false;
+    try { for await (const m of q) if (m.type === "result") { sessionId = m.session_id; isError = m.is_error; text = m.subtype === "success" ? m.result : m.errors.join("\n"); } }
+    finally { q.close(); }
+    return { text, sessionId, isError };
   }
 }

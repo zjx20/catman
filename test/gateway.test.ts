@@ -1495,7 +1495,7 @@ test("并发上限可运行时调整", async () => {
 
 // --- 管理员权限的下放 ---
 
-test("管理员令牌只注入 admin 回合的子进程", async () => {
+test("管理员和普通回合都不获得控制面原始令牌", async () => {
   const t = 1_000_000;
   process.env.CATMAN_ADMIN_TOKEN = "secret-token";
   try {
@@ -1504,7 +1504,7 @@ test("管理员令牌只注入 admin 回合的子进程", async () => {
     await channel.receive(BUILTIN_ADMIN_USER_KEY, "管理员");
 
     assert.equal(agent.calls[0]!.env?.["CATMAN_ADMIN_TOKEN"], undefined, "普通回合不得拿到管理员令牌");
-    assert.equal(agent.calls[1]!.env?.["CATMAN_ADMIN_TOKEN"], "secret-token");
+    assert.equal(agent.calls[1]!.env?.["CATMAN_ADMIN_TOKEN"], undefined);
     // 回合令牌两边都有,且各不相同。
     assert.ok(agent.calls[0]!.env?.["CATMAN_SESSION_TOKEN"]);
     assert.notEqual(
@@ -1558,7 +1558,7 @@ test("把普通用户列为管理员后,他的回合也拿到管理员能力", a
     await channel.receive(U1, "现在是了");
 
     assert.equal(agent.calls[0]!.env?.["CATMAN_ADMIN_TOKEN"], undefined);
-    assert.equal(agent.calls[1]!.env?.["CATMAN_ADMIN_TOKEN"], "secret-token");
+    assert.equal(agent.calls[1]!.env?.["CATMAN_ADMIN_TOKEN"], undefined);
     assert.equal(agent.calls[1]!.skills?.includes(ADMIN_SKILL), true);
   } finally {
     delete process.env.CATMAN_ADMIN_TOKEN;

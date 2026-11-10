@@ -122,7 +122,7 @@ export async function runSelfCheck(opts: SelfCheckOptions = {}): Promise<SelfChe
     const configDir = process.env["CLAUDE_CONFIG_DIR"]!;
     const settings = new GlobalSettings({ path: config.settingsPath, env: config });
     const prefs = new PrefsStore({ path: config.prefsPath, defaults: () => settings.effective() });
-    const agent = new Agent(config);
+    const agent = Agent.forProbe(config);
     const sessions = new SessionManager({
       store: new FileStore(config.statePath),
       timeoutMs: config.sessionTimeoutMs,

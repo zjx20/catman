@@ -28,6 +28,8 @@
  */
 
 export type CommandName =
+  | "extendRuntime"
+  | "reclaimRuntime"
   | "help"
   | "status"
   | "jobs"
@@ -95,6 +97,8 @@ export interface CommandDef {
 }
 
 export const COMMAND_TABLE: readonly CommandDef[] = [
+  { name: "extendRuntime", canonical: "/延长", aliases: ["/extend"], desc: "延长指定执行环境的闲置期限，最多 240 分钟", immediate: true, takesArg: true, argHint: "环境ID [分钟]" },
+  { name: "reclaimRuntime", canonical: "/回收", aliases: ["/reclaim"], desc: "立即停止指定执行环境，保留文件和聊天记录", immediate: true, takesArg: true, argHint: "环境ID" },
   {
     name: "help",
     canonical: "/帮助",

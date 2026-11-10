@@ -6,6 +6,7 @@ import {
   existsSync,
 } from "node:fs";
 import { join } from "node:path";
+import { readScopedFile, scopedFileStat } from "./scoped-files.js";
 
 /**
  * 读取 Agent SDK 写出的会话 JSONL(位于 CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/<session-id>.jsonl)。
@@ -82,7 +83,7 @@ export function sessionFileExists(
   projectDir: string,
   sessionId: string,
 ): boolean {
-  return existsSync(join(projectsRoot(configDir), projectDir, `${sessionId}.jsonl`));
+  try { return scopedFileStat(configDir, join(projectsRoot(configDir), projectDir, `${sessionId}.jsonl`)).isFile(); } catch { return false; }
 }
 
 /**
@@ -107,7 +108,7 @@ export function listSessions(configDir: string, projectDir: string): SessionSumm
     const path = join(dir, file);
     let st;
     try {
-      st = statSync(path);
+      st = scopedFileStat(configDir, path);
     } catch {
       continue;
     }
@@ -117,7 +118,7 @@ export function listSessions(configDir: string, projectDir: string): SessionSumm
       path,
       mtimeMs: st.mtimeMs,
       sizeBytes: st.size,
-      preview: firstUserPreview(path),
+      preview: firstUserPreview(path, configDir),
     });
   }
   out.sort((a, b) => b.mtimeMs - a.mtimeMs);
@@ -132,7 +133,7 @@ export function readSession(
 ): TranscriptEntry[] {
   const summary = listSessions(configDir, projectDir).find((s) => s.sessionId === sessionId);
   if (!summary) return [];
-  return parseFile(summary.path);
+  return parseFile(summary.path, configDir);
 }
 
 /**
@@ -150,7 +151,7 @@ export function search(
   const hits: SearchHit[] = [];
 
   for (const s of listSessions(configDir, projectDir)) {
-    for (const entry of parseFile(s.path)) {
+    for (const entry of parseFile(s.path, configDir)) {
       const idx = entry.text.toLowerCase().indexOf(q);
       if (idx >= 0) {
         const start = Math.max(0, idx - 40);
@@ -259,10 +260,10 @@ export function cleanupOldSessionsAcross(
 
 // --- 内部解析 ---
 
-function parseFile(path: string): TranscriptEntry[] {
+function parseFile(path: string, configDir: string): TranscriptEntry[] {
   let raw: string;
   try {
-    raw = readFileSync(path, "utf8");
+    raw = readScopedFile(configDir, path, 64 * 1024 * 1024);
   } catch {
     return [];
   }
@@ -284,8 +285,8 @@ function parseFile(path: string): TranscriptEntry[] {
   return entries;
 }
 
-function firstUserPreview(path: string): string {
-  for (const e of parseFile(path)) {
+function firstUserPreview(path: string, configDir: string): string {
+  for (const e of parseFile(path, configDir)) {
     if (e.role === "user" && e.text) return e.text.slice(0, 80);
   }
   return "";

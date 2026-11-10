@@ -25,13 +25,9 @@ function job(over: Partial<CronJob> = {}): CronJob {
     schedule: { kind: "every", ms: 3600_000 },
     task: {
       kind: "script",
-      image: "catman-env:1",
       cmd: ["bash", "-lc", "df -h /"],
       env: {},
-      network: "none",
-      mounts: [],
-      limits: { memory: "512m", cpus: 0.5, pids: 128 },
-    },
+      },
     timeoutMs: 600_000,
     overlap: "skip",
     notify: { start: false, end: true, onlyFailure: false },
@@ -73,25 +69,11 @@ test("列表页:总开关关掉时必须说清楚 —— 否则「为什么都�
   assert.doesNotMatch(list([row()], true), /总开关是关的/);
 });
 
-test("列表页:危险的那几项标出来 —— 出事时最先要查的就是它们", () => {
-  const rw = row({
-    task: {
-      kind: "script",
-      image: "catman-env:1",
-      cmd: ["bash", "-lc", "rsync -a /svc /backup"],
-      env: {},
-      network: "mynet",
-      mounts: [
-        { host: "/opt/services/x", at: "/x", ro: false },
-        { host: "/opt/services/y", at: "/y", ro: true },
-      ],
-      limits: { memory: "512m", cpus: 0.5, pids: 128 },
-    },
-  });
-  const html = list([rw]);
-  assert.match(html, /可写挂载 \/opt\/services\/x/);
-  assert.match(html, /只读挂载 1 条/);
-  assert.match(html, /联网 mynet/);
+test("列表页说明 owner 上下文与独立 workspace", () => {
+  const html = list([row()]);
+  assert.match(html, /owner 执行上下文/);
+  assert.match(html, /独立 workspace/);
+  assert.doesNotMatch(html, /可写挂载/);
 });
 
 test("列表页:停用与连续失败都看得见", () => {
@@ -115,13 +97,9 @@ test("XSS:任务名、命令、归属都转义 —— 它们全是用户可控�
     name: `<script>alert(1)</script>`,
     task: {
       kind: "script",
-      image: "catman-env:1",
       cmd: ["bash", "-lc", `echo "<img src=x onerror=alert(2)>"`],
       env: {},
-      network: "none",
-      mounts: [],
-      limits: { memory: "512m", cpus: 0.5, pids: 128 },
-    },
+      },
   });
   const html = renderCronList({
     rows: [{ ...evil, owner: `<b>坏名字</b>` }],
@@ -155,7 +133,7 @@ function run(over: Partial<CronRun> = {}): CronRun {
 test("详情页:配置、执行记录、耗时与退出码", () => {
   const html = renderCronDetail({ row: row(), runs: [run()], tz: SH, token: "tk" });
   assert.match(html, /df -h \//);
-  assert.match(html, /镜像 catman-env:1/);
+  assert.match(html, /该任务的持久 workspace/);
   assert.match(html, /超时 10 分钟/);
   assert.match(html, /5 秒/);
   assert.match(html, /退出码 0/);

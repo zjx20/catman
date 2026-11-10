@@ -55,13 +55,11 @@ test("自进化 skill 的指令写法从 COMMAND_TABLE 取,不手写字面量", 
   assert.ok(body.includes(canonicalOf("upgradeStatus")));
 });
 
-test("自进化 skill 教的制备路径是固化副本,不是 release 里那份", () => {
-  // 制备门(全量测试)就在 prepare.sh 里。教 agent 跑 release 里那份 = 让被考的人
-  // 自己出卷子:一次把 npm test 改没了的进化会让此后每次制备都不再跑测试。
+test("自进化 skill 通过受控接口请求制备", () => {
   const body = evolveSkillBody(PATHS);
-  assert.ok(body.includes("/data/deploy/bin/prepare.sh"), "要教固化路径");
-  // release 内那条路径只该以「不要跑它」的形式出现,绝不能是一条可照抄的绝对路径。
-  assert.equal(body.includes("/data/releases/current/scripts/evolve/prepare.sh"), false);
+  assert.match(body, /api\/execution\/prepare/);
+  assert.match(body, /X-Catman-Session/);
+  assert.doesNotMatch(body, /docker run|CATMAN_ADMIN_TOKEN/);
 });
 
 test("自进化 skill 明说不要自己起 deployer —— 确认权在人", () => {
@@ -69,12 +67,9 @@ test("自进化 skill 明说不要自己起 deployer —— 确认权在人", ()
   assert.match(body, /不要自己起 deployer|绝不.*deployer/);
 });
 
-test("自进化 skill 明说 bless 要管理员开口 —— 固化的是判卷子的门本身", () => {
+test("自进化 skill 不教 worker 改写部署指针或自行 bless", () => {
   const body = evolveSkillBody(PATHS);
-  assert.match(body, /默认不自己 bless/);
-  // 授权之后代跑也有两条不能松,少哪条都会把「批准了哪棵树」和「固化了哪棵树」拆开。
-  assert.match(body, /releases\/current/, "要说清固化源必须是批准过的那棵树");
-  assert.match(body, /CATMAN_PIN/, "要说清 pinned 得显式传,别让它默认跟着 stable 走");
+  assert.match(body, /不要直接修改发布指针或自行 bless/);
 });
 
 test("自进化 skill 正文不带某台机器专属的路径 —— 它随仓库走", () => {
@@ -95,18 +90,10 @@ test("skill 正文里绝不出现令牌字面量,只写环境变量引用", () =
   }
 });
 
-test("路径全部来自参数 —— 换了 CATMAN_DEPLOY_DIR 之后 skill 不会教错地方", () => {
-  const body = evolveSkillBody({
-    srcDir: "/srv/code",
-    deployBinDir: "/srv/deploy/bin",
-    releasesDir: "/srv/rel",
-    deployDir: "/srv/deploy",
-    courierDir: "/srv/courier",
-  });
-  assert.ok(body.includes("/srv/code"));
-  assert.ok(body.includes("/srv/deploy/bin/prepare.sh"));
-  assert.ok(body.includes("/srv/rel/current"));
-  assert.equal(body.includes("/data/"), false, "不该有写死的默认路径漏出来");
+test("自进化 skill 使用固定的 worker 内源码路径，与宿主路径无关", () => {
+  const body = evolveSkillBody({ ...PATHS, srcDir: "/host-secret/code", deployBinDir: "/host-secret/deploy" });
+  assert.match(body, /\/catman-src/);
+  assert.doesNotMatch(body, /host-secret/);
 });
 
 test("帮助文案里的 /发布 与 skill 说的是同一条指令", () => {
@@ -156,13 +143,12 @@ test("skillsFor 列出的每个 skill,writeSkills 都真的写了文件", () => 
   }
 });
 
-test("救援 skill 教的是诊断与退版本,不是改代码", () => {
+test("救援 skill 使用固定诊断和恢复接口", () => {
   const body = rescueSkillBody(PATHS);
-  assert.match(body, /你不改代码/);
-  assert.match(body, /demote/, "退版本走固化的 deployer");
-  assert.match(body, /绝不自己动.*符号链接/s, "换指针要先停容器,而它就跑在容器里");
-  // stable 是"回退目标"这个概念本身,机械判据不该改写它。
-  assert.match(body, /绝不动 `stable`|绝不动 stable/);
+  assert.match(body, /api\/execution\/diagnostics/);
+  assert.match(body, /api\/execution\/recover/);
+  assert.match(body, /demote/);
+  assert.doesNotMatch(body, /docker restart|docker logs/);
 });
 
 test("救援 skill 不教 /发布,那是主人格那边的事", () => {
@@ -172,18 +158,9 @@ test("救援 skill 不教 /发布,那是主人格那边的事", () => {
   assert.equal(body.includes(canonicalOf("publish")), false);
 });
 
-test("救援 skill 的路径全部来自参数", () => {
-  const body = rescueSkillBody({
-    srcDir: "/srv/code",
-    deployBinDir: "/srv/deploy/bin",
-    releasesDir: "/srv/rel",
-    deployDir: "/srv/deploy",
-    courierDir: "/srv/courier",
-  });
-  assert.ok(body.includes("/srv/deploy/report.json"), "部署报告");
-  assert.ok(body.includes("/srv/rel/current"), "指针");
-  assert.ok(body.includes("/srv/courier/inbox"), "信使队列");
-  assert.equal(body.includes("/data/"), false, "不该有写死的默认路径漏出来");
+test("救援 skill 不要求 worker 访问宿主数据路径", () => {
+  const body = rescueSkillBody({ ...PATHS, deployDir: "/host-secret/deploy", courierDir: "/host-secret/courier" });
+  assert.doesNotMatch(body, /host-secret/);
 });
 
 test("救援 skill 正文里也没有令牌字面量", () => {
