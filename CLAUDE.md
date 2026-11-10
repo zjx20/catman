@@ -271,9 +271,16 @@ tenants/<tenantId>/
 每个聊天 session 与每个 cron 有独立 workspace；同一个 cron 的多次执行复用其目录。
 公共人格和 skill 只读装配；个人 skill 与 MCP 在 /user。原始公共凭据仅由控制面 broker 持有。管理员权限由 API 现查，不下发原始管理员 token。
 后台脚本使用 `catman-task run --timeout <秒> -- <命令>`，在当前容器里由独立任务管理进程执行。任务有硬超时，SDK 后台任务按事件追踪；只要 SDK 有任务就保留其 CLI。SDK 结果按输入 UUID 关联。
+SDK 的 `background_tasks_changed` 是完整、权威的任务快照，不与 bookend 事件混合增删。
+普通前台 Bash 也会发 `task_notification`，它的结果交给当前回合；只有跨过前台回复仍在运行
+的任务才单独通知用户。ambient 任务不发结束通知，worker 重启中断等异常仍报告。
 未知后台进程由执行环境闲置回收兜底，提前十分钟通知，可 /延长 或 /回收。CLI/容器、聊天路由、数据保留分别管理。容器由 Docker cgroup 限制内存，agent 与后台任务共享限额。
 管理员源码在 /catman-src，通过固定制备 API 触发自进化；worker 不能直接运行宿主 Docker 或读部署凭据。
 本次允许不兼容升级，旧布局必须人工迁移并写 schema=2 标记，不能静默降级。原 session-container、user-private、cron-data 和 notify 独立容器实现已删除。
+
+`skills/webgrab/` 保存公共网页抓取 skill 的版本与回归用例；安装和更新由管理员显式复制到
+控制数据的 `claude/skills/webgrab/`，不加入 `writeSkills` 的启动覆盖名单。worker 只读快照
+在创建时生成，已有容器要在释放后重建才会读取新 skill。
 
 ## 会话与回合
 

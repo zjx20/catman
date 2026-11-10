@@ -294,9 +294,17 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
   await t.test("真实 cgroup 内存限制：内存失控任务被 OOM 杀掉，管理器继续响应", async () => {
     const c = contexts.chat("memory-probe"); const previousLimit = config.sessionMemoryLimit;
     let r: RuntimeRecord;
-    try { config.sessionMemoryLimit = "96m"; r = await runtimes.ensure(c); }
+    // Leave room for the supervisor and RPC client before adding the memory
+    // hog. Native Node baselines vary across architectures and runtime versions.
+    try { config.sessionMemoryLimit = "192m"; r = await runtimes.ensure(c); }
     finally { config.sessionMemoryLimit = previousLimit; }
-    const oomKills = async () => Number(await exec(r, "import fs from 'node:fs'; console.log(/^oom_kill (\\d+)$/m.exec(fs.readFileSync('/sys/fs/cgroup/memory.events','utf8'))[1])"));
+    // Reading a counter must not start another Node under the deliberately small
+    // cgroup: the observer itself can otherwise become an unrelated OOM victim.
+    const oomKills = async () => {
+      const events = await docker(["exec", r.container, "cat", "/sys/fs/cgroup/memory.events"]);
+      const match = /^oom_kill (\d+)$/m.exec(events); assert.ok(match, events);
+      return Number(match[1]);
+    };
     try {
       const before = await oomKills();
       const hungry = await task(r, ["node", "-e", "const pages=[];setInterval(()=>pages.push(Buffer.alloc(8*1024*1024,1)),5)"], 10_000);

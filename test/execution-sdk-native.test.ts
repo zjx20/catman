@@ -17,14 +17,14 @@ test("真实 SDK：后台 Bash 留在原 CLI，前台回复后还能处理下一
     if (req.url?.includes("count_tokens")) { res.setHeader("content-type", "application/json"); res.end('{"input_tokens":5}'); return; }
     if (!req.url?.includes("/messages")) { res.writeHead(404); res.end("{}"); return; }
     requests++;
-    const tool = requests === 1;
+    const tool = requests <= 2;
     res.writeHead(200, { "content-type": "text/event-stream" });
     const send = (type: string, data: unknown) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
     send("message_start", { type: "message_start", message: { id: `msg_local_${requests}`, type: "message", role: "assistant", content: [], model: "claude-sonnet-4-5", stop_reason: null, stop_sequence: null, usage: { input_tokens: 5, output_tokens: 0 } } });
     if (tool) {
-      send("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tool_local_background", name: "Bash", input: {} } });
+      send("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: `tool_local_${requests}`, name: "Bash", input: {} } });
       send("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify({
-        command: `${JSON.stringify(process.execPath)} -e 'setTimeout(()=>console.log("background-done"),1800)'`, run_in_background: true, description: "local background probe",
+        command: `${JSON.stringify(process.execPath)} -e 'setTimeout(()=>console.log("probe-done"),${requests === 1 ? 4500 : 1800})'`, run_in_background: requests === 2, description: requests === 1 ? "local foreground probe" : "local background probe",
       }) } });
     } else {
       send("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
@@ -42,8 +42,11 @@ test("真实 SDK：后台 Bash 留在原 CLI，前台回复后还能处理下一
     model: "claude-sonnet-4-5", systemPrompt: "Use Bash when requested.", settingSources: [], tools: ["Bash"], permissionMode: "bypassPermissions", perTaskStopAffordance: true,
   } }), { onBackground: message => { events.push(message); }, onClose: () => {}, stopAgent: async () => {}, idleMs: 100 });
   try {
-    const first = await session.run({ message: buildUserMessage("start a bounded local probe", []), onMessage: () => {} });
+    const foreground: SDKMessage[] = [];
+    const first = await session.run({ message: buildUserMessage("start a bounded local probe", []), onMessage: m => { foreground.push(m); } });
     assert.equal(first.text, "local reply");
+    assert.ok(foreground.some(m => m.type === "system" && m.subtype === "task_notification" && m.summary === "local foreground probe"), "实际前台 Bash 也发任务结束事件");
+    assert.ok(!events.some(m => m.type === "system" && m.subtype === "task_notification" && m.summary === "local foreground probe"), "前台事件不转为单独用户通知");
     assert.ok(events.some(m => m.type === "system" && m.subtype === "background_tasks_changed" && m.tasks.length > 0), "实际 CLI 发出后台任务完整快照");
     await new Promise(resolve => setTimeout(resolve, 200)); assert.equal(session.alive, true);
     const second = await session.run({ message: buildUserMessage("second user turn", []), onMessage: () => {} });

@@ -60,3 +60,60 @@ test("取消会终止当前 CLI 并兑现等待者，不中止管理器中的独
     abort.abort(new Error("cancel")); await assert.rejects(pending, /cancel/); assert.equal(h.session.alive, false); assert.ok(h.stopped() >= 1);
   } finally { h.session.close(); }
 });
+
+test("前台工具的完成和失败只交给当前回合，不额外通知用户", async () => {
+  const h = harness(); const seen: SDKMessage[] = [];
+  try {
+    const a = buildUserMessage("fetch page", []);
+    const pending = h.session.run({ message: a, onMessage: m => { seen.push(m); } });
+    for (const status of ["completed", "failed", "stopped"]) h.events.push(message({ type: "system", subtype: "task_notification", task_id: status, status, summary: "foreground Bash" }));
+    h.result([a.uuid!]); await pending;
+    assert.equal(seen.filter(m => m.type === "system" && m.subtype === "task_notification").length, 3);
+    assert.equal(h.background.filter(m => m.type === "system" && m.subtype === "task_notification").length, 0);
+  } finally { h.session.close(); }
+});
+
+test("跨过前台结果的后台任务，在新回合中结束仍单独通知", async () => {
+  const h = harness();
+  try {
+    const a = buildUserMessage("start job", []);
+    const first = h.session.run({ message: a, onMessage: () => {} });
+    h.events.push(message({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "job", description: "download" }] }));
+    h.result([a.uuid!]); await first;
+    const b = buildUserMessage("next question", []);
+    const next = h.session.run({ message: b, onMessage: () => {} });
+    // The membership update commonly precedes the completion bookend.
+    h.events.push(message({ type: "system", subtype: "background_tasks_changed", tasks: [] }));
+    h.events.push(message({ type: "system", subtype: "task_notification", task_id: "job", status: "failed", summary: "download failed" }));
+    h.result([b.uuid!]); await next;
+    assert.equal(h.background.filter(m => m.type === "system" && m.subtype === "task_notification").length, 1);
+  } finally { h.session.close(); }
+});
+
+test("后台快照与 bookend 乱序不会复活已结束任务或阻止 CLI 释放", async () => {
+  const h = harness();
+  try {
+    const a = buildUserMessage("work", []);
+    const pending = h.session.run({ message: a, onMessage: () => {} });
+    h.events.push(message({ type: "system", subtype: "background_tasks_changed", tasks: [] }));
+    h.events.push(message({ type: "system", subtype: "task_started", task_id: "already-done", is_backgrounded: true }));
+    h.result([a.uuid!]); await pending; await pause(60);
+    assert.equal(h.session.alive, false);
+  } finally { h.session.close(); }
+});
+
+test("ambient 任务不刷通知，worker_restart 异常仍通知", async () => {
+  const h = harness();
+  try {
+    const a = buildUserMessage("work", []);
+    const pending = h.session.run({ message: a, onMessage: () => {} });
+    h.events.push(message({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "watcher", ambient: true }] }));
+    h.result([a.uuid!]); await pending;
+    h.events.push(message({ type: "system", subtype: "background_tasks_changed", tasks: [] }));
+    h.events.push(message({ type: "system", subtype: "task_notification", task_id: "watcher", status: "completed", ambient: true }));
+    h.events.push(message({ type: "system", subtype: "task_notification", task_id: "orphan", status: "stopped", reason: "worker_restart" }));
+    await pause();
+    const notices = h.background.filter(m => m.type === "system" && m.subtype === "task_notification");
+    assert.equal(notices.length, 1); assert.equal(notices[0]!.task_id, "orphan");
+  } finally { h.session.close(); }
+});

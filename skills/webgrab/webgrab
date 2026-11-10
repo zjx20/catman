@@ -1,0 +1,4 @@
+#!/bin/sh
+# webgrab 的入口。真正的实现是同目录的 webgrab.mjs(ESM,所以必须带 .mjs 后缀
+# —— node 对无扩展名文件一律按 CommonJS 解析,import 会直接语法报错)。
+exec node "$(dirname "$(readlink -f "$0")")/webgrab.mjs" "$@"

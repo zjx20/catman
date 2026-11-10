@@ -15,7 +15,9 @@ export class SdkSession {
   private sessionId = "";
   private readonly inputs: SDKUserMessage[] = [];
   private wake?: () => void;
-  private tasks = new Set<string>();
+  private tasks = new Map<string, boolean>(); // task id -> ambient
+  private hasTaskSnapshot = false;
+  private readonly detachedTasks = new Set<string>();
   private idleTimer?: ReturnType<typeof setTimeout>;
   private readonly query: Query;
   constructor(factory: (input: AsyncIterable<SDKUserMessage>) => Query, private readonly hooks: {
@@ -61,15 +63,28 @@ export class SdkSession {
       for await (const message of this.query) {
         if ("session_id" in message && message.session_id) this.sessionId = message.session_id;
         if (message.type === "system" && message.subtype === "background_tasks_changed") {
-          this.tasks = new Set(message.tasks.map(t => t.task_id));
+          // Membership snapshots are authoritative. Bookends can arrive before or
+          // after them; pairing the two streams can resurrect an already-ended task.
+          this.hasTaskSnapshot = true;
+          this.tasks = new Map(message.tasks.map(t => [t.task_id, !!t.ambient]));
+          if (!this.pending) this.rememberDetachedTasks();
           this.hooks.onBackground(message);
           if (this.tasks.size && this.idleTimer) clearTimeout(this.idleTimer);
           if (!this.tasks.size && !this.pending) this.scheduleIdle();
         } else if (message.type === "system" && ["task_notification", "task_started", "task_updated", "task_progress"].includes(message.subtype)) {
-          if (message.subtype === "task_started" && message.is_backgrounded) this.tasks.add(message.task_id);
-          if (message.subtype === "task_updated" && message.patch.is_backgrounded) this.tasks.add(message.task_id);
-          if (message.subtype === "task_notification") this.tasks.delete(message.task_id);
-          this.hooks.onBackground(message);
+          if (!this.hasTaskSnapshot) {
+            if (message.subtype === "task_started" && message.is_backgrounded) this.tasks.set(message.task_id, !!(message.ambient || message.skip_transcript));
+            if (message.subtype === "task_updated" && message.patch.is_backgrounded) this.tasks.set(message.task_id, this.tasks.get(message.task_id) ?? false);
+          }
+          if (!this.pending) this.rememberDetachedTasks();
+          if (message.subtype === "task_notification") {
+            const detached = this.detachedTasks.delete(message.task_id);
+            if (!this.hasTaskSnapshot) this.tasks.delete(message.task_id);
+            // Blocking Bash also emits these events. The foreground agent already
+            // receives its tool result; only work that outlived a turn needs a
+            // separate user notice. Unexpected worker loss is always surfaced.
+            if ((detached || message.reason === "worker_restart") && !message.ambient && !message.skip_transcript) this.hooks.onBackground(message);
+          } else this.hooks.onBackground(message);
           if (!this.pending && !this.tasks.size) this.scheduleIdle();
         }
         const p = this.pending;
@@ -83,6 +98,7 @@ export class SdkSession {
           if (text) p.results.push(text);
           if (!p.uuids.size || message.is_error) {
             this.pending = undefined; p.turn.signal?.removeEventListener("abort", p.abort);
+            this.rememberDetachedTasks();
             p.resolve({ text: p.results.join("\n\n") || (p.error ? "回合失败，SDK 未返回详情" : "(助手没有返回内容)"), sessionId: this.sessionId, isError: p.error });
             this.scheduleIdle();
           }
@@ -91,6 +107,9 @@ export class SdkSession {
       }
       this.close(new Error("CLI 已退出"));
     } catch (error) { this.close(error instanceof Error ? error : new Error(String(error))); }
+  }
+  private rememberDetachedTasks(): void {
+    for (const [id, ambient] of this.tasks) if (!ambient) this.detachedTasks.add(id);
   }
   private scheduleIdle(): void {
     if (this.tasks.size || this.pending || this.closed) return;

@@ -380,6 +380,11 @@ env 要改 compose,而 compose 属 Tier 3、每次调整都要人;写进仓库�
 
 ### 日常升级
 
+公共网页抓取 skill 的维护版本在 `skills/webgrab/`。管理员更新前备份数据目录中的
+`claude/skills/webgrab/`，再复制这些非凭据文件；启动过程不会覆盖管理员安装的 skill。
+凭据只保存在 owner 的 `/user`，不要随 skill 分发。新建 worker 会装配最新副本；
+运行中的 worker 保持创建时的只读快照。
+
 ```bash
 git -C data/src/catman pull            # 或让 agent 自己在 evolve/* 分支上改
 
