@@ -25,7 +25,17 @@ async function main(): Promise<void> {
   if (verb === "list") { console.log(JSON.stringify(await taskRequest("/tasks"), null, 2)); return; }
   if (verb === "stop") { if (!args[0]) throw new Error("需要任务 ID"); console.log(JSON.stringify(await taskRequest(`/tasks/${args[0]}`, "DELETE"))); return; }
   if (verb === "send") {
-    const text = args.join(" ");
+    let text = args.join(" ");
+    if (!args.length && !process.stdin.isTTY) {
+      const chunks: Buffer[] = []; let length = 0;
+      for await (const chunk of process.stdin) {
+        length += chunk.length;
+        if (length > 24_000) throw new Error("通知正文过长");
+        chunks.push(chunk);
+      }
+      text = Buffer.concat(chunks).toString("utf8");
+    }
+    if (!text.trim()) throw new Error("通知正文不能为空");
     const response = await fetch(`${process.env.CATMAN_API_BASE}/api/runtime/notify`, { method: "POST", headers: {
       "content-type": "application/json", "X-Catman-Runtime": process.env.CATMAN_RUNTIME_TOKEN ?? "" }, body: JSON.stringify({ text }), signal: AbortSignal.timeout(20_000) });
     if (!response.ok) throw new Error(`通知失败 HTTP ${response.status}`);
