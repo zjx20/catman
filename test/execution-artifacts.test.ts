@@ -67,6 +67,7 @@ test("启动失败但已确认容器移除时立即回收投影", async () => {
     await assert.rejects(manager.ensure(c), /launch failed/);
     assert.equal(existsSync(join(f.config.dataDir, "execution/projections", c.id)), false);
     assert.equal(manager.all().length, 0);
+    assert.equal(manager.pending(c.id).length, 0, "启动失败由调用方报告,不叠加回收通知");
   } finally { f.cleanup(); }
 });
 

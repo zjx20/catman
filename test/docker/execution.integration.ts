@@ -47,8 +47,9 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
   const savedEnv = { ...process.env };
   let networkCreated = false, connected = false, self: string | undefined;
   let upstream: Server | undefined, server: Server | undefined, broker: CapabilityBroker | undefined;
+  let beforeRun: ((args: string[]) => Promise<void>) | undefined;
   const docker = async (args: string[], env?: NodeJS.ProcessEnv) => {
-    if (args[0] === "run") containers.add(args[args.indexOf("--name") + 1]!);
+    if (args[0] === "run") { containers.add(args[args.indexOf("--name") + 1]!); await beforeRun?.(args); }
     return dockerCommand(args, env);
   };
   t.after(async () => {
@@ -230,6 +231,31 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
       assert.equal(existsSync(old), false); assert.ok(existsSync(bound));
       assert.ok(existsSync(join(root, "execution/projections", alice.id, a.container.slice(-16))));
     } finally { await docker(["rm", "-f", name]); }
+  });
+  await t.test("真实 Docker 启动与巡检交错：容器创建前的投影不能被回收", async () => {
+    const c = contexts.chat("startup-race-probe");
+    let entered!: () => void, resume!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    beforeRun = async args => {
+      if (args[args.indexOf("--name") + 1]?.includes(c.id)) { entered(); await gate; }
+    };
+    const creating = runtimes.ensure(c);
+    try {
+      await waiting;
+      const pending = runtimes.all("startup-race-probe")[0]!;
+      await assert.rejects(docker(["inspect", pending.container]), /No such/);
+      await runtimes.tick();
+      assert.ok(runtimes.resolve(pending.token));
+      assert.ok(existsSync(join(root, "execution/projections", c.id, pending.container.slice(-16))));
+      assert.equal(notices.filter(n => n.owner === "startup-race-probe").length, 0);
+      resume(); const started = await creating;
+      assert.equal(started.container, pending.container);
+      assert.equal(await exec(started, "console.log('worker-ready')"), "worker-ready");
+    } finally {
+      beforeRun = undefined; resume(); await creating.catch(() => {});
+      await runtimes.stop(c.id, "test cleanup", true);
+    }
   });
   await t.test("真实 CLI 发现和调用公共 MCP，协议会话和服务端凭据经过控制面", async () => {
     writeFileSync(join(aPaths.sdk, "settings.json"), JSON.stringify({ env: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" } }));

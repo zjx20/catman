@@ -50,7 +50,6 @@ export class RuntimeManager {
   private events: RuntimeEvent[];
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly reclaiming = new Set<string>();
-  private readonly stops = new Map<string, Promise<void>>();
   private readonly owned = new Set<string>();
   private readonly adoptions = new Map<string, Promise<void>>();
   private readonly listeners = new Map<string, () => void>();
@@ -87,16 +86,18 @@ export class RuntimeManager {
   }
   onStop(contextId: string, callback: () => void): void { this.listeners.set(contextId, callback); }
   async ensure(context: ExecutionContext): Promise<RuntimeRecord> {
-    const previous = this.locks.get(context.id) ?? Promise.resolve();
-    const next = previous.catch(() => {}).then(() => this.provision(context));
-    this.locks.set(context.id, next);
-    try { return await next; } finally { if (this.locks.get(context.id) === next) this.locks.delete(context.id); }
+    return this.withContext(context.id, () => this.provision(context));
+  }
+  private async withContext<T>(id: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.locks.get(id) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(operation);
+    this.locks.set(id, next);
+    try { return await next; } finally { if (this.locks.get(id) === next) this.locks.delete(id); }
   }
   private async provision(context: ExecutionContext): Promise<RuntimeRecord> {
-    await this.stops.get(context.id);
     if (!this.config.hostDataDir) throw new Error("多租户执行要求配置 CATMAN_HOST_DATA_DIR；拒绝退回控制进程执行");
     let old = this.records.find(r => r.contextId === context.id);
-    if (old && old.admin !== this.opts.isAdmin(context.userKey)) { await this.stop(context.id, "用户权限已改变"); old = undefined; }
+    if (old && old.admin !== this.opts.isAdmin(context.userKey)) { await this.remove(context.id, "用户权限已改变"); old = undefined; }
     if (old) {
       // A daemon outage must not be confused with a missing container.
       let state: string;
@@ -159,7 +160,8 @@ export class RuntimeManager {
           if (!(removal instanceof DockerFailure && removal.missing)) throw error;
         }
       }
-      await this.forget(r, "执行环境启动失败"); throw error;
+      // 启动失败由调用方报告,不再额外发送一次“运行环境已回收”。
+      await this.forget(r, "执行环境启动失败", true); throw error;
     }
   }
   private project(context: ExecutionContext, generation: string): string {
@@ -271,18 +273,18 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
     this.events.push({ id: randomBytes(16).toString("hex"), userKey, contextId, text, delivered: false, at: this.now() }); this.save();
   }
   async stop(id: string, reason: string, silent = false): Promise<void> {
-    const previous = this.stops.get(id); if (previous) return previous;
+    // 创建、重建、主动回收共用上下文队列,不能在 docker run 尚未完成时 rm/forget。
+    await this.withContext(id, () => this.remove(id, reason, silent));
+  }
+  private async remove(id: string, reason: string, silent = false): Promise<void> {
     const r = this.records.find(r => r.contextId === id); if (!r) return;
     this.reclaiming.add(id);
     // Invalidate callbacks/capabilities only after the daemon confirms removal.
-    const stopping = (async () => {
+    try {
       try { await this.docker(["rm", "-f", r.container]); }
       catch (error) { if (!(error instanceof DockerFailure && error.missing)) throw error; }
       await this.forget(r, reason, silent);
-    })();
-    this.stops.set(id, stopping);
-    try { await stopping; }
-    finally { this.reclaiming.delete(id); this.stops.delete(id); }
+    } finally { this.reclaiming.delete(id); }
   }
   private async forget(r: RuntimeRecord, reason: string, silent = false): Promise<void> {
     this.records = this.records.filter(item => item.container !== r.container);
@@ -340,20 +342,37 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
       }
     } finally { this.notifying = false; }
   }
+  private canMonitor(r: RuntimeRecord): boolean {
+    // ensure 在 docker run 前持久化身份;此时容器尚不存在并不表示已经退出。
+    // 每次异步读取后都要重新确认,不能把旧实例的快照用于已经重建的上下文。
+    return this.records.includes(r) && !this.locks.has(r.contextId) && !this.reclaiming.has(r.contextId);
+  }
   async tick(): Promise<void> {
     if (this.ticking || this.closed) return; this.ticking = true;
     try {
       for (const r of [...this.records]) {
         try {
+        if (!this.canMonitor(r)) continue;
         if (r.admin !== this.opts.isAdmin(r.userKey)) { await this.stop(r.contextId, "用户权限已改变"); continue; }
         let snapshot: { tasks: TaskRecord[]; processes: string[]; agents?: string[]; unmanaged?: string[] };
         try {
-          await this.adopt(r); snapshot = JSON.parse(await this.rpc(r, "/processes"));
+          await this.adopt(r);
+          if (!this.canMonitor(r)) continue;
+          snapshot = JSON.parse(await this.rpc(r, "/processes"));
+          if (!this.canMonitor(r)) continue;
           if (!Array.isArray(snapshot.tasks) || !Array.isArray(snapshot.processes)) throw new Error("运行时状态无效");
         }
         catch {
-          try { if (await this.docker(["inspect", "-f", "{{.State.Running}}", r.container]) !== "true") { await this.stop(r.contextId, "容器异常退出"); continue; } }
-          catch (error) { if (error instanceof DockerFailure && error.missing) { await this.forget(r, "执行容器已不存在"); continue; } }
+          if (!this.canMonitor(r)) continue;
+          try {
+            const state = await this.docker(["inspect", "-f", "{{.State.Running}}", r.container]);
+            if (!this.canMonitor(r)) continue;
+            if (state !== "true") { await this.stop(r.contextId, "容器异常退出"); continue; }
+          }
+          catch (error) {
+            if (!this.canMonitor(r)) continue;
+            if (error instanceof DockerFailure && error.missing) { await this.forget(r, "执行容器已不存在"); continue; }
+          }
           snapshot = { tasks: r.tasks, processes: ["运行时无响应，无法读取进程列表"] };
         }
         for (const task of snapshot.tasks) {

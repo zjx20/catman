@@ -134,6 +134,10 @@ accountId 这一段不能省 —— 两份 iLink 凭据下可能出现相同的 
 Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/context，SDK project 路径由
 该 context 的独立 cwd 派生；用户 home 不是聊天或 cron 的 cwd。
 
+同一 context 的创建、重建与回收必须串行。运行身份在 `docker run` 前持久化，巡检不能
+把尚未创建的容器当作已经消失；每次异步读取后重新核对实例和上下文锁，禁止使用旧快照
+回收重建后的实例。实例投影只能在确认该实例退出且不会继续启动后清理。
+
 ## 关键文件
 
 只列**光看文件名猜不到职责**的。其余按目录约定即可(`channels/` 渠道实现、
