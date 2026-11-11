@@ -302,7 +302,7 @@ docker run --rm -e HTTP_PROXY -e HTTPS_PROXY -e http_proxy -e https_proxy catman
 mkdir -p "$DATA/ssh/fetch"
 chmod 700 "$DATA/ssh" "$DATA/ssh/fetch"
 
-# ① 助手拉代码用的:GitHub 上建一个**只读** deploy key
+# ① 控制服务拉代码用的:GitHub 上建一个**只读** deploy key
 cp ~/catman_readonly     "$DATA/ssh/fetch/id_ed25519"
 chmod 600 "$DATA/ssh/fetch/id_ed25519"
 chown -R 10001:10001 "$DATA/ssh/fetch"
@@ -362,17 +362,16 @@ deploy key** —— 而后者更强:属主挡不住一个挂了 docker.sock 的�
 只做一把也能跑:放 `$DATA/ssh/id_ed25519` 并 `chown 10001`,`init.sh` 会认出它是给助手用的
 (pull 通、push 跳过)。`init.sh` 跑完会打一段诊断,把两个槽位各自的状态和属主说清楚。
 
-助手那把是写进**仓库配置**的(`core.sshCommand`,由 `init.sh` 设),不走容器 env ——
-env 要改 compose,而 compose 属 Tier 3、每次调整都要人;写进仓库之后助手一句朴素的
-`git pull` 就能跑,不必知道钥匙在哪。也可以用 `CATMAN_GIT_FETCH_KEY` / `CATMAN_GIT_SSH_KEY`
+拉取密钥的路径写进**仓库配置**(`core.sshCommand`,由 `init.sh` 设)。
+密钥路径适用于控制服务，普通 worker 不挂载部署密钥。需要拉取时先获得含 Docker socket 的运维授权，
+运行 `catman-ops connect` 并执行系统清单中的“自进化源码拉取”命令；系统按当前部署生成控制服务容器名、
+源码路径和 owner UID，由控制服务使用只读 SSH 密钥 fetch。随后在 worker 的 `/catman-src` 检查并
+用 `git merge --ff-only '@{u}'` 快进合并。保留 SSH origin，发布后的 push 仍由 deployer 使用可写密钥。
+也可以用 `CATMAN_GIT_FETCH_KEY` / `CATMAN_GIT_SSH_KEY`
 把两个槽位分别指到别处。
 
-> **SSH 出不去的话改用 HTTPS + token。** 部署密钥只能走 SSH,而 HTTP 代理转发不了裸 TCP;
-> 端口 22 被挡时可试 `ssh.github.com:443`,再不行就用细粒度只读 PAT 走
-> `https://<token>@github.com/...`(注意 token 会明文留在 `.git/config` 里,
-> 属主那道闸对它不成立 —— 助手读得到)。
-> 另外:挂了 docker.sock 的助手本来就等同宿主 root,理论上总能绕过属主,所以属主防的是
-> **失误**(顺手一个 `git push`),真正的边界是 GitHub 侧那把钥匙的权限。
+> SSH 端口 22 被挡时，可在控制服务的 SSH 配置中使用 `ssh.github.com:443`，保留主机公钥校验。
+> 含 Docker socket 的运维授权等同宿主 root，必须由用户硬指令授予；两把部署密钥用于区分拉取与发布职责。
 
 > **架构不必再操心**:依赖是在**目标机器上**用 `catman-env` 装的(见 `scripts/evolve/prepare.sh`),
 > 天然就是对的架构。以前那套 buildx + QEMU 多架构构建随源码直跑一起消失了 ——

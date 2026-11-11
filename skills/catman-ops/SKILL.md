@@ -53,6 +53,15 @@ SCRIPT
 相对路径从共享 workspace 开始，worker 与运维容器里路径相同；脚本、备份与日志放在这里即可互见。
 默认镜像带 Bash、git、curl、SSH/SCP、网络排查工具、Docker CLI/Compose；自定义镜像以实际工具为准。
 
+## 拉取 catman 源码
+
+自进化保留部署配置的 SSH origin，发布完成后仍由 deployer 用可写密钥推送。
+普通 worker 不挂部署密钥；在运维容器直接按宿主路径运行 git，也可能找不到仓库配置中的控制服务密钥路径。
+已获含 Docker socket 的授权后，运行 `catman-ops connect`，执行系统清单里的“自进化源码拉取”命令。
+系统按当前部署生成控制服务容器名、源码路径和 owner UID，命令通过 `docker exec` 在控制服务内使用只读 SSH 密钥 fetch。
+随后回到 worker 的 `/catman-src` 检查当前分支与上游，用 `git merge --ff-only '@{u}'` 快进合并。
+目录运维授权不包含这项操作；不要复制私钥、切换 HTTPS 或自行扩大挂载。
+
 ## 使用挂载与 Docker
 
 可先探索清单中的目录找服务配置。修改前检查实际文件、软链接、Compose 项目和卷，

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { Config } from "../../config.js";
@@ -76,6 +76,8 @@ export class OpsManager {
   list(userKey: string): OpsRecord[] { this.checkAdmin(userKey); return structuredClone(this.records.filter(r => r.userKey === userKey)); }
   description(r: OpsRecord): string {
     const work = this.contexts.paths(this.contexts.get(r.contextId, r.userKey)!).work;
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    const repository = r.config.dockerSocket && this.config.persona === "primary" ? statSync(this.config.srcDir, { throwIfNoEntry: false }) : undefined;
     return [
       `运维环境 ${r.id}（${({ pending: "待授权", starting: "启动中", active: "已授权", revoking: "回收中" })[r.state]}）`,
       `所属会话：${r.contextId}`, `用途：${r.reason}`, `工具镜像：${r.config.image}`,
@@ -83,6 +85,10 @@ export class OpsManager {
       ...(r.config.mounts.length ? [] : ["- 无额外宿主目录"]),
       `当前 workspace：${hostPath(this.config.mainDataDir, this.config.hostDataDir!, work)} → ${work}（与主会话共享，可读写）`,
       r.config.dockerSocket ? "Docker socket：/var/run/docker.sock（完整宿主 Docker 权限，相当于宿主机 root 授权）" : "Docker socket：未挂载，不能直接管理宿主 Docker。",
+      ...(repository?.isDirectory() ? [
+        "自进化源码拉取（授权后执行）：由控制服务使用现有 SSH 配置和只读密钥，仅更新远端引用，不合并工作区；随后在 /catman-src 按上游快进合并。",
+        `catman-ops exec -- docker exec --user ${repository.uid} ${quote(this.config.containerName)} git -C ${quote(this.config.srcDir)} fetch --prune --no-recurse-submodules origin`,
+      ] : []),
       "独立 SSH shell，不运行第二个 agent。默认工具包含 shell、SSH/SCP、git、curl、文件与网络排查工具、Docker CLI/Compose。",
       "不设置独立时限，与原会话执行容器同生共死；原容器回收或重建后授权失效。原会话的闲置预告和回收规则继续生效。",
       r.state === "active" ? "连接：在原会话运行 catman-ops connect 查看清单及专属 SSH 登录方法；用 catman-ops exec -- <程序> [参数...] 或 catman-ops run <本地脚本或-> [参数...] 执行，工具处理 SSH 转义。" : `授权硬指令：/授权 ${r.id}`,

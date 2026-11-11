@@ -789,7 +789,10 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(只对**主人格
   `/data/ssh/id_ed25519`(uid 10002、远端可写)用于部署器推送。两者均不挂给 worker。
   宿主缺少 Git 时通过可信工具容器完成拉取，不要恢复给 agent 挂 Docker socket 的旧做法。
   管理员 worker 在 `/catman-src` 改代码、提交，再请求制备 API；仓库配置里的密钥路径
-  不代表 worker 能读取该密钥。`init.sh` 不随意 chown 密钥，原属主决定使用槽位。
+  不代表 worker 能读取该密钥。拉取先申请含 Docker socket 的用户硬授权，按运维清单生成的
+  `catman-ops exec -- docker exec --user <owner> <控制服务> git -C <源码路径> fetch ... origin`
+  在控制服务内使用只读 SSH 密钥；随后在 worker 检查并快进合并。保持 SSH origin，
+  deployer 在发布完成后使用可写密钥推送。`init.sh` 不随意 chown 密钥，原属主决定使用槽位。
 - **远端只由 deployer 在部署成功、stable 前移之后推进**(`lib.sh` 的 `push_upstream`):
   GitHub 上出现的永远是真正上线过并活下来的提交(推得更早会让远端记录一堆从未运行过的
   东西,而人恰恰靠远端判断线上是什么)。推失败**只记日志,绝不反过来判部署失败**;

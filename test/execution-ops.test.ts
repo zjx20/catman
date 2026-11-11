@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { executionFixture } from "./helpers/execution.js";
@@ -50,6 +51,7 @@ test("申请不启动容器；硬授权冻结部署挂载，系统清单不泄�
     const description = f.ops.description(active);
     for (const expected of ["/opt/services", "/mnt/usb", "/var/run/docker.sock", "root", "workspace", "SSH", "同生共死"]) assert.ok(description.includes(expected));
     assert.ok(!description.includes("private-key-secret"));
+    assert.ok(description.includes(`catman-ops exec -- docker exec --user ${statSync(f.config.srcDir).uid} '${f.config.containerName}' git -C '${f.config.srcDir}' fetch --prune --no-recurse-submodules origin`));
     assert.ok(f.calls.some(c => c.args[0] === "network" && c.args[1] === "create" && c.args.includes("--internal")));
   } finally { f.cleanup(); }
 });
@@ -183,8 +185,28 @@ test("仅目录运维不会获得 Docker 权限或借自进化制备扩大权限
     const parent = await f.runtimes.ensure(f.contexts.chat("admin")), request = await f.ops.request(parent, "目录排查");
     const { record } = await f.ops.grant("admin", request.id);
     assert.match(f.ops.description(record), /Docker socket：未挂载/);
+    assert.doesNotMatch(f.ops.description(record), /自进化源码拉取|docker exec/);
     assert.ok(!f.calls.filter(c => c.args[0] === "run")[1]!.args.some(a => a.includes("docker.sock")));
     await assert.rejects(f.ops.requireHostAccess(parent), /包含 Docker socket/);
+  } finally { f.cleanup(); }
+});
+
+test("源码拉取命令按当前部署生成，容器名和路径保留为完整参数，不解释 shell 内容", async () => {
+  const f = fixture();
+  try {
+    f.config.containerName = "catman-primary-custom";
+    f.config.srcDir = join(f.root, "source '$(touch injected)' with spaces"); mkdirSync(f.config.srcDir);
+    const ops = new OpsManager(f.config, f.contexts, f.runtimes, f.opsOptions);
+    try {
+      const parent = await f.runtimes.ensure(f.contexts.chat("admin"));
+      const request = await ops.request(parent, "通过 SSH 拉取源码");
+      const command = ops.description(request).split("\n").find(line => line.startsWith("catman-ops exec --")); assert.ok(command);
+      const bin = join(f.root, "bin"); mkdirSync(bin);
+      writeFileSync(join(bin, "catman-ops"), '#!/bin/sh\nprintf "%s\\0" "$@"\n', { mode: 0o700 });
+      const result = execFileSync("sh", ["-c", command], { cwd: f.root, env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+      assert.deepEqual(result.toString().split("\0").slice(0, -1), ["exec", "--", "docker", "exec", "--user", String(statSync(f.config.srcDir).uid), "catman-primary-custom", "git", "-C", f.config.srcDir, "fetch", "--prune", "--no-recurse-submodules", "origin"]);
+      assert.equal(existsSync(join(f.root, "injected")), false);
+    } finally { ops.close(); }
   } finally { f.cleanup(); }
 });
 

@@ -498,6 +498,31 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
       assert.equal(inspect.Config.User, "0:0");
       const badIdentity = `const {execFileSync}=await import('node:child_process');const key='/tmp/ops-wrong-identity';execFileSync('ssh-keygen',['-q','-t','ed25519','-N','','-f',key]);try{execFileSync('ssh',['-F','/dev/null','-i',key,'-p','2222','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o',${JSON.stringify(`UserKnownHostsFile=${configPath.replace(/ssh_config$/, "known_hosts")}`)},${JSON.stringify(`root@${record.container}`)},'true'],{stdio:'pipe'});throw new Error('wrong key accepted')}catch(e){if(e.status!==255||!String(e.stderr).includes('Permission denied'))throw e;console.log('wrong-key-denied')}`;
       assert.equal(await exec(parent, badIdentity), "wrong-key-denied");
+      // SSH 源码拉取：worker -> 已授权运维 SSH -> 控制服务 -> Git SSH 服务。
+      // 所有仓库和密钥均为本测试创建，不连接真实远端或生产容器。
+      const fetchController = `catman-fetch-${suffix}`;
+      opsConfig.containerName = fetchController;
+      containers.add(fetchController);
+      try {
+        const origin = "/tmp/catman-git-origin", seed = "/tmp/catman-git-seed";
+        await ssh(`git init --bare ${quote(origin)} && git init ${quote(seed)} && git -C ${quote(seed)} -c user.name=Probe -c user.email=probe@example.invalid commit --allow-empty -m probe && git -C ${quote(seed)} push ${quote(origin)} HEAD:refs/heads/main`);
+        const key = join(config.dataDir, "execution", "ops", id, "client_key"), hosts = join(root, "git-known-hosts");
+        const connection = await ops.connection(parent);
+        writeFileSync(hosts, `[${record.container}]:2222 ${connection.hostKey}\n`);
+        await docker(["run", "-d", "--name", fetchController, "--network", record.network, "--user", `${process.getuid?.() ?? 10001}:${process.getgid?.() ?? 10001}`,
+          "--mount", `type=bind,src=${join(hostRoot, relative(repo, root))},dst=${root}`, image, "node", "-e", "setInterval(()=>{},1000)"]);
+        await docker(["exec", fetchController, "git", "-C", config.srcDir, "init"]);
+        const remote = `ssh://root@${record.container}:2222${origin}`;
+        await docker(["exec", fetchController, "git", "-C", config.srcDir, "remote", "add", "origin", remote]);
+        await docker(["exec", fetchController, "git", "-C", config.srcDir, "config", "core.sshCommand", `ssh -i ${quote(key)} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${quote(hosts)}`]);
+        assert.equal(await exec(parent, `const fs = await import('node:fs'); console.log(fs.existsSync(${JSON.stringify(key)}))`), "false", "worker 看不到 Git SSH 密钥");
+        const manifest = await docker(["exec", parent.container, "catman-ops", "connect"]);
+        const command = manifest.split("\n").find(line => line.startsWith("catman-ops exec -- docker exec --user")); assert.ok(command);
+        await docker(["exec", parent.container, "sh", "-c", command]);
+        const fetched = await docker(["exec", parent.container, "git", "-C", "/catman-src", "rev-parse", "origin/main"]);
+        assert.match(fetched, /^[a-f0-9]{40}$/);
+        assert.equal(await docker(["exec", fetchController, "git", "-C", config.srcDir, "remote", "get-url", "origin"]), remote, "拉取后保持 SSH origin");
+      } finally { await docker(["rm", "-f", fetchController]); }
       await ssh(`node -e ${quote("require('child_process').spawn('sleep',['120'],{detached:true,stdio:'ignore'}).unref()")}`);
       now += 31_000; await runtimes.tick(); assert.ok(runtimes.all().some(r => r.container === parent.container), "远端仍有任务时不触发空 worker 快速回收");
       await runtimes.stop(context.id, "运维父子回收验证", true);
