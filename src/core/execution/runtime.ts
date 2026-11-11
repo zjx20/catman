@@ -10,6 +10,7 @@ import { MAX_TASK_MS, type TaskRecord, type TaskRequest } from "./task-superviso
 import { readScopedFile } from "../scoped-files.js";
 import { ExecutionArtifacts } from "./artifacts.js";
 import { projectInstructions } from "./instructions.js";
+import { codeBlock, inlineCode } from "../markdown.js";
 
 export interface RuntimeRecord {
   contextId: string; userKey: string; container: string; token: string; admin: boolean;
@@ -270,7 +271,7 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
     r.tasks = r.tasks.filter(t => t.id !== task.id).concat({ ...task, name: String(task.name).slice(0, 100) }).slice(-100);
     if (task.status !== "running" && task.endedAt !== undefined && !r.cronTaskIds?.includes(task.id)) {
       const label = task.status === "timeout" ? "超过执行时限，已终止" : `已结束（${task.status}）`;
-      this.event(r, `后台任务「${task.name}」${label}。\n${String(tail).slice(-1200)}\n工作目录保留。`, `task:${r.container}:${task.id}:${task.status}`);
+      this.event(r, [`后台任务 ${inlineCode(task.name)} ${label}。`, ...(tail.trim() ? [codeBlock(String(tail).trim().slice(-1200))] : []), "工作目录保留。"].join("\n\n"), `task:${r.container}:${task.id}:${task.status}`);
     }
     this.save();
   }
@@ -320,7 +321,11 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
     this.owned.delete(r.container);
     this.listeners.get(r.contextId)?.(); this.listeners.delete(r.contextId);
     if (silent) console.info(`[runtime] ${r.contextId} 回收：${reason}`);
-    else this.event(r, `执行环境 ${r.contextId} 已回收：${reason}。\n${r.tasks.filter(t => t.endedAt === undefined).map(t => `后台任务「${t.name}」已中断`).join("\n")}\n工作目录和会话记录保留。`);
+    else this.event(r, [
+      `执行环境 ${inlineCode(r.contextId)} 已回收：${reason}。`,
+      ...r.tasks.filter(t => t.endedAt === undefined).map(t => `后台任务 ${inlineCode(t.name)} 已中断。`),
+      "工作目录和会话记录保留。",
+    ].join("\n\n"));
     this.save();
     try {
       this.artifacts.removeProjection(r.contextId, r.container.slice(-16));
@@ -429,7 +434,14 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
         if (deadline - this.now() <= 10 * 60_000 && r.warnedDeadline !== deadline) {
           // A user interaction while snapshot was being collected wins over this warning.
           r.warnedDeadline = deadline;
-          this.event(r, `会话 ${r.contextId} 已长时间没有交互，执行环境可能停滞，将在 ${Math.ceil((deadline - this.now()) / 60_000)} 分钟后回收。\n当前进程（名称，不含命令参数）：\n${snapshot.processes.join("\n")}\nSDK 后台任务：${r.sdkTasks.map(t => t.description).join("；") || "无已知任务"}\n延长 30 分钟：/延长 ${r.contextId} 30\n立即回收：/回收 ${r.contextId}\n不操作将按时回收，工作目录保留。`);
+          this.event(r, [
+            `会话 ${inlineCode(r.contextId)} 已长时间没有交互，执行环境可能停滞，将在 ${Math.ceil((deadline - this.now()) / 60_000)} 分钟后回收。`,
+            "当前进程（名称，不含命令参数）：", codeBlock(snapshot.processes.join("\n")),
+            `SDK 后台任务：${r.sdkTasks.map(t => inlineCode(t.description)).join("；") || "无已知任务"}`,
+            "延长 30 分钟，发送：", codeBlock(`/延长 ${r.contextId} 30`),
+            "立即回收，发送：", codeBlock(`/回收 ${r.contextId}`),
+            "不操作将按时回收，工作目录保留。",
+          ].join("\n\n"));
         }
         } catch (error) { console.warn(`[runtime] ${r.contextId} 检查失败，将重试：${String(error)}`); }
       }

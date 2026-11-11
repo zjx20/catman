@@ -53,6 +53,7 @@ import { formatDeployReport } from "./deploy-report.js";
 import { formatDeployProgress } from "./deploy-progress.js";
 import type { SendKind } from "../ipc/protocol.js";
 import type { Persona } from "../config.js";
+import { codeBlock, inlineCode, splitMarkdown } from "./markdown.js";
 
 /** 会话 id 的展示形式:开头 8 位足够在 HISTORY_LIMIT 条内无歧义,也好在手机上打。 */
 export function shortSessionId(sessionId: string): string {
@@ -67,8 +68,8 @@ export function shortSessionId(sessionId: string): string {
 export function reminderText(sessionShortId: string): string {
   return (
     "这次对话已经安静了一会儿。再发消息我会默认开一段新对话来处理;" +
-    `如果想接着刚才的话题聊,发 ${canonicalOf("continue")} 即可。` +
-    `开了新对话之后,发「${canonicalOf("switchSession")} ${sessionShortId}」也能随时切回这段。`
+    "如果想接着刚才的话题聊,发送：\n\n" + codeBlock(canonicalOf("continue")) +
+    "\n\n开了新对话之后,也能随时切回这段：\n\n" + codeBlock(`${canonicalOf("switchSession")} ${sessionShortId}`)
   );
 }
 
@@ -1231,13 +1232,13 @@ export class Gateway {
         // (另两个:超时提醒、/切换会话 的确认语)。
         if (prev) {
           lines.push(
-            `想回到刚才的对话,发「${canonicalOf("switchSession")} ${shortSessionId(prev.sessionId)}」。`,
+            "想回到刚才的对话,发送：", codeBlock(`${canonicalOf("switchSession")} ${shortSessionId(prev.sessionId)}`),
           );
         } else if (detached) {
           // 那一轮还没 record 过(它就是第一轮),id 要等它跑完才有。
           lines.push(`跑完的这段之后可以用 ${canonicalOf("switchSession")} 找回。`);
         }
-        await this.trySend(userKey, lines.join("\n"), "新会话确认");
+        await this.trySend(userKey, lines.join("\n\n"), "新会话确认");
         return true;
       }
 
@@ -1324,30 +1325,27 @@ export class Gateway {
       const when = j.enabled && j.nextAt !== undefined ? formatAt(j.nextAt, this.cron.tz) : "已停用";
       const last = j.lastStatus ? `,上次${JOB_STATUS_CN[j.lastStatus] ?? j.lastStatus}` : "";
       const streak = j.failStreak >= 2 ? `(已连续失败 ${j.failStreak} 次)` : "";
-      lines.push(`· ${j.name} —— 下次 ${when}${last}${streak}`);
+      lines.push(`- ${inlineCode(j.name)} —— 下次 ${when}${last}${streak}`);
     }
     lines.push("要看某个任务跑出了什么,直接问我。");
-    return lines.join("\n");
+    return [lines[0], lines.slice(1, -1).join("\n"), lines.at(-1)].join("\n\n");
   }
 
   private upgradeStatusText(): string {
     const lines = ["🚀 升级状态", versionLine(this.version)];
     if (!this.deploy) {
       lines.push("这台机器没有配自进化的部署机制。");
-      return lines.join("\n");
+      return lines.join("\n\n");
     }
     const last = this.deploy.lastReport();
-    lines.push(last ? `上次部署:${formatDeployReport(last)}` : "上次部署:还没有部署记录。");
+    lines.push(last ? `上次部署：\n\n${formatDeployReport(last)}` : "上次部署:还没有部署记录。");
 
     // 待发布的候选。它是 `/发布` 那几位数字的唯一查法 —— 制备的汇报早被聊天顶上去了,
     // 而这条指令不进 LLM、不花额度,任何时候问都答得出。
     const waiting = this.deploy.publishable().filter((c) => !c.running);
     if (waiting.length) {
-      lines.push(
-        `待发布:${waiting
-          .map((c) => `${shortSha(c.sha)}${c.branch ? `(${c.branch})` : ""}`)
-          .join("、")} —— 发「${canonicalOf("publish")} <前6位>」上线。`,
-      );
+      lines.push("待发布：");
+      for (const c of waiting) lines.push(`${inlineCode(shortSha(c.sha))}${c.branch ? `（${inlineCode(c.branch)}）` : ""}，确认后发送：`, codeBlock(`${canonicalOf("publish")} ${shortSha(c.sha)}`));
     }
 
     const history = this.deploy.verifiedHistory();
@@ -1359,10 +1357,10 @@ export class Gateway {
           history.map((r) => `${shortSha(r.sha)}${r.verifiedAt ? `(${r.verifiedAt})` : ""}`).join("、"),
       );
       if (history.length >= 2) {
-        lines.push(`发 ${canonicalOf("rollback")} 会退到 ${shortSha(history[1]!.sha)}。`);
+        lines.push(`回退到 ${inlineCode(shortSha(history[1]!.sha))}，发送：`, codeBlock(canonicalOf("rollback")));
       }
     }
-    return lines.join("\n");
+    return lines.join("\n\n");
   }
 
   /**
@@ -1574,8 +1572,9 @@ export class Gateway {
       return [
         `${def.label}:${show(cur)}${own ? "(你设的)" : "(默认)"}`,
         `可选:${def.hint(ctx)}`,
-        `发「${cmd.canonical} <${cmd.argHint ?? "值"}>」切换,「${cmd.canonical} 默认」回到默认。`,
-      ].join("\n");
+        "切换指令（替换参数值）：", codeBlock(`${cmd.canonical} <${cmd.argHint ?? "值"}>`),
+        "回到默认设置：", codeBlock(`${cmd.canonical} 默认`),
+      ].join("\n\n");
     }
     if (arg === "默认" || arg.toLowerCase() === "default") {
       const eff = this.prefs.set(userKey, { [key]: null });
@@ -1624,7 +1623,7 @@ export class Gateway {
       // 而那时用户手上多半只有微信。
       versionLine(this.version),
     ];
-    return lines.join("\n");
+    return lines.join("\n\n");
   }
 
   /**
@@ -1664,9 +1663,9 @@ export class Gateway {
         const lines = [`好,切到对话 ${shortSessionId(res.to.sessionId)}${topic},直接发消息就是接着它聊。`];
         if (detached) lines.push("刚才那一轮我在后台接着跑,跑完把结果发你。");
         if (res.from) {
-          lines.push(`刚才的对话想切回来就发「${sw} ${shortSessionId(res.from.sessionId)}」。`);
+          lines.push("刚才的对话想切回来就发送：", codeBlock(`${sw} ${shortSessionId(res.from.sessionId)}`));
         }
-        await this.trySend(userKey, lines.join("\n"), "切换确认");
+        await this.trySend(userKey, lines.join("\n\n"), "切换确认");
         return true;
       }
       case "already-current":
@@ -1686,7 +1685,7 @@ export class Gateway {
           ...res.matches.map((m) => this.describeRef(m)),
         ];
         if (hasPayload) lines.push("这批消息先不处理,切换成功后再发一次。");
-        await this.trySend(userKey, lines.join("\n"), "切换歧义说明");
+        await this.trySend(userKey, lines.join("\n\n"), "切换歧义说明");
         return false;
       }
       case "not-found": {
@@ -1695,7 +1694,7 @@ export class Gateway {
           this.sessionListText(userKey),
         ];
         if (hasPayload) lines.push("这批消息先不处理,切换成功后再发一次。");
-        await this.trySend(userKey, lines.join("\n"), "切换失败说明");
+        await this.trySend(userKey, lines.join("\n\n"), "切换失败说明");
         return false;
       }
       case "gone": {
@@ -1705,7 +1704,7 @@ export class Gateway {
           this.sessionListText(userKey),
         ];
         if (hasPayload) lines.push("这批消息先不处理,换个目标后再发一次。");
-        await this.trySend(userKey, lines.join("\n"), "切换失败说明");
+        await this.trySend(userKey, lines.join("\n\n"), "切换失败说明");
         return false;
       }
     }
@@ -1730,10 +1729,12 @@ export class Gateway {
     }
     return [
       "🗂 最近的对话:",
-      ...(current ? [`${this.describeRef(current)}(当前)`] : []),
-      ...history.map((h) => this.describeRef(h)),
-      `发「${canonicalOf("switchSession")} <会话id>」切换,id 给开头几位就行。`,
-    ].join("\n");
+      [
+        ...(current ? [`- ${this.describeRef(current)}(当前)`] : []),
+        ...history.map((h) => `- ${this.describeRef(h)}`),
+      ].join("\n"),
+      `切换指令（替换会话 id,给开头几位即可）：`, codeBlock(`${canonicalOf("switchSession")} <会话id>`),
+    ].join("\n\n");
   }
 
   /** 列表里的一行:短 id + 最近活动 + 主题提示。 */
@@ -1998,7 +1999,7 @@ export class Gateway {
             ? (memAbort && circuitTripped(this.memAbortStreak.get(userKey) ?? 0)
                 ? circuitTripText(this.memAbortStreak.get(userKey) ?? 0, memAbort.limit)
                 : abortNoticeText(memAbort))
-            : `处理出错了:${(err as Error).message}`,
+            : `处理出错了：\n\n${codeBlock((err as Error).message ?? String(err))}`,
         ),
         "错误说明",
       );
@@ -2038,15 +2039,15 @@ export class Gateway {
    */
   private labelMidTurn(ctx: TurnContext, text: string): string {
     if (!ctx.detached) return text;
-    return `【后台对话说】\n${text}`;
+    return `【后台对话说】\n\n${text}`;
   }
 
   private labelIfDetached(ctx: TurnContext, sessionId: string | undefined, text: string): string {
     if (!ctx.detached) return text;
-    if (sessionId === undefined) return `【后台对话的结果】\n${text}`;
+    if (sessionId === undefined) return `【后台对话的结果】\n\n${text}`;
     return (
-      `【后台对话 ${shortSessionId(sessionId)} 的结果】\n${text}\n\n` +
-      `(想接着这段聊,发「${canonicalOf("switchSession")} ${shortSessionId(sessionId)}」)`
+      `【后台对话 ${shortSessionId(sessionId)} 的结果】\n\n${text}\n\n` +
+      "想接着这段聊,发送：\n\n" + codeBlock(`${canonicalOf("switchSession")} ${shortSessionId(sessionId)}`)
     );
   }
 
@@ -2129,11 +2130,11 @@ export class Gateway {
    * 走到这个失败分支说明的是 IPC 层面的问题(信使不可达),那时后面几段同样发不出去。
    */
   private async sendChunked(userKey: string, text: string, maxChars: number): Promise<void> {
-    const total = Math.ceil(text.length / maxChars);
-    for (let i = 0, n = 1; i < text.length; i += maxChars, n += 1) {
-      const ok = await this.trySend(userKey, text.slice(i, i + maxChars), "正文");
+    const chunks = splitMarkdown(text, maxChars);
+    for (const [i, chunk] of chunks.entries()) {
+      const ok = await this.trySend(userKey, chunk, "正文");
       if (!ok) {
-        console.error(`[gateway] ${userKey} 的正文发到第 ${n}/${total} 段停下 —— 后面几段不再发`);
+        console.error(`[gateway] ${userKey} 的正文发到第 ${i + 1}/${chunks.length} 段停下 —— 后面几段不再发`);
         return;
       }
     }

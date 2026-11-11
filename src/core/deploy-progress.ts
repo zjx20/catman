@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { readJsonFile, writeJsonFileAtomic } from "./file-store.js";
 import { shortSha } from "./version.js";
+import { codeBlock } from "./markdown.js";
 
 /**
  * 部署里程碑 —— deployer 一路写、catman 一路播的那份**跨版本契约**。
@@ -128,7 +129,7 @@ export function formatDeployProgress(p: DeployProgress): string {
         : p.ok
           ? `📤 ${shortSha(p.sha)} 已推送到远端。`
           : `⚠️ ${shortSha(p.sha)} 没能推上远端 —— 版本照常在跑,但远端还没有这个提交。`;
-  return p.detail ? `${head}\n${p.detail}` : head;
+  return p.detail ? `${head}\n\n${p.detail.includes("\n") ? codeBlock(p.detail) : p.detail}` : head;
 }
 
 /** 已播报名单里最多留几条。够覆盖最近几次部署,又不会让这份文件无限长。 */

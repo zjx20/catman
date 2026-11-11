@@ -1,5 +1,6 @@
 import { formatAt } from "./schedule.js";
 import type { CronJob, CronRun } from "./types.js";
+import { codeBlock, splitMarkdown } from "../markdown.js";
 
 /**
  * 通知文案。**纯函数** —— 发不发、发给谁是 scheduler 的事,这里只负责说什么。
@@ -68,18 +69,22 @@ export function renderEnd(job: CronJob, run: CronRun, tail: string, nextText: st
   })();
 
   const lines = [head + TRIGGER_CN[run.trigger]];
-  const body = trimTail(tail);
-  if (body) lines.push(body);
-  else if (run.status === "ok") lines.push("(没有输出)");
-  if (run.note) lines.push(run.note);
+  const body = tail.trim();
+  if (body && job.task.kind === "script") lines.push(codeBlock(trimTail(body)));
+  else if (body) {
+    const chunks = splitMarkdown(body, 1500);
+    lines.push(chunks[0]!);
+    if (chunks.length > 1) lines.push("回复较长，仅展示开头；完整结果见该任务的执行记录。");
+  } else if (run.status === "ok") lines.push("(没有输出)");
+  if (run.note) lines.push(run.note.includes("\n") ? codeBlock(run.note) : run.note);
   lines.push(nextText);
-  return lines.join("\n");
+  return lines.join("\n\n");
 }
 
 /** 连续失败到阈值、任务被自动停用时那一条。 */
 export function renderAutoDisabled(job: CronJob, streak: number): string {
   return (
-    `🛑 「${job.name}」已连续失败 ${streak} 次,我把它停用了 —— 免得它一直空转。\n` +
+    `🛑 「${job.name}」已连续失败 ${streak} 次,我把它停用了 —— 免得它一直空转。\n\n` +
     "修好之后跟我说一声,我把它打开。"
   );
 }

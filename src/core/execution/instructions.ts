@@ -10,9 +10,14 @@ export function instructionOptions(persona: Persona, memoryLimit?: string): Pick
   return {
     settingSources: ["user", "project", "local"],
     permissionMode: "bypassPermissions",
-    systemPrompt: { type: "preset", preset: "claude_code", append: personaBriefing(persona, memoryLimit) },
+    systemPrompt: { type: "preset", preset: "claude_code", append: `${personaBriefing(persona, memoryLimit)}\n\n${REPLY_FORMAT}` },
   };
 }
+
+const REPLY_FORMAT = `## 回复格式
+聊天客户端按 Markdown 渲染。段落、列表、代码围栏之间留空行，不依赖单换行排版。
+需要用户复制执行或发送的完整命令（包括 /授权、/发布、/回收 等硬指令）单独放进代码围栏；每条指令一个代码块，填好实际参数，不带 shell 提示符或解释文字。
+路径、版本号、程序名使用行内代码。汇报先给结论和必要的验证结果，不直接粘贴整段工具输出；确需展示的日志片段放进 text 代码围栏。`;
 
 /** Materialize User memory; Project memory remains native CLI discovery in the workspace. */
 export function projectInstructions(dataDir: string, home: string, target: string, ops = false): void {

@@ -4,6 +4,7 @@ import { constants, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { OpsConnection } from "./ops.js";
+import { codeBlock } from "../markdown.js";
 
 /** 凭证只写进当前 worker 的临时目录；工具输出只有清单和登录命令。 */
 export function installOpsConnection(connection: OpsConnection): { configPath: string; text: string } {
@@ -13,7 +14,15 @@ export function installOpsConnection(connection: OpsConnection): { configPath: s
   writeFileSync(key, connection.privateKey, { mode: 0o600, flag: "wx" });
   writeFileSync(hosts, `[${connection.host}]:${connection.port} ${connection.hostKey}\n`, { mode: 0o600, flag: "wx" });
   writeFileSync(configPath, ["Host catman-ops", `  HostName ${connection.host}`, `  Port ${connection.port}`, "  User root", `  IdentityFile ${key}`, `  UserKnownHostsFile ${hosts}`, "  StrictHostKeyChecking yes", "  IdentitiesOnly yes", "  BatchMode yes", "  ForwardAgent no", "  ClearAllForwardings yes", "  ConnectTimeout 10", "  ServerAliveInterval 15", "  ServerAliveCountMax 3", ""].join("\n"), { mode: 0o600, flag: "wx" });
-  return { configPath, text: `${connection.description}\n\n执行程序：catman-ops exec -- <程序> [参数...]\n运行本地脚本：catman-ops run <脚本路径或-> [参数...]\n脚本与产物可直接放在两边共享的 workspace，无需复制。\nSSH 登录：ssh -F ${configPath} catman-ops\n复制文件：scp -F ${configPath} <本地文件> catman-ops:<远端路径>\n私钥保存在当前容器临时目录，不要输出或保存到 workspace、skill、credential。` };
+  return { configPath, text: [
+    connection.description,
+    "执行程序（替换程序和参数）：", codeBlock("catman-ops exec -- <程序> [参数...]", "bash"),
+    "运行本地脚本（替换脚本路径和参数）：", codeBlock("catman-ops run <脚本路径或-> [参数...]", "bash"),
+    "脚本与产物可直接放在两边共享的 workspace，无需复制。",
+    "SSH 登录：", codeBlock(`ssh -F ${configPath} catman-ops`, "bash"),
+    "复制文件（替换本地和远端路径）：", codeBlock(`scp -F ${configPath} <本地文件> catman-ops:<远端路径>`, "bash"),
+    "私钥保存在当前容器临时目录，不要输出或保存到 workspace、skill、credential。",
+  ].join("\n\n") };
 }
 
 /** SSH 会再次把命令交给远端 shell，不能只依赖本地 spawn 的 argv 分隔。 */

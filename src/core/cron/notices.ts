@@ -132,7 +132,7 @@ export function mergeNotices(pending: readonly PendingNotice[]): string[] {
       }
       parts[0] += `、${[...kinds].map(([k, v]) => `${v} 次${k}`).join("、")}`;
     }
-    out.push(`${parts[0]}。\n最后一次是这样:\n${last.text}`);
+    out.push(`${parts[0]}。\n\n最后一次是这样:\n\n${last.text}`);
   }
   return out;
 }

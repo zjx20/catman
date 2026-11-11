@@ -195,6 +195,7 @@ test("跑完:记录 ok、输出存盘、通知带下次触发时刻", async () =
 
   assert.equal(h.notes.length, 1);
   assert.equal(h.notes[0]!.kind, "announce");
+  assert.match(h.notes[0]!.text, /\n\n```text\n根分区 62%\n```\n\n下次:/);
   assert.match(h.notes[0]!.text, /✅.*跑完了/);
   assert.match(h.notes[0]!.text, /根分区 62%/);
   assert.match(h.notes[0]!.text, /下次:08-13 11:00/);
@@ -607,6 +608,22 @@ test("agent 任务:到点交给大脑,而且**不等它跑完**", async () => {
   assert.equal(run.status, "ok");
   assert.equal(h.store.readLog("j_1", run.id), "磁盘 62%,没异常");
   assert.match(h.notes[0]!.text, /磁盘 62%/);
+});
+
+test("agent cron 通知保留 Markdown 开头和完整命令，长回复只展示可独立渲染的部分", async () => {
+  const h = harness(), brain = new FakeAgentRunner(), sched = h.withAgent(brain);
+  const job = agentJob(h);
+  await sched.tick();
+  const reply = `**已完成**\n\n复制此指令：\n\n\`\`\`text\n/升级状态\n\`\`\`\n\n${"详情说明。".repeat(1000)}`;
+  brain.finish(reply);
+  await settleAll();
+  const notification = h.notes[0]!.text;
+  assert.ok(notification.includes("**已完成**"), "不能读日志尾部而丢掉结论和开头围栏");
+  assert.match(notification, /\n\n```text\n\/升级状态\n```\n\n/);
+  assert.match(notification, /完整结果见该任务的执行记录/);
+  assert.ok(notification.length < 2000);
+  const run = h.store.listRuns(job.id)[0]!;
+  assert.equal(h.store.readLog(job.id, run.id), reply, "完整回复仍保存在执行记录");
 });
 
 test("agent 任务:tick 期间不会被自己收尸(它还在跑)", async () => {

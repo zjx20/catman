@@ -560,6 +560,17 @@ test("中途正文:超过分段长度时像最终答复一样分段,拼起来一
   assert.equal(msgs.at(-1)!.text, "echo:来", "答复仍然排在最后");
 });
 
+test("长 Markdown 回复实际发送时保持发布命令完整，不跨消息拆开代码围栏", async () => {
+  const { channel, agent } = build(() => 1_000_000, { settings: { maxReplyChars: 200 } });
+  const command = "```text\n/发布 029e6bd\n```";
+  const reply = `${"说明。".repeat(60)}\n\n${command}\n\n下一步。`;
+  agent.progressEvents = [{ kind: "text", text: reply }];
+  await channel.receive(U1, "来");
+  const messages = afterGreeting(channel.sent).map(m => m.text);
+  assert.ok(messages.some(text => text.includes(command)));
+  assert.ok(!messages.includes(reply), "总长度超过限制，确实发生了分段");
+});
+
 test("中途正文:progressEnabled=false 也照发 —— 那个开关关的是刷屏,不是它说的话", async () => {
   const t = 1_000_000;
   const { channel, agent } = build(() => t, { settings: { progressEnabled: false } });
@@ -2253,7 +2264,7 @@ test("后台回合中途说的话照发,带出处 —— 最终答复里不含�
   open();
   await stuck;
   const texts = channel.sent.map((m) => m.text);
-  assert.ok(texts.includes("【后台对话说】\n先看看日志"), `要带出处地发出来,实际:${JSON.stringify(texts)}`);
+  assert.ok(texts.includes("【后台对话说】\n\n先看看日志"), `要带出处地发出来,实际:${JSON.stringify(texts)}`);
   assert.ok(!texts.some((x) => x.startsWith("🔧")), "进度仍然不推");
 });
 

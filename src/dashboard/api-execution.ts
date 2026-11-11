@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdirSync, openSync, closeSync, readFileSync } from "node:fs";
+import { mkdirSync, openSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import type { Config } from "../config.js";
 import type { ContextStore } from "../core/execution/contexts.js";
@@ -9,6 +9,7 @@ import type { CapabilityBroker, SharedTools } from "../core/execution/broker.js"
 import type { TurnTokens } from "../core/turn-tokens.js";
 import type { OpsManager } from "../core/execution/ops.js";
 import { BUILTIN_ADMIN_USER_KEY } from "../core/identity.js";
+import { formatPrepareReport, readPrepareTail } from "../core/prepare-report.js";
 
 const json = (res: ServerResponse, status: number, body: unknown) => { res.writeHead(status, { "content-type": "application/json; charset=utf-8" }); res.end(JSON.stringify(body)); };
 const header = (req: IncomingMessage, key: string) => { const h = req.headers[key]; return Array.isArray(h) ? h[0] : h; };
@@ -119,17 +120,23 @@ export class ExecutionApi {
         const input = await body(req); const ref = input.ref;
         if (typeof ref !== "string" || !/^(HEAD|[a-f0-9]{7,40})$/.test(ref)) throw new Error("ref 必须是 HEAD 或提交 SHA");
         if (this.preparing) { json(res, 409, { error: "已有制备任务运行中" }); return true; }
-        this.preparing = true;
         const logDir = join(this.opts.config.dataDir, "execution", "builds"); mkdirSync(logDir, { recursive: true });
         const log = join(logDir, `${Date.now()}.log`); const fd = openSync(log, "wx", 0o600);
-        const child = spawn(join(this.opts.config.deployDir, "bin", "prepare.sh"), [ref], { cwd: this.opts.config.srcDir, env: process.env, stdio: ["ignore", fd, fd] }); closeSync(fd);
-        const timeout = setTimeout(() => child.kill("SIGTERM"), 30 * 60_000);
+        let child: ReturnType<typeof spawn>;
+        try { child = spawn(join(this.opts.config.deployDir, "bin", "prepare.sh"), [ref], { cwd: this.opts.config.srcDir, env: process.env, stdio: ["ignore", fd, fd] }); }
+        finally { closeSync(fd); }
+        this.preparing = true;
+        let finished = false, timedOut = false;
+        const timeout = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, 30 * 60_000);
         const finish = (status: string) => {
+          if (finished) return;
+          finished = true;
           clearTimeout(timeout); this.preparing = false;
-          let tail = ""; try { tail = readFileSync(log, "utf8").slice(-1500); } catch {}
-          runtimes.notifyUser(principal, runtime?.contextId ?? "prepare", `自进化制备${status}。\n${tail}`);
+          let tail = ""; try { tail = readPrepareTail(log); } catch {}
+          runtimes.notifyUser(principal, runtime?.contextId ?? "prepare", formatPrepareReport(status, tail, log));
         };
-        child.once("error", err => finish(`启动失败：${String(err)}`)); child.once("exit", code => finish(code === 0 ? "完成" : `失败（${code}）`));
+        child.once("error", err => finish(`启动失败：${String(err)}`));
+        child.once("exit", (code, signal) => finish(timedOut ? "超时" : code === 0 ? "完成" : `失败（${signal ?? code}）`));
         json(res, 202, { ok: true, note: "制备已开始，完成后通知；发布仍使用 /发布 指令。" }); return true;
       }
       const match = /^\/api\/execution\/(c_[a-f0-9]{24})\/(extend|reclaim)$/.exec(path);

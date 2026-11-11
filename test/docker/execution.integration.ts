@@ -474,7 +474,7 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
       const { record } = await ops.grant("admin", id);
       assert.equal(await docker(["exec", parent.container, "ip", "-j", "route", "show", "default"]), routesBefore, "授权不改变原 worker 的默认路由");
       const output = await docker(["exec", parent.container, "catman-ops", "connect"]);
-      const configPath = /SSH 登录：ssh -F (\S+) catman-ops/.exec(output)?.[1]; assert.ok(configPath);
+      const configPath = /ssh -F (\S+) catman-ops/.exec(output)?.[1]; assert.ok(configPath);
       assert.ok(output.includes("/opt/services")); assert.ok(output.includes("/mnt/usb")); assert.ok(output.includes("docker.sock")); assert.ok(!output.includes("BEGIN OPENSSH PRIVATE KEY"));
       const ssh = (command: string) => docker(["exec", parent.container, "ssh", "-F", configPath, "catman-ops", command]);
       const probe = "const fs=require('fs');console.log(fs.readFileSync('/opt/services/probe','utf8'),fs.readFileSync('/mnt/usb/probe','utf8'));fs.writeFileSync('ops-output','same-workspace');";

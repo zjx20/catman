@@ -258,7 +258,8 @@ export class CronScheduler {
     if (job.notify.onlyFailure && run.status === "ok") return;
     // 跳过这一轮不值得单独推一条:用户没损失什么,而记录里查得到。
     if (run.status === "skipped") return;
-    const tail = this.opts.store.readLog(job.id, run.id, TAIL_BYTES);
+    // Agent results are Markdown, not a stdout tail: keep their opening fences and conclusion.
+    const tail = this.opts.store.readLog(job.id, run.id, job.task.kind === "script" ? TAIL_BYTES : undefined);
     const next = renderNextLine(job.nextAt, this.opts.tz, job.enabled, job.schedule.kind === "once");
     const text = renderEnd(job, run, tail, next);
 

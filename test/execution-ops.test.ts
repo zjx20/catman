@@ -49,6 +49,8 @@ test("申请不启动容器；硬授权冻结部署挂载，系统清单不泄�
     assert.equal(repeated.record.container, active.container); assert.equal(repeated.newlyGranted, false);
     assert.equal(f.calls.filter(c => c.args[0] === "run").length, 2);
     const description = f.ops.description(active);
+    assert.match(description, /挂载：\n\n- `/);
+    assert.ok(description.includes(`\n\n\`\`\`text\n/运维回收 ${active.id}\n\`\`\``));
     for (const expected of ["/opt/services", "/mnt/usb", "/var/run/docker.sock", "root", "workspace", "SSH", "同生共死"]) assert.ok(description.includes(expected));
     assert.ok(!description.includes("private-key-secret"));
     assert.ok(description.includes(`catman-ops exec -- docker exec --user ${statSync(f.config.srcDir).uid} '${f.config.containerName}' git -C '${f.config.srcDir}' fetch --prune --no-recurse-submodules origin`));

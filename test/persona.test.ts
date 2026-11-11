@@ -68,7 +68,10 @@ test("自述短 —— 它每回合都要付钱", () => {
 test("自述真的接到了 SDK 的 systemPrompt 上", () => {
   // Actual CLI requests (including Docker workers) are covered by instruction checks.
   for (const persona of ["primary", "rescue"] as const) {
-    assert.deepEqual(instructionOptions(persona).systemPrompt, { type: "preset", preset: "claude_code", append: personaBriefing(persona) });
+    const prompt = instructionOptions(persona).systemPrompt;
+    assert.ok(prompt && typeof prompt === "object" && !Array.isArray(prompt) && prompt.type === "preset");
+    assert.equal(prompt.preset, "claude_code");
+    assert.ok(prompt.append?.startsWith(`${personaBriefing(persona)}\n\n`), "人格自述必须完整附在系统提示词中");
   }
 });
 

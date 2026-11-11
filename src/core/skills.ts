@@ -319,16 +319,20 @@ export function evolveSkillBody(_paths: SkillPaths): string {
   return `${frontmatter(EVOLVE_SKILL, "修改 catman 自己的代码、测试并请求制备；发布和回滚由管理员明确触发。")}
 # Catman 自进化
 
-管理员的源码工作区挂在 /catman-src。先检查 git status 和当前分支的上游，再开分支修改，并运行 npm run typecheck 与 npm test。
+管理员的源码工作区挂在 /catman-src。先检查 git status 和当前分支的上游；有代码修改时再开分支。
+普通 worker 不挂载 /data/releases，源码中的 node_modules 软链可能指向不可见的 release，不能据此在源码目录直接跑 npm，也不要改写这个软链或往源码目录安装依赖。
+仅拉取上游并制备时，快进合并后直接调用下方制备接口；固定执行器会在独立容器完成依赖、typecheck、全量测试和编译，不必先在 worker 重复跑一遍。
+修改代码需要提前验证时，在 workspace 复制源码、独立安装依赖并运行 npm run typecheck 与 npm test；提交后仍须经过正式制备。
 Git 远端使用部署配置的 SSH 地址；发布后的推送由 deployer 使用可写密钥完成。普通 worker 看不到部署密钥，仓库里的 core.sshCommand 路径只在控制服务内有效。
 需要拉取上游时，先按 ${OPS_SKILL} skill 申请并等待用户硬指令授权，清单必须包含 Docker socket。
 获得授权后运行 catman-ops connect，执行系统清单中的“自进化源码拉取”命令：通过运维环境在控制服务内以源码 owner 身份 git fetch origin，使用既有只读 SSH 密钥。
 这一步只更新远端引用；随后在 worker 的 /catman-src 检查变更，并用 git merge --ff-only '@{u}' 快进当前分支。
+执行命令必须保留真实退出码；需要用 tail 裁剪输出时先设置 pipefail，不得用 tail 的退出码认定 fetch、合并或测试成功。
 有未提交改动、没有上游或发生分叉时先报告现状，不自动丢弃修改、强制重置或推送。
 不要把 origin 改成 HTTPS、把私钥复制进 worker，或反复尝试普通 Bash 的 git pull。
 若部署启用了运维授权，制备也需要本会话已获含 Docker socket 的授权（它会运行仓库脚本）；上述拉取授权可以复用。
 尚未授权时先按 ${OPS_SKILL} skill 申请并等待用户硬指令；遇到 403 不要尝试绕过授权。
-提交修改后，用下面的控制接口请求制备（固定制备脚本由控制面执行）：
+源码提交就绪后，用下面的控制接口请求制备（固定制备脚本由控制面执行，不需要在运维目录中搜索或手动执行它）：
 
 \`\`\`bash
 curl --fail-with-body -s -X POST -H "X-Catman-Session: $CATMAN_SESSION_TOKEN" -H 'content-type: application/json' -d '{"ref":"HEAD"}' "$CATMAN_API_BASE/api/execution/prepare"

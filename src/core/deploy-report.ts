@@ -1,5 +1,6 @@
 import { readJsonFile, writeJsonFileAtomic } from "./file-store.js";
 import { shortSha } from "./version.js";
+import { codeBlock } from "./markdown.js";
 
 /**
  * 部署报告 —— deployer 写、catman 读的那份**跨版本契约**。
@@ -136,13 +137,13 @@ export function formatDeployReport(r: DeployReport): string {
           `你要的那个改动**没有**上线,现在跑的还是旧版本。`
         : `⛔ 这次部署在切换前就中止了(${shortSha(r.sha)}),线上版本一直没动过。`;
   const lines = [head];
-  if (r.detail) lines.push(r.detail);
+  if (r.detail) lines.push(r.detail.includes("\n") ? codeBlock(r.detail) : r.detail);
   if (r.interruptedBackgroundTurns) {
     // 后台回合是用户主动切走、说过"你接着跑"的。它们被切换杀掉了,
     // 不说的话那几段就是无声无息地消失 —— 那是最糟的失败模式。
     lines.push(`另外:切换时有 ${r.interruptedBackgroundTurns} 段后台对话被中断,没能把结果发给你。`);
   }
-  return lines.join("\n");
+  return lines.join("\n\n");
 }
 
 /**
