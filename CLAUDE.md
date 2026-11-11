@@ -170,7 +170,7 @@ Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/conte
 | `src/core/transcript.ts` | JSONL 防御式解析与检索；生产扫描范围由 ContextStore 提供 |
 | `src/core/file-store.ts` | 状态原子写(tmp + rename) |
 | `src/core/version.ts` | 版本戳:读 release 根目录的 VERSION;**读不到返回 undefined,绝不编** |
-| `src/core/selfcheck.ts` | SELFCHECK 模式:临时目录装配一遍 + 探一次大脑;失败分类(限流/网络/凭据/代码) |
+| `src/core/selfcheck.ts` | SELFCHECK 模式:临时目录装配 + 真实 CLI 指令加载检查 + 探一次大脑;失败分类(限流/网络/凭据/代码) |
 | `src/core/deploy-report.ts` | 部署报告契约(deployer 写、catman 读)+ 防御式解析 |
 | `src/core/deploy-progress.ts` | 部署里程碑契约(JSONL 追加)+ 防御式解析 |
 | `src/core/releases.ts` | release 目录的**只读**视图 + `/发布` 的 sha 前缀解析 |
@@ -240,6 +240,16 @@ Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/conte
   个人偏好在租户 `home/CLAUDE.md`。控制面创建 worker 时合并两者，并单文件只读挂到
   当前 context 的 `$CLAUDE_CONFIG_DIR/CLAUDE.md`；workspace 的 Project memory 由 CLI
   正常发现。不要恢复失效的 `@../CLAUDE.md`，也不要为指令继承整挂数据根。
+  修改共享或个人指令后，需要重新建立 worker 以刷新只读投影。
+- **指令加载检查**：`execution/instructions.ts` 是正式会话与自检共用的 SDK 加载选项和
+  User memory 投影实现。`instruction-check.ts` 用临时 owner/context、三层独立标记和
+  本地假模型端点，检查真实 CLI 发出的首个正式任务请求；标题生成等辅助请求不计入。
+  同时拒绝其他 owner、其他 workspace 和控制面标记，验证 `systemPrompt.append`
+  中的人格身份。`npm test` 覆盖两个人格的聊天/cron；`npm run test:docker` 再通过
+  正式 RuntimeManager/Agent 和真实挂载验证相同矩阵。部署 selfcheck 在其当前人格下
+  先检查聊天/cron，再调用真实大脑；指令检查失败或超时归 `code`，阻止切换。
+  检查只使用临时合成数据，不审计线上用户指令正文，不调用付费模型，不需要 Docker socket。
+  修改挂载、cwd 或 SDK 版本时，必须运行 Docker 回归。
 
 ## 多租户执行上下文 v2
 
@@ -274,7 +284,9 @@ tenants/<tenantId>/
 控制数据，救援控制服务只读主数据并写自己的命名空间；这些权限不传给 agent worker。
 
 默认产物写当前 cwd。个人持久文件写 `/user`，跨上下文的最终产物写 `/user/artifacts`。
+workspace 是当前上下文的独立工作区，脚本和中间文件可直接写入并按任务组织子目录；容器回收后仍保留，容器的 `/tmp` 随容器回收。
 每个聊天 session 与每个 cron 有独立 workspace；同一个 cron 的多次执行复用其目录。
+脚本 cron 入口任务的通知归属由控制面在启动前持久化，统一交由 CronScheduler 应用通知策略；不要根据 worker 的字段、任务名称或整个 cron context 屏蔽通知。同一上下文中独立登记的后台任务仍需报告完成及超时。
 公共人格和 skill 只读装配；个人 skill 与 MCP 在 /user。原始公共凭据仅由控制面 broker 持有。管理员权限由 API 现查，不下发原始管理员 token。
 后台脚本使用 `catman-task run --timeout <秒> -- <命令>`，在当前容器里由独立任务管理进程执行。任务有硬超时，SDK 后台任务按事件追踪；只要 SDK 有任务就保留其 CLI。SDK 结果按输入 UUID 关联。
 SDK 的 `background_tasks_changed` 是完整、权威的任务快照，不与 bookend 事件混合增删。

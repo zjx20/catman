@@ -150,6 +150,16 @@ function harness(runtime: Partial<CronRuntime> = {}): Harness {
   return h;
 }
 
+test("缺少通知发送函数时拒绝启动，不能把已启用的 cron 结果通知静默丢弃", () => {
+  const h = harness();
+  const incomplete = {
+    store: h.store, runner: h.runner, tz: SH,
+    runtime: () => ({ enabled: true, maxConcurrent: 1, catchUpMs: 900_000, runMaxAgeMs: 1e12 }),
+  };
+  // @ts-expect-error Simulate incomplete assembly; both the type and runtime guard must reject it.
+  assert.throws(() => new CronScheduler(incomplete), /必须配置通知发送函数/);
+});
+
 test("到点就起容器,而且隔离参数一个不少", async () => {
   const h = harness();
   h.add();
@@ -406,6 +416,7 @@ test("没配宿主 /data 路径:记 error,而不是挂一个永远收不了的 r
     runner,
     runtime: () => ({ enabled: true, maxConcurrent: 1, catchUpMs: 900_000, runMaxAgeMs: 1e12 }),
     tz: SH,
+    notify: async () => {},
     now: () => clock,
   });
   store.put({

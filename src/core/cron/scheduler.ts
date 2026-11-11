@@ -52,7 +52,8 @@ export interface SchedulerOptions {
   readonly runtime: () => CronRuntime;
   /** 展示用时区。 */
   readonly tz: string;
-  readonly notify?: CronNotifier;
+  /** Required even when individual jobs disable notifications; missing wiring must fail at startup. */
+  readonly notify: CronNotifier;
   readonly now?: () => number;
   readonly tickMs?: number;
 }
@@ -81,6 +82,7 @@ export class CronScheduler {
   private readonly inFlightAgents = new Map<string, AbortController>();
 
   constructor(opts: SchedulerOptions) {
+    if (typeof opts.notify !== "function") throw new Error("cron 必须配置通知发送函数");
     this.opts = opts;
     this.now = opts.now ?? Date.now;
     this.tickMs = opts.tickMs ?? 30_000;
@@ -280,7 +282,6 @@ export class CronScheduler {
    * (它描述的是"现在开始了",天亮再说毫无意义),与结果那条攒起来不同。
    */
   private async push(userKey: string, text: string, kind: NotifyKind, job?: CronJob): Promise<void> {
-    if (!this.opts.notify) return;
     if (job && inQuietHours(job.notify.quiet, this.now(), this.opts.tz)) return;
     try {
       await this.opts.notify(userKey, text, kind);

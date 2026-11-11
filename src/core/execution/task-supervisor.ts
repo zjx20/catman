@@ -13,7 +13,7 @@ export interface TaskRecord {
   status: "running" | "completed" | "failed" | "timeout" | "stopped" | "interrupted";
   pid?: number; exitCode?: number; endedAt?: number;
 }
-export interface TaskRequest { name?: string; cmd: string[]; cwd: string; env?: Record<string, string>; timeoutMs: number }
+export interface TaskRequest { id?: string; name?: string; cmd: string[]; cwd: string; env?: Record<string, string>; timeoutMs: number }
 
 /** A child of tini, independent of CLI lifetime. All tracked jobs have finite deadlines. */
 export class TaskSupervisor {
@@ -41,12 +41,14 @@ export class TaskSupervisor {
     const max = Math.min(this.opts.maxTaskMs ?? MAX_TASK_MS, MAX_TASK_MS);
     if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0 || input.timeoutMs > max) throw new Error(`必须指定 timeoutMs，范围 1-${max}`);
     if (typeof input.cwd !== "string" || !input.cwd.startsWith("/") || !existsSync(input.cwd)) throw new Error("cwd 必须是存在的绝对路径");
+    const id = input.id ?? `t_${randomUUID()}`;
+    if (!/^t_[a-f0-9-]{36}$/.test(id) || this.tasks.has(id)) throw new Error("任务 ID 无效或已存在");
     if (this.list().filter(t => t.status === "running").length >= 16) throw new Error("此上下文最多同时运行 16 个后台任务");
     const env = { ...process.env, ...input.env };
     // A turn/admin credential must not outlive its turn. Runtime capability has a separate scope.
     for (const k of ["CATMAN_SESSION_TOKEN", "CATMAN_ADMIN_TOKEN", "CATMAN_IPC_SECRET"]) delete env[k];
     const now = Date.now();
-    const task: TaskRecord = { id: `t_${randomUUID()}`, name: (input.name || basename(input.cmd[0]!)).replace(/[\r\n]/g, " ").slice(0, 100),
+    const task: TaskRecord = { id, name: (input.name || basename(input.cmd[0]!)).replace(/[\r\n]/g, " ").slice(0, 100),
       command: basename(input.cmd[0]!), startedAt: now, deadlineAt: now + input.timeoutMs, status: "running" };
     this.tasks.set(task.id, task); this.persist();
     const child = spawn(input.cmd[0]!, input.cmd.slice(1), { cwd: input.cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });

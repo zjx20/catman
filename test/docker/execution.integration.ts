@@ -16,6 +16,7 @@ import { TurnTokens } from "../../src/core/turn-tokens.js";
 import { ExecutionApi } from "../../src/dashboard/api-execution.js";
 import { OpsManager } from "../../src/core/execution/ops.js";
 import { parseOpsMounts } from "../../src/core/execution/ops-config.js";
+import { INSTRUCTION_PROBE_PROMPT, instructionFixture, isInstructionProbeRequest, verifyInstructionRequest } from "../../src/core/execution/instruction-check.js";
 
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until<T>(get: () => Promise<T>, ready: (value: T) => boolean, label: string, timeout = 15_000): Promise<T> {
@@ -259,6 +260,34 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
       await runtimes.stop(c.id, "test cleanup", true);
     }
   });
+  await t.test("真实 worker/CLI 指令加载：主人格/守护人格 × 聊天/cron，三层指令和租户隔离", { timeout: 60_000 }, async () => {
+    const previousApi = api;
+    try {
+      for (const persona of ["primary", "rescue"] as const) for (const kind of ["chat", "cron"] as const) {
+        const memoryRoot = join(root, `instructions-${persona}-${kind}`);
+        const fixture = instructionFixture(memoryRoot, kind);
+        // This ancestor would be Project memory on the controller, but must not exist
+        // in the worker mount namespace. Catch an accidental whole-data-root mount.
+        writeFileSync(join(memoryRoot, "CLAUDE.md"), fixture.forbidden.control);
+        const memoryConfig = { ...config, persona, dataDir: memoryRoot };
+        const manager = new RuntimeManager(memoryConfig, fixture.contexts, options); managers.push(manager);
+        const memoryBroker = new CapabilityBroker(join(memoryRoot, "execution/shared-tools.json"), manager, options.isAdmin);
+        const memoryAgent = new Agent(memoryConfig, { contexts: fixture.contexts, runtimes: manager, broker: memoryBroker }); agents.push(memoryAgent);
+        api = new ExecutionApi({ config: memoryConfig, contexts: fixture.contexts, runtimes: manager, broker: memoryBroker, turns: new TurnTokens(), isAdmin: options.isAdmin });
+        try {
+          const start = seen.length;
+          const reply = await memoryAgent.run(INSTRUCTION_PROBE_PROMPT, { context: fixture.context, maxTurns: 1 });
+          assert.equal(reply.isError, false, `${persona}/${kind}`);
+          const first = seen.slice(start).find(r => r.path.startsWith("/v1/messages") && !r.path.includes("count_tokens") && isInstructionProbeRequest(r.body));
+          verifyInstructionRequest(first?.body, fixture, persona);
+        } finally {
+          memoryAgent.close();
+          await manager.stop(fixture.context.id, "instruction test cleanup", true);
+          manager.close(); await memoryBroker.close();
+        }
+      }
+    } finally { api = previousApi; }
+  });
   await t.test("真实 CLI 发现和调用公共 MCP，协议会话和服务端凭据经过控制面", async () => {
     writeFileSync(join(aPaths.sdk, "settings.json"), JSON.stringify({ env: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" } }));
     modelTool = { name: "mcp__public_shared__probe", input: { value: "through-real-cli" } };
@@ -374,6 +403,7 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
       assert.deepEqual(await runner.launch({ container: run, jobId: job.id, userKey: "alice", cmd, env: job.task.kind === "script" ? job.task.env : {}, timeoutMs: job.timeoutMs }), { ok: true });
       assert.deepEqual(await until(() => runner.poll(run), r => r.state !== "running", "cron completion"), { state: "exited", exitCode: 0 });
       assert.match(await runner.logs(run), /alice-only/); assert.ok((await runner.logs(run)).includes(`${work}|owner-env`));
+      assert.equal(runtimes.pending(cron.id).length, 0, "cron 入口的通用后台任务通知由调度器接管");
       await runtimes.stop(cron.id, "recreate cron runtime", true);
     }
     assert.equal(readFileSync(join(work, "counter"), "utf8"), "2"); assert.ok(!existsSync(join(aPaths.work, "counter")));

@@ -33,14 +33,13 @@ catman-ops exec -- docker ps --format '{{.Names}} {{.Status}}'
 catman-ops exec -- ls -la /opt/services
 
 # 多行脚本在 worker 的 workspace 编写，再传给运维容器的 bash 执行
-mkdir -p .tmp
-cat > .tmp/inspect.sh <<'SCRIPT'
+cat > inspect.sh <<'SCRIPT'
 set -euo pipefail
 cd "$1"
 pwd
 ls -la
 SCRIPT
-catman-ops run .tmp/inspect.sh /opt/services
+catman-ops run inspect.sh /opt/services
 
 # 也可从 stdin 传脚本。用带引号的 heredoc 防止 worker 提前展开变量
 catman-ops run - /opt/services <<'SCRIPT'

@@ -11,6 +11,7 @@ import { UserRegistry } from "./users.js";
 import { TurnTokens } from "./turn-tokens.js";
 import { writeSkills } from "./skills.js";
 import { readVersion, type VersionInfo } from "./version.js";
+import { checkInstructions } from "./execution/instruction-check.js";
 
 /**
  * 启动自检(smoke)。`CATMAN_SELFCHECK=1` 时 index.ts 走这条路,不起渠道、不起
@@ -19,7 +20,8 @@ import { readVersion, type VersionInfo } from "./version.js";
  * ## 它回答的问题
  *
  * "这份 release 能不能跑" —— 依赖装齐了吗(尤其 claude 二进制的 arch/libc 对不对)、
- * 各层装配会不会当场抛错、**大脑通不通**(一次真实的最小 SDK 请求)。部署流水线在
+ * 各层装配会不会当场抛错、三层指令是否实际加载且隔离、**大脑通不通**
+ * (一次真实的最小 SDK 请求)。指令检查使用本地假模型，不增加模型费用。部署流水线在
  * 切换**之前**跑它:不通就中止,正在服务的旧版本一根汗毛都没动。
  *
  * ## 两条硬纪律
@@ -93,6 +95,8 @@ const DEFAULT_TIMEOUT_MS = 180_000;
 const DEFAULT_PROBE_MODEL = "haiku";
 
 export interface SelfCheckOptions {
+  /** Native CLI + local provider; injected only when testing selfcheck orchestration. */
+  checkInstructions?: typeof checkInstructions;
   /**
    * 真正跑一次 agent 的那步。单测注入假实现 —— 自检的价值在于它跑真链路,
    * 但它的**分类与收尾逻辑**必须能脱离网络与 Claude 单独验证。
@@ -113,6 +117,8 @@ export async function runSelfCheck(opts: SelfCheckOptions = {}): Promise<SelfChe
 
   // 纪律 ①:自己开临时目录,覆盖掉调用方给的任何数据目录。
   const sandbox = mkdtempSync(join(tmpdir(), "catman-selfcheck-"));
+  const savedDataDir = process.env["CATMAN_DATA_DIR"];
+  const savedConfigDir = process.env["CLAUDE_CONFIG_DIR"];
   process.env["CATMAN_DATA_DIR"] = sandbox;
   process.env["CLAUDE_CONFIG_DIR"] = join(sandbox, "claude");
 
@@ -149,13 +155,20 @@ export async function runSelfCheck(opts: SelfCheckOptions = {}): Promise<SelfChe
     const cwd = users.ensureWorkspace(probeKey);
     sessions.decide(probeKey);
 
-    // ── 第二段:大脑。一次真实请求,带硬超时与轮数上限,跑飞不了。
+    // ── 第二段:实际指令加载。零模型费用；缺层/越界加载属于代码问题。
+    try {
+      await (opts.checkInstructions ?? checkInstructions)(join(sandbox, "instructions"), config.persona, Math.max(1, Math.min(45_000, timeoutMs - (Date.now() - startedAt))));
+    } catch (error) {
+      return fail("code", `指令自检失败:${String(error)}`, version, startedAt);
+    }
+
+    // ── 第三段:大脑。一次真实请求,带硬超时与轮数上限,跑飞不了。
     const abort = new AbortController();
     // **不 unref**:这个定时器欠着一个动作 —— 中止探测并给出 network 分类的结论。
     // unref 掉的话,一旦事件循环没有别的句柄,进程会在它触发前直接退出、什么都不打印,
     // 而 deployer 把「没有可解析的结论」判成代码问题 —— 一次上游卡顿就此废掉一个好版本。
     // finally 里会 clearTimeout,所以它最多把进程多留 timeoutMs,而那正是该活着的时候。
-    const timer = setTimeout(() => abort.abort(), timeoutMs);
+    const timer = setTimeout(() => abort.abort(), Math.max(1, timeoutMs - (Date.now() - startedAt)));
     // 探测模型优先用线上配置的那个:自检要回答的是"**这份部署**的大脑通不通",
     // 写死 haiku 只在 Anthropic 官方 API 上成立。第三方 provider(或改过默认模型
     // 的部署)上,那个模型名可能不存在 —— 于是凭据明明没问题,自检却报模型错误。
@@ -169,7 +182,7 @@ export async function runSelfCheck(opts: SelfCheckOptions = {}): Promise<SelfChe
       return {
         ok: true,
         category: "ok",
-        detail: `装配通过,大脑应答正常(${reply.text.trim().slice(0, 40) || "空回复"})`,
+        detail: `装配与指令加载检查通过,大脑应答正常(${reply.text.trim().slice(0, 40) || "空回复"})`,
         ...(version ? { version } : {}),
         elapsedMs: Date.now() - startedAt,
       };
@@ -186,6 +199,10 @@ export async function runSelfCheck(opts: SelfCheckOptions = {}): Promise<SelfChe
     return fail("code", `装配失败:${String(err)}`, version, startedAt);
   } finally {
     rmSync(sandbox, { recursive: true, force: true });
+    if (savedDataDir === undefined) delete process.env["CATMAN_DATA_DIR"];
+    else process.env["CATMAN_DATA_DIR"] = savedDataDir;
+    if (savedConfigDir === undefined) delete process.env["CLAUDE_CONFIG_DIR"];
+    else process.env["CLAUDE_CONFIG_DIR"] = savedConfigDir;
   }
 }
 

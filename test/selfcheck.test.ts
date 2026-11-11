@@ -1,7 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { classifyFailure, runSelfCheck } from "../src/core/selfcheck.js";
+import { classifyFailure, runSelfCheck as realSelfCheck, type SelfCheckOptions } from "../src/core/selfcheck.js";
+
+const runSelfCheck = (opts: SelfCheckOptions) => realSelfCheck({ checkInstructions: async () => {}, ...opts });
+
+test("部署自检默认执行真实 CLI 指令检查，再运行大脑探测", { timeout: 20_000 }, async () => {
+  const result = await realSelfCheck({ runProbe: async () => ({ text: "ok", isError: false }) });
+  assert.equal(result.ok, true, result.detail);
+  assert.match(result.detail, /指令加载检查通过/);
+});
 
 /**
  * 分类错了的代价是不对称的:把环境问题误判成 `code` 会白白废掉一个完好的版本,
@@ -161,4 +169,19 @@ test("超时归 network —— 等不到应答与连不上,对 deployer 是同�
   assert.equal(result.ok, false);
   assert.equal(result.category, "network");
   assert.match(result.detail, /超时/);
+});
+
+test("指令加载缺层/越界/超时阻止部署，归 code 且不调用真实大脑，并恢复环境及清理目录", async () => {
+  const savedData = process.env.CATMAN_DATA_DIR, savedConfig = process.env.CLAUDE_CONFIG_DIR;
+  for (const reason of ["指令未加载：personal", "指令越界加载：otherPersonal", "指令自检超时(30ms)"]) {
+    let root = "", called = false;
+    const result = await runSelfCheck({
+      checkInstructions: async (path, _persona, timeout) => { root = path; assert.ok(timeout !== undefined && timeout > 0); throw new Error(reason); },
+      runProbe: async () => { called = true; return { text: "ok", isError: false }; },
+    });
+    assert.equal(result.category, "code"); assert.equal(result.ok, false);
+    assert.ok(result.detail.includes(reason)); assert.equal(called, false);
+    assert.equal(existsSync(root), false);
+    assert.equal(process.env.CATMAN_DATA_DIR, savedData); assert.equal(process.env.CLAUDE_CONFIG_DIR, savedConfig);
+  }
 });

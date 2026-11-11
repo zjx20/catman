@@ -57,6 +57,18 @@ test("执行环境重启只认定旧任务已中断，不重置 deadline 或自�
     await manager.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+test("控制面预分配的任务身份贯穿事件且不能重复启动", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "catman-task-id-"));
+  const events: string[] = [], manager = new TaskSupervisor({ dir, onEvent: task => { events.push(task.id); } });
+  try {
+    const id = `t_${randomUUID()}`, request = { id, cmd: [process.execPath, "-e", "process.exit(0)"], cwd: dir, timeoutMs: 3000 };
+    assert.equal(manager.start(request).id, id);
+    await waitFor(() => manager.list()[0]?.endedAt !== undefined);
+    assert.deepEqual(events, [id, id]);
+    assert.throws(() => manager.start(request), /任务.*存在/);
+    assert.throws(() => manager.start({ ...request, id: "../outside" }), /任务.*无效/);
+  } finally { await manager.close(); rmSync(dir, { recursive: true, force: true }); }
+});
 test("CLI 在登记完成前快速退出，仍转发真实退出码而不是误报成功", async () => {
   const dir = mkdtempSync(join(tmpdir(), "catman-fast-cli-"));
   const socket = join(dir, "rpc.sock"); const manager = new TaskSupervisor({ dir, socket, killGraceMs: 20 });

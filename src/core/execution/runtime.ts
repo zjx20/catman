@@ -1,19 +1,22 @@
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
+import { cpSync, existsSync, mkdirSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import type { Config } from "../../config.js";
 import { writeJsonFileAtomic } from "../file-store.js";
 import { skillsFor, skillsOnDisk } from "../skills.js";
 import { ContextStore, hostPath, readTenantFile, readExecutionState, type ExecutionContext } from "./contexts.js";
-import { MAX_TASK_MS, type TaskRecord } from "./task-supervisor.js";
+import { MAX_TASK_MS, type TaskRecord, type TaskRequest } from "./task-supervisor.js";
 import { readScopedFile } from "../scoped-files.js";
 import { ExecutionArtifacts } from "./artifacts.js";
+import { projectInstructions } from "./instructions.js";
 
 export interface RuntimeRecord {
   contextId: string; userKey: string; container: string; token: string; admin: boolean;
   createdAt: number; lastInteractionAt: number; extensionUntil: number; warnedDeadline?: number;
   tasks: TaskRecord[]; sdkTasks: Array<{ task_id: string; description: string; ambient?: boolean }>;
+  /** Control-plane ownership; worker events cannot opt themselves out of notification. */
+  cronTaskIds?: string[];
 }
 export interface RuntimeEvent { id: string; userKey: string; contextId: string; text: string; delivered: boolean; consumed?: boolean; at: number }
 export type DockerCommand = (args: string[], env?: NodeJS.ProcessEnv) => Promise<string>;
@@ -76,6 +79,7 @@ export class RuntimeManager {
     this.events = readExecutionState<RuntimeEvent[]>(this.eventPath, []);
     if (!Array.isArray(this.records) || !Array.isArray(this.events)) throw new Error("执行环境状态损坏");
     for (const r of this.records) if (!contexts.get(r.contextId, r.userKey) || !/^catman-ctx-c_[a-f0-9]{24}-[a-f0-9]{16}$/.test(r.container) || !/^[a-f0-9]{64}$/.test(r.token)) throw new Error("执行环境归属或身份损坏");
+    for (const r of this.records) if (r.cronTaskIds !== undefined && (!Array.isArray(r.cronTaskIds) || r.cronTaskIds.some(id => typeof id !== "string" || !/^t_[a-f0-9-]{36}$/.test(id)))) throw new Error("cron 任务归属记录损坏");
     this.docker = opts.docker ?? dockerCommand;
   }
   private now(): number { return (this.opts.now ?? Date.now)(); }
@@ -186,14 +190,10 @@ export class RuntimeManager {
       const canonical = /^---\r?\n[\s\S]*?^name:[ \t]*(\S+)/m.exec(body)?.[1] ?? entry.name;
       if (names.includes(canonical)) cpSync(source, join(target, "skills", entry.name), { recursive: true, dereference: false });
     }
-    const globalInstructions = join(this.config.dataDir, "shared", "CLAUDE.md");
-    const common = existsSync(globalInstructions) ? readFileSync(globalInstructions, "utf8") : "";
-    const personal = readTenantFile(p.home, "CLAUDE.md") ?? "";
-    writeFileSync(join(target, "CLAUDE.md"), `${common}\n\n${personal}\n\n## 执行环境\n任务产物与临时文件写在当前 workspace，临时中间文件可放 .tmp/。跨会话保留的产物放 /user/artifacts，个人项目放 /user/projects，skill 放 /user/skills。不要把共享目录或控制面数据目录当作工作区。后台命令必须通过 catman-task run --timeout <秒> -- <命令> 登记；最长 86400 秒。长期服务需要部署。\n`, { mode: 0o600 });
+    projectInstructions(this.config.dataDir, p.home, join(target, "CLAUDE.md"), !!this.config.ops && this.opts.isAdmin(context.userKey));
     const launcher = '#!/bin/sh\nexec node /runtime/release/dist/src/core/execution/task-cli.js "$@"\n';
     for (const name of ["catman-task", "catman-notify"]) writeFileSync(join(target, name), launcher, { mode: 0o755 });
     writeFileSync(join(target, "catman-ops"), '#!/bin/sh\nexec node /runtime/release/dist/src/core/execution/ops-cli.js "$@"\n', { mode: 0o755 });
-    if (this.config.ops && this.opts.isAdmin(context.userKey)) writeFileSync(join(target, "CLAUDE.md"), "\n## 临时运维环境\n宿主维护按 catman-ops skill 申请用户硬指令授权，使用 catman-ops exec/run 执行；普通 Bash 仍在原 worker 中。\n", { flag: "a" });
     return target;
   }
   private async adopt(r: RuntimeRecord): Promise<void> {
@@ -237,6 +237,22 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
   rpc(r: RuntimeRecord, path: string, method = "GET", body?: unknown): Promise<string> {
     return this.docker(["exec", r.container, "node", "/runtime/release/dist/src/core/execution/task-cli.js", "rpc", path, method, ...(body === undefined ? [] : [JSON.stringify(body)])]);
   }
+  ownCronTask(runtime: RuntimeRecord, taskId: string): void {
+    const r = this.records.find(r => r.contextId === runtime.contextId && r.token === runtime.token);
+    if (!r || this.contexts.get(r.contextId, r.userKey)?.kind !== "cron" || !/^t_[a-f0-9-]{36}$/.test(taskId)) throw new Error("cron 任务归属无效");
+    const ids = r.cronTaskIds ??= [];
+    if (!ids.includes(taskId)) { ids.push(taskId); this.save(); }
+  }
+  async startCronTask(runtime: RuntimeRecord, request: Omit<TaskRequest, "id">): Promise<TaskRecord> {
+    const id = `t_${randomUUID()}`;
+    // Persist ownership before launch: even an immediate exit may report its event
+    // before the RPC response arrives. Keep ownership if the launch result is unknown.
+    this.ownCronTask(runtime, id);
+    const task: TaskRecord = JSON.parse(await this.rpc(runtime, "/tasks", "POST", { ...request, id }));
+    if (task.id !== id) throw new Error("cron 任务启动响应身份不匹配");
+    this.taskEvent(runtime.token, task, "");
+    return task;
+  }
   activity(id: string): void {
     const r = this.records.find(r => r.contextId === id);
     if (r) { r.lastInteractionAt = this.now(); r.warnedDeadline = undefined; this.contexts.touch(id); this.save(); }
@@ -252,7 +268,7 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
     if (prev && prev.status !== "running" && prev.endedAt !== undefined) return;
     if (prev && prev.deadlineAt !== task.deadlineAt) throw new Error("任务截止时间不可由进程修改");
     r.tasks = r.tasks.filter(t => t.id !== task.id).concat({ ...task, name: String(task.name).slice(0, 100) }).slice(-100);
-    if (task.status !== "running" && task.endedAt !== undefined) {
+    if (task.status !== "running" && task.endedAt !== undefined && !r.cronTaskIds?.includes(task.id)) {
       const label = task.status === "timeout" ? "超过执行时限，已终止" : `已结束（${task.status}）`;
       this.event(r, `后台任务「${task.name}」${label}。\n${String(tail).slice(-1200)}\n工作目录保留。`, `task:${r.container}:${task.id}:${task.status}`);
     }

@@ -14,16 +14,20 @@ export class ContextScriptRunner implements ScriptRunner {
   constructor(private readonly contexts: ContextStore, private readonly runtimes: RuntimeManager, private readonly jobs: CronStore) {
     this.path = join(contexts.root, "execution", "cron-handles.json");
     this.handles = readJsonFile<Handle[]>(this.path, []);
+    // Also claim in-flight handles from a release that predated explicit ownership.
+    for (const handle of this.handles) {
+      const runtime = runtimes.all(handle.userKey).find(r => r.contextId === handle.contextId);
+      if (runtime) runtimes.ownCronTask(runtime, handle.taskId);
+    }
   }
   async launch(spec: LaunchSpec): Promise<{ ok: true } | { ok: false; error: string }> {
     try {
       const job = this.jobs.get(spec.jobId); if (!job) throw new Error("cron 任务不存在");
       const context = this.contexts.cron(job.userKey, job.id);
       const runtime = await this.runtimes.ensure(context);
-      const task: TaskRecord = JSON.parse(await this.runtimes.rpc(runtime, "/tasks", "POST", {
+      const task = await this.runtimes.startCronTask(runtime, {
         name: job.name, cmd: [...spec.cmd], env: spec.env, cwd: this.contexts.paths(context).work, timeoutMs: job.timeoutMs,
-      }));
-      this.runtimes.taskEvent(runtime.token, task, "");
+      });
       this.handles.push({ run: spec.container, contextId: context.id, taskId: task.id, userKey: job.userKey }); this.save();
       return { ok: true };
     } catch (error) { return { ok: false, error: String(error) }; }

@@ -5,7 +5,7 @@ import type { Config } from "../config.js";
 import type { EffortLevel } from "./settings.js";
 import type { Attachment } from "./attachments.js";
 import { AGENT_TRACE, describeSdkMessage } from "./agent-trace.js";
-import { personaBriefing } from "./persona.js";
+import { instructionOptions } from "./execution/instructions.js";
 import { ContextStore, readTenantFile, type ExecutionContext } from "./execution/contexts.js";
 import { RuntimeManager, networkEnvironment } from "./execution/runtime.js";
 import { CapabilityBroker } from "./execution/broker.js";
@@ -343,8 +343,7 @@ export class Agent {
       };
       const session = new SdkSession(input => query({ prompt: input, options: {
         pathToClaudeCodeExecutable: e.runtimes.wrapper(context, runtime),
-        cwd: paths.work, env, settingSources: ["user", "project", "local"], permissionMode: "bypassPermissions",
-        systemPrompt: { type: "preset", preset: "claude_code", append: personaBriefing(this.config.persona, this.config.sessionMemoryLimit) },
+        cwd: paths.work, env, ...instructionOptions(this.config.persona, this.config.sessionMemoryLimit),
         ...(context.sdkStarted ? { resume: context.sdkSessionId } : { sessionId: context.sdkSessionId }),
         ...(opts.model ?? this.config.model ? { model: opts.model ?? this.config.model } : {}),
         ...(opts.effort ? { effort: opts.effort } : {}), ...(opts.maxTurns ? { maxTurns: opts.maxTurns } : {}),
@@ -395,8 +394,7 @@ export class Agent {
   private async runProbe(prompt: string, opts: AgentRunOptions): Promise<AgentReply> {
     const q = query({ prompt, options: {
       cwd: opts.cwd, model: opts.model ?? this.config.model, maxTurns: 1,
-      abortController: opts.abortController, permissionMode: "bypassPermissions",
-      systemPrompt: { type: "preset", preset: "claude_code", append: personaBriefing(this.config.persona) },
+      abortController: opts.abortController, ...instructionOptions(this.config.persona),
     } });
     let text = "", sessionId = "", isError = false;
     try { for await (const m of q) if (m.type === "result") { sessionId = m.session_id; isError = m.is_error; text = m.subtype === "success" ? m.result : m.errors.join("\n"); } }

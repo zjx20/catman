@@ -422,6 +422,7 @@ function createCron(
   });
   const scheduler = new CronScheduler({
     store,
+    notify: (userKey, text, kind) => gateway.push(userKey, text, kind),
     runner: new ContextScriptRunner(deps.contexts, deps.runtimes, store),
     contextBusy: job => {
       const context = deps.contexts.all(job.userKey).find(c => c.jobId === job.id);

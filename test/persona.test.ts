@@ -1,13 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import {
   adminBaseline,
   initialSharedClaudeMd,
   personaBriefing,
 } from "../src/core/persona.js";
 import { canonicalOf } from "../src/core/commands.js";
+import { instructionOptions } from "../src/core/execution/instructions.js";
 
 /**
  * 「守护人格知不知道自己是守护人格」。
@@ -67,24 +66,14 @@ test("自述短 —— 它每回合都要付钱", () => {
 });
 
 test("自述真的接到了 SDK 的 systemPrompt 上", () => {
-  // 结构性断言。agent.ts 直接 import SDK 的 query,注入不进去 ——
-  // 而"注释里写的不变量不等于代码里有"是这个仓库反复踩到的坑(IPC secret 的
-  // childEnv 剔除、守护人格状态页的启动顺序,都是先有注释后有实现)。
-  // 与其让这条只活在注释里,不如让删掉 append 这一行的人当场变红。
-  const src = readFileSync(
-    fileURLToPath(new URL("../src/core/agent.ts", import.meta.url)),
-    "utf8",
-  );
-  assert.match(
-    src,
-    /systemPrompt:\s*\{[^}]*preset:\s*"claude_code"[^}]*append:\s*personaBriefing\(/s,
-    "systemPrompt 里必须带 append: personaBriefing(...)",
-  );
+  // Actual CLI requests (including Docker workers) are covered by instruction checks.
+  for (const persona of ["primary", "rescue"] as const) {
+    assert.deepEqual(instructionOptions(persona).systemPrompt, { type: "preset", preset: "claude_code", append: personaBriefing(persona) });
+  }
 });
 
 test("共享人设占位分人格,且守护人格那份说清身份归系统提示词管", () => {
-  // 它只是让每用户 CLAUDE.md 首行的 `@../CLAUDE.md` 不悬空。人能改它,
-  // 所以不能让人误以为在这里改一句就能把身份改掉。
+  // Shared instructions are editable; immutable identity belongs in systemPrompt.append.
   const r = initialSharedClaudeMd("rescue");
   assert.match(r, /守护人格/);
   assert.match(r, /系统提示词/);

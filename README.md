@@ -57,6 +57,7 @@
 ```
 
 普通聊天每段 session 使用独立 workspace；每个 cron 使用固定 workspace，多次执行共享游标与台账。两者继承同一 owner 的个人配置和 skill。
+任务文件、脚本和中间文件直接写在 workspace，按需要组织子目录。workspace 在容器回收后仍保留，容器的 `/tmp` 随容器回收；跨会话使用的产物放 `/user/artifacts`。
 管理员可以通过受控接口修改全局设置、公共能力配置并触发自进化。worker 没有 Docker socket、整棵 `/data`、其他用户目录或原始管理员凭据。容器启动失败直接报错，不退回控制进程执行。控制服务重启后认领原容器与已登记任务；无法重连的旧 SDK stdio 连接会先停止，再恢复会话，防止两个 CLI 并发写同一会话。
 
 全局人格在 `/data/shared/CLAUDE.md`；公共 skill 保留在控制面的 `$CLAUDE_CONFIG_DIR/skills`，按角色只读投影。个人偏好在 `/user/CLAUDE.md`，个人 skill 在 `/user/skills/<名字>/SKILL.md`。
@@ -646,6 +647,9 @@ agent task 使用 `{"kind":"agent","prompt":"检查状态","session":"chain","ma
 `chain` 续此任务的 SDK 会话；`fresh` 创建新的 SDK 会话，但保留同一 cron workspace。
 任务的后台工作也计入 overlap 判断。删除任务先停止其上下文，再删除该任务的文件。每次执行有硬超时；产出的后台任务另外登记自己的有限期限。
 调度状态、执行记录和通知仍由控制面保存，worker 不能直接改写别人的任务表。
+脚本 cron 的入口任务由控制面在启动前登记通知归属，结果统一由 CronScheduler 按成功/失败、静默时段等配置投递，不额外发送通用后台完成通知。该 cron 内另行登记的后台任务仍独立报告完成、失败和超时。
+
+公众号日报的按文章分目录取材、预览和素材归档脚本见 [`scripts/wechat-daily/`](scripts/wechat-daily/README.md)。它们安装到任务自己的持久 workspace；仓库发版不会覆盖用户的任务脚本和提示词。
 
 管理员页面 `/cron` 查看各用户任务，`/任务` 显示本人任务。调度频率、并发、历史保留和静默时段仍由全局设置与任务定义控制。
 
@@ -712,7 +716,7 @@ CATMAN_OPS_MAX_ACTIVE=1
 
 ```bash
 catman-ops exec -- docker ps --format '{{.Names}} {{.Status}}'
-catman-ops run .tmp/inspect.sh /opt/services
+catman-ops run inspect.sh /opt/services
 catman-ops run - /opt/services <<'SCRIPT'
 set -euo pipefail
 find "$1" -maxdepth 2 -name '*compose*' -print
@@ -971,7 +975,7 @@ docker build --pull -t catman-env:integration -f docker/Dockerfile .
 npm run test:docker
 ```
 
-集成测试使用独立临时数据、真实 worker/Claude CLI 和本地模型/MCP 服务，覆盖挂载与权限隔离、凭据代理、后台任务、取消、超时、cron 状态、重启认领和闲置回收；结束后清理测试容器与临时数据。可用 `CATMAN_DOCKER_IMAGE` 指定已有的基底镜像。在 devcontainer 内会自动从当前容器的挂载信息换算宿主路径；自动识别不了时，用 `CATMAN_DOCKER_HOST_ROOT` 指定仓库在 Docker 宿主上的绝对路径，必要时用 `CATMAN_DOCKER_CONTROLLER` 指定当前容器 ID。
+集成测试使用独立临时数据、真实 worker/Claude CLI 和本地模型/MCP 服务，覆盖挂载与权限隔离、凭据代理、后台任务、取消、超时、cron 状态、重启认领和闲置回收；结束后清理测试容器与临时数据。指令加载检查覆盖主人格/守护人格 × 聊天/cron：直接检查 CLI 正式任务请求中的共享、个人和 workspace 三层标记，并拒绝其他用户、其他 workspace 和控制面标记，不依赖模型自述。可用 `CATMAN_DOCKER_IMAGE` 指定已有的基底镜像。在 devcontainer 内会自动从当前容器的挂载信息换算宿主路径；自动识别不了时，用 `CATMAN_DOCKER_HOST_ROOT` 指定仓库在 Docker 宿主上的绝对路径，必要时用 `CATMAN_DOCKER_CONTROLLER` 指定当前容器 ID。
 
 迁移报告中的 targetContainerRoot 决定 SDK project 编码；已迁移到 /data 的数据应通过相同容器路径使用。原生开发调试使用独立测试数据，避免混入生产会话。
 
@@ -1072,7 +1076,7 @@ data/releases/
 | 制备 | agent(`data/deploy/bin/prepare.sh`) | 浅 clone → 装依赖 → typecheck + 全量测试 → 编译 → 版本戳 + 内容清单 → 原子就位 |
 | 汇报 | agent | 改动摘要 + 测试结果 + **变更分级** + 「回一句 `/发布 <前6位>`」 |
 | 确认 | **管理员亲手打** | `/发布 <版本号前 6 位>` —— 那串 sha 就是确认口令本身 |
-| 自检 | **deployer 亲自** | 起一次性容器跑 `CATMAN_SELFCHECK=1`,含一次真实的最小 SDK 请求 |
+| 自检 | **deployer 亲自** | 起一次性容器跑 `CATMAN_SELFCHECK=1`：临时数据下的真实 CLI 指令加载检查（本地假模型、零模型费用），再跑一次真实的最小 SDK 请求；指令缺层、越界或检查超时阻止切换 |
 | 切换 | deployer | 排水 → 停容器 → 换 current → 起容器 → 健康门(比对 `/health` 回报的 sha) |
 | 观察 | deployer | 30 分钟盯重启次数与健康;**这期间 stable 不动** |
 | 收尾 | deployer | 通过则前移 stable + 入清单 + GC + 推远端;不通过则退回并写报告 |
