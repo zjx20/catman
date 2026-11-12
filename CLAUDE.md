@@ -283,7 +283,7 @@ tenants/<tenantId>/
 其他用户、整棵 `/data` 以及 docker.sock 都不在 worker 中。主控制服务和信使需要访问
 控制数据，救援控制服务只读主数据并写自己的命名空间；这些权限不传给 agent worker。
 
-默认产物写当前 cwd。个人持久文件写 `/user`，跨上下文的最终产物写 `/user/artifacts`。
+默认临时执行内容写当前 cwd，任务私有状态留在本 workspace。聊天与 cron 共用 owner 的 `/user`；长期共用的配置、脚本和保留输出统一归入 `/user/projects/<项目>`，不再使用顶层 `/user/artifacts`。项目内部结构是建议，优先沿用已有布局，允许自选提示词文件名和输出目录；脚本通过参数或配置读取实际路径，不把 `prompts/`、`scripts/`、`outputs/` 写成系统硬约束。
 workspace 是当前上下文的独立工作区，脚本和中间文件可直接写入并按任务组织子目录；容器回收后仍保留，容器的 `/tmp` 随容器回收。
 每个聊天 session 与每个 cron 有独立 workspace；同一个 cron 的多次执行复用其目录。
 脚本 cron 入口任务的通知归属由控制面在启动前持久化，统一交由 CronScheduler 应用通知策略；不要根据 worker 的字段、任务名称或整个 cron context 屏蔽通知。同一上下文中独立登记的后台任务仍需报告完成及超时。

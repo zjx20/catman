@@ -58,7 +58,7 @@
 ```
 
 普通聊天每段 session 使用独立 workspace；每个 cron 使用固定 workspace，多次执行共享游标与台账。两者继承同一 owner 的个人配置和 skill。
-任务文件、脚本和中间文件直接写在 workspace，按需要组织子目录。workspace 在容器回收后仍保留，容器的 `/tmp` 随容器回收；跨会话使用的产物放 `/user/artifacts`。
+临时执行内容、中间文件和任务私有状态写在 workspace，按需要组织子目录。workspace 在容器回收后仍保留，容器的 `/tmp` 随容器回收。同一用户的聊天和 cron 共用 `/user`；长期共用的提示词、配置、脚本和需保留的输出统一归入 `/user/projects/<项目>`。项目内部结构灵活，优先沿用已有布局，`prompts/`、`scripts/`、`outputs/` 只是建议；不再使用顶层 `/user/artifacts`。
 管理员可以通过受控接口修改全局设置、公共能力配置并触发自进化。worker 没有 Docker socket、整棵 `/data`、其他用户目录或原始管理员凭据。容器启动失败直接报错，不退回控制进程执行。控制服务重启后认领原容器与已登记任务；无法重连的旧 SDK stdio 连接会先停止，再恢复会话，防止两个 CLI 并发写同一会话。
 
 全局人格在 `/data/shared/CLAUDE.md`；公共 skill 保留在控制面的 `$CLAUDE_CONFIG_DIR/skills`，按角色只读投影。个人偏好在 `/user/CLAUDE.md`，个人 skill 在 `/user/skills/<名字>/SKILL.md`。
@@ -434,7 +434,7 @@ docker logs catman-deployer            # 看这次到底发生了什么
 ### 每个人自己的存储
 
 个人 home 是 `/data/tenants/<tenantId>/home`，在本人的 worker 中挂成 `/user`。聊天 session 与 cron 各自有独立 workspace，不挂整个租户根目录。
-默认把产物写当前 cwd。跨上下文保留的文件放 /user；个人 skill 放 /user/skills/<目录>/SKILL.md，个人偏好放 /user/CLAUDE.md，个人 MCP 配置放 /user/mcp.json。
+默认把临时执行内容写当前 cwd。跨上下文共用的配置、脚本和保留的输出放 /user/projects/<项目>，目录结构按项目需要组织；个人 skill 放 /user/skills/<目录>/SKILL.md，个人偏好放 /user/CLAUDE.md，个人 MCP 配置放 /user/mcp.json。
 worker 不能访问其他用户、控制配置或 Docker socket。普通用户管理自己的配置和任务，管理员通过受控接口管理全局能力与自进化。
 
 ### 重新扫码(凭据失效 / 换手机)

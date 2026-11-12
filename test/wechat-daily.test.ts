@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const scripts = fileURLToPath(new URL("../scripts/wechat-daily/", import.meta.url));
 function fixture() {
-  const root = mkdtempSync(join(tmpdir(), "catman-wechat-")), articleDir = join(root, "article with spaces"), artifacts = join(root, "home/artifacts/wechat-daily");
+  const root = mkdtempSync(join(tmpdir(), "catman-wechat-")), articleDir = join(root, "article with spaces"), artifacts = join(root, "home/projects/daily paper/published files");
   mkdirSync(join(articleDir, "images"), { recursive: true });
   writeFileSync(join(articleDir, "images/selected.jpg"), "selected");
   writeFileSync(join(articleDir, "images/unused.jpg"), "unused");
@@ -56,8 +56,11 @@ test("发布包装器预检在云端调用前完成，成功只创建一次并�
     const work = join(f.root, "workflow"), skill = join(f.root, "config/skills/wechat-article/scripts"), calls = join(f.root, "calls");
     cpSync(scripts, work, { recursive: true }); mkdirSync(skill, { recursive: true });
     writeFileSync(join(skill, "publish.sh"), `#!/bin/sh\nset -eu\nprintf '%s\\n' "$1" >> "$CALLS"\ncase "$1" in\nrender) printf preview > "$4" ;;\ndraft|update) [ "\${FAIL_API:-}" != 1 ] || exit 1; printf '%s\\n' '{"status":"created","media_id":"confirmed-draft"}' ;;\nesac\n`, { mode: 0o700 });
-    const env = { ...process.env, CLAUDE_CONFIG_DIR: join(f.root, "config"), CATMAN_USER_PRIVATE_DIR: join(f.root, "home"), CALLS: calls };
+    const cover = join(f.root, "custom cover.png"); writeFileSync(cover, "configured cover");
+    const env = { ...process.env, CLAUDE_CONFIG_DIR: join(f.root, "config"), WECHAT_DAILY_ARCHIVE_ROOT: f.artifacts, WECHAT_DAILY_COVER: cover, CALLS: calls };
     const run = (key: string, extra = {}) => spawnSync("sh", [join(work, "publish.sh"), "draft", f.article, "--job-key", key], { env: { ...env, ...extra }, encoding: "utf8" });
+    assert.notEqual(run("article-1", { WECHAT_DAILY_ARCHIVE_ROOT: "" }).status, 0);
+    assert.equal(existsSync(calls), false, "未指定归档目录时不能先写微信再报错");
     assert.notEqual(run("../bad").status, 0); assert.equal(existsSync(calls), false);
     f.save("images/missing.jpg"); assert.notEqual(run("article-1").status, 0); assert.equal(existsSync(calls), false);
     f.save(); const failure = run("article-1", { FAIL_API: "1" });
@@ -67,6 +70,7 @@ test("发布包装器预检在云端调用前完成，成功只创建一次并�
     assert.equal(JSON.parse(result.stdout).media_id, "confirmed-draft");
     assert.deepEqual(readFileSync(calls, "utf8").trim().split("\n"), ["render", "draft"]);
     assert.deepEqual(readdirSync(join(f.artifacts, "article-1/images")), ["selected.jpg"]);
+    assert.equal(readFileSync(join(f.artifacts, "article-1/assets/cover.png"), "utf8"), "configured cover");
     // A successful cloud write must remain visible even when the local archive fails.
     rmSync(f.artifacts, { recursive: true }); writeFileSync(f.artifacts, "blocked"); writeFileSync(calls, "");
     const archiveFailure = run("article-1");
@@ -80,10 +84,11 @@ test("发布包装器预检在云端调用前完成，成功只创建一次并�
 test("取材按日期创建独立目录，重复运行保留已有文章，过期数据不创建新产物", () => {
   const root = mkdtempSync(join(tmpdir(), "catman-wechat-collect-"));
   try {
-    const source = join(root, "latest.json"), articles = join(root, "work/articles");
+    const source = join(root, "latest.json"), work = join(root, "work"), articles = join(work, "articles");
+    mkdirSync(work);
     const date = new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Shanghai" }).format(new Date());
     writeFileSync(source, JSON.stringify({ date, sections: [] }));
-    const run = () => spawnSync(process.execPath, [join(scripts, "collect.cjs"), "--source", source, "--output-root", articles], { encoding: "utf8" });
+    const run = () => spawnSync(process.execPath, [join(scripts, "collect.cjs"), "--source", source], { cwd: work, encoding: "utf8" });
     assert.equal(run().status, 0);
     const dir = join(articles, `tech-daily-${date}-v1`);
     assert.equal(JSON.parse(readFileSync(join(dirname(articles), "collection.json"), "utf8")).jobKey, `tech-daily-${date}-v1`);
@@ -92,5 +97,24 @@ test("取材按日期创建独立目录，重复运行保留已有文章，过�
     assert.equal(run().status, 0); assert.equal(readFileSync(join(dir, "images/keep.jpg"), "utf8"), "keep");
     writeFileSync(source, JSON.stringify({ date: "2000-01-01", sections: [] }));
     assert.equal(run().status, 2); assert.equal(existsSync(join(articles, "tech-daily-2000-01-01-v1")), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("项目脚本从其他 workspace 执行，输入输出可配置且指针相对执行目录", () => {
+  const root = mkdtempSync(join(tmpdir(), "catman-wechat-paths-"));
+  try {
+    const work = join(root, "workspace"), output = join(root, "custom project/material files"), pointer = join(root, "state/current.json"), source = join(root, "source.json");
+    mkdirSync(work);
+    writeFileSync(source, JSON.stringify({ date: "2026-11-12", sections: [] }));
+    const env = { ...process.env, WECHAT_DAILY_NEWS_SOURCE: source, WECHAT_DAILY_ARTICLE_ROOT: output, WECHAT_DAILY_COLLECTION: pointer };
+    const result = spawnSync(process.execPath, [join(scripts, "collect.cjs"), "--allow-stale"], { cwd: work, env, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const collection = JSON.parse(readFileSync(pointer, "utf8"));
+    assert.equal(readFileSync(join(work, collection.materials), "utf8").includes("2026-11-12"), true);
+    assert.equal(existsSync(join(work, collection.articleDir, "source-news.json")), true);
+    assert.deepEqual(readdirSync(work), [], "配置外部输出时不往 workspace 或脚本目录乱写");
+    const missing = spawnSync(process.execPath, [join(scripts, "collect.cjs")], { cwd: work, env: { ...env, WECHAT_DAILY_NEWS_SOURCE: "" }, encoding: "utf8" });
+    assert.notEqual(missing.status, 0); assert.match(missing.stderr, /需要 --source/);
+    assert.deepEqual(readdirSync(work), []);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

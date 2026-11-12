@@ -188,7 +188,9 @@ GET 列出；POST 创建；PATCH /<id> 修改；DELETE /<id> 删除；POST /<id>
 agent 任务的 task 为 {"kind":"agent","prompt":"检查本目录的状态","session":"chain","maxTurns":10}。
 
 每个任务有固定 workspace，多次执行共享其中的游标和台账。聊天、其他 cron 的 workspace 互相隔离。
-个人文件和 skill 在 /user。跨上下文保留的产物才保存到 /user。
+同一用户的聊天和 cron 共用可读写的 /user。需要跨会话查看或修改的长期提示词、配置、脚本和保留输出，统一放在 /user/projects/<项目>；不要把聊天需要读取的配置仅放在 cron workspace，也不再使用顶层 /user/artifacts。
+简单指令可直接写在 task.prompt；较长指引可让 task.prompt 引用项目内的文件。优先沿用项目现有布局；prompt.md、scripts/、outputs/ 只是建议，不强制目录名或层级。读取或修改前先检查实际配置路径，路径调整时同步更新任务和相关 skill 的引用，保持一份权威配置，不另建可能过期的缓存副本。
+执行中的中间文件和任务私有状态留在 cron workspace；个人 skill 放 /user/skills。自己的项目配置不需要宿主运维授权。
 不接受宿主挂载、镜像、网络或资源参数；执行环境由服务端按 owner 授权生成。
 每次执行必须受 timeoutMinutes 限制；它启动的后台任务也必须用 catman-task run --timeout <秒> -- <命令> 登记。
 长期运行的 server 属于部署。不要用后台进程代替部署。

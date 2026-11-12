@@ -2,7 +2,7 @@
 /**
  * 公众号日报取材:读 newsdaily 的 latest.json,抓每条的原文,汇总成 materials.txt。
  *
- *   node collect.cjs [--max-chars 700] [--source file] [--output-root directory]
+ *   node collect.cjs --source file [--max-chars 700] [--output-root directory] [--collection file]
  *
  * 产物(每期独立存于 articles/tech-daily-YYYY-MM-DD-v1):
  *   materials.txt   给成文模型看的材料(分组 / 标题 / 链接 / 已有 detail / 原文摘录)
@@ -25,13 +25,16 @@ const execFileP = promisify(execFile);
 
 function option(name, fallback) {
   const at = process.argv.indexOf(name);
-  if (at < 0) return fallback;
-  const value = process.argv[at + 1];
+  const value = at < 0 ? fallback : process.argv[at + 1];
+  if (at < 0 && value === undefined) return undefined;
   if (!value || value.startsWith('--')) throw new Error(`缺少 ${name} 的值`);
   return path.resolve(value);
 }
-const NEWS = option('--source', '/user/artifacts/newsdaily/latest.json');
-const OUTPUT_ROOT = option('--output-root', path.join(__dirname, 'articles'));
+const NEWS = option('--source', process.env.WECHAT_DAILY_NEWS_SOURCE || undefined);
+if (!NEWS) throw new Error('需要 --source <新闻 JSON> 或 WECHAT_DAILY_NEWS_SOURCE，输入路径由项目配置指定');
+const WORK = process.cwd();
+const OUTPUT_ROOT = option('--output-root', process.env.WECHAT_DAILY_ARTICLE_ROOT || path.join(WORK, 'articles'));
+const POINTER = option('--collection', process.env.WECHAT_DAILY_COLLECTION || path.join(WORK, 'collection.json'));
 let DIR, OUT, IMG_DIR;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
            '(KHTML, like Gecko) Chrome/128.0 Safari/537.36';
@@ -223,8 +226,9 @@ async function main() {
   OUT = path.join(DIR, 'materials.txt');
   IMG_DIR = path.join(DIR, 'images');
   fs.mkdirSync(DIR, { recursive: true, mode: 0o700 });
-  const collection = { date: data.date, jobKey: key, articleDir: path.relative(__dirname, DIR), materials: path.relative(__dirname, OUT) };
-  const pointer = path.join(path.dirname(OUTPUT_ROOT), 'collection.json');
+  const collection = { date: data.date, jobKey: key, articleDir: path.relative(WORK, DIR), materials: path.relative(WORK, OUT) };
+  const pointer = POINTER;
+  fs.mkdirSync(path.dirname(pointer), { recursive: true, mode: 0o700 });
   if (fs.existsSync(path.join(DIR, 'article.json')) && fs.existsSync(OUT)) {
     fs.writeFileSync(pointer, JSON.stringify(collection, null, 2) + '\n', { mode: 0o600 });
     console.log('已存在本期文章，复用现有材料，不覆盖图片或文章。');

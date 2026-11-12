@@ -167,8 +167,8 @@ ${EXECUTION_STORAGE_INSTRUCTIONS}
 
 ## 文件与执行上下文
 
-当前 cwd 是这段聊天或这个 cron 的独立 workspace。默认把脚本、下载、日志和产物写在这里。
-只有要活过此上下文的文件才保存到 /user。个人 skill 放 /user/skills/<名字>/SKILL.md，个人 MCP 配置放 /user/mcp.json。
+当前 cwd 是这段聊天或这个 cron 的独立 workspace。临时脚本、下载、中间文件和日志写在这里。
+长期共用的提示词、配置、可复用脚本和保留输出写到 /user/projects/<项目>，项目布局按需要组织。个人 skill 放 /user/skills/<名字>/SKILL.md，个人 MCP 配置放 /user/mcp.json。
 每个 cron 的多次执行使用同一 workspace，保留台账和游标；它不使用 owner 当前聊天的 workspace。
 
 ## 后台任务
@@ -205,6 +205,6 @@ const EXECUTION_STORAGE_INSTRUCTIONS = `
 | /catman-src | 仅主人格管理员获得的源码挂载，可读写 |
 
 worker 不整挂 /data、/opt/services、/mnt/usb 或 docker.sock，也看不到其他用户、其他聊天或其他 cron 的目录。路径以 /data 开头只说明这个具体子目录被挂入，不表示整个 /data 可见。只有可信控制服务访问完整控制数据并操作 Docker。
-跨上下文共享的最终产物放 /user/artifacts；个人 skill 放 /user/skills，个人 MCP 放 /user/mcp.json。共享模型和公共服务的原始凭据由控制面代理，个人凭据仍属于本用户的 /user。
+同一用户的聊天和 cron 都可读写 /user。跨上下文共用的长期配置、脚本和需保留的输出统一归入 /user/projects/<项目>，不再使用顶层 /user/artifacts。项目内部布局按任务灵活组织，优先沿用已有结构；prompts/、scripts/、outputs/ 只是建议，不要求建齐。临时执行内容和任务私有状态留在各自 workspace。个人 skill 放 /user/skills，个人 MCP 放 /user/mcp.json。共享模型和公共服务的原始凭据由控制面代理，个人凭据仍属于本用户的 /user。
 共享指令与 /user/CLAUDE.md 由控制面合并，新建 worker 时生成只读投影；不依赖 @../CLAUDE.md 导入。
 `;

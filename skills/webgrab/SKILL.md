@@ -15,7 +15,7 @@ WG=/runtime/bin/skills/webgrab/webgrab
 ```
 
 产物默认写**当前 workspace 的相对路径**，例如 `article.md`、`page.html`。
-父目录要先创建。个人长期文件放 `/user`，跨会话产物放 `/user/artifacts`。
+父目录要先创建。需要长期保留或跨会话使用的文件归入 `/user/projects/<项目>`；项目内部布局沿用已有约定，输出目录名可自行选择。
 公共 skill 及参考资料只读。不要写旧全局临时目录，也不要请求增加宿主挂载。
 
 大页面用 `--out` 保存，再分段读取。不要把整个 HTML 灌进上下文。

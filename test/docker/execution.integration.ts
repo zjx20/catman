@@ -394,7 +394,8 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
   });
   await t.test("cron 使用 owner home 和固定 workspace，容器重建后状态继续累加", async () => {
     const jobs = new CronStore({ dir: join(root, "cron"), contexts, hostDataRoot: config.hostDataDir });
-    const cmd = ["node", "-e", "const fs=require('fs');const n=fs.existsSync('counter')?+fs.readFileSync('counter','utf8'):0;fs.writeFileSync('counter',String(n+1));console.log(fs.readFileSync('/user/private','utf8')+'|'+process.cwd()+'|'+process.env.CRON_PROBE)"];
+    await exec(a, "import fs from 'node:fs';fs.mkdirSync('/user/projects/paper/custom layout',{recursive:true});fs.writeFileSync('/user/projects/paper/rules.md','shared project rules')");
+    const cmd = ["node", "-e", "const fs=require('fs');const n=fs.existsSync('counter')?+fs.readFileSync('counter','utf8'):0;fs.writeFileSync('counter',String(n+1));fs.writeFileSync('/user/projects/paper/custom layout/result.txt',fs.readFileSync('/user/projects/paper/rules.md','utf8')+'|'+(n+1));console.log(fs.readFileSync('/user/private','utf8')+'|'+process.cwd()+'|'+process.env.CRON_PROBE)"];
     const job = jobs.put({ id: "probe", userKey: "alice", name: "cron-probe", enabled: true, schedule: { kind: "every", ms: 3600_000 }, task: { kind: "script", cmd, env: { CRON_PROBE: "owner-env" } }, timeoutMs: 5000,
       overlap: "skip", notify: { start: false, end: false, onlyFailure: false }, keepRuns: 5, createdAt: now, updatedAt: now, failStreak: 0 });
     const runner = new ContextScriptRunner(contexts, runtimes, jobs);
@@ -411,6 +412,8 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
       await runtimes.stop(cron.id, "recreate cron runtime", true);
     }
     assert.equal(readFileSync(join(work, "counter"), "utf8"), "2"); assert.ok(!existsSync(join(aPaths.work, "counter")));
+    assert.equal(await exec(a, "import fs from 'node:fs';console.log(fs.readFileSync('/user/projects/paper/custom layout/result.txt','utf8'))"), "shared project rules|2");
+    assert.equal(await exec(b, "import fs from 'node:fs';console.log(fs.existsSync('/user/projects/paper/rules.md'))"), "false");
   });
   await t.test("控制面重启认领同一容器：杀掉孤立 CLI，保留登记任务和截止时间", async () => {
     const c = contexts.chat("restart-probe"), r = await runtimes.ensure(c);

@@ -5,6 +5,8 @@ SKILL_DIR=${CLAUDE_CONFIG_DIR:?}/skills/wechat-article
 case "${1:-}" in
   draft|update)
     ARTICLE=${2:?需要 article.json 路径}
+    ARCHIVE_ROOT=${WECHAT_DAILY_ARCHIVE_ROOT:?需要通过 WECHAT_DAILY_ARCHIVE_ROOT 指定项目的归档目录}
+    COVER=${WECHAT_DAILY_COVER:-"$ROOT/assets/cover.png"}
     KEY=
     PREVIOUS=
     for ARG in "$@"; do
@@ -12,10 +14,10 @@ case "${1:-}" in
       PREVIOUS=$ARG
     done
     [ "$PREVIOUS" != --job-key ] || { printf '%s\n' '缺少 --job-key 的值' >&2; exit 2; }
-    node "$ROOT/package.mjs" check --article "$ARTICLE" --cover "$ROOT/assets/cover.png" --job-key "${KEY:-draft}"
+    node "$ROOT/package.mjs" check --article "$ARTICLE" --cover "$COVER" --job-key "${KEY:-draft}"
     "$SKILL_DIR/scripts/publish.sh" render "$ARTICLE" --output "$(dirname -- "$ARTICLE")/preview.html" >&2
     RESULT=$("$SKILL_DIR/scripts/publish.sh" "$@")
-    set -- pack --article "$ARTICLE" --root "${CATMAN_USER_PRIVATE_DIR:-/user}/artifacts/wechat-daily" --result "$RESULT" --cover "$ROOT/assets/cover.png"
+    set -- pack --article "$ARTICLE" --root "$ARCHIVE_ROOT" --result "$RESULT" --cover "$COVER"
     [ -z "$KEY" ] || set -- "$@" --job-key "$KEY"
     if ! node "$ROOT/package.mjs" "$@" >&2; then
       printf '%s\n' "$RESULT"

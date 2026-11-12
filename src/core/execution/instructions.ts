@@ -25,5 +25,5 @@ export function projectInstructions(dataDir: string, home: string, target: strin
   const common = existsSync(shared) ? readFileSync(shared, "utf8") : "";
   const personal = readTenantFile(home, "CLAUDE.md") ?? "";
   const operations = ops ? "\n## 临时运维环境\n宿主维护按 catman-ops skill 申请用户硬指令授权，使用 catman-ops exec/run 执行；普通 Bash 仍在原 worker 中。\n" : "";
-  writeFileSync(target, `${common}\n\n${personal}\n\n## 执行环境\n当前 workspace 是本会话或定时任务的独立工作区。任务产物、脚本与中间文件直接写在这里，按任务需要组织子目录。workspace 在执行容器回收后仍保留；容器的 /tmp 随容器回收。需要跨会话使用的产物放 /user/artifacts，个人项目放 /user/projects，skill 放 /user/skills。不要把共享目录或控制面数据目录当作工作区。后台命令必须通过 catman-task run --timeout <秒> -- <命令> 登记；最长 86400 秒。长期服务需要部署。\n${operations}`, { mode: 0o600 });
+  writeFileSync(target, `${common}\n\n${personal}\n\n## 执行环境\n当前 workspace 是本会话或定时任务的独立工作区。临时执行内容、中间文件和任务私有状态放在这里，按任务需要组织子目录。workspace 在执行容器回收后仍保留；容器的 /tmp 随容器回收。同一用户的聊天和 cron 都可读写 /user。需要跨会话共用的长期配置、脚本和保留的输出统一归入 /user/projects/<项目>，不再使用顶层 /user/artifacts。项目内部结构是建议，优先沿用现有布局；例如可用 prompts/、scripts/、outputs/，简单项目可直接放文件，不要求建齐固定目录。读写以项目已有配置和实际路径为准，迁移时同步更新引用。个人 skill 放 /user/skills。不要把共享目录或控制面数据目录当作工作区。后台命令必须通过 catman-task run --timeout <秒> -- <命令> 登记；最长 86400 秒。长期服务需要部署。\n${operations}`, { mode: 0o600 });
 }
