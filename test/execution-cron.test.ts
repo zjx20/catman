@@ -61,3 +61,35 @@ test("从旧 cron handle 恢复控制面通知归属，聊天任务不能登记�
     assert.throws(() => f.runtimes.ownCronTask(chat, `t_${randomUUID()}`), /归属无效/);
   } finally { f.cleanup(); }
 });
+
+test("每日 cron 重建容器后巡检历史任务不重播结果，新入口保持静默，独立后台任务仍通知", async () => {
+  const f = executionFixture();
+  try {
+    const context = f.contexts.cron("alice", "checkin"), first = await f.runtimes.ensure(context);
+    const yesterday: TaskRecord = { id: `t_${randomUUID()}`, name: "checkin", command: "node", status: "completed", startedAt: f.time(), deadlineAt: f.time() + 1000, endedAt: f.time() + 10 };
+    f.runtimes.ownCronTask(first, yesterday.id);
+    f.advance(10);
+    f.runtimes.taskEvent(first.token, yesterday, "yesterday: +7 points, 5 days");
+    assert.equal(f.runtimes.pending(context.id).length, 0);
+    writeFileSync(join(f.contexts.paths(context).tasks, "tasks.json"), JSON.stringify([yesterday]));
+    await f.runtimes.stop(context.id, "completed cron", true);
+    f.advance(24 * 3600_000);
+    const second = await f.runtimes.ensure(context);
+    assert.deepEqual(second.inheritedTaskIds, [yesterday.id]);
+    assert.notEqual(second.container, first.container);
+    assert.equal(second.cronTaskIds?.includes(yesterday.id) ?? false, false, "旧入口的运行态归属已随容器回收");
+    const today: TaskRecord = { ...yesterday, id: `t_${randomUUID()}`, startedAt: f.time(), deadlineAt: f.time() + 1000, endedAt: f.time() + 10 };
+    f.runtimes.ownCronTask(second, today.id);
+    f.advance(10);
+    f.runtimes.taskEvent(second.token, today, "today: +2 points, 6 days");
+    f.tasks.push(yesterday, today);
+    await f.runtimes.tick();
+    assert.equal(f.runtimes.pending(context.id).length, 0, "不能把 tasks.json 中昨天的完成记录当成今天的新事件");
+    assert.equal(f.notices.length, 0, "通知只能由 cron 调度器按本次 run 发送");
+    const independent = { ...today, id: `t_${randomUUID()}`, name: "independent download", endedAt: f.time() };
+    f.runtimes.taskEvent(second.token, independent, "new independent result");
+    await f.runtimes.tick();
+    assert.equal(f.notices.length, 1);
+    assert.match(f.notices[0]!, /new independent result/);
+  } finally { f.cleanup(); }
+});

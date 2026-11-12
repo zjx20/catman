@@ -403,7 +403,11 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
       assert.deepEqual(await runner.launch({ container: run, jobId: job.id, userKey: "alice", cmd, env: job.task.kind === "script" ? job.task.env : {}, timeoutMs: job.timeoutMs }), { ok: true });
       assert.deepEqual(await until(() => runner.poll(run), r => r.state !== "running", "cron completion"), { state: "exited", exitCode: 0 });
       assert.match(await runner.logs(run), /alice-only/); assert.ok((await runner.logs(run)).includes(`${work}|owner-env`));
+      // /processes returns the persistent task history, including the previous container's run.
+      // launch/poll alone never exercises the external supervisor's event reconciliation.
+      await runtimes.tick();
       assert.equal(runtimes.pending(cron.id).length, 0, "cron 入口的通用后台任务通知由调度器接管");
+      await runner.remove(run);
       await runtimes.stop(cron.id, "recreate cron runtime", true);
     }
     assert.equal(readFileSync(join(work, "counter"), "utf8"), "2"); assert.ok(!existsSync(join(aPaths.work, "counter")));

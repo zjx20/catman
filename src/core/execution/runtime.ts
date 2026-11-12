@@ -18,6 +18,8 @@ export interface RuntimeRecord {
   tasks: TaskRecord[]; sdkTasks: Array<{ task_id: string; description: string; ambient?: boolean }>;
   /** Control-plane ownership; worker events cannot opt themselves out of notification. */
   cronTaskIds?: string[];
+  /** Terminal tasks already present before this container was launched. */
+  inheritedTaskIds?: string[];
 }
 export interface RuntimeEvent { id: string; userKey: string; contextId: string; text: string; delivered: boolean; consumed?: boolean; at: number }
 export type DockerCommand = (args: string[], env?: NodeJS.ProcessEnv) => Promise<string>;
@@ -80,7 +82,7 @@ export class RuntimeManager {
     this.events = readExecutionState<RuntimeEvent[]>(this.eventPath, []);
     if (!Array.isArray(this.records) || !Array.isArray(this.events)) throw new Error("执行环境状态损坏");
     for (const r of this.records) if (!contexts.get(r.contextId, r.userKey) || !/^catman-ctx-c_[a-f0-9]{24}-[a-f0-9]{16}$/.test(r.container) || !/^[a-f0-9]{64}$/.test(r.token)) throw new Error("执行环境归属或身份损坏");
-    for (const r of this.records) if (r.cronTaskIds !== undefined && (!Array.isArray(r.cronTaskIds) || r.cronTaskIds.some(id => typeof id !== "string" || !/^t_[a-f0-9-]{36}$/.test(id)))) throw new Error("cron 任务归属记录损坏");
+    for (const r of this.records) for (const ids of [r.cronTaskIds, r.inheritedTaskIds]) if (ids !== undefined && (!Array.isArray(ids) || ids.some(id => typeof id !== "string" || !/^t_[a-f0-9-]{36}$/.test(id)))) throw new Error("后台任务归属记录损坏");
     this.docker = opts.docker ?? dockerCommand;
   }
   private now(): number { return (this.opts.now ?? Date.now)(); }
@@ -126,8 +128,13 @@ export class RuntimeManager {
     const binary = join(release, "node_modules/@anthropic-ai", sdkNativePackage, "claude");
     if (!existsSync(binary) || !existsSync(join(release, "dist/src/core/execution/worker.js"))) throw new Error("release 缺少执行运行时，请先构建");
     const generation = randomBytes(8).toString("hex");
+    // Snapshot history before starting the worker. Persist this baseline so adopting
+    // the same container after controller downtime cannot swallow a new completion.
+    const history: TaskRecord[] = JSON.parse(readTenantFile(p.tasks, "tasks.json") ?? "[]");
+    if (!Array.isArray(history)) throw new Error("后台任务状态损坏");
+    const inheritedTaskIds = history.filter(t => t && /^t_[a-f0-9-]{36}$/.test(t.id) && t.status !== "running" && Number.isFinite(t.endedAt)).map(t => t.id);
     const r: RuntimeRecord = { contextId: context.id, userKey: context.userKey, container: `catman-ctx-${context.id}-${generation}`,
-      token: randomBytes(32).toString("hex"), admin: this.opts.isAdmin(context.userKey), createdAt: this.now(), lastInteractionAt: this.now(), extensionUntil: 0, tasks: [], sdkTasks: [] };
+      token: randomBytes(32).toString("hex"), admin: this.opts.isAdmin(context.userKey), createdAt: this.now(), lastInteractionAt: this.now(), extensionUntil: 0, tasks: [], sdkTasks: [], inheritedTaskIds };
     let launchAttempted = false;
     try {
       const projection = this.project(context, generation);
@@ -269,9 +276,19 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
     if (prev && prev.status !== "running" && prev.endedAt !== undefined) return;
     if (prev && prev.deadlineAt !== task.deadlineAt) throw new Error("任务截止时间不可由进程修改");
     r.tasks = r.tasks.filter(t => t.id !== task.id).concat({ ...task, name: String(task.name).slice(0, 100) }).slice(-100);
-    if (task.status !== "running" && task.endedAt !== undefined && !r.cronTaskIds?.includes(task.id)) {
+    // The supervisor keeps tasks.json across containers. Its /processes snapshot is
+    // a history as well as a live view, so an inherited terminal result is not a new
+    // completion (and its old cron ownership may already be gone). For already
+    // running containers from older releases, fall back to the creation timestamp.
+    // Previously running tasks become interrupted after restart; their new endedAt
+    // still needs to be reported, as do tasks finishing during controller adoption.
+    const historical = r.inheritedTaskIds?.includes(task.id) || (r.inheritedTaskIds === undefined && task.endedAt !== undefined && task.endedAt < r.createdAt);
+    if (task.status !== "running" && task.endedAt !== undefined && !historical && !r.cronTaskIds?.includes(task.id)) {
       const label = task.status === "timeout" ? "超过执行时限，已终止" : `已结束（${task.status}）`;
-      this.event(r, [`后台任务 ${inlineCode(task.name)} ${label}。`, ...(tail.trim() ? [codeBlock(String(tail).trim().slice(-1200))] : []), "工作目录保留。"].join("\n\n"), `task:${r.container}:${task.id}:${task.status}`);
+      // A task ID belongs to its persistent context, not to a disposable container.
+      // Honor queued/delivered/consumed events written by releases using the old key.
+      const legacy = this.events.some(e => e.userKey === r.userKey && e.contextId === r.contextId && e.id.startsWith(`task:catman-ctx-${r.contextId}-`) && e.id.split(":").at(-2) === task.id);
+      if (!legacy) this.event(r, [`后台任务 ${inlineCode(task.name)} ${label}。`, ...(tail.trim() ? [codeBlock(String(tail).trim().slice(-1200))] : []), "工作目录保留。"].join("\n\n"), `task:${r.contextId}:${task.id}`);
     }
     this.save();
   }
