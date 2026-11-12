@@ -37,6 +37,7 @@ export class SdkSession {
   }
   get alive(): boolean { return !this.closed; }
   get busy(): boolean { return !!this.pending; }
+  get hasBackgroundTasks(): boolean { return this.tasks.size > 0; }
   async run(turn: SdkTurn): Promise<SdkTurnResult> {
     if (this.closed) throw new Error("CLI 已退出");
     if (this.pending) throw new Error("同一上下文不能并发执行两个 agent 回合");

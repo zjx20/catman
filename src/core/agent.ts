@@ -130,6 +130,9 @@ export interface AgentRunOptions {
    * 且会把部署门拖到超时。给它一个硬上限,自检就不可能跑飞。
    */
   maxTurns?: number;
+  maxBudgetUsd?: number;
+  /** An automatic continuation consumes only the events it was dispatched for. */
+  backgroundEventIds?: readonly string[];
   /** 供 /取消 中断本回合。abort 后 run() 抛错,由上层的错误分支处理。 */
   abortController?: AbortController;
   /** 中间过程回调(思考/工具调用)。回调应快速返回,耗时操作自行异步化。 */
@@ -293,7 +296,7 @@ function isBenignStderr(line: string): boolean {
 
 /** SDK transport for owner-scoped execution contexts. */
 export class Agent {
-  private readonly live = new Map<string, { session: SdkSession; options: AgentRunOptions; model?: string; effort?: string }>();
+  private readonly live = new Map<string, { session: SdkSession; options: AgentRunOptions; model?: string; effort?: string; maxTurns?: number; maxBudgetUsd?: number }>();
   constructor(private readonly config: Config, private readonly execution?: {
     contexts: ContextStore; runtimes: RuntimeManager; broker: CapabilityBroker;
   }, private readonly probe = false) {}
@@ -313,8 +316,8 @@ export class Agent {
     if (entry && (opts.resumeSessionId === undefined && context.sdkStarted === false)) {
       entry.session.close(); this.live.delete(context.id); entry = undefined;
     }
-    if (entry && (entry.model !== opts.model || entry.effort !== opts.effort)) {
-      if (runtime.sdkTasks.length) throw new Error("此上下文仍有 SDK 后台任务；请先结束任务，再切换模型或思考设置");
+    if (entry && (entry.model !== opts.model || entry.effort !== opts.effort || entry.maxTurns !== opts.maxTurns || entry.maxBudgetUsd !== opts.maxBudgetUsd)) {
+      if (runtime.sdkTasks.length || entry.session.hasBackgroundTasks) throw new Error("此上下文仍有 SDK 后台任务；请先结束任务，再切换模型、思考设置或执行预算");
       entry.session.close(); this.live.delete(context.id); entry = undefined;
     }
     if (!entry) {
@@ -338,8 +341,8 @@ export class Agent {
         ...Object.fromEntries(Object.entries(e.broker.mcpServers(runtime, this.config.apiBase)).map(([name, config]) => [`public_${name}`, config])),
       };
       const allSkills = [...new Set([...(opts.skills ?? []), ...skillsOnDisk(paths.home).filter(name => !(GENERATED_SKILLS as readonly string[]).includes(name))])];
-      const slot: { session: SdkSession; options: AgentRunOptions; model?: string; effort?: string } = {
-        session: undefined!, options: opts, model: opts.model, effort: opts.effort,
+      const slot: { session: SdkSession; options: AgentRunOptions; model?: string; effort?: string; maxTurns?: number; maxBudgetUsd?: number } = {
+        session: undefined!, options: opts, model: opts.model, effort: opts.effort, maxTurns: opts.maxTurns, maxBudgetUsd: opts.maxBudgetUsd,
       };
       const session = new SdkSession(input => query({ prompt: input, options: {
         pathToClaudeCodeExecutable: e.runtimes.wrapper(context, runtime),
@@ -347,6 +350,7 @@ export class Agent {
         ...(context.sdkStarted ? { resume: context.sdkSessionId } : { sessionId: context.sdkSessionId }),
         ...(opts.model ?? this.config.model ? { model: opts.model ?? this.config.model } : {}),
         ...(opts.effort ? { effort: opts.effort } : {}), ...(opts.maxTurns ? { maxTurns: opts.maxTurns } : {}),
+        ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
         thinking: { type: "adaptive", display: "summarized" }, skills: allSkills, mcpServers,
         perTaskStopAffordance: true,
         stderr: data => { if (data.trim() && !isBenignStderr(data.trim())) console.warn(`[agent ${context.id}] ${data.slice(0, 2000)}`); },
@@ -371,8 +375,14 @@ export class Agent {
       if (!entry!.session.feed(buildUserMessage(text, attachments))) return false;
       e.runtimes.activity(context.id); return true;
     });
-    const pendingEvents = e.runtimes.pending(context.id);
-    const events = pendingEvents.map(event => event.text).join("\n\n").slice(-12000);
+    const available = opts.backgroundEventIds ? e.runtimes.selected(context.id, opts.backgroundEventIds) : e.runtimes.pending(context.id);
+    const pendingEvents = [];
+    let events = "";
+    for (const event of available) {
+      const text = event.text.slice(0, 12000);
+      if (pendingEvents.length && events.length + text.length + 2 > 12000) break;
+      pendingEvents.push(event); events += (events ? "\n\n" : "") + text;
+    }
     const message = buildUserMessage(prompt, opts.attachments ?? [], [opts.ambient, events ? `后台任务记录：\n${events}` : ""].filter(Boolean).join("\n\n"));
     const reply = await entry.session.run({ message, signal: opts.abortController?.signal, onMessage: message => {
       if ("session_id" in message && message.session_id) { e.contexts.started(context.id, message.session_id); opts.onSessionId?.(message.session_id); }
@@ -385,7 +395,7 @@ export class Agent {
       }
       if (message.type === "result") e.runtimes.activity(context.id);
     } });
-    e.runtimes.acknowledge(pendingEvents.map(event => event.id));
+    if (!reply.isError) e.runtimes.acknowledge(pendingEvents.map(event => event.id));
     return reply;
   }
 

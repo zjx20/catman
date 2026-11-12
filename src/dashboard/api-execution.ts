@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdirSync, openSync, closeSync } from "node:fs";
+import { mkdirSync, openSync, closeSync, copyFileSync, constants } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { Config } from "../config.js";
 import type { ContextStore } from "../core/execution/contexts.js";
@@ -126,6 +127,7 @@ export class ExecutionApi {
         try { child = spawn(join(this.opts.config.deployDir, "bin", "prepare.sh"), [ref], { cwd: this.opts.config.srcDir, env: process.env, stdio: ["ignore", fd, fd] }); }
         finally { closeSync(fd); }
         this.preparing = true;
+        const releaseRuntime = runtime ? runtimes.retainWhile(r => r.contextId === runtime.contextId) : () => {};
         let finished = false, timedOut = false;
         const timeout = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, 30 * 60_000);
         const finish = (status: string) => {
@@ -133,7 +135,17 @@ export class ExecutionApi {
           finished = true;
           clearTimeout(timeout); this.preparing = false;
           let tail = ""; try { tail = readPrepareTail(log); } catch {}
-          runtimes.notifyUser(principal, runtime?.contextId ?? "prepare", formatPrepareReport(status, tail, log));
+          let readableLog = log;
+          let logNote = "";
+          const context = runtime && contexts.get(runtime.contextId, principal);
+          try {
+            if (context) {
+              const target = join(contexts.paths(context).tasks, `prepare-${randomUUID()}.log`);
+              try { copyFileSync(log, target, constants.COPYFILE_EXCL); readableLog = target; }
+              catch (error) { logNote = "\n\n原上下文日志副本保存失败，完整日志暂需管理员从控制面读取。"; console.error("[prepare] 日志副本保存失败:", String(error)); }
+            }
+            runtimes.notifyUser(principal, runtime?.contextId ?? "prepare", formatPrepareReport(status, tail, readableLog) + logNote, false, context ? "prepare" : undefined);
+          } finally { releaseRuntime(); }
         };
         child.once("error", err => finish(`启动失败：${String(err)}`));
         child.once("exit", (code, signal) => finish(timedOut ? "超时" : code === 0 ? "完成" : `失败（${signal ?? code}）`));

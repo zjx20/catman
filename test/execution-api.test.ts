@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { CapabilityBroker } from "../src/core/execution/broker.js";
@@ -78,6 +78,11 @@ test("制备 API 异步发送可复制的成功摘要，失败与启动异常各
     const success = await waitFor(1);
     assert.match(success, /测试 3\/3/);
     assert.match(success, /```text\n\/发布 029e6bd\n```/);
+    const successEvent = f.runtimes.continuations()[0]!;
+    assert.equal(successEvent.wake, "prepare");
+    const readable = success.match(/完整日志：`([^`]+)`/)![1]!;
+    assert.ok(readable.startsWith(f.contexts.paths(context).tasks + "/"));
+    assert.match(readFileSync(readable, "utf8"), /# pass 3/);
     writeFileSync(script, "#!/bin/sh\nprintf 'test failed\\nline two\\n'\nexit 7\n");
     await request();
     const failed = await waitFor(2);

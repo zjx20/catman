@@ -117,6 +117,10 @@ interface FakeCall {
   skills?: string[];
   env?: Record<string, string | undefined>;
   attachments?: readonly Attachment[];
+  maxTurns?: number;
+  maxBudgetUsd?: number;
+  backgroundEventIds?: readonly string[];
+  contextId?: string;
 }
 
 /** abort 时 reject 的 promise;没有 controller 就永不 settle。 */
@@ -167,6 +171,7 @@ class FakeAgent {
       skills: opts.skills,
       env: opts.env,
       attachments: opts.attachments,
+      maxTurns: opts.maxTurns, maxBudgetUsd: opts.maxBudgetUsd, backgroundEventIds: opts.backgroundEventIds, contextId: opts.context?.id,
     });
     this.inFlight += 1;
     this.peakInFlight = Math.max(this.peakInFlight, this.inFlight);
@@ -375,6 +380,117 @@ test("运维只有用户硬指令授权，清单自动续接原会话；重复�
     await h.channel.receive(U1, `/运维回收 ${request.id}`);
     assert.equal(ops.list(U1).length, 0); assert.equal(f.runtimes.all(U1).length, 1);
   } finally { ops.close(); f.cleanup(); }
+});
+
+function continuationGateway() {
+  const f = executionFixture(true);
+  const h = build(f.time, { settings: { adminUserKeys: [U1] }, execution: { contexts: f.contexts, runtimes: f.runtimes } });
+  const run = h.agent.run.bind(h.agent);
+  // The real Agent loads/acknowledges exactly this batch around the SDK turn.
+  h.agent.run = async (prompt, opts = {}) => {
+    const events = opts.backgroundEventIds ? f.runtimes.selected(opts.context!.id, opts.backgroundEventIds) : f.runtimes.pending(opts.context!.id);
+    const reply = await run(prompt, opts);
+    f.contexts.started(opts.context!.id, reply.sessionId);
+    if (!reply.isError) f.runtimes.acknowledge(events.map(e => e.id));
+    return reply;
+  };
+  return { f, h };
+}
+
+test("后台结束不需用户开口即续接原 session，带执行预算；成功消费后不重复触发", async () => {
+  const { f, h } = continuationGateway();
+  try {
+    await h.channel.receive(U1, "下载并核对文件");
+    const context = f.contexts.all(U1)[0]!, before = h.sessions.currentOf(U1)!;
+    f.runtimes.notifyUser(U1, context.id, "download done, read task.log", false, "task");
+    await h.gw.flushContinuations();
+    assert.equal(h.agent.calls.length, 2);
+    const call = h.agent.calls[1]!;
+    assert.equal(call.resume, before.sessionId); assert.equal(call.contextId, context.id);
+    assert.equal(call.cwd, f.contexts.paths(context).work); assert.equal(call.maxTurns, 12); assert.equal(call.maxBudgetUsd, 2);
+    assert.equal(call.backgroundEventIds?.length, 1); assert.match(call.prompt, /完整日志和实际产物/);
+    assert.equal(h.sessions.currentOf(U1)!.hint, before.hint);
+    await h.gw.flushContinuations(); assert.equal(h.agent.calls.length, 2);
+    f.runtimes.notifyUser(U1, context.id, "ordinary notice");
+    await h.gw.flushContinuations(); assert.equal(h.agent.calls.length, 2);
+  } finally { await h.gw.stop(); f.cleanup(); }
+});
+
+test("旧会话后台自动续接不会顶掉新会话，回复标注原 session", async () => {
+  const { f, h } = continuationGateway();
+  try {
+    await h.channel.receive(U1, "旧任务"); const old = f.contexts.all(U1)[0]!;
+    await h.channel.receive(U1, "/新会话"); await h.channel.receive(U1, "新话题");
+    const current = h.sessions.currentOf(U1)!;
+    f.runtimes.notifyUser(U1, old.id, "old task finished", false, "task");
+    await h.gw.flushContinuations();
+    assert.equal(h.agent.calls.length, 3); assert.equal(h.agent.calls[2]!.resume, old.sdkSessionId);
+    assert.equal(h.sessions.currentOf(U1)!.sessionId, current.sessionId);
+    assert.ok(h.channel.sent.some(m => m.text.includes(`后台对话 ${old.sdkSessionId.slice(0, 8)} 的结果`)));
+  } finally { await h.gw.stop(); f.cleanup(); }
+});
+
+test("用户正在处理或 SDK 原生后台任务未结束时暂缓自动续接，不并发 resume", async () => {
+  const { f, h } = continuationGateway();
+  try {
+    await h.channel.receive(U1, "原任务"); const context = f.contexts.all(U1)[0]!;
+    const runtime = await f.runtimes.ensure(context);
+    let release!: () => void; h.agent.gate = new Promise<void>(r => { release = r; });
+    const input = h.channel.receive(U1, "用户的新要求");
+    await waitUntil(() => h.agent.calls.length === 2, "用户回合启动");
+    f.runtimes.notifyUser(U1, context.id, "finished during human turn", false, "task");
+    await h.gw.flushContinuations(); assert.equal(h.agent.calls.length, 2);
+    release(); await input; h.agent.gate = undefined;
+    f.runtimes.sdkTasks(context.id, [{ task_id: "native", description: "native download" }]);
+    await h.gw.flushContinuations(); assert.equal(h.agent.calls.length, 2);
+    f.runtimes.sdkTasks(context.id, []);
+    await h.gw.flushContinuations(); assert.equal(h.agent.calls.length, 3); assert.equal(h.agent.peakInFlight, 1);
+    assert.equal(f.runtimes.all(U1)[0]!.container, runtime.container);
+  } finally { await h.gw.stop(); f.cleanup(); }
+});
+
+test("取消会持久化暂停自动续接，新用户输入才重新开放；权限使用当前配置", async () => {
+  const { f, h } = continuationGateway();
+  try {
+    await h.channel.receive(U1, "原任务"); const context = f.contexts.all(U1)[0]!;
+    f.runtimes.notifyUser(U1, context.id, "queued result", false, "task");
+    await h.channel.receive(U1, "/取消"); await h.gw.flushContinuations();
+    assert.equal(h.agent.calls.length, 1);
+    await h.channel.receive(U1, "接着核对"); assert.equal(h.agent.calls.length, 2);
+    f.runtimes.notifyUser(U1, context.id, "new result", false, "task");
+    h.settings.set({ adminUserKeys: [] }); await h.gw.flushContinuations();
+    assert.equal(h.agent.calls.length, 3); assert.ok(!h.agent.calls[2]!.skills?.includes(ADMIN_SKILL));
+    assert.equal(h.agent.calls[2]!.env?.CATMAN_ADMIN_TOKEN, undefined);
+  } finally { await h.gw.stop(); f.cleanup(); }
+});
+
+test("自动续接到达五分钟硬期限会退出并暂停，不用新事件再次拉起", async t => {
+  const { f, h } = continuationGateway();
+  try {
+    await h.channel.receive(U1, "原任务"); const context = f.contexts.all(U1)[0]!;
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    h.agent.gate = new Promise<void>(() => {});
+    f.runtimes.notifyUser(U1, context.id, "done", false, "task");
+    const automatic = h.gw.flushContinuations();
+    await waitUntil(() => h.agent.calls.length === 2, "自动回合启动");
+    t.mock.timers.tick(5 * 60_000); await automatic;
+    assert.ok(h.channel.sent.some(m => m.text.includes("后台自动续接超过 5 分钟")));
+    await h.gw.flushContinuations(); assert.equal(h.agent.calls.length, 2);
+    assert.equal(h.turns.allFor(U1).length, 0);
+  } finally { await h.gw.stop(); f.cleanup(); }
+});
+
+test("已进入聚合窗口的用户输入优先消费后台结果，不再另起自动回合", async () => {
+  const { f, h } = continuationGateway();
+  try {
+    await h.channel.receive(U1, "原任务"); const context = f.contexts.all(U1)[0]!;
+    f.runtimes.notifyUser(U1, context.id, "done", false, "task");
+    h.settings.set({ messageAggregationMs: 20 });
+    const input = h.channel.receive(U1, "看看这个结果");
+    await h.gw.flushContinuations(); assert.equal(h.agent.calls.length, 1);
+    await input; await h.gw.flushContinuations(); assert.equal(h.agent.calls.length, 2);
+    assert.equal(h.agent.calls[1]!.backgroundEventIds, undefined);
+  } finally { await h.gw.stop(); f.cleanup(); }
 });
 
 test("完整回合:准入 → decide → 回执 → agent → record → send", async () => {

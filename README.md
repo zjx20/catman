@@ -71,6 +71,7 @@
     contexts.json                # 归属、session/cron、SDK session ID
     runtimes.json                # 运行环境、身份、活动时间、任务截止时间
     events.json                  # 完成、超时、回收和通知状态
+    continuations.json           # 后台自动续接的次数、暂停状态和崩溃重试租约
     shared-tools.json            # 公共 MCP/服务端点及凭据，0600
   shared/CLAUDE.md
   tenants/<tenantId>/
@@ -563,6 +564,10 @@ docker compose exec catman node dist/src/scripts/ilink-login.js --rebind <账号
 第一次的使用指引或 `/帮助` 里发现。
 
 ## 自助设置与管理员
+
+聊天中通过 `catman-task` 登记的后台任务完成、失败或超时后，以及版本制备结束后，系统会自动续接原会话检查结果。交给助手的记录包含状态、任务 ID、完整日志位置和末尾输出；助手需要读取日志与产物再汇报。已经切走的会话在后台续接，回复会标明来源，不改变当前话题。普通通知、SDK 自行处理的结果和 cron 通知不会再次启动推理。
+
+用户消息先处理，续接复用全局并发限制和当前权限。每次用户输入后最多自动续接 3 次，每轮上限为 12 轮、5 分钟及 SDK 估算费用 2 美元。`/取消` 或主动回收会暂停续接，用户新输入才重新开放；达到上限时保留结果并提示继续。没有收到确认时，不会自行执行需要硬指令批准的发布或提权。
 
 ### 用户改自己的
 

@@ -306,6 +306,8 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
     assert.ok(runtimes.all("alice").find(r => r.contextId === alice.id)!.sdkTasks.length > 0);
     const before = JSON.parse(await runtimes.rpc(a, "/processes")).agents;
     assert.equal(before.length, 1);
+    await assert.rejects(agent.run("An automatic budget must wait for native tasks.", { context: contexts.get(alice.id)!, resumeSessionId: first.sessionId, maxTurns: 12, maxBudgetUsd: 2 }), /仍有 SDK 后台任务/);
+    assert.deepEqual(JSON.parse(await runtimes.rpc(a, "/processes")).agents, before, "切预算不能杀掉正在持有原生后台任务的 CLI");
     const processEnv = JSON.parse(await exec(a, `import fs from 'node:fs'; const children=fs.readdirSync('/proc').filter(p=>/^\\d+$/.test(p)).flatMap(p=>{try{const env=fs.readFileSync('/proc/'+p+'/environ','utf8');if(!env.includes('CATMAN_AGENT_ID='))return [];return [{capability:env.includes('CATMAN_RUNTIME_TOKEN='),rawSecret:env.includes('controller-model-secret-for-integration')||env.includes('controller-admin-secret-for-integration')||env.includes('controller-ipc-secret-for-integration')||env.includes('controller-host-only-for-integration')}]}catch{return []}});console.log(JSON.stringify(children));`));
     assert.ok(processEnv.length > 0); assert.ok(processEnv.every((p: { capability: boolean; rawSecret: boolean }) => p.capability && !p.rawSecret), "CLI 及其工具也只能继承 capability，不能继承控制面环境");
     const second = await agent.run("Reply while the background probe is running.", { context: contexts.get(alice.id)!, resumeSessionId: first.sessionId, maxTurns: 4 });
@@ -325,6 +327,28 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
     assert.equal(reply.isError, false); assert.equal(reply.sessionId, sdkSessionId); assert.equal(reply.text, "integration reply");
     const ids = JSON.parse(await runtimes.rpc(a, "/processes")).agents; assert.equal(ids.length, 1); assert.notDeepEqual(ids, sdkAgentIds);
     agent.close();
+  });
+  await t.test("真实 CLI 切换自动回合预算并恢复正常预算；仅注入和确认指定后台事件", async () => {
+    const context = contexts.chat("budget-probe"), runtime = await runtimes.ensure(context);
+    const first = await agent.run("Warm the human conversation.", { context });
+    assert.equal(first.isError, false);
+    const originalIds = JSON.parse(await runtimes.rpc(runtime, "/processes")).agents;
+    runtimes.notifyUser(context.userKey, context.id, "unselected-background-record");
+    runtimes.notifyUser(context.userKey, context.id, "selected-background-record\n" + "x".repeat(13000), false, "task");
+    const event = runtimes.continuations().find(e => e.contextId === context.id)!;
+    const start = seen.length;
+    const automatic = await agent.run("Inspect the background result.", { context: contexts.get(context.id)!, resumeSessionId: first.sessionId, maxTurns: 12, maxBudgetUsd: 2, backgroundEventIds: [event.id] });
+    assert.equal(automatic.isError, false); assert.equal(automatic.sessionId, first.sessionId);
+    const limitedIds = JSON.parse(await runtimes.rpc(runtime, "/processes")).agents;
+    assert.notDeepEqual(limitedIds, originalIds, "复用旧 CLI 会导致自动预算不生效");
+    const request = JSON.stringify(seen.slice(start).filter(r => r.path.startsWith("/v1/messages")).map(r => r.body));
+    assert.ok(request.includes("selected-background-record")); assert.ok(!request.includes("unselected-background-record"));
+    assert.ok(!runtimes.pending(context.id).some(e => e.id === event.id));
+    assert.ok(runtimes.pending(context.id).some(e => e.text === "unselected-background-record"));
+    const human = await agent.run("Continue with normal user limits.", { context: contexts.get(context.id)!, resumeSessionId: first.sessionId });
+    assert.equal(human.isError, false); assert.equal(human.sessionId, first.sessionId);
+    assert.notDeepEqual(JSON.parse(await runtimes.rpc(runtime, "/processes")).agents, limitedIds);
+    await runtimes.stop(context.id, "budget test cleanup", true);
   });
   await t.test("OAuth 凭据代理只替换上游身份，worker 不获取 OAuth 密钥", async () => {
     delete process.env.ANTHROPIC_API_KEY; process.env.CLAUDE_CODE_OAUTH_TOKEN = "controller-oauth-secret-for-integration";
