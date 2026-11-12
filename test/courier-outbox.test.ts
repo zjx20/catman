@@ -54,6 +54,32 @@ function fakeChannel(replies: ReplyStore) {
 
 const U = "wechat:acct:u1";
 
+test("超时提醒仅即时发送：无额度、网络失败或队列有积压均不排队、不确认成功", async () => {
+  await withDir(async dir => {
+    const replies = new ReplyStore(join(dir, "ctx.json"));
+    replies.remember(U, "raw", "tok-1");
+    const channel = fakeChannel(replies);
+    const box = new Outbox({ replies, deliver: channel.deliver, paceMs: 0 });
+    try {
+      assert.equal(await box.sendReminder(U, "idle-1"), true);
+      assert.equal(channel.sent.at(-1)?.text, "idle-1");
+      exhaust(replies);
+      assert.equal(await box.sendReminder(U, "no budget"), false);
+      assert.equal(box.depth(U), 0);
+      replies.remember(U, "raw", "tok-new");
+      channel.setFail(true);
+      assert.equal(await box.sendReminder(U, "idle-2"), false);
+      assert.equal(box.depth(U), 0);
+      await box.submit(U, "queued answer", "body");
+      assert.equal(box.depth(U), 1);
+      channel.setFail(false);
+      assert.equal(await box.sendReminder(U, "idle-3"), false, "不能越过队列里的正文");
+      assert.equal(box.depth(U), 1, "提醒不能进入队列等待迟发");
+      assert.equal(channel.sent.some(s => s.text === "idle-2" || s.text === "idle-3"), false);
+    } finally { await box.stop(); }
+  });
+});
+
 /**
  * 把这条来信的额度**连保留格一起**烧光:9 条普通消息 + 那句提示。
  *

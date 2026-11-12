@@ -36,6 +36,11 @@ function mgr(store = new InMemoryStore(), c = clock()) {
   };
 }
 
+function confirmReminder(sm: SessionManager, userKey = "stdin:local:u1"): void {
+  const current = sm.currentOf(userKey); assert.ok(current);
+  assert.equal(sm.markReminderDelivered(userKey, current), true);
+}
+
 test("首个用户消息 → 新会话", () => {
   const { sm } = mgr();
   const d = sm.decide("stdin:local:u1");
@@ -52,13 +57,45 @@ test("超时窗口内的后续消息 → 恢复当前会话", () => {
   assert.equal(d.resumeSessionId, "sess-A");
 });
 
-test("超时后的普通消息 → 开新会话", () => {
+test("超时但未实际提醒时仍恢复旧会话，即使重启或超过多个超时周期", () => {
+  const { sm, c, store } = mgr();
+  sm.record("stdin:local:u1", "sess-A");
+  c.advance(TIMEOUT * 4);
+  assert.equal(sm.decide("stdin:local:u1").resumeSessionId, "sess-A");
+  assert.deepEqual(sm.dueReminders(), ["stdin:local:u1"]);
+  const restarted = new SessionManager({ store, timeoutMs: TIMEOUT, now: c.now });
+  assert.equal(restarted.decide("stdin:local:u1").resumeSessionId, "sess-A");
+});
+
+test("超时且提醒确认实际发出后，普通消息才开新会话", () => {
   const { sm, c } = mgr();
   sm.record("stdin:local:u1", "sess-A");
   c.advance(TIMEOUT + 1);
+  confirmReminder(sm);
   const d = sm.decide("stdin:local:u1");
   assert.equal(d.isNew, true);
   assert.equal(d.resumeSessionId, undefined);
+  assert.equal(d.expiredSession?.sessionId, "sess-A");
+});
+
+test("旧版 reminded=true 不作为实际发送证据；新确认持久化且不能跨会话或闲置周期复用", () => {
+  const user = "stdin:local:u1", c = clock(TIMEOUT * 2);
+  const store = new InMemoryStore({ [user]: { current: { sessionId: "old", lastActive: 0 }, reminded: true, history: [] } });
+  const sm = new SessionManager({ store, timeoutMs: TIMEOUT, now: c.now });
+  assert.equal(sm.decide(user).resumeSessionId, "old");
+  assert.deepEqual(sm.dueReminders(), [user]);
+  const original = sm.currentOf(user)!;
+  assert.equal(sm.markReminderDelivered(user, { ...original, sessionId: "foreign" }), false);
+  confirmReminder(sm);
+  const restarted = new SessionManager({ store, timeoutMs: TIMEOUT, now: c.now });
+  assert.equal(restarted.decide(user).isNew, true);
+  restarted.touch(user);
+  assert.equal(restarted.markReminderDelivered(user, original), false);
+  assert.equal(restarted.decide(user).resumeSessionId, "old");
+  restarted.record(user, "new");
+  c.advance(TIMEOUT);
+  assert.equal(restarted.markReminderDelivered(user, original), false);
+  assert.equal(restarted.decide(user).resumeSessionId, "new");
 });
 
 test("超时后 /继续 → touch 保活 → 恢复旧会话", () => {
@@ -78,6 +115,7 @@ test('超时后先开新会话,之后的"继续"属于新会话(不再恢复旧�
   sm.record("stdin:local:u1", "sess-A");
   c.advance(TIMEOUT + 1);
   // 普通消息触发新会话
+  confirmReminder(sm);
   assert.equal(sm.decide("stdin:local:u1").isNew, true);
   sm.record("stdin:local:u1", "sess-B"); // agent 返回了新会话 id
   // 紧接着"继续"应恢复 sess-B(当前会话),而不是 sess-A
@@ -91,6 +129,7 @@ test("touch:超时后保活,下一条普通消息仍恢复旧会话", () => {
   const { sm, c } = mgr();
   sm.record("stdin:local:u1", "sess-A");
   c.advance(TIMEOUT + 1);
+  confirmReminder(sm);
   assert.equal(sm.decide("stdin:local:u1").isNew, true, "超时后普通消息本该开新会话");
 
   assert.equal(sm.touch("stdin:local:u1"), true);
@@ -130,12 +169,14 @@ test("touch 持久化:重启后保活效果仍在", () => {
   assert.equal(second.decide("stdin:local:u1").resumeSessionId, "sess-A");
 });
 
-test("dueReminders 在到点时返回用户且只提醒一次", () => {
+test("dueReminders 只列候选，不能把尝试发送当成已提醒；实际确认后才停止提醒", () => {
   const { sm, c } = mgr();
   sm.record("stdin:local:u1", "sess-A");
   assert.deepEqual(sm.dueReminders(), []); // 还没到点
   c.advance(TIMEOUT);
   assert.deepEqual(sm.dueReminders(), ["stdin:local:u1"]); // 到点
+  assert.deepEqual(sm.dueReminders(), ["stdin:local:u1"], "尚无发送确认，仍应允许重试");
+  confirmReminder(sm);
   assert.deepEqual(sm.dueReminders(), []); // 不重复提醒
 });
 
@@ -243,6 +284,7 @@ test("switchTo:切到已超时的**当前**会话,同样即刻生效", () => {
   const { sm, c } = mgr();
   sm.record("stdin:local:u1", "aaaa1111");
   c.advance(TIMEOUT * 3); // 放凉了 —— decide() 此刻会判新会话
+  confirmReminder(sm);
   assert.equal(sm.decide("stdin:local:u1").isNew, true, "前提:不切的话就是新会话");
 
   const res = sm.switchTo("stdin:local:u1", "aaaa");
@@ -257,6 +299,7 @@ test("switchTo:切到当前会话会清掉超时提醒标记,下轮闲置能再�
   sm.record("stdin:local:u1", "aaaa1111");
   c.advance(TIMEOUT * 2);
   assert.deepEqual(sm.dueReminders(), ["stdin:local:u1"], "先提醒过一次");
+  confirmReminder(sm);
 
   sm.switchTo("stdin:local:u1", "aaaa");
   c.advance(TIMEOUT * 2);
@@ -342,6 +385,7 @@ test("多用户互不干扰", () => {
   c.advance(30 * 60 * 1000);
   sm.record("stdin:local:u2", "sess-2");
   c.advance(TIMEOUT - 30 * 60 * 1000); // u1 累计超时,u2 未超时
+  confirmReminder(sm);
   assert.equal(sm.decide("stdin:local:u1").isNew, true);
   assert.equal(sm.decide("stdin:local:u2").resumeSessionId, "sess-2");
 });
@@ -358,11 +402,12 @@ test("每用户超时:timeoutMsFor 覆盖全局默认", () => {
   sm.record(shortFor, "sess-S");
   sm.record("stdin:local:normal", "sess-N");
   c.advance(120_000); // 超过 short 的 1 分钟,远未到默认的 1 小时
+  confirmReminder(sm, shortFor);
 
   assert.equal(sm.decide(shortFor).isNew, true, "短超时的用户应当开新会话");
   assert.equal(sm.decide("stdin:local:normal").isNew, false, "默认超时的用户仍在窗口内");
   // dueReminders 也要按每用户超时算,否则短超时的人永远等不到提醒。
-  assert.deepEqual(sm.dueReminders(), [shortFor]);
+  assert.deepEqual(sm.dueReminders(), [], "短超时用户已经确认发送，不再重复提醒");
 });
 
 test("idleMsOf:无记录返回 undefined,有记录返回空闲时长", () => {

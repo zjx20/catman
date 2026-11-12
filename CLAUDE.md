@@ -302,10 +302,15 @@ SDK 的 `background_tasks_changed` 是完整、权威的任务快照，不与 bo
 
 ## 会话与回合
 
-- **会话规则**(`session.ts`):距上次 <1h(可每用户覆盖)→ resume,否则开新会话;
-  `reminded` 标记防重复提醒,`record()` 与 `touch()` 都重置它。
-  **指令词汇不住在这里**,`decide()` 连布尔标记都不收 —— 规则只有一条「未超时就续上」,
+- **会话规则**(`session.ts`):距上次达到 1h(可每用户覆盖)后才有资格提醒；只有提醒实际发送成功，
+  下一条普通消息才开新会话。未提醒、发送失败或只有队列接受均继续原会话。
+  `reminderDelivery` 记录已发送的会话 id、lastActive 和发送时刻，旧 `reminded=true` 单独不作数；
+  `record()` 与 `touch()` 重置提醒，迟到确认不能跨会话或闲置周期复用。
+  **指令词汇不住在这里**,`decide()` 连布尔标记都不收 —— 规则是「未确认超时就续上」,
   `/继续` 由分拣节点用 `touch()` 消化(把时钟拨到现在,同一批里后面的话自然命中)。
+  超时提醒走 `Channel.sendReminder` → IPC `/reminder`，只即时尝试，队列有积压或发送失败时不排队；
+  普通 `/send` 仍只表示信使接受。升级必须同步更新 pinned 信使；旧信使缺少该端点时保留原会话，
+  不回退到 `/send` 假定成功。前台回合执行期间不发闲置提醒；确认后实际切换会额外说明并给出恢复指令。
 - **离开的会话归档进 history,不删除**:每用户 `current + history`(上限 `HISTORY_LIMIT`,
   同 id 去重),`/新会话` 与被切走都走 `archiveCurrent()`,`/切换会话` 用 `switchTo()`
   按 id 前缀切回并刷新时钟。SDK 的 resume 默认不 fork,**同一段对话的 id 稳定不变** ——

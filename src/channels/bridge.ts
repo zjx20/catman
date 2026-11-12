@@ -189,6 +189,11 @@ export class BridgeChannel implements Channel {
     if (!r.ok) throw new Error(r.reason ?? "信使拒绝了这条消息");
   }
 
+  async sendReminder(userKey: string, text: string): Promise<boolean> {
+    // An old courier cannot prove actual delivery; keep the conversation resumable.
+    return this.opts.client.sendReminder ? (await this.opts.client.sendReminder(userKey, text)).ok : false;
+  }
+
   /**
    * 「还在动」。转给信使,由它决定多久往微信打一次 —— 频率是渠道知识,
    * 人格这边只管报事实,爱推多密推多密。

@@ -63,6 +63,7 @@ class FakeChannel implements Channel {
   attempted = 0;
   /** 仅"支持撤回"的实例才有 recall 方法(网关按方法是否存在判断能力)。 */
   recall?: (userKey: string, messageId: string) => Promise<void>;
+  sendReminder?: (userKey: string, text: string) => Promise<boolean>;
 
   constructor(supportsRecall = false) {
     if (supportsRecall) {
@@ -905,6 +906,128 @@ test("超时提醒:渠道不支持推送时静默降级,不抛错", async () => 
   await channel.receive(U1, "hi");
   t += TIMEOUT;
   await assert.doesNotReject(gw["flushReminders"]());
+});
+
+for (const priorReminder of ["not-polled", "failed", "delivered"] as const) {
+  test(`只有提醒实际发送成功才切换会话，并给出旧会话恢复指令（提前提醒 ${priorReminder}）`, async () => {
+    let t = 1_000_000;
+    const { channel, agent, gw } = build(() => t);
+    agent.nextSessionId = "f0e93ae0-original";
+    await channel.receive(U1, "原话题");
+    // Reproduce 08:17:28 -> 09:18:44, before the next six-minute reminder tick.
+    t += TIMEOUT + 76_000;
+    if (priorReminder !== "not-polled") {
+      channel.failSend = priorReminder === "failed";
+      await gw["flushReminders"]();
+      channel.failSend = false;
+    }
+    channel.sent.length = 0;
+    agent.nextSessionId = "new-session";
+    await channel.receive(U1, "选 C，改成全面发布");
+    if (priorReminder !== "delivered") {
+      assert.equal(agent.calls.at(-1)!.resume, "f0e93ae0-original", "未实际提醒时，即使超过一小时也应继续旧会话");
+      assert.ok(!channel.sent.some(m => m.text.includes("超时设置")));
+      return;
+    }
+    assert.equal(agent.calls.at(-1)!.resume, undefined);
+    const notice = channel.sent.findIndex(m => m.text.includes("超时设置"));
+    const reply = channel.sent.findIndex(m => m.text === "echo:选 C，改成全面发布");
+    assert.ok(notice >= 0 && notice < reply, "必须由系统在新会话正文前说明切换，不能等 LLM 发现缺少上文");
+    assert.equal(channel.sent[notice]!.kind, "announce", "切换说明不能被正文当作过期 reminder 清掉");
+    assert.match(channel.sent[notice]!.text, /61 分钟/);
+    assert.match(channel.sent[notice]!.text, /60 分钟/);
+    assert.match(channel.sent[notice]!.text, /```text\n\/切换会话 f0e93ae0\n```/);
+    const before = channel.sent.length;
+    await channel.receive(U1, "接着新话题");
+    assert.ok(!channel.sent.slice(before).some(m => m.text.includes("超时设置")));
+    assert.equal(agent.calls.at(-1)!.resume, "new-session");
+  });
+}
+
+test("首聊、未超时续聊、显式新会话与 /继续 不发自动超时切换说明；关闭回执不屏蔽已确认的超时", async () => {
+  let t = 1_000_000;
+  const { channel, agent, prefs, gw } = build(() => t);
+  await channel.receive(U1, "第一句");
+  t += TIMEOUT - 1;
+  await channel.receive(U1, "未到一小时");
+  assert.equal(agent.calls.at(-1)!.resume, "sess-1");
+  await channel.receive(U1, "/新会话");
+  await channel.receive(U1, "主动开始");
+  t += TIMEOUT + 1;
+  await channel.receive(U1, "/继续");
+  await channel.receive(U1, "继续旧会话");
+  assert.ok(!channel.sent.some(m => m.text.includes("超时设置")));
+  prefs.set(U1, { ackEnabled: false, sessionTimeoutMs: 5 * 60_000 });
+  t += 5 * 60_000;
+  await gw["flushReminders"]();
+  const before = channel.sent.length;
+  await channel.receive(U1, "现在超时");
+  const messages = channel.sent.slice(before);
+  assert.ok(!messages.some(m => m.kind === "ack"));
+  assert.ok(messages.some(m => m.text.includes("超时设置 5 分钟")));
+});
+
+test("提醒未实际送达就不切换，队列接受不能冒充发送确认", async () => {
+  let t = 1_000_000;
+  const { channel, sessions, agent, gw } = build(() => t);
+  await channel.receive(U1, "旧话题");
+  channel.sendReminder = async () => false;
+  t += TIMEOUT;
+  await gw["flushReminders"]();
+  assert.equal(sessions.snapshot()[U1]?.reminded, false);
+  await channel.receive(U1, "继续问");
+  assert.equal(agent.calls.at(-1)!.resume, "sess-1");
+});
+
+test("提醒确认迟于用户继续聊天时作废，同一用户不并发重复提醒", async () => {
+  let t = 1_000_000, calls = 0;
+  const { channel, agent, sessions, gw } = build(() => t);
+  await channel.receive(U1, "旧话题");
+  let finish!: (sent: boolean) => void;
+  channel.sendReminder = async () => { calls++; return new Promise(resolve => { finish = resolve; }); };
+  t += TIMEOUT;
+  const pending = gw["flushReminders"]();
+  await waitUntil(() => calls === 1, "reminder attempt");
+  await gw["flushReminders"]();
+  assert.equal(calls, 1);
+  await channel.receive(U1, "提醒发送过程中我已回来");
+  assert.equal(agent.calls.at(-1)!.resume, "sess-1");
+  finish(true); await pending;
+  assert.equal(sessions.snapshot()[U1]?.reminded, false, "旧闲置周期的确认不能让刚恢复的会话失效");
+  assert.equal(sessions.decide(U1).resumeSessionId, "sess-1");
+});
+
+test("前台回合仍在执行时不按上次回合结束时间发送超时提醒", async () => {
+  let t = 1_000_000;
+  const { channel, agent, sessions, gw } = build(() => t);
+  await channel.receive(U1, "开始");
+  let finish!: () => void;
+  agent.gate = new Promise(resolve => { finish = resolve; });
+  const busy = channel.receive(U1, "长任务");
+  await waitUntil(() => agent.calls.length === 2, "active turn");
+  t += TIMEOUT * 2;
+  await gw["flushReminders"]();
+  assert.ok(!channel.sent.some(m => m.kind === "reminder"));
+  finish(); await busy;
+  assert.equal(sessions.decide(U1).resumeSessionId, "sess-1");
+});
+
+test("来信仍在聚合窗口时，迟到提醒确认和定时轮询都不能让它切到新会话", async () => {
+  let t = 1_000_000;
+  const { channel, agent, gw, settings } = build(() => t);
+  await channel.receive(U1, "原会话");
+  t += TIMEOUT;
+  let calls = 0, finish!: (sent: boolean) => void;
+  channel.sendReminder = async () => { calls++; return new Promise(resolve => { finish = resolve; }); };
+  const attempt = gw["flushReminders"]();
+  await waitUntil(() => calls === 1, "reminder start");
+  settings.set({ messageAggregationMs: 30 });
+  const incoming = channel.receive(U1, "还在聚合的追加消息");
+  finish(true); await attempt;
+  await gw["flushReminders"]();
+  assert.equal(calls, 1, "已收到来信但尚未开跑时也不能再提醒");
+  await incoming;
+  assert.equal(agent.calls.at(-1)!.resume, "sess-1");
 });
 
 // --- 多用户隔离 ---

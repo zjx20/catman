@@ -116,6 +116,9 @@ export interface Channel {
    */
   send(userKey: string, text: string, kind?: SendKind): Promise<string | void>;
 
+  /** Immediate timeout reminder: true only after actual delivery, never queued. */
+  sendReminder?(userKey: string, text: string): Promise<boolean>;
+
   /**
    * 可选:告诉用户「对方正在输入」。`on=false` 熄灭。
    *

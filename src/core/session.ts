@@ -1,9 +1,9 @@
 /**
  * 会话状态机 —— 核心规则:
  *  - 距上次活动 < 超时(默认 1h)→ 继续当前会话
- *  - 超时后开新会话;想续上就先 touch()
+ *  - 超时且提醒已实际发出后开新会话;未提醒就继续旧会话
  *  - touch() 把会话当作刚刚活动过 —— `/继续` 就是这么消化的,不必起任何回合
- *  - 超时到点推送一次提醒(reminded 标记防重复)
+ *  - 超时到点尝试提醒,发送确认绑定具体会话及闲置周期
  *  - 离开的会话不丢:归档进每用户的 history(新→旧,上限 HISTORY_LIMIT),
  *    switchTo() 按 id 前缀切回其中一段 —— 微信只有一个聊天窗,这是唯一的
  *    「多话题并行」出路
@@ -36,6 +36,8 @@ export interface UserState {
   current?: SessionRef;
   /** 当前空闲周期内是否已推送过超时提醒。 */
   reminded: boolean;
+  /** Actual channel delivery; an old reminded=true alone is not delivery evidence. */
+  reminderDelivery?: { sessionId: string; lastActive: number; sentAt: number };
   /**
    * 这个用户最近一次被告知过的 release sha(全长)。见 gateway 的懒注入。
    *
@@ -79,6 +81,8 @@ export interface Decision {
   isNew: boolean;
   /** 需要恢复的会话 id(isNew 为 false 时有值)。 */
   resumeSessionId?: string;
+  /** 已实际提醒过、现在将离开的旧会话。 */
+  expiredSession?: SessionRef;
 }
 
 
@@ -142,7 +146,7 @@ export class SessionManager {
     let dropped = 0;
     for (const [userKey, st] of Object.entries(this.store.load())) {
       // 不是合法 userKey、或形态对不上的条目直接丢弃(例如旧版本的存储格式)。
-      // 本程序不认识历史格式,也不迁移它 —— 丢掉一段最多 1 小时的上下文,
+      // 本程序不认识历史格式,也不迁移它 —— 丢掉无法识别的会话引用,
       // 换取代码里没有任何格式分支。
       if (!parseUserKey(userKey) || !isUserState(st)) {
         dropped += 1;
@@ -164,18 +168,32 @@ export class SessionManager {
    * 决定 resume 还是新开会话。纯读,不改状态。
    * 状态的更新在 agent 跑完拿到真实 sessionId 后由 record() 完成。
    *
-   * 规则只有一条 —— **未超时就续上**。`/继续` 不需要在这里露面:它由网关的
-   * 分拣节点用 `touch()` 消化,把时钟拨到现在,后面的话自然命中"未超时"。
+   * 规则是 —— **未确认超时就续上**。`/继续` 不需要在这里露面:它由网关的
+   * 分拣节点用 `touch()` 消化,把时钟拨到现在并清除发送确认。
    * 一批消息按到达顺序线性处理,所以"先续上、后说话"的先后是天然成立的,
    * 不必把"用户说了 /继续"这件事一路传到状态机里来。
    */
   decide(userKey: string): Decision {
-    const cur = this.states.get(userKey)?.current;
+    const st = this.states.get(userKey), cur = st?.current;
     if (!cur) return { isNew: true };
-    if (this.now() - cur.lastActive < this.timeoutFor(userKey)) {
+    if (this.now() - cur.lastActive < this.timeoutFor(userKey) || !this.reminderDelivered(st!)) {
       return { isNew: false, resumeSessionId: cur.sessionId };
     }
-    return { isNew: true };
+    return { isNew: true, expiredSession: cloneRef(cur) };
+  }
+
+  private reminderDelivered(st: UserState): boolean {
+    const proof = st.reminderDelivery;
+    return st.reminded && !!st.current && proof?.sessionId === st.current.sessionId && proof.lastActive === st.current.lastActive && Number.isFinite(proof.sentAt);
+  }
+
+  /** A late receipt must not expire a different session or a newly active idle cycle. */
+  markReminderDelivered(userKey: string, expected: SessionRef): boolean {
+    const st = this.states.get(userKey), cur = st?.current;
+    if (!cur || cur.sessionId !== expected.sessionId || cur.lastActive !== expected.lastActive || this.now() - cur.lastActive < this.timeoutFor(userKey)) return false;
+    st!.reminded = true;
+    st!.reminderDelivery = { sessionId: cur.sessionId, lastActive: cur.lastActive, sentAt: this.now() };
+    this.persist(); return true;
   }
 
   /** 该用户当前的空闲时长(ms);没有当前会话返回 undefined。供 /状态 使用。 */
@@ -330,7 +348,7 @@ export class SessionManager {
       // 偏偏这是超时之后最常走的一条路:那段会话在 /切换会话 的清单里排在最上面,
       // 还标着「(当前)」—— 想接着聊的人自然就切它。真机上踩到过,人以为切回去了,
       // 实际在跟一段空白上下文说话。
-      const revived = this.now() - st.current.lastActive >= this.timeoutFor(userKey);
+      const revived = this.decide(userKey).isNew;
       st.current.lastActive = this.now();
       st.reminded = false;
       this.persist();
@@ -365,22 +383,17 @@ export class SessionManager {
   }
 
   /**
-   * 返回本轮到点、且尚未提醒过的用户列表,并把它们标记为已提醒。
-   * 运行时按固定间隔调用,对返回的每个用户尝试推送超时提醒。
+   * 只返回待提醒用户。尝试或排队均不改变会话状态,必须收到实际发送确认。
    */
   dueReminders(): string[] {
     const due: string[] = [];
     const t = this.now();
-    let changed = false;
     for (const [userKey, st] of this.states) {
       if (!st.current) continue; // 只有历史、没有进行中会话的用户没什么可提醒的
-      if (!st.reminded && t - st.current.lastActive >= this.timeoutFor(userKey)) {
-        st.reminded = true;
+      if (!this.reminderDelivered(st) && t - st.current.lastActive >= this.timeoutFor(userKey)) {
         due.push(userKey);
-        changed = true;
       }
     }
-    if (changed) this.persist();
     return due;
   }
 

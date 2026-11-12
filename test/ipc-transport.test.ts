@@ -150,6 +150,15 @@ test("正常 send 把信封原样交给信使,并把剩余额度带回来", asyn
   });
 });
 
+test("旧信使没有提醒发送确认端点时不回退到仅表示排队的 /send", async () => {
+  await withServer(async (client, api) => {
+    const result = await client.sendReminder("wechat:a:u", "idle notice");
+    assert.equal(result.ok, false);
+    assert.equal(api.sends.length, 0);
+    assert.equal((await client.send("wechat:a:u", "normal reply", "body")).ok, true);
+  });
+});
+
 test("长轮询挂着时 stop() 也要能收摊 —— 否则进程卡在优雅关闭里出不去", async () => {
   // dashboard 的 SSE 踩过一模一样的坑(已实测复现):server.close() 会一直等长连接,
   // 不先中止在飞请求,close 的回调永远不触发。

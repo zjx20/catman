@@ -643,6 +643,7 @@ export class Gateway {
   private readonly semaphore: Semaphore;
 
   private reminderTimer?: NodeJS.Timeout;
+  private readonly reminding = new Map<string, { cancelled: boolean }>();
   private deployNewsTimer?: NodeJS.Timeout;
   /**
    * 主动播报的串行链。定时器与用户开口这两条路径都会去播同一批消息 ——
@@ -765,6 +766,8 @@ export class Gateway {
    * 收成一个方法之后两边共用同一份,想岔都岔不了。
    */
   onIncoming(msg: IncomingMessage): Accepted {
+    const reminder = this.reminding.get(msg.userKey);
+    if (reminder) reminder.cancelled = true;
     const current = this.sessions.currentOf(msg.userKey);
     const context = current && this.execution?.contexts.bySession(msg.userKey, current.sessionId);
     if (context) this.execution!.runtimes.activity(context.id);
@@ -923,13 +926,11 @@ export class Gateway {
       .finally(() => {
         this.queued -= 1;
       });
-    this.queues.set(
-      userKey,
-      sorted.then(
-        () => {},
-        () => {},
-      ),
-    );
+    const tail = sorted.then(() => {}, () => {});
+    this.queues.set(userKey, tail);
+    // Keep only active sorting chains; reminders must also wait for queued input,
+    // including the gap before a turn is minted or a batch finishes its prelude.
+    void tail.then(() => { if (this.queues.get(userKey) === tail) this.queues.delete(userKey); });
     return sorted.then(async (turns) => {
       await Promise.all(turns);
     });
@@ -1606,7 +1607,7 @@ export class Gateway {
       current === undefined || idle === undefined
         ? "会话:还没有进行中的对话,下一条消息开新的"
         : `会话:${shortSessionId(current.sessionId)},${humanDuration(idle)}前活动过,下一条消息${
-            idle < p.sessionTimeoutMs ? "接着聊" : `开新对话(想续上就发 ${canonicalOf("continue")})`
+            !this.sessions.decide(userKey).isNew ? "接着聊" : `开新对话(想续上就发 ${canonicalOf("continue")})`
           }`,
       ...(historyCount
         ? [`旧对话:${historyCount} 段(发 ${canonicalOf("switchSession")} 可列出并切换)`]
@@ -1780,6 +1781,14 @@ export class Gateway {
     // 回执在排队之前发:并发受限时用户可能要等一会儿,先让他知道消息收到了。
     const ackId = prefs.ackEnabled ? await this.trySendAck(userKey, ACK_TEXT) : undefined;
     if (ackId !== undefined) ackIds.push(ackId);
+
+    if (decision.expiredSession) {
+      const expired = decision.expiredSession;
+      await this.trySend(userKey, [
+        `上一会话 ${inlineCode(shortSessionId(expired.sessionId))} 已空闲约 ${Math.round((this.now() - expired.lastActive) / 60_000)} 分钟（超时设置 ${Math.round(prefs.sessionTimeoutMs / 60_000)} 分钟），且已发过超时提醒；这条消息已开启新会话。`,
+        "要继续刚才的话题，发送：", codeBlock(`${canonicalOf("switchSession")} ${shortSessionId(expired.sessionId)}`),
+      ].join("\n\n"), "会话切换说明", "announce");
+    }
 
     const isAdmin = this.settings.isAdmin(userKey);
     const hint = sessionHint(text, attachments.length > 0);
@@ -2099,23 +2108,24 @@ export class Gateway {
     }
   }
 
-  /** 到点提醒:尝试主动推送;推送失败(如渠道不支持)则静默降级。 */
+  /** The deadline only makes a reminder eligible; confirmed delivery allows rotation. */
   private async flushReminders(): Promise<void> {
-    for (const userKey of this.sessions.dueReminders()) {
-      // dueReminders 只返回有当前会话的用户;这里再判一次纯属防御。
+    await Promise.all(this.sessions.dueReminders().map(async userKey => {
+      if (this.reminding.has(userKey) || this.pending.has(userKey) || this.queues.has(userKey) || this.turns.foregroundFor(userKey)) return;
       const current = this.sessions.currentOf(userKey);
-      if (!current) continue;
-      const ok = await this.trySend(
-        userKey,
-        reminderText(shortSessionId(current.sessionId)),
-        "超时提醒",
-        "reminder",
-      );
-      if (!ok) {
-        // 渠道无法主动推送:降级为下次用户发消息时由会话规则处理,无需额外动作。
-        console.info(`[gateway] 用户 ${userKey} 超时提醒推送失败,降级为下次消息提示`);
-      }
-    }
+      if (!current) return;
+      const attempt = { cancelled: false };
+      this.reminding.set(userKey, attempt);
+      try {
+        const text = reminderText(shortSessionId(current.sessionId));
+        let sent: boolean;
+        if (this.channel.sendReminder) sent = await this.channel.sendReminder(userKey, text);
+        else { await this.channel.send(userKey, text, "reminder"); sent = true; }
+        if (sent && !attempt.cancelled && !this.turns.foregroundFor(userKey)) this.sessions.markReminderDelivered(userKey, current);
+        if (!sent) console.info(`[gateway] ${userKey} 超时提醒未实际发送，保留原会话`);
+      } catch (error) { console.warn(`[gateway] ${userKey} 超时提醒失败，保留原会话：${String(error)}`); }
+      finally { this.reminding.delete(userKey); }
+    }));
   }
 
   /**

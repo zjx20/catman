@@ -79,6 +79,16 @@ test("send 把 kind 原样转给子渠道 —— 少一个形参就是预算账�
   );
 });
 
+test("复合渠道保留即时提醒的真实确认，不用普通 send 的队列接受替代", async () => {
+  const wechat = Object.assign(new Fake("wechat"), { sendReminder: async () => false });
+  const dashboard = new Fake("dashboard");
+  const composite = new CompositeChannel([wechat, dashboard]);
+  assert.equal(await composite.sendReminder("wechat:acct:u1", "idle"), false);
+  assert.equal(wechat.sent.length, 0);
+  assert.equal(await composite.sendReminder("dashboard:admin:admin", "idle"), true);
+  assert.equal(dashboard.sent.length, 1);
+});
+
 test("未知渠道前缀报错,而不是发给随便某个渠道", async () => {
   const c = new CompositeChannel([new Fake("wechat")]);
   await assert.rejects(() => c.send("telegram:acct:u1", "x"), /没有能处理/);

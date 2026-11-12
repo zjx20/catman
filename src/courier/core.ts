@@ -327,6 +327,12 @@ export class CourierCore implements CourierApi {
     await this.ack(persona, msgIds);
   }
 
+  async sendReminder(persona: PersonaId, out: unknown): Promise<SendResult> {
+    const env = parseOutbound(out);
+    if (!env || env.kind !== "reminder" || this.opts.routing.personaFor(env.userKey) !== persona) return { schema: IPC_SCHEMA, ok: false, remainingProgress: 0, reason: "提醒身份或路由无效" };
+    return { schema: IPC_SCHEMA, ok: await this.outbox.sendReminder(env.userKey, env.text), remainingProgress: this.opts.replies.remainingSends(env.userKey) };
+  }
+
   async send(persona: PersonaId, out: unknown): Promise<SendResult> {
     const env = parseOutbound(out);
     if (!env) {

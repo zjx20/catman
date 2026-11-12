@@ -35,6 +35,7 @@ export interface CourierApi {
   /** 人格读不懂这些消息。计入投递失败并亮红灯 —— 契约漂移必须是红灯,不能是静默。 */
   nack(persona: PersonaId, msgIds: readonly string[], reason: string): Promise<void>;
   send(persona: PersonaId, out: unknown): Promise<SendResult>;
+  sendReminder?(persona: PersonaId, out: unknown): Promise<SendResult>;
   /** 账号管理等控制面,供人格 dashboard 代理。 */
   admin(persona: PersonaId, method: string, path: string, body: unknown): Promise<AdminResponse>;
   /** 人格报「这一轮还在动」。信使据此维持微信那边的输入气泡。 */
@@ -117,6 +118,12 @@ export async function handleIpc(
         };
       }
       return { status: 200, body: await api.send(persona, out) };
+    }
+    case "POST /reminder": {
+      if (!api.sendReminder) return { status: 404, body: { ok: false, reason: "信使不支持实际发送确认" } };
+      const out = parseOutbound(body);
+      if (!out || out.kind !== "reminder") return { status: 400, body: { schema: IPC_SCHEMA, ok: false, reason: "只接受超时提醒" } };
+      return { status: 200, body: await api.sendReminder(persona, out) };
     }
     case "POST /typing": {
       const t = parseTyping(body);

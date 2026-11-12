@@ -187,6 +187,13 @@ export class Outbox {
     }
   }
 
+  /** A timeout reminder must not arrive late from the queue after the user resumes. */
+  async sendReminder(userKey: string, text: string): Promise<boolean> {
+    if (!this.running || this.depth(userKey) || this.pumping.has(userKey)) return false;
+    try { await this.opts.deliver(userKey, text, "reminder"); return true; }
+    catch { return false; }
+  }
+
   /**
    * 一条消息被渠道拒了、已经入队 —— 判断是不是额度的事,是就当场说提示。
    *

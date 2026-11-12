@@ -63,6 +63,12 @@ export class CompositeChannel implements Channel {
     return this.route(userKey).send(userKey, text, kind);
   }
 
+  async sendReminder(userKey: string, text: string): Promise<boolean> {
+    const target = this.route(userKey);
+    if (target.sendReminder) return target.sendReminder(userKey, text);
+    await target.send(userKey, text, "reminder"); return true;
+  }
+
   /** 把各成员的自述摊平。不实现 health() 的成员不出现 —— 不替它编一个健康状态。 */
   health(): readonly ChannelHealth[] {
     return [...this.byName.values()].flatMap((c) => c.health?.() ?? []);

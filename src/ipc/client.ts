@@ -43,6 +43,7 @@ export interface CourierLink {
   ack(msgIds: readonly string[]): Promise<void>;
   nack(msgIds: readonly string[], reason: string): Promise<void>;
   send(userKey: string, text: string, kind: SendKind): Promise<SendResult>;
+  sendReminder?(userKey: string, text: string): Promise<SendResult>;
   /** 报一次「还在动」。可选:没有它的实现只是不亮输入气泡,别的照常。 */
   typing?(userKey: string): Promise<void>;
 }
@@ -96,6 +97,14 @@ export class IpcClient implements CourierLink {
     const parsed = parseSendResult(r.body);
     // 读不懂信使的回复时按"没发出去、也没有额度"处理:**宁可少发,不可超发**。
     return parsed ?? { schema: IPC_SCHEMA, ok: false, remainingProgress: 0, reason: "信使的回复读不懂" };
+  }
+
+  async sendReminder(userKey: string, text: string): Promise<SendResult> {
+    // A separate endpoint prevents old couriers' queue-accepted /send replies being
+    // mistaken for delivery. Missing endpoint or ambiguous reply means no timeout.
+    const r = await this.post("/reminder", { schema: IPC_SCHEMA, userKey, kind: "reminder", text });
+    const parsed = parseSendResult(r.body);
+    return r.status === 200 && parsed ? parsed : { schema: IPC_SCHEMA, ok: false, remainingProgress: 0, reason: "信使没有确认提醒已实际发出" };
   }
 
   /**

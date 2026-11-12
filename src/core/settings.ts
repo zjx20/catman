@@ -300,7 +300,7 @@ export const SETTING_SCHEMA: Schema = {
   sessionTimeoutMs: intDef(
     "user",
     "会话超时",
-    "安静超过这个时长后,下一条消息默认开新对话。",
+    "安静达到这个时长后尝试提醒；提醒实际发出后，下一条消息默认开新对话。",
     HOUR,
     MINUTE,
     7 * DAY,
