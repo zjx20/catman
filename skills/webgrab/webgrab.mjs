@@ -103,6 +103,7 @@ function runCurl(configLines) {
       body: r.stdout,
       stderr: (r.stderr || '').toString(),
       exit: r.status,
+      headers,
     }
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -311,18 +312,39 @@ function cnbConfigOrDie() {
 }
 
 /** 网关只认 Authorization 头(/healthz 除外)。token 走 --config,不进 argv。 */
-function cnbCurl(c, { path, post, body, out, timeout }) {
+function cnbCurl(c, { path, post, method, body, out, timeout, headers, dataFile }) {
   const cfg = [
     `url = ${q(c.url + path)}`,
     `header = ${q(`Authorization: Bearer ${c.token}`)}`,
     `max-time = ${timeout || 180}`,
   ]
-  if (post) cfg.push('request = "POST"')
+  const verb = method || (post ? 'POST' : 'GET')
+  if (verb !== 'GET') cfg.push(`request = ${q(verb)}`)
+  for (const h of headers || []) cfg.push(`header = ${q(h)}`)
   if (body !== undefined) {
     cfg.push(`header = ${q('Content-Type: application/json')}`, `data = ${q(body)}`)
   }
+  if (dataFile !== undefined) cfg.push(`data-binary = ${q('@' + dataFile)}`)
   if (out) cfg.push(`output = ${q(out)}`)
   return runCurl(cfg)
+}
+
+// profile id 与服务端同一条规则(profile_store.PROFILE_ID_RE),先在本地挡掉。
+const CNB_PROFILE_ID = /^[A-Za-z0-9_-]{1,64}$/
+
+function cnbProfileId(opt) {
+  if (opt.profile === undefined) return null
+  if (typeof opt.profile !== 'string' || !CNB_PROFILE_ID.test(opt.profile)) {
+    die(`--profile 只允许 A-Z a-z 0-9 _ -,长度 1-64:${opt.profile}`)
+  }
+  return opt.profile
+}
+
+/** 不带 profile 走原有形态;带 id 时每次请求都显式落到 /profiles/{id}/... */
+function cnbPagePath(opt, rest) {
+  const id = cnbProfileId(opt)
+  if (!id) return rest
+  return `/profiles/${id}${rest === '/' ? '/api' : rest}`
 }
 
 function tryParse(s) {
@@ -374,18 +396,26 @@ function cnbFail(r, j) {
   }
   if (r.status === 403) die(`403 网关策略挡下了(别重试,换做法): ${err}`, 2)
   if (r.status === 502) die(`502 网关调不动云平台,不是你能修的: ${err}`, 2)
+  if (r.status === 413) die(`413 归档超过 64MB 上限:${err}。清掉浏览器缓存再导出,或让维护者调大上限`, 2)
+  if (r.status === 400) {
+    const hint = /archive|profile/i.test(err)
+      ? '(归档必须是本网关导出的 tar.gz:manifest 格式版本、路径穿越、符号链接、sha256 不符都会被拒;原有 profile 不受影响)'
+      : ''
+    die(`400 ${err}${hint}`, 2)
+  }
   die(`HTTP ${r.status}: ${err}`, 2)
 }
 
 /** 发一个浏览器动作。撞上「空间没起来」就自动拉起再来一次。 */
 function cnbAction(c, bodyObj, opt, tolerant) {
   const body = JSON.stringify(bodyObj)
-  let r = cnbCurl(c, { path: '/', post: true, body, timeout: opt.timeout })
+  const path = cnbPagePath(opt, '/')
+  let r = cnbCurl(c, { path, post: true, body, timeout: opt.timeout })
   let j = tryParse(r.body)
   if (r.status === 503 || (j && /WORKSPACE_(STARTING|UNREACHABLE)/.test(j.error || ''))) {
     process.stderr.write('[空间未就绪,先拉起]\n')
     cnbStart(c)
-    r = cnbCurl(c, { path: '/', post: true, body, timeout: opt.timeout })
+    r = cnbCurl(c, { path, post: true, body, timeout: opt.timeout })
     j = tryParse(r.body)
   }
   if (r.status >= 400 || !j) cnbFail(r, j)
@@ -499,18 +529,97 @@ function cnbEmit(text, opt) {
   } else process.stdout.write(text.endsWith('\n') ? text : text + '\n')
 }
 
+/** 非动作类请求(profile 管理)。遇到空间没起来同样自动拉起一次再重试。 */
+function cnbCall(c, req, opt) {
+  let r = cnbCurl(c, { ...req, timeout: opt.timeout })
+  let j = tryParse(r.body)
+  if (r.status === 503 || (j && /WORKSPACE_(STARTING|UNREACHABLE)/.test(j.error || ''))) {
+    process.stderr.write('[空间未就绪,先拉起]\n')
+    cnbStart(c)
+    r = cnbCurl(c, { ...req, timeout: opt.timeout })
+    j = tryParse(r.body)
+  }
+  return { r, j }
+}
+
+/** profile 管理:create/start/stop/delete/export/import。列表用 `cnb profiles`。 */
+function cmdCnbProfile(c, pos, opt) {
+  const action = pos[0] || die('缺 profile 动作;可用: create start stop delete export import')
+  const id = pos[1] || die(`缺少 profile id;例:webgrab cnb profile ${action} work`)
+  if (!CNB_PROFILE_ID.test(id)) die(`profile id 只允许 A-Z a-z 0-9 _ -,长度 1-64:${id}`)
+  const base = `/profiles/${id}`
+
+  if (action === 'create') {
+    const { r, j } = cnbCall(c, { path: '/profiles', post: true, body: JSON.stringify({ id }) }, opt)
+    if (r.status >= 400 || !j) cnbFail(r, j)
+    return void cnbEmit(JSON.stringify(j, null, 2), opt)
+  }
+  if (action === 'start' || action === 'stop') {
+    const { r, j } = cnbCall(c, { path: `${base}/${action}`, post: true }, opt)
+    if (r.status >= 400 || !j) cnbFail(r, j)
+    return void cnbEmit(JSON.stringify(j, null, 2), opt)
+  }
+  if (action === 'delete') {
+    const { r, j } = cnbCall(c, { path: base, method: 'DELETE' }, opt)
+    if (r.status >= 400 || !j) cnbFail(r, j)
+    return void cnbEmit(JSON.stringify(j, null, 2), opt)
+  }
+  if (action === 'export') {
+    if (!opt.out) die('export 要落盘,必须给 --out <文件.tar.gz>')
+    const { r } = cnbCall(c, { path: `${base}/archive`, out: opt.out }, opt)
+    if (r.status >= 400) {
+      // 错误体也写进了同一个文件,读出来再删掉,别留个假归档
+      let detail = ''
+      try {
+        detail = readFileSync(opt.out, 'utf8').slice(0, 400)
+      } catch {}
+      rmSync(opt.out, { force: true })
+      cnbFail(r, tryParse(detail))
+    }
+    const h = r.headers || ''
+    const sha = /^x-archive-sha256:\s*(\S+)/im.exec(h)?.[1]
+    const bytes = /^x-archive-bytes:\s*(\S+)/im.exec(h)?.[1]
+    process.stderr.write(`→ ${opt.out}${sha ? `  sha256=${sha}` : ''}${bytes ? `  ${bytes} bytes` : ''}\n`)
+    process.stderr.write('[归档隐含 stop:返回后这个 profile 已停止,下次带 id 的请求会自动重新拉起]\n')
+    return
+  }
+  if (action === 'import') {
+    const input = opt.in
+    if (!input) die('import 需要 --in <文件.tar.gz>')
+    if (!existsSync(input)) die(`文件不存在:${input}`)
+    const headers = ['Content-Type: application/gzip']
+    if (opt.sha256) headers.push(`X-Archive-Sha256: ${opt.sha256}`)
+    const { r, j } = cnbCall(c, { path: `${base}/archive`, method: 'PUT', dataFile: input, headers }, opt)
+    if (r.status >= 400 || !j) cnbFail(r, j)
+    return void cnbEmit(JSON.stringify(j, null, 2), opt)
+  }
+  die(`未知 profile 动作 ${action};可用: create start stop delete export import`)
+}
+
 function cmdCnb(sub, pos, opt) {
   const c = cnbConfigOrDie()
 
   if (sub === 'start') {
     const j = cnbStart(c)
-    return void cnbEmit(JSON.stringify(j, null, 2), opt)
+    const id = cnbProfileId(opt)
+    if (!id) return void cnbEmit(JSON.stringify(j, null, 2), opt)
+    // 空间就绪后再显式预热目标 profile。不带这一步也行(带 id 的请求会懒启动),
+    // 但单独调 start 能更早暴露「这个 profile 起不来」。
+    const { r, j: p } = cnbCall(c, { path: `/profiles/${id}/start`, post: true }, opt)
+    if (r.status >= 400) cnbFail(r, p)
+    return void cnbEmit(JSON.stringify({ workspace: j, profile: (p || {}).profile ?? p }, null, 2), opt)
   }
   if (sub === 'status') {
     const r = cnbCurl(c, { path: '/gw/status', timeout: 60 })
     if (r.status >= 400) cnbFail(r, tryParse(r.body))
     return void cnbEmit(String(r.body), opt)
   }
+  if (sub === 'profiles') {
+    const { r, j } = cnbCall(c, { path: '/profiles' }, opt)
+    if (r.status >= 400 || !j) cnbFail(r, j)
+    return void cnbEmit(JSON.stringify(j, null, 2), opt)
+  }
+  if (sub === 'profile') return void cmdCnbProfile(c, pos, opt)
   if (sub === 'do') {
     // 原样透传一个动作 JSON。'-' 读 stdin,'@f' 读文件 —— 长脚本别塞进 argv。
     let raw = pos[0] || die('缺动作 JSON;例:webgrab cnb do \'{"action":"get_page_info"}\'')
@@ -588,7 +697,7 @@ function cmdCnb(sub, pos, opt) {
     const which = opt.desktop ? 'desktop' : 'browser'
     const wh = opt.wh || '512' // 全分辨率图非常费 token,默认缩到 512
     const r = cnbCurl(c, {
-      path: `/screenshot/${which}?whLargest=${encodeURIComponent(wh)}`,
+      path: cnbPagePath(opt, `/screenshot/${which}?whLargest=${encodeURIComponent(wh)}`),
       out: opt.out,
       timeout: opt.timeout,
     })
@@ -605,7 +714,7 @@ const HELP = `webgrab —— 抓直接 curl 抓不到的网页
   webgrab plain <url> [--ua S] [--noproxy] [--out F]
   webgrab jina  <url> [--plain] [--cache] [--out F]
   webgrab cf <action> <url> [选项]      (后备:无状态渲染,已不是首选)
-  webgrab cnb <start|text|html|shot|do|status> [url] [选项]
+  webgrab cnb <start|text|html|shot|do|status|profiles|profile> [url] [选项]
   webgrab actions                      列出 CF 的 action
 
 cf action: ${CF_ACTIONS.join(' ')}
@@ -628,6 +737,9 @@ cnb:  远程真实浏览器,有状态(cookie/登录态跨请求保留),串行,�
       --nav-timeout 30  --sel-timeout 15   两者相加要留在网关 ~60s 硬顶内
       --selector CSS 等元素;默认等 visible,命中隐藏元素会白等 → 加 --attached
       --settle N   取正文前再等 N 秒(懒加载列表用它,比猜 selector 省事)
+      --profile ID 落到 /profiles/{id}/…;不带就是内置默认 profile
+      profiles 列出全部 profile  profile <create|start|stop|delete|export|import> <id>
+      profile export <id> --out f.tar.gz(隐含 stop)  profile import <id> --in f [--sha256 S]
       goto 报 abort 不一定是失败(跳转链):脚本靠文档记号判,晚到会自动重取正文
       完整动作表: /runtime/bin/skills/webgrab/cnb-browser.md
 `
@@ -643,7 +755,7 @@ function parse(argv) {
       '--extra': 'extra', '--cookies': 'cookies',
       '--html': 'html', '--timeout': 'timeout', '--goto-timeout': 'timeoutMs',
       '--wh': 'wh', '--nav-timeout': 'navTimeout', '--sel-timeout': 'selTimeout',
-      '--settle': 'settle',
+      '--settle': 'settle', '--profile': 'profile', '--in': 'in', '--sha256': 'sha256',
     }
     const flags = {
       // kitesurf 是默认,所以 --kitesurf 留着只为向后兼容,是个空开关

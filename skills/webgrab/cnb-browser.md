@@ -1,6 +1,6 @@
 > 这是 skill **webgrab** 的 `cnb` 通道的完整动作参考,不是独立 skill。
 > 什么时候该用它、怎么起手,看 [SKILL.md](SKILL.md);这里是动作表和坑。
-> 命令行封装:`webgrab cnb <start|status|text|html|shot|do>`,
+> 命令行封装:`webgrab cnb <start|status|text|html|shot|do|profiles|profile>`,
 > 它替你带 token、撞上冷启动自动重试、run_script 的两层 success 也替你判过了。
 
 
@@ -15,6 +15,10 @@
 ```
 
 网关做三件事：按需把开发空间拉起来（空间不是常驻的）、校验你的令牌、拦掉一部分危险动作。你只需要跟网关说话。
+
+空间内还有一个 `profile-manager`（监听 8080、只绑回环）：它按 profile id 把请求转发到各自的
+浏览器进程，并负责归档的打包/解包。**一个 profile = 一个进程 = 一份用户目录 = 一个 X display**，
+所以多 profile 用的是多进程，不是在一个进程里切目录。
 
 ## 什么时候用它
 
@@ -89,6 +93,71 @@ P '{"action":"get_text"}'
 ```
 
 浏览器是**有状态且长期存活**的：cookie、登录态、打开的标签页会一直保留到空间被回收，下一个请求接着用。不需要每次重新登录。
+
+## 用 profile 保存 / 恢复登录态
+
+空间被回收后浏览器状态归零。要跨空间保留登录态，用 **profile**：一份完整的 Firefox
+用户配置目录（cookie、localStorage、IndexedDB、登录态、指纹配置）。归档文件由**调用方自己保管**，
+网关只负责打包和接收。
+
+- **不带 profile id** 就是前面这套原有形态（`POST /`、`/mcp/`），落在内置默认 profile。
+- **带 profile id** 时每个请求都显式指定。不存在「激活某个 profile 之后所有操作都落它下面」
+  的全局状态，所以多个 profile 可以并行。
+- 第一次带某个 id 的请求会**懒启动**对应的浏览器进程（有已上传的归档就用归档，没有就起空目录），
+  不必先 `start`。空间重建后也是「上传归档 → 直接带 id 操作」，登录态就回来了。
+
+```bash
+# 带 profile 干活：--profile 接在任何 cnb 子命令后面
+"$WG" cnb start --profile work --timeout 180          # 可选：提前暴露启动失败
+"$WG" cnb do '{"action":"goto","url":"https://example.com/login"}' --profile work
+"$WG" cnb text https://example.com/account --profile work --out account.txt
+"$WG" cnb shot --profile work --out page.png
+
+# 管理
+"$WG" cnb profiles                                    # 列出全部 profile 及 running / port / hasArchive / manifest
+"$WG" cnb profile create work
+"$WG" cnb profile stop work                           # 幂等
+"$WG" cnb profile delete work                         # 停止并删除目录
+
+# 导出 / 恢复（归档文件自己保管）
+"$WG" cnb profile export work --out work.tar.gz       # 隐含 stop，返回后 work 必然已停
+"$WG" cnb profile import work --in work.tar.gz --sha256 <export 报出的值>
+```
+
+**接口与语义**（wrapper 背后就是这些，出问题时对照）：
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/profiles` | 列表。内置默认 profile 的 `id` 是 `null`、`builtin: true` |
+| POST | `/profiles` | 新建空 profile，body `{"id":"work"}` 或 `?id=work`；返回 201 |
+| POST | `/profiles/{id}/start` | 显式预热（不存在会自动创建） |
+| POST | `/profiles/{id}/stop` | 幂等停止 |
+| DELETE | `/profiles/{id}` | 停止并删除目录，返回 `{"id":"work","deleted":true}` |
+| GET | `/profiles/{id}/archive` | **隐含 stop** 后导出 tar.gz |
+| PUT | `/profiles/{id}/archive` | 上传归档；id 不存在会自动创建，已运行会先停 |
+| POST | `/profiles/{id}/api` | 就是原来的 `POST /` 动作协议 |
+| GET/POST/DELETE | `/profiles/{id}/mcp/` | 每个 profile 独立的 MCP 会话 |
+| GET | `/profiles/{id}/state`、`/health`、`/screenshot/{browser,desktop}` | 透传 |
+
+注意：
+
+- **`archive` 返回后进程一定停了**：manager 要先停浏览器再打包，否则 sqlite/WAL 可能写到一半。
+  下一次带 id 的请求会自动重新拉起。
+- 归档的响应头带 `x-archive-sha256`、`x-archive-format`、`x-archive-bytes`、`x-profile-stopped`。
+  上传时带 `X-Archive-Sha256` 可让服务端校验完整性；对不上就是 400。
+- 归档是 **tar.gz**，根目录一份 `cnb-browser-manifest.json`（`format=cnb-browser-profile-v1`、
+  profile id、导出时间、上游提交、Camoufox 版本、文件数、解压后大小）。
+- 限制：压缩包 ≤ 64MB（超了 `413 ARCHIVE_TOO_LARGE`），解压后 ≤ 512MB，文件数 ≤ 20000。
+  路径穿越、符号链接、缺 manifest、格式版本不对都会被 400 拒绝，且**原有 profile 不受影响**
+  （先解到临时目录再原子替换）。
+- **归档是明文的会话凭据**：别提交到仓库、别贴日志；有网关 token 就能导出任意 profile。
+- **并发度调低**：一个 profile = 一个浏览器进程 = 一份 X display。空间 4 核 8GB，
+  同时只操作 1-2 个，用完 `stop`，开多了会 OOM。
+- **VNC(5900) 只显示内置默认 profile**；命名 profile 只能靠截图动作调试。
+- profile id 只能是 `A-Z a-z 0-9 _ -`，最长 64 字符。`start`/`stop`/`delete`/导出一个
+  不存在的 profile 返回 404；页面操作（`/api`、`/state`、截图等）则会自动创建并拉起。
+- `hasArchive` 表示这个 profile 目录里有 manifest（即由上传的归档解出来的），**不是**「导出过」。
+  导出只把 manifest 打进归档文件，目录本身不变。
 
 ## 动作参考
 
@@ -295,7 +364,9 @@ P '{
 | `503 WORKSPACE_STARTING` | 空间正在拉起，`stage` 是当前阶段 | 等十几秒重试，直到成功。冷启动一百多秒是正常的 |
 | `503 WORKSPACE_UNREACHABLE` | 空间中途没了 | 直接重试；网关会自动重新发现或拉起 |
 | `502 CNB_API_*` | 网关调不动云平台 | 不是你能修的，报告给维护的人 |
-| `404 NOT_FOUND` | 路径不在白名单 | 转发到浏览器的只有 `/`、`/state`、`/health`、`/screenshot/browser`、`/screenshot/desktop`；`/healthz` 和 `/gw/*` 由网关自己处理，不进浏览器 |
+| `404 NOT_FOUND` | 路径不在白名单，或 profile 不存在 | 原有形态只有 `/`、`/mcp/`、`/state`、`/health`、`/screenshot/browser`、`/screenshot/desktop`；profile 形态是 `/profiles` 与 `/profiles/{id}/...`（id 只能 `A-Za-z0-9_-`，≤64 字符）。`start`/`stop`/`delete`/导出不存在的 profile 也是 404——只有页面操作会自动创建。`/healthz` 和 `/gw/*` 由网关自己处理，不进浏览器 |
+| `413 ARCHIVE_TOO_LARGE` | profile 归档超过 64MB | 清掉浏览器缓存再导出，或让维护者调大上限 |
+| `400` + 归档错误 | 路径穿越 / 符号链接 / 缺 manifest / 格式版本不对 / sha256 对不上 / 解压后过大 | 重新导出一份干净的归档；原有 profile 不会被破坏 |
 | `success:false` + `error` | 动作本身失败（选择器没匹配到、超时……） | 先 `get_page_info` 看现在在哪一页，再 `get_interactive_elements` 看有什么能点 |
 | `goto` 报 `NS_ERROR_ABORT` / `NS_BINDING_ABORTED` | 导航被取消，**不代表页面没打开** | 先 `get_page_info`，URL 和标题对得上就当成功，别重试（见下） |
 | 外层 `success:true` 但 `run_script` 没效果 | 脚本里某一步失败了 | 看 `data.success` 和 `data.step_results` |
@@ -325,13 +396,15 @@ P '{
 
 ## 必须知道的几件事
 
-- **请求是串行的。** 浏览器一次只处理一个请求，并发发过去也是排队。想减少往返就用 `run_script`。
-- **状态跨请求保留，但不跨空间重建。** 空间被回收（长时间无人用，或到达运行时长上限）后重新拉起的是一个全新的浏览器：cookie、登录态、标签页全部归零。长流程做完及时把结果取走。
+- **请求是串行的。** 同一个浏览器进程一次只处理一个请求，并发发过去也是排队。想减少往返就用 `run_script`。不同 profile 是不同进程，可以并行，但**并发度建议低（1-2 个）**：每个 profile 都是一套独立的 Camoufox + Xvfb，空间只有 4 核 8GB，开多了会 OOM。
+- **状态跨请求保留，但不跨空间重建。** 空间被回收（长时间无人用，或到达运行时长上限）后重新拉起的是一个全新的浏览器：cookie、登录态、标签页全部归零。**要跨空间保留就用 profile 归档**（见「用 profile 保存 / 恢复登录态」），重建后上传归档即可恢复；不带 profile id 的默认浏览器仍然会归零。
 - **`get_text` 截断在 10000 字符。** 长页面用 `get_elements` 或 `eval` 精确取你要的那块，别指望一次拿全。
-- **文件出不来。** 下载的文件、录的屏都留在容器里，网关只能返回 JSON 和截图 PNG。
-- **不要用 MCP 端点。** 网关也转发 `/mcp/`，但这份说明覆盖的是 HTTP 接口，两者能力相同，混用只会让你困惑。
-- **令牌就是全部权限。** 拿到它的人能完全控制这个浏览器，也能停掉空间。不要把它写进代码、日志或提交里。
+- **普通文件还是出不来。** 下载的文件、录的屏都留在容器里，网关只能返回 JSON、截图 PNG，以及 **profile 归档**（`GET /profiles/{id}/archive`）。别把归档接口当通用文件下载用。
+- **不要用 MCP 端点。** 网关也转发 `/mcp/`（以及 `/profiles/{id}/mcp/`），但这份说明覆盖的是 HTTP 接口，两者能力相同，混用只会让你困惑。
+- **令牌就是全部权限。** 拿到它的人能完全控制这个浏览器、停掉空间，也能**导出任意 profile 的会话凭据**。不要把它写进代码、日志或提交里；归档文件本身也别提交或贴日志。
 
 ---
 
 动作语义来自上游项目 [psyb0t/docker-stealthy-auto-browse](https://github.com/psyb0t/docker-stealthy-auto-browse)（WTFPL），本文对着固定构建的 `87154cf` 核对过，并按网关的裁剪做了删改。上游完整动作表见该仓库 `.agents/skills/stealthy-auto-browse/SKILL.md`；本文没写的动作，网关同样会转发，但参数请以上游为准。
+
+profile 部分（`/profiles/*`、归档格式）上游没有，来自网关自己的 `profile-manager` / `profile_store`；上游侧只打了一个引入 `USER_DATA_DIR` 的小补丁，好让每个 profile 各起一个进程。

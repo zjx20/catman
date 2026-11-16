@@ -67,6 +67,44 @@ test("webgrab：CNB 动作使用秒，补齐不重试的导航参数，HTTP 错�
   assert.notEqual(status.code, 0); assert.match(status.stderr, /401/);
 });
 
+test("webgrab：--profile 落到 /profiles/{id}/…，导出接住归档响应头", async t => {
+  const f = await fixture(t); const requests: Array<{ method: string; path: string }> = [];
+  const server = createServer((req, res) => {
+    let raw = ""; req.on("data", d => { raw += d; }); req.on("end", () => {
+      requests.push({ method: req.method!, path: req.url! });
+      if (req.url === "/profiles") { res.setHeader("content-type", "application/json"); res.end('{"profiles":[]}'); return; }
+      if (req.url!.endsWith("/archive")) {
+        res.writeHead(200, { "x-archive-sha256": "deadbeef", "x-archive-bytes": "7" });
+        res.end("archive"); return;
+      }
+      res.setHeader("content-type", "application/json");
+      res.end('{"success":true,"data":{"ok":true}}');
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address(); assert.ok(address && typeof address !== "string");
+  const env = { CNB_BROWSER_URL: `http://127.0.0.1:${address.port}` };
+
+  const bad = await f.run(["cnb", "do", '{"action":"get_page_info"}', "--profile", "bad id"], env);
+  assert.notEqual(bad.code, 0); assert.match(bad.stderr, /--profile/); assert.equal(requests.length, 0);
+
+  const ok = await f.run(["cnb", "do", '{"action":"get_page_info"}', "--profile", "work"], env);
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.deepEqual(requests.at(-1), { method: "POST", path: "/profiles/work/api" });
+
+  const list = await f.run(["cnb", "profiles"], env);
+  assert.equal(list.code, 0, list.stderr);
+  assert.deepEqual(requests.at(-1), { method: "GET", path: "/profiles" });
+
+  const exported = await f.run(["cnb", "profile", "export", "work", "--out", "work.tar.gz"], env);
+  assert.equal(exported.code, 0, exported.stderr);
+  assert.deepEqual(requests.at(-1), { method: "GET", path: "/profiles/work/archive" });
+  assert.equal(readFileSync(join(f.cwd, "work.tar.gz"), "utf8"), "archive");
+  assert.match(exported.stderr, /sha256=deadbeef/);
+  assert.match(exported.stderr, /隐含 stop/);
+});
+
 test("webgrab：503 冷启动重试共享同一个总超时", { timeout: 5000 }, async t => {
   const f = await fixture(t); const paths: string[] = [];
   const server = createServer((req, res) => { paths.push(req.url!); res.writeHead(503); res.end('{"error":"WORKSPACE_STARTING"}'); });

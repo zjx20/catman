@@ -28,7 +28,7 @@ WG=/runtime/bin/skills/webgrab/webgrab
 |---|---|---|
 | 静态 HTML、RSS、JSON、原始字节 | `plain` | 不执行 JS；403 后换通道，不换 UA 反复试 |
 | 文章正文、Markdown | `jina` | 返回第三方阅读器结果；可能只有预览，不代表真实浏览器访问成功 |
-| 明确要求浏览器、JS 渲染、登录、截图、点击填表 | `cnb` | 远程 Firefox，有状态、串行；冷启动可能需要一两分钟 |
+| 明确要求浏览器、JS 渲染、登录、截图、点击填表 | `cnb` | 远程 Firefox，有状态、串行；可用 profile 跨空间保留登录态；冷启动可能需要一两分钟 |
 | cnb 不可用，或需要 PDF/结构化 JSON | `cf` | 无状态、有额度限制；Medium 需要 `--chromium`，仍无法获得无权限的会员正文 |
 
 用户明确要求真实浏览器时先用 cnb。若改用 jina，说明是降级到阅读器，不要混报结果。
@@ -86,6 +86,20 @@ goto 的 abort 有时来自跳转链，必须看页面状态；504 也不保证�
 多步动作支持 `cnb do @flow.json` 或 `cnb do -`。JSON 写在 workspace。
 完整动作参考：[cnb-browser.md](cnb-browser.md)。token 由脚本读取，不自行拼入 curl 参数。
 远程浏览器有跨请求登录态，串行操作；空间被回收后状态可能丢失。
+
+要**跨空间保留登录态**时用 profile——一份完整的 Firefox 用户目录，可以导出成 tarball 自己保管：
+
+```bash
+"$WG" cnb profiles                                  # 列表:running / hasArchive / manifest
+"$WG" cnb text https://example.com --profile work --out a.txt
+"$WG" cnb profile export work --out work.tar.gz     # 隐含 stop,返回后该 profile 已停
+"$WG" cnb profile import work --in work.tar.gz      # 空间重建后恢复登录态
+"$WG" cnb profile delete work
+```
+
+不带 `--profile` 就是内置默认浏览器；带 id 的请求落到 `/profiles/{id}/...`，不存在「激活某个
+profile」的全局状态，多个 profile 可以并行——但空间只有 4 核 8GB，同时开 1-2 个就够。
+归档里是明文会话凭据，别提交、别贴日志。
 
 ## Cloudflare 后备通道
 
