@@ -322,9 +322,12 @@ export function evolveSkillBody(_paths: SkillPaths): string {
 # Catman 自进化
 
 管理员的源码工作区挂在 /catman-src。先检查 git status 和当前分支的上游；有代码修改时再开分支。
-普通 worker 不挂载 /data/releases，源码中的 node_modules 软链可能指向不可见的 release，不能据此在源码目录直接跑 npm，也不要改写这个软链或往源码目录安装依赖。
+普通 worker 不挂载 /data/releases，源码目录的 node_modules 必须是源码自己的一份，不要把它软链到某个 release（那等于让 npm 写线上正在执行的字节）。
+/catman-src 目前自带独立依赖，可以直接在源码目录跑 npm run typecheck 和单个测试文件；全量测试较慢，交给制备。
+容器里 /tmp 是 noexec，测试要执行临时脚本时先把 TMPDIR 指到 workspace，否则脚本起不来，表现为莫名其妙的 curl 退出码。
+npm ci 不要用管道接 tail 判断成败：管道的退出码是 tail 的，装了一半也会显示成功；要取 npm 自己的退出码。
 仅拉取上游并制备时，快进合并后直接调用下方制备接口；固定执行器会在独立容器完成依赖、typecheck、全量测试和编译，不必先在 worker 重复跑一遍。
-修改代码需要提前验证时，在 workspace 复制源码、独立安装依赖并运行 npm run typecheck 与 npm test；提交后仍须经过正式制备。
+修改代码需要提前验证时，先跑 typecheck 与受影响的测试；提交后仍须经过正式制备。
 Git 远端使用部署配置的 SSH 地址；发布后的推送由 deployer 使用可写密钥完成。普通 worker 看不到部署密钥，仓库里的 core.sshCommand 路径只在控制服务内有效。
 需要拉取上游时，先按 ${OPS_SKILL} skill 申请并等待用户硬指令授权，清单必须包含 Docker socket。
 获得授权后运行 catman-ops connect，执行系统清单中的“自进化源码拉取”命令：通过运维环境在控制服务内以源码 owner 身份 git fetch origin，使用既有只读 SSH 密钥。

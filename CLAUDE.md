@@ -32,10 +32,11 @@ CATMAN_SELFCHECK=1 node dist/src/index.js
 手工使用 stdin 通道时也必须配置 worker 的 release、宿主数据路径与 mynet 网络;
 使用独立测试数据,不要直接启动已按 /data 迁移的生产数据副本。详见 README「本地开发」。
 
-开发机使用自己安装的依赖。可信控制服务里的源码工作区若把 `node_modules` 链接到
-release，只能用于读取，禁止 npm 写操作。worker 不挂整个 release，不要在 worker 内
-建立指向不可见 `/data/releases/current` 的依赖链接；需要独立验证时，在自己的 workspace
-中复制源码并安装依赖，或通过制备 API 运行正式测试。`.gitignore` 必须同时排除
+`/catman-src` 自带一份独立的 `node_modules`（在数据盘上，不指向任何 release），可以直接在
+源码目录跑 `npm run typecheck` 和测试；不要把它改回指向 `/data/releases/current` 的软链，
+那会让 npm 写操作直接落在线上正在执行的字节上。worker 里 `/tmp` 是 noexec，测试需要执行
+临时脚本时把 `TMPDIR` 指到 workspace。`npm ci` 约两分钟、落盘约 731MB；判断成败要取 npm
+自己的退出码，用管道接 `tail` 时拿到的是 `tail` 的。`.gitignore` 必须同时排除
 `node_modules/` 和 `node_modules`，防止目录或软链被提交。
 
 ## 日常维护动作
@@ -737,17 +738,19 @@ agent 那一侧的全部知识写在 `catman-evolve` skill 里(只对**主人格
   `cp -al` 硬链接复用上一个 release 的 node_modules —— 若那棵树里没有 tsc/tsx,
   **最常见的那条路径必然失败**;补装又会就地写文件,透过硬链接污染上一个(可能正是
   stable)release 的字节。配套纪律:**复用之后对那棵树零 npm 写操作**。
-- **源码工作区若用 `node_modules` 软链指向 `releases/current`，依赖就不是工作区私有的** ——
-  也就是正在跑的那个 release。所以在 `/data/src/catman` 里跑任何 npm 写操作
+- **源码工作区曾经用 `node_modules` 软链指向 `releases/current`，依赖不是工作区私有的** ——
+  也就是正在跑的那个 release。于是在 `/data/src/catman` 里跑任何 npm 写操作
   (`npm install`、`npm update`、顺手补一个包)都会**直接改到线上正在执行的字节**,
   上一条那句"零 npm 写操作"在这里同样成立,而且更隐蔽:你以为在改自己的工作区,
-  `ls -ld node_modules` 才看得出它根本不是自己的目录。
-  升依赖的正确姿势是**只改 `package.json` + `package-lock.json`**,依赖交给
+  `ls -ld node_modules` 才看得出它根本不是自己的目录。2026-11 起 `/catman-src` 改为
+  **自带独立 `node_modules`**(USB 数据盘,`npm ci` 约 2 分钟、约 731MB,worker 内存
+  峰值约 300MB),依赖才是工作区私有的;**别再把软链恢复回来**。
+  升依赖仍然**只改 `package.json` + `package-lock.json`**,依赖交给
   `prepare.sh` 在一次性容器里装。注意它跑的是 `npm ci` —— **严格照 lock,所以
   lock 不更新等于没升**(`^0.3.259` 允许 0.3.280,`npm ci` 照样给你装 0.3.259)。
-  更新 lock 又不能就地跑 `npm install`,于是:把两个 package 文件复制到 `/tmp` 下的
-  空目录,在那里 `npm install --package-lock-only`(只重写 lock、不碰 node_modules),
-  再把 lock 拷回来。2026-09-23 升 Agent SDK 时就是这么做的。
+  更新 lock 可以就地 `npm install --package-lock-only`(只重写 lock、不碰 node_modules);
+  依赖还是别人 release 的软链时不能就地跑,得把两个 package 文件复制到 `/tmp` 空目录里做,
+  2026-09-23 升 Agent SDK 时就是这么做的。
 - **不用 `git worktree` 制备,用浅 clone**:worktree 的 `.git` 只是指向共享仓库的指针,
   清理时 `rm -rf` 会留下元数据残骸,导致**同一个 sha 无法再次 worktree add** ——
   恰好死在"回滚之后想重新制备旧版本"这条事故恢复路径上。
