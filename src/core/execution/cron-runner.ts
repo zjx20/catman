@@ -35,11 +35,21 @@ export class ContextScriptRunner implements ScriptRunner {
   async poll(run: string): Promise<PollResult> {
     const handle = this.handles.find(h => h.run === run); if (!handle) return { state: "gone" };
     const runtime = this.runtimes.all(handle.userKey).find(r => r.contextId === handle.contextId);
-    if (!runtime) return { state: "gone" };
-    const tasks: TaskRecord[] = JSON.parse(await this.runtimes.rpc(runtime, "/tasks"));
+    // 容器消失不等于任务没跑完:执行环境有空闲回收(15 秒巡检,任务一结束就可能被删),
+    // 而调度器 30 秒才收一次结果,慢一点也不稀奇。supervisor 会把终态写进 tasks.json,
+    // 容器已经不在时改读盘上这份,否则一次成功的执行会被记成 interrupted。
+    const tasks: TaskRecord[] = runtime
+      ? JSON.parse(await this.runtimes.rpc(runtime, "/tasks"))
+      : this.persistedTasks(handle);
     const task = tasks.find(t => t.id === handle.taskId);
     if (!task) return { state: "gone" };
-    return task.status === "running" ? { state: "running" } : { state: "exited", exitCode: task.status === "completed" ? 0 : task.exitCode || 1 };
+    // 还挂着 running 却没有容器:现场确实丢了,让调度器照实记。
+    if (task.status === "running") return runtime ? { state: "running" } : { state: "gone" };
+    return { state: "exited", exitCode: task.status === "completed" ? 0 : task.exitCode || 1 };
+  }
+  private persistedTasks(handle: Handle): TaskRecord[] {
+    const c = this.contexts.get(handle.contextId, handle.userKey); if (!c) return [];
+    return readJsonFile<TaskRecord[]>(join(this.contexts.paths(c).tasks, "tasks.json"), []);
   }
   async logs(run: string): Promise<string> {
     const handle = this.handles.find(h => h.run === run); if (!handle) return "";

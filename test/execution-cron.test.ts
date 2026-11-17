@@ -93,3 +93,32 @@ test("每日 cron 重建容器后巡检历史任务不重播结果，新入口�
     assert.match(f.notices[0]!, /new independent result/);
   } finally { f.cleanup(); }
 });
+
+test("容器在任务结束后被当成空闲回收，调度器照样取回退出码和日志", async () => {
+  const f = executionFixture();
+  try {
+    const context = f.contexts.cron("alice", "checkin"), runtime = await f.runtimes.ensure(context);
+    const task: TaskRecord = { id: `t_${randomUUID()}`, name: "GLaDOS 每日签到", command: "bash", status: "completed", exitCode: 0,
+      startedAt: f.time(), deadlineAt: f.time() + 900_000, endedAt: f.time() + 240_000 };
+    const tasksDir = f.contexts.paths(context).tasks;
+    writeFileSync(join(tasksDir, "tasks.json"), JSON.stringify([task]));
+    writeFileSync(join(tasksDir, `${task.id}.log`), "── account 1 ──\n+2 points\n");
+    writeFileSync(join(f.config.dataDir, "execution/cron-handles.json"), JSON.stringify([{ run: "reclaimed-run", contextId: context.id, taskId: task.id, userKey: "alice" }]));
+    const jobs = new CronStore({ dir: join(f.config.dataDir, "cron"), contexts: f.contexts });
+    const runner = new ContextScriptRunner(f.contexts, f.runtimes, jobs);
+    // 容器已经被空闲回收：调度器去问的时候 runtime 早没了。
+    await f.runtimes.stop(context.id, "没有活动进程，释放空闲执行环境", true);
+    assert.equal(f.runtimes.all("alice").length, 0);
+    assert.deepEqual(await runner.poll("reclaimed-run"), { state: "exited", exitCode: 0 }, "跑完了就是跑完了，不能记成现场丢了");
+    assert.match(await runner.logs("reclaimed-run"), /\+2 points/, "日志本来就在 context 盘上，与容器无关");
+    // 容器还在时仍以 supervisor 的实时状态为准。
+    const second = await f.runtimes.ensure(context); f.tasks.push(task);
+    assert.deepEqual(await runner.poll("reclaimed-run"), { state: "exited", exitCode: 0 });
+    // 还挂着 running 却没有容器：这次是真的丢了现场。
+    const running: TaskRecord = { id: task.id, name: task.name, command: task.command, status: "running", startedAt: task.startedAt, deadlineAt: task.deadlineAt };
+    writeFileSync(join(tasksDir, "tasks.json"), JSON.stringify([running]));
+    f.tasks.length = 0;
+    await f.runtimes.stop(second.contextId, "容器异常退出", true);
+    assert.deepEqual(await runner.poll("reclaimed-run"), { state: "gone" });
+  } finally { f.cleanup(); }
+});
