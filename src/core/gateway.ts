@@ -1,7 +1,7 @@
 import type { ContextStore } from "./execution/contexts.js";
 import type { RuntimeManager } from "./execution/runtime.js";
 import type { OpsManager } from "./execution/ops.js";
-import { BackgroundContinuations, CONTINUATION_TIMEOUT_MS, CONTINUATION_MAX_TURNS, CONTINUATION_MAX_USD } from "./execution/continuations.js";
+import { BackgroundContinuations, CONTINUATION_TIMEOUT_MS, CONTINUATION_MAX_TURNS, CONTINUATION_MAX_USD, CHAT_MAX_TURNS } from "./execution/continuations.js";
 import type { RuntimeEvent } from "./execution/runtime.js";
 import type { Accepted, Channel, IncomingMessage } from "../channels/types.js";
 import type { Agent, AgentProgressEvent } from "./agent.js";
@@ -1928,12 +1928,19 @@ export class Gateway {
       const prior = this.lastMemAbort.get(userKey);
       if (prior) this.lastMemAbort.delete(userKey);
       const ambient = this.releaseNoteFor(userKey, decision.isNew);
+      // 续接该给多少回合：用户那一份额度还没用完的部分可以接着用，但至少给
+      // CONTINUATION_MAX_TURNS —— 一次续接不该比固定额度还窄，否则用户交代的事
+      // 会因为"是后台叫醒的"而被腰斩（2026-11-20 就撞过：一句用户消息之后的续接
+      // 只拿到 12 步，改脚本、跑测试全耗在这 12 步里）。
+      const continuationTurns = context
+        ? Math.max(CHAT_MAX_TURNS - (this.continuations?.turnsUsed(context.id) ?? 0), CONTINUATION_MAX_TURNS)
+        : CONTINUATION_MAX_TURNS;
       const reply = await this.agent.run(prior ? priorAbortPrefix(prior) + text : text, {
         cwd: pre.cwd,
         ...(context ? { context } : {}),
         ...(ambient ? { ambient } : {}),
         resumeSessionId: decision.isNew ? undefined : decision.resumeSessionId,
-        ...(continuation ? { maxTurns: CONTINUATION_MAX_TURNS, maxBudgetUsd: CONTINUATION_MAX_USD, backgroundEventIds: continuation.events.map(e => e.id) } : {}),
+        ...(continuation ? { maxTurns: continuationTurns, maxBudgetUsd: CONTINUATION_MAX_USD, backgroundEventIds: continuation.events.map(e => e.id) } : {}),
         ...(prefs.model ? { model: prefs.model } : {}),
         ...(prefs.effort ? { effort: prefs.effort } : {}),
         env: this.childEnv(isAdmin, turn.token, userKey),
@@ -1998,6 +2005,9 @@ export class Gateway {
           };
         },
       });
+      // 记这一回合用掉了多少步：下一次续接据此算"用户那份额度还剩多少"。
+      // 用户回合和续接都要记，只记续接的话剩额度永远是满的。
+      if (context && typeof reply.turns === "number") this.continuations?.addTurns(context.id, reply.turns);
       // 产出记到哪,取决于这一轮还是不是前台:
       //   前台 → record() 写 current(常规路径);
       //   已被切走 → archiveTurn() 只更新 history —— 写 current 会把用户

@@ -7,7 +7,13 @@ export const CONTINUATION_LIMIT = 3;
 export const CONTINUATION_TIMEOUT_MS = 5 * 60_000;
 export const CONTINUATION_MAX_TURNS = 12;
 export const CONTINUATION_MAX_USD = 2;
-interface Budget { attempts: number; notBefore: number; paused?: boolean; warned?: boolean }
+/**
+ * 用户回合可用的模型往返数。用户开口的那一轮不显式设上限，实际就是 SDK 的默认值；
+ * 这里写出来是给续接算账用的：用户那份额度还没用完的部分，续接应当能接着用，
+ * 而不是一律被压到 CONTINUATION_MAX_TURNS。
+ */
+export const CHAT_MAX_TURNS = 50;
+interface Budget { attempts: number; notBefore: number; paused?: boolean; warned?: boolean; turns?: number }
 
 /** Durable, bounded dispatch. Only explicit task/prepare events can start inference. */
 export class BackgroundContinuations {
@@ -26,7 +32,16 @@ export class BackgroundContinuations {
   }
   private now(): number { return (this.opts.now ?? Date.now)(); }
   private save(): void { writeJsonFileAtomic(this.path, this.budgets, 0o600); }
-  reset(contextId: string): void { this.budgets[contextId] = { attempts: 0, notBefore: 0 }; this.save(); }
+  reset(contextId: string): void { this.budgets[contextId] = { attempts: 0, notBefore: 0, turns: 0 }; this.save(); }
+  /** 记下这一回合用掉的模型往返（用户回合和续接都要记）。 */
+  addTurns(contextId: string, turns: number): void {
+    if (!Number.isFinite(turns) || turns <= 0) return;
+    const b = this.budgets[contextId] ??= { attempts: 0, notBefore: 0 };
+    b.turns = (b.turns ?? 0) + Math.floor(turns);
+    this.save();
+  }
+  /** 本次用户输入以来已经用掉的模型往返（含它之后的续接）。 */
+  turnsUsed(contextId: string): number { return this.budgets[contextId]?.turns ?? 0; }
   pause(contextId: string): void {
     const b = this.budgets[contextId] ??= { attempts: 0, notBefore: 0 };
     b.paused = true; this.save();

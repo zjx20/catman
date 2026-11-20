@@ -1,7 +1,7 @@
 import type { SDKMessage, SDKUserMessage, Query } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
 
-export interface SdkTurnResult { text: string; sessionId: string; isError: boolean }
+export interface SdkTurnResult { text: string; sessionId: string; isError: boolean; turns: number }
 export interface SdkTurn {
   message: SDKUserMessage;
   onMessage: (message: SDKMessage) => void;
@@ -10,7 +10,7 @@ export interface SdkTurn {
 
 /** Input remains open across results. Native SDK tasks remain owned by the same CLI. */
 export class SdkSession {
-  private pending?: { resolve: (r: SdkTurnResult) => void; reject: (e: unknown) => void; turn: SdkTurn; abort: () => void; results: string[]; uuids: Set<string>; error: boolean };
+  private pending?: { resolve: (r: SdkTurnResult) => void; reject: (e: unknown) => void; turn: SdkTurn; abort: () => void; results: string[]; uuids: Set<string>; error: boolean; turns: number };
   private closed = false;
   private sessionId = "";
   private readonly inputs: SDKUserMessage[] = [];
@@ -49,7 +49,7 @@ export class SdkSession {
         void this.hooks.stopAgent().catch(() => {}); this.close(turn.signal?.reason ?? new Error("回合已取消"));
       };
       turn.message.uuid ??= randomUUID();
-      this.pending = { resolve, reject, turn, abort, results: [], uuids: new Set([turn.message.uuid]), error: false };
+      this.pending = { resolve, reject, turn, abort, results: [], uuids: new Set([turn.message.uuid]), error: false, turns: 0 };
       turn.signal?.addEventListener("abort", abort, { once: true });
       this.inputs.push(turn.message); this.wake?.(); this.wake = undefined;
     });
@@ -97,10 +97,12 @@ export class SdkSession {
           p.error ||= message.is_error;
           const text = message.subtype === "success" ? message.result : message.errors.join("\n");
           if (text) p.results.push(text);
+          // num_turns 数的是这一轮里的模型往返；一个回合可能收到多条 result，累加即可。
+          if (typeof message.num_turns === "number") p.turns += message.num_turns;
           if (!p.uuids.size || message.is_error) {
             this.pending = undefined; p.turn.signal?.removeEventListener("abort", p.abort);
             this.rememberDetachedTasks();
-            p.resolve({ text: p.results.join("\n\n") || (p.error ? "回合失败，SDK 未返回详情" : "(助手没有返回内容)"), sessionId: this.sessionId, isError: p.error });
+            p.resolve({ text: p.results.join("\n\n") || (p.error ? "回合失败，SDK 未返回详情" : "(助手没有返回内容)"), sessionId: this.sessionId, isError: p.error, turns: p.turns });
             this.scheduleIdle();
           }
         } else if (p) p.turn.onMessage(message);

@@ -19,6 +19,7 @@ import {
   helpText,
 } from "../src/core/gateway.js";
 import { canonicalOf } from "../src/core/commands.js";
+import { CHAT_MAX_TURNS, CONTINUATION_MAX_TURNS } from "../src/core/execution/continuations.js";
 import { SessionManager, InMemoryStore } from "../src/core/session.js";
 import { UserRegistry } from "../src/core/users.js";
 import { GlobalSettings, type SettingsPatch } from "../src/core/settings.js";
@@ -136,6 +137,8 @@ class FakeAgent {
   calls: FakeCall[] = [];
   private n = 0;
   nextSessionId?: string;
+  /** 每回合如实报回用掉的模型往返数；续接的额度就用它算。不设 = 老行为（不报）。 */
+  replyTurns?: number;
   /** 各回合中途收到的追加输入,按到达顺序。 */
   fed: Array<{ prompt: string; attachments: readonly Attachment[] }> = [];
   /** run 时依序回放给 onProgress 的事件。 */
@@ -196,9 +199,9 @@ class FakeAgent {
       }
       if (this.fail) throw new Error("agent boom");
       if (this.replyIsError) {
-        return { text: "Credit balance is too low", sessionId, isError: true };
+        return { text: "Credit balance is too low", sessionId, isError: true, turns: this.replyTurns };
       }
-      return { text: `echo:${prompt}`, sessionId, isError: false };
+      return { text: `echo:${prompt}`, sessionId, isError: false, turns: this.replyTurns };
     } finally {
       accepting = false;
       this.inFlight -= 1;
@@ -407,12 +410,35 @@ test("后台结束不需用户开口即续接原 session，带执行预算；成
     assert.equal(h.agent.calls.length, 2);
     const call = h.agent.calls[1]!;
     assert.equal(call.resume, before.sessionId); assert.equal(call.contextId, context.id);
-    assert.equal(call.cwd, f.contexts.paths(context).work); assert.equal(call.maxTurns, 12); assert.equal(call.maxBudgetUsd, 2);
+    // 用户回合没报用了几步（假件默认不报）→ 用户那份额度是满的，续接拿满额；
+    // 下限仍是 CONTINUATION_MAX_TURNS。
+    assert.equal(call.cwd, f.contexts.paths(context).work); assert.equal(call.maxTurns, CHAT_MAX_TURNS); assert.equal(call.maxBudgetUsd, 2);
     assert.equal(call.backgroundEventIds?.length, 1); assert.match(call.prompt, /完整日志和实际产物/);
     assert.equal(h.sessions.currentOf(U1)!.hint, before.hint);
     await h.gw.flushContinuations(); assert.equal(h.agent.calls.length, 2);
     f.runtimes.notifyUser(U1, context.id, "ordinary notice");
     await h.gw.flushContinuations(); assert.equal(h.agent.calls.length, 2);
+  } finally { await h.gw.stop(); f.cleanup(); }
+});
+
+test("后台续接的 maxTurns = max(用户回合剩余额度, 12)", async () => {
+  const { f, h } = continuationGateway();
+  try {
+    // 用户那轮只用掉 5 步 → 还剩 45，续接拿 45，而不是一律 12。
+    h.agent.replyTurns = 5;
+    await h.channel.receive(U1, "下载并核对文件");
+    const context = f.contexts.all(U1)[0]!;
+    assert.equal(h.agent.calls[0]!.maxTurns, undefined, "用户回合照旧不设上限");
+    f.runtimes.notifyUser(U1, context.id, "download done, read task.log", false, "task");
+    await h.gw.flushContinuations();
+    assert.equal(h.agent.calls[1]!.maxTurns, CHAT_MAX_TURNS - 5);
+
+    // 用户那轮几乎用满额度（48 步）→ 只剩 2，续接按 12 兜底。
+    h.agent.replyTurns = 48;
+    await h.channel.receive(U1, "再看看日志");
+    f.runtimes.notifyUser(U1, context.id, "task done", false, "task");
+    await h.gw.flushContinuations();
+    assert.equal(h.agent.calls[3]!.maxTurns, CONTINUATION_MAX_TURNS);
   } finally { await h.gw.stop(); f.cleanup(); }
 });
 

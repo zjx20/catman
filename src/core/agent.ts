@@ -24,6 +24,8 @@ export interface AgentReply {
   sessionId: string;
   /** 是否为错误结果(鉴权失败、超限等)。 */
   isError: boolean;
+  /** 这一轮实际用掉的模型往返数。后台续接靠它算"用户那份额度还剩多少"。 */
+  turns?: number;
 }
 
 /** 一次回合中的中间过程事件,供上层向用户透出进度。 */
