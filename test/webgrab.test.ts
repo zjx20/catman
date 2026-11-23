@@ -105,6 +105,38 @@ test("webgrab：--profile 落到 /profiles/{id}/…，导出接住归档响应�
   assert.match(exported.stderr, /隐含 stop/);
 });
 
+test("webgrab：cnb proxy 读走 GET、改走 PUT，非法模式不发请求", async t => {
+  const f = await fixture(t);
+  const seen: Array<{ method: string; path: string; body: string }> = [];
+  const server = createServer((req, res) => {
+    let raw = ""; req.on("data", d => { raw += d; }); req.on("end", () => {
+      seen.push({ method: req.method!, path: req.url!, body: raw });
+      res.setHeader("content-type", "application/json");
+      res.end('{"profile":{"id":null,"proxy":{"mode":"on","enabled":true,"available":true}},"changed":true,"restarted":false}');
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address(); assert.ok(address && typeof address !== "string");
+  const env = { CNB_BROWSER_URL: `http://127.0.0.1:${address.port}` };
+
+  const read = await f.run(["cnb", "proxy"], env);
+  assert.equal(read.code, 0, read.stderr);
+  assert.deepEqual(seen.at(-1), { method: "GET", path: "/proxy", body: "" });
+
+  const write = await f.run(["cnb", "proxy", "--profile", "work", "--mode", "off"], env);
+  assert.equal(write.code, 0, write.stderr);
+  assert.deepEqual(seen.at(-1), { method: "PUT", path: "/profiles/work/proxy", body: '{"mode":"off"}' });
+
+  const toggle = await f.run(["cnb", "proxy", "--enabled", "false"], env);
+  assert.equal(toggle.code, 0, toggle.stderr);
+  assert.deepEqual(seen.at(-1), { method: "PUT", path: "/proxy", body: '{"enabled":false}' });
+
+  const before = seen.length;
+  const bad = await f.run(["cnb", "proxy", "--mode", "sometimes"], env);
+  assert.notEqual(bad.code, 0); assert.match(bad.stderr, /auto\|on\|off/); assert.equal(seen.length, before);
+});
+
 test("webgrab：503 冷启动重试共享同一个总超时", { timeout: 5000 }, async t => {
   const f = await fixture(t); const paths: string[] = [];
   const server = createServer((req, res) => { paths.push(req.url!); res.writeHead(503); res.end('{"error":"WORKSPACE_STARTING"}'); });

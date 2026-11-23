@@ -1,6 +1,6 @@
 > 这是 skill **webgrab** 的 `cnb` 通道的完整动作参考,不是独立 skill。
 > 什么时候该用它、怎么起手,看 [SKILL.md](SKILL.md);这里是动作表和坑。
-> 命令行封装:`webgrab cnb <start|status|text|html|shot|do|profiles|profile>`,
+> 命令行封装:`webgrab cnb <start|status|text|html|shot|do|profiles|profile|proxy>`,
 > 它替你带 token、撞上冷启动自动重试、run_script 的两层 success 也替你判过了。
 
 
@@ -158,6 +158,40 @@ P '{"action":"get_text"}'
   不存在的 profile 返回 404；页面操作（`/api`、`/state`、截图等）则会自动创建并拉起。
 - `hasArchive` 表示这个 profile 目录里有 manifest（即由上传的归档解出来的），**不是**「导出过」。
   导出只把 manifest 打进归档文件，目录本身不变。
+
+## 出口代理（本地增补，不是上游内容）
+
+部署侧新增的接口，**不是上游动作**，所以 `cnb do` 透传不到它，要用 `cnb proxy` 子命令。
+上游文档同步覆盖本文件时，这一节要手工保留（`sync-cnb-doc.mjs` 不生成它）：
+
+```bash
+"$WG" cnb proxy                                    # 看内置默认浏览器
+"$WG" cnb proxy --profile work                     # 看某个 profile
+"$WG" cnb proxy --profile work --mode on           # auto|on|off
+"$WG" cnb proxy --profile work --enabled false     # 另一种写法,等价 mode=off
+```
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/proxy`、`/profiles/{id}/proxy` | 返回 `{profile:{…,proxy:{mode,enabled,available}}}` |
+| PUT | 同上 | body `{"mode":"auto|on|off"}` 或 `{"enabled":true|false|null}`，返回 `{profile,restarted,changed}` |
+
+语义与坑：
+
+- **`on`** 走部署代理（实测出口是 Cloudflare WARP，`warp=on`，IPv4/IPv6 都有）；
+  **`off`** 直连空间自己的网络（实测 `warp=off`，拿到空间真实出口 IP，**IPv6 不通**）；
+  **`auto`** 由部署决定，当前部署下等同于启用。
+- **改配置会重启这台浏览器**：响应里 `restarted: true`，实测 12~30 秒；`changed:false`
+  时不会重启。刚 `PUT` 完不要立刻叠页面动作，给 `--timeout` 留够（默认 120 秒够）。
+- 是否按 profile 独立生效：是。`--profile` 的 PUT 只影响那个 profile 进程；不带
+  `--profile` 改的是内置默认浏览器。
+- **什么时候要动它**：站点在直连出口下连不上或过不了人机验证时。实测案例：
+  `challenges.cloudflare.com`（Turnstile 的挑战域）在 `off` 下 IPv6 不通、域名请求挂死，
+  切到 `on` 后立刻恢复；反过来也有站点只认直连出口。判断方法是先 `GET /proxy` 看
+  `mode/enabled/available`，再分别试一次目标和 `https://www.cloudflare.com/cdn-cgi/trace`
+  （后者能看出当前出口 IP 和 `warp=` 状态）。
+- `available:false` 表示这个空间/部署没有可用的代理，此时 `on` 不一定生效，看返回的
+  `proxy` 字段为准。
 
 ## 动作参考
 

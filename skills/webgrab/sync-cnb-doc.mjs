@@ -4,6 +4,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 const input = process.argv[2] || '/user/notes/CNB_BROWSER_SKILL.md'
 const output = process.argv[3] || '/user/notes/cnb-browser.md'
+// 注意：本脚本只生成上游那部分。cnb-browser.md 里的「出口代理」一节是部署侧自己加的，
+// 上游没有；重新生成后要手工把那一节合回去（文件里标了「本地增补」）。
 const source = fs.readFileSync(input, 'utf8')
 if (!/^---\r?\n/.test(source)) throw new Error('上游格式变了：没有 frontmatter')
 const start = source.indexOf('## 调用约定\n')

@@ -596,6 +596,34 @@ function cmdCnbProfile(c, pos, opt) {
   die(`未知 profile 动作 ${action};可用: create start stop delete export import`)
 }
 
+/**
+ * 出口代理开关。GET 看状态;带 --mode/--enabled 就 PUT 改。
+ * 改完服务端会重启这台浏览器(响应里 restarted:true,实测 12~30 秒),所以别在
+ * 一次 --timeout 很小的调用里改。
+ * mode: auto(部署决定) / on(强制走代理) / off(直连)。
+ */
+function cmdCnbProxy(c, opt) {
+  const path = cnbPagePath(opt, '/proxy')
+  const body = {}
+  if (opt.proxyMode !== undefined) {
+    if (!['auto', 'on', 'off'].includes(opt.proxyMode)) die('--mode 只支持 auto|on|off')
+    body.mode = opt.proxyMode
+  }
+  if (opt.proxyEnabled !== undefined) {
+    const v = String(opt.proxyEnabled).toLowerCase()
+    if (v !== 'true' && v !== 'false') die('--enabled 只支持 true|false')
+    body.enabled = v === 'true'
+  }
+  const write = Object.keys(body).length > 0
+  const { r, j } = cnbCall(
+    c,
+    write ? { path, method: 'PUT', body: JSON.stringify(body) } : { path },
+    opt
+  )
+  if (r.status >= 400 || !j) cnbFail(r, j)
+  return void cnbEmit(JSON.stringify(j, null, 2), opt)
+}
+
 function cmdCnb(sub, pos, opt) {
   const c = cnbConfigOrDie()
 
@@ -620,6 +648,7 @@ function cmdCnb(sub, pos, opt) {
     return void cnbEmit(JSON.stringify(j, null, 2), opt)
   }
   if (sub === 'profile') return void cmdCnbProfile(c, pos, opt)
+  if (sub === 'proxy') return void cmdCnbProxy(c, opt)
   if (sub === 'do') {
     // 原样透传一个动作 JSON。'-' 读 stdin,'@f' 读文件 —— 长脚本别塞进 argv。
     let raw = pos[0] || die('缺动作 JSON;例:webgrab cnb do \'{"action":"get_page_info"}\'')
@@ -704,7 +733,7 @@ function cmdCnb(sub, pos, opt) {
     if (r.status >= 400) die(`HTTP ${r.status}(错误正文在 ${opt.out} 里)`, 2)
     return void process.stderr.write(`→ ${opt.out}\n`)
   }
-  die(`未知 cnb 子命令 ${sub};可用: start status text html shot do`)
+  die(`未知 cnb 子命令 ${sub};可用: start status text html shot do profiles profile proxy`)
 }
 
 // ── args ─────────────────────────────────────────────────────────────────────
@@ -714,7 +743,7 @@ const HELP = `webgrab —— 抓直接 curl 抓不到的网页
   webgrab plain <url> [--ua S] [--noproxy] [--out F]
   webgrab jina  <url> [--plain] [--cache] [--out F]
   webgrab cf <action> <url> [选项]      (后备:无状态渲染,已不是首选)
-  webgrab cnb <start|text|html|shot|do|status|profiles|profile> [url] [选项]
+  webgrab cnb <start|text|html|shot|do|status|profiles|profile|proxy> [url] [选项]
   webgrab actions                      列出 CF 的 action
 
 cf action: ${CF_ACTIONS.join(' ')}
@@ -740,6 +769,8 @@ cnb:  远程真实浏览器,有状态(cookie/登录态跨请求保留),串行,�
       --profile ID 落到 /profiles/{id}/…;不带就是内置默认 profile
       profiles 列出全部 profile  profile <create|start|stop|delete|export|import> <id>
       profile export <id> --out f.tar.gz(隐含 stop)  profile import <id> --in f [--sha256 S]
+      proxy [--mode auto|on|off] [--enabled true|false]   看/改出口代理;不带参数只看
+            改完浏览器会重启(十几秒);on 走部署代理(WARP),off 直连
       goto 报 abort 不一定是失败(跳转链):脚本靠文档记号判,晚到会自动重取正文
       完整动作表: /runtime/bin/skills/webgrab/cnb-browser.md
 `
@@ -756,6 +787,7 @@ function parse(argv) {
       '--html': 'html', '--timeout': 'timeout', '--goto-timeout': 'timeoutMs',
       '--wh': 'wh', '--nav-timeout': 'navTimeout', '--sel-timeout': 'selTimeout',
       '--settle': 'settle', '--profile': 'profile', '--in': 'in', '--sha256': 'sha256',
+      '--mode': 'proxyMode', '--enabled': 'proxyEnabled',
     }
     const flags = {
       // kitesurf 是默认,所以 --kitesurf 留着只为向后兼容,是个空开关
