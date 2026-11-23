@@ -27,7 +27,14 @@ export class ExecutionApi {
     const path = url.pathname;
     if (!path.startsWith("/api/runtime/") && path !== "/api/execution" && !path.startsWith("/api/execution/")) return false;
     const { runtimes, contexts } = this.opts;
-    const token = header(req, "x-catman-runtime") || header(req, "x-catman-session") || header(req, "authorization")?.replace(/^Bearer /i, "");
+    const modelQueryKey = path.startsWith("/api/runtime/model/") ? (url.searchParams.get("key") ?? undefined) : undefined;
+    const token =
+      header(req, "x-catman-runtime") ||
+      header(req, "x-catman-session") ||
+      header(req, "authorization")?.replace(/^Bearer /i, "") ||
+      header(req, "x-api-key") ||
+      header(req, "x-goog-api-key") ||
+      modelQueryKey;
     const runtime = runtimes.resolve(token);
     const principal = runtime?.userKey ?? (token ? this.opts.turns.resolve(token)?.userKey : undefined) ?? (staticAdmin ? BUILTIN_ADMIN_USER_KEY : undefined);
     if (!principal) { json(res, 401, { error: "需要有效的执行身份" }); return true; }

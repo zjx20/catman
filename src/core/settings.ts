@@ -259,7 +259,7 @@ export const SETTING_SCHEMA: Schema = {
   model: {
     scope: "user",
     label: "模型",
-    desc: "跑这个助手用哪个 Claude 模型。改完下一轮生效。",
+    desc: "跑这个助手用哪个模型。改完下一轮生效。",
     floor: undefined,
     hint: (ctx) => ctx.modelAllowlist.join(" / "),
     validate(raw, ctx) {

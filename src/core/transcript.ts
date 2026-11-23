@@ -86,13 +86,13 @@ export function sessionFileExists(
   try { return scopedFileStat(configDir, join(projectsRoot(configDir), projectDir, `${sessionId}.jsonl`)).isFile(); } catch { return false; }
 }
 
-/**
- * 列出会话文件,按修改时间倒序。
- * 必须传 projectDir(catman 自己 workspace 的编码目录名),只扫描该子目录,
- * 从设计上杜绝误碰其它项目的会话。
- */
-export function listSessions(configDir: string, projectDir: string): SessionSummary[] {
-  const dir = join(projectsRoot(configDir), projectDir);
+/** 控制面独立 transcripts 目录下的会话文件是否存在。 */
+export function flatSessionFileExists(dir: string, sessionId: string): boolean {
+  if (!sessionId || sessionId.includes("/") || sessionId.includes("\\") || sessionId.includes("..")) return false;
+  try { return scopedFileStat(dir, join(dir, `${sessionId}.jsonl`)).isFile(); } catch { return false; }
+}
+
+function listSessionsInDir(dir: string, scopeRoot: string, projectDir: string): SessionSummary[] {
   if (!existsSync(dir)) return [];
   const out: SessionSummary[] = [];
 
@@ -108,7 +108,7 @@ export function listSessions(configDir: string, projectDir: string): SessionSumm
     const path = join(dir, file);
     let st;
     try {
-      st = scopedFileStat(configDir, path);
+      st = scopedFileStat(scopeRoot, path);
     } catch {
       continue;
     }
@@ -118,11 +118,25 @@ export function listSessions(configDir: string, projectDir: string): SessionSumm
       path,
       mtimeMs: st.mtimeMs,
       sizeBytes: st.size,
-      preview: firstUserPreview(path, configDir),
+      preview: firstUserPreview(path, scopeRoot),
     });
   }
   out.sort((a, b) => b.mtimeMs - a.mtimeMs);
   return out;
+}
+
+/**
+ * 列出会话文件,按修改时间倒序。
+ * 必须传 projectDir(catman 自己 workspace 的编码目录名),只扫描该子目录,
+ * 从设计上杜绝误碰其它项目的会话。
+ */
+export function listSessions(configDir: string, projectDir: string): SessionSummary[] {
+  return listSessionsInDir(join(projectsRoot(configDir), projectDir), configDir, projectDir);
+}
+
+/** 列出控制面独立 transcripts 目录（平铺 `<sessionId>.jsonl`）下的会话。 */
+export function listFlatSessions(dir: string, projectDir = "transcripts"): SessionSummary[] {
+  return listSessionsInDir(dir, dir, projectDir);
 }
 
 /** 解析单个会话的消息列表。 */
@@ -136,13 +150,16 @@ export function readSession(
   return parseFile(summary.path, configDir);
 }
 
-/**
- * 关键词检索:扫描本 workspace 会话 JSONL 的文本内容,返回命中会话及片段。
- * 纯 JS 扫描(不依赖外部 ripgrep),对个人规模 + 30 天保留足够。
- */
-export function search(
-  configDir: string,
-  projectDir: string,
+/** 解析控制面独立 transcripts 目录中的单个会话。 */
+export function readFlatSession(dir: string, sessionId: string): TranscriptEntry[] {
+  const summary = listFlatSessions(dir).find((s) => s.sessionId === sessionId);
+  if (!summary) return [];
+  return parseFile(summary.path, dir);
+}
+
+function searchInSummaries(
+  summaries: readonly SessionSummary[],
+  scopeRoot: string,
   query: string,
   maxHits = 50,
 ): SearchHit[] {
@@ -150,8 +167,8 @@ export function search(
   if (!q) return [];
   const hits: SearchHit[] = [];
 
-  for (const s of listSessions(configDir, projectDir)) {
-    for (const entry of parseFile(s.path, configDir)) {
+  for (const s of summaries) {
+    for (const entry of parseFile(s.path, scopeRoot)) {
       const idx = entry.text.toLowerCase().indexOf(q);
       if (idx >= 0) {
         const start = Math.max(0, idx - 40);
@@ -166,6 +183,24 @@ export function search(
     if (hits.length >= maxHits) break;
   }
   return hits;
+}
+
+/**
+ * 关键词检索:扫描本 workspace 会话 JSONL 的文本内容,返回命中会话及片段。
+ * 纯 JS 扫描(不依赖外部 ripgrep),对个人规模 + 30 天保留足够。
+ */
+export function search(
+  configDir: string,
+  projectDir: string,
+  query: string,
+  maxHits = 50,
+): SearchHit[] {
+  return searchInSummaries(listSessions(configDir, projectDir), configDir, query, maxHits);
+}
+
+/** 在控制面独立 transcripts 目录中检索关键词。 */
+export function searchFlatSessions(dir: string, query: string, maxHits = 50): SearchHit[] {
+  return searchInSummaries(listFlatSessions(dir), dir, query, maxHits);
 }
 
 /**

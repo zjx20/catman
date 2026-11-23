@@ -2,6 +2,7 @@ import { ContextStore, requireExecutionLayout } from "./core/execution/contexts.
 import { RuntimeManager } from "./core/execution/runtime.js";
 import { OpsManager } from "./core/execution/ops.js";
 import { CapabilityBroker } from "./core/execution/broker.js";
+import { resolveHarness } from "./core/execution/harness.js";
 import { ContextScriptRunner } from "./core/execution/cron-runner.js";
 import { ExecutionApi } from "./dashboard/api-execution.js";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
@@ -11,9 +12,9 @@ import { Agent } from "./core/agent.js";
 import { SessionManager } from "./core/session.js";
 import { FileStore, readJsonFile } from "./core/file-store.js";
 import { Gateway } from "./core/gateway.js";
-import { UserRegistry, listWorkspaceDirs } from "./core/users.js";
+import { UserRegistry } from "./core/users.js";
 import { adminBaseline, initialSharedClaudeMd } from "./core/persona.js";
-import { TokenAlerter, readTokenExpiry } from "./core/token-alert.js";
+import { TokenAlerter } from "./core/token-alert.js";
 import { allowAll, type AdmissionPolicy } from "./core/admission.js";
 import { GlobalSettings } from "./core/settings.js";
 import { PrefsStore } from "./core/prefs.js";
@@ -31,7 +32,6 @@ import { CompositeChannel, compositeAdmission } from "./channels/composite.js";
 import type { Channel } from "./channels/types.js";
 import type { AttachmentLimits } from "./core/attachments.js";
 import { Dashboard } from "./dashboard/server.js";
-import { cleanupOldSessionsAcross, encodeProjectDir, sessionFileExists } from "./core/transcript.js";
 import { installLogStamps, redirectConsoleToStderr } from "./core/log-stamp.js";
 import { readVersion, versionLine, type VersionInfo } from "./core/version.js";
 import { syncSrcRepoToRelease } from "./core/src-repo-sync.js";
@@ -242,21 +242,16 @@ async function main(): Promise<void> {
     version,
     persona: config.persona,
     skillsDir: configDir,
-    // token 到期告警的微信出口。过期时刻从凭据文件读(env 长效 token 没有这份信息,
-    // 那时它安静地什么都不报 —— 绝不编)。记账落在本进程自己的可写区。
+    // token 到期告警的微信出口。仅当前 Harness 支持本地 OAuth 过期时间戳时才启用告警,
+    // API Key 模式或 env 长效 token 没有这份信息,安静跳过 —— 绝不编。
     tokenAlert: new TokenAlerter({
-      expiry: () => readTokenExpiry(configDir),
+      expiry: () => resolveHarness(config).credentialExpiry?.(configDir),
       seenPath: `${config.dataDir}/token-alert-seen.json`,
     }),
     ...(deploy ? { deploy } : {}),
-    // /切换会话 切换前确认目标的 JSONL 还在 —— 记录没了 resume 必然失败,
-    // 提前给句人话并出清死引用,比让回合炸出原始报错友好得多。
-    sessionExists: (userKey, sessionId) => {
-      const context = contexts.bySession(userKey, sessionId);
-      if (!context) return false;
-      const p = contexts.paths(context);
-      return sessionFileExists(p.sdk, encodeProjectDir(p.work), sessionId);
-    },
+    // /切换会话 切换前确认目标的 JSONL 还在(兼容 Claude SDK 目录与控制面 transcripts 目录) ——
+    // 记录没了 resume 必然失败,提前给句人话并出清死引用,比让回合炸出原始报错友好得多。
+    sessionExists: (userKey, sessionId) => contexts.sessionExists(userKey, sessionId),
     // 提醒轮询:取超时时长的 1/10,但不短于 1 分钟。
     reminderIntervalMs: Math.max(60_000, Math.floor(config.sessionTimeoutMs / 10)),
     // `/任务` 的数据源。任务表在 gateway 之后才建,用一个后填的引用打破这个环 ——
@@ -332,17 +327,20 @@ async function main(): Promise<void> {
 
   // 保留期清理以 ContextStore 为范围，跳过 cron 和活跃 runtime；删除后同步清理路由死引用。
   const runCleanup = () => {
-    const deleted: string[] = [];
+    const deletedSessionIds: string[] = [];
+    let cleanedContexts = 0;
     const active = new Set(runtimes.all().map(runtime => runtime.contextId));
     for (const context of contexts.all()) {
       if (context.kind === "chat" && !active.has(context.id) && Date.now() - context.lastActivityAt > settings.effective().retentionMs) {
-        deleted.push(context.sdkSessionId); contexts.remove(context.id);
+        deletedSessionIds.push(context.sdkSessionId, ...(context.previousSessionIds ?? []));
+        contexts.remove(context.id);
+        cleanedContexts += 1;
       }
     }
     // 当前会话与 /切换会话 的历史名单都要剔除死引用,否则会把用户领到
     // 一段 resume 必然失败的会话上。
-    sessions.dropSessionIds(deleted);
-    if (deleted.length) console.info(`[cleanup] 清理了 ${deleted.length} 个过期会话`);
+    sessions.dropSessionIds(deletedSessionIds);
+    if (cleanedContexts) console.info(`[cleanup] 清理了 ${cleanedContexts} 个过期会话`);
   };
   runCleanup();
 

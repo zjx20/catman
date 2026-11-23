@@ -1050,6 +1050,11 @@ test("大脑凭据按前缀转发,且值不进 argv", () => {
           ANTHROPIC_BASE_URL: "http://llm.example/v1",
           ANTHROPIC_AUTH_TOKEN: "secret-token-value",
           CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+          GEMINI_API_KEY: "gemini-secret-key",
+          GOOGLE_GEMINI_BASE_URL: "http://gemini.example",
+          OPENAI_API_KEY: "openai-secret-key",
+          CATMAN_HARNESS: "agy",
+          CATMAN_ACP_COMMAND: '["gemini","--acp"]',
           CATMAN_MODEL: "deepseek-flash",
           CATMAN_IPC_SECRET: "must-not-forward",
         }),
@@ -1059,12 +1064,19 @@ test("大脑凭据按前缀转发,且值不进 argv", () => {
       "ANTHROPIC_BASE_URL",
       "ANTHROPIC_AUTH_TOKEN",
       "CLAUDE_CODE_OAUTH_TOKEN",
+      "GEMINI_API_KEY",
+      "GOOGLE_GEMINI_BASE_URL",
+      "OPENAI_API_KEY",
+      "CATMAN_HARNESS",
+      "CATMAN_ACP_COMMAND",
       "CATMAN_MODEL",
     ]) {
       assert.ok(out.includes(`-e ${name}`), `${name} 必须被转发`);
     }
     assert.equal(out.includes("secret-token-value"), false, "值必须从环境取 —— 进了 argv 就等于进了宿主 ps");
     assert.equal(out.includes("oauth-secret"), false);
+    assert.equal(out.includes("gemini-secret-key"), false);
+    assert.equal(out.includes("openai-secret-key"), false);
     assert.equal(out.includes("must-not-forward"), false);
     assert.equal(/\bCATMAN_IPC_SECRET\b/.test(out), false, "IPC 密钥不是大脑凭据,不该被带进部署链路");
   });

@@ -6,10 +6,12 @@
 ## 这是什么
 
 catman:跑在 OpenWrt / x86 软路由 Docker 里的个人 AI 助手。微信(iLink 协议)作为聊天入口,
-后端用 **Claude Agent SDK** 长驻,按 Claude 订阅计费,通过按 owner/context 隔离的
-worker 执行命令;Docker 操作由可信控制面负责。**多账号**:多人各自扫码接入,各自独立的会话与
-工作目录;dashboard 带鉴权,兼做扫码接入与账号管理。
-纯 TypeScript / ESM(NodeNext),运行时依赖 `@anthropic-ai/claude-agent-sdk` 与 `undici`。
+后端通过统一的 `AgentHarness` 抽象驱动常驻智能体大脑 —— 默认直连 **Claude Agent SDK**
+(按 Claude 订阅或 Anthropic API 计费),也可切换为 **Antigravity CLI (`agy acp` + `GEMINI_API_KEY`)**
+或任意兼容 **ACP v1 (`stdio` JSON-RPC 2.0)** 的 CLI(如 `gemini --acp`、`codex-acp`),
+统一运行在按 owner/context 隔离的无凭据 worker 容器中;Docker 操作与上游密钥代理由可信控制面负责。
+**多账号**:多人各自扫码接入,各自独立的会话与工作目录;dashboard 带鉴权,兼做扫码接入与账号管理。
+纯 TypeScript / ESM(NodeNext),运行时仅依赖 `@anthropic-ai/claude-agent-sdk` 与 `undici`(`AcpSession` 零外部依赖)。
 
 **源码直跑**:镜像 `catman-env` 只是不含业务代码的运行环境,真正跑的是数据卷里的
 **release 目录**(`/data/releases/<sha>/` = 浅 clone + 自带 node_modules + dist),
@@ -148,12 +150,15 @@ Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/conte
 |---|---|
 | `src/core/identity.ts` | userKey 编解码、内置管理员常量与旧目录名工具 |
 | `src/core/users.ts` | UserRegistry；用户资料与租户 home，不负责 session/cron 的 cwd |
-| `src/core/execution/contexts.ts` | owner、聊天/cron context、tenantId、独立路径和 SDK 会话注册表 |
-| `src/core/execution/runtime.ts` | 精确挂载、能力身份、worker 创建/认领、闲置预警与回收 |
+| `src/core/execution/contexts.ts` | owner、聊天/cron context、tenantId、独立路径、跨引擎重绑与会话注册表 |
+| `src/core/execution/runtime.ts` | 精确挂载、能力身份、按 Harness 创建/重建 worker、闲置预警与回收 |
+| `src/core/execution/harness.ts` | `AgentHarness` 统一契约及 `claude` / `agy` / 通用 `acp` 三套实现 |
+| `src/core/execution/acp-session.ts` | 零依赖 ACP v1(`stdio` JSON-RPC 2.0)常驻会话、流式分块聚合、中途补话与护栏 |
+| `src/core/execution/transcript-recorder.ts` | 控制面自持的 ACP 会话 JSONL 记录器(`O_NOFOLLOW`,不挂进 worker) |
 | `src/core/execution/artifacts.ts` | 实例投影与 wrapper 清理，不触碰用户持久数据；活动容器由 runtime 对账保护 |
 | `src/core/execution/task-supervisor.ts` | 同容器独立任务管理器；进程组、显式超时、任务状态与日志 |
 | `src/core/execution/sdk-session.ts` | 保持 SDK 输入连接、后台任务跟踪、按输入 UUID 关联结果 |
-| `src/core/execution/broker.ts` | 模型、公共 MCP 和 HTTP 服务的凭据代理 |
+| `src/core/execution/broker.ts` | Anthropic / Gemini / OpenAI 模型、公共 MCP 和 HTTP 服务的零凭据反向代理 |
 | `src/core/scoped-files.ts` | 限定目录的文件描述符读取，拒绝越界软链、非普通文件与超大输入 |
 | `src/dashboard/api-execution.ts` | 执行身份鉴权、延长/回收、公共能力及固定管理员操作 |
 | `src/core/admission.ts` | 准入策略(TOFU 绑定 / 本地全放行),以函数注入网关 |
@@ -163,12 +168,12 @@ Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/conte
 | `src/core/turn-env.ts` | 回合元数据；worker 凭据与目录环境由 Agent/RuntimeManager 按身份生成 |
 | `src/core/skills.ts` | 启动时**按人格**生成接口说明、安装仓库中的运维 skill(按需加载,不占系统提示词) |
 | `src/core/persona.ts` | 人格自述(进 `systemPrompt.append`)、共享人设占位、管理员名单跨命名空间继承 |
-| `src/core/agent.ts` | SDK 封装、context 身份、受限环境、技能/MCP 装配与持续连接 |
+| `src/core/agent.ts` | 多 Harness 会话编排、context 身份、受限环境、技能/MCP 装配与持续连接 |
 | `src/core/session.ts` | 会话状态机(纯函数 decide + 注入时钟/store;current + history) |
 | `src/core/gateway.ts` | 串联各层;**分拣节点**;追加输入;每会话串行;并发信号量;greeting |
 | `src/core/agent-trace.ts` | LLM 侧可观测性:SDK 消息 → 一行日志(纯函数,分 always/trace 两级) |
 | `src/core/attachments.ts` | 图片附件的中立表示 + 格式嗅探 + 上限(不认识渠道也不认识 SDK) |
-| `src/core/transcript.ts` | JSONL 防御式解析与检索；生产扫描范围由 ContextStore 提供 |
+| `src/core/transcript.ts` | SDK 项目目录与控制面扁平 JSONL 的防御式解析与检索；生产扫描范围由 ContextStore 提供 |
 | `src/core/file-store.ts` | 状态原子写(tmp + rename) |
 | `src/core/version.ts` | 版本戳:读 release 根目录的 VERSION;**读不到返回 undefined,绝不编** |
 | `src/core/selfcheck.ts` | SELFCHECK 模式:临时目录装配 + 真实 CLI 指令加载检查 + 探一次大脑;失败分类(限流/网络/凭据/代码) |
@@ -264,8 +269,9 @@ tenants/<tenantId>/
   home/                         个人持久文件、skill、配置、个人凭据
   contexts/<contextId>/
     work/                       当前聊天或固定 cron 的 workspace
-    sdk/                        该 context 的 SDK 状态与会话记录
+    sdk/                        该 context 的 CLI HOME / SDK 状态与会话记录
     tasks/                      后台任务状态和日志
+    transcripts/                控制面自持的 ACP 会话 JSONL（不挂进 worker）
 ```
 
 旧 `catman_userdata/<旧用户目录>` 已迁入 `home/`；生产数据根为 `/mnt/usb/catman_data`。
@@ -303,6 +309,39 @@ Agent 按指定事件 ID 注入结果，未放入输入的事件不得确认消�
 `skills/webgrab/` 保存公共网页抓取 skill 的版本与回归用例；安装和更新由管理员显式复制到
 控制数据的 `claude/skills/webgrab/`，不加入 `writeSkills` 的启动覆盖名单。worker 只读快照
 在创建时生成，已有容器要在释放后重建才会读取新 skill。
+
+## 多 Harness 抽象与 ACP 接入纪律
+
+- **内部 TS 契约统一，底层传输双轨，不用 `claude-agent-acp` 二次套娃**(`execution/harness.ts`)：
+  Claude Code 二进制本身没有内置 `acp` 子命令，社区 `claude-agent-acp` 本质是在外层再包一个调用
+  `@anthropic-ai/claude-agent-sdk` 的 Node 进程。在 700m 软路由容器里多包一层既白占几十 MB 常驻内存，
+  又会丢掉 `background_tasks_changed` 权威快照与 `preset: "claude_code"`。因此 `claude` 走原生
+  `SdkSession`，而原生内置 `acp` 的 CLI(`agy acp`、`gemini --acp`)及官方桥接器(`codex-acp`)直接走
+  `AcpSession`(`stdio` JSON-RPC 2.0)。网关、容器隔离、后台续接与自检门禁只面向 `AgentHarness` 契约。
+- **多提供商零凭据边界**(`execution/broker.ts` + `dashboard/api-execution.ts`)：worker 容器始终不持有真实
+  `ANTHROPIC_*`、`GEMINI_API_KEY` 或 `OPENAI_API_KEY`，只拿到单容器能力令牌 `runtime.token`。
+  `ExecutionApi` 同时识别 `X-Catman-Runtime`、`Authorization`、`x-api-key`、`x-goog-api-key` 以及模型代理路径上的
+  `?key=` 查询参数；`CapabilityBroker` 在转发至上游前剥离 `?key=`(防止泄露运行时令牌或覆盖上游认证)并按
+  `/api/runtime/model/{anthropic|gemini|openai}/...` 白名单注入真实凭据。
+- **`agy` 容器化与指令分层细节**(`agyHarness`)：
+  ① worker 容器是 `--read-only` 根文件系统，必须注入 `AGY_CLI_DISABLE_AUTO_UPDATE=true` 阻止后台自更新锁失败；
+  ② 启用 HTTP MCP 时必须带 `--process-per-session`，并通过 `--add-dir /user`(主人格管理员另加 `/catman-src`)放行工作区外受控目录；
+  ③ `agy` 对单个规则文件有 24KB 截断上限，因此不可变装配事实(人格自述、内存限制、执行规则)单独写入只读
+  `~/.gemini/GEMINI.md`，共享与个人可编辑指令写入 `~/.gemini/AGENTS.md`(兼容读取 `AGENTS.md` 与 `CLAUDE.md`)，
+  防止超长个人偏好挤掉人格身份；
+  ④ `RuntimeManager` 在 `docker run` 前必须先以控制面 UID 建好 `p.sdk` 下的子挂载父目录(`.gemini/antigravity-cli` 等)，
+  防止 Docker daemon 以 root 创建父目录导致容器内非特权进程写状态时报 `EACCES`；
+  ⑤ 模型与思考强度通过 ACP `session/set_config_option` 下发(`effort="xhigh"` 自动映射 `agy` 的 `"Extra"` 档位)。
+- **ACP 安全边界与会话记录归属**(`acp-session.ts` + `transcript-recorder.ts`)：
+  ① 控制面 `clientCapabilities` 不声明宿主文件或终端能力，收到容器内 ACP 进程发来的 `fs/*`、`terminal/*`
+  反向调用一律回 `-32601`，确保所有命令与文件读写严格留在 worker 容器内；
+  ② ACP 流式 `agent_thought_chunk` / `agent_message_chunk` 必须在工具边界与回合边界聚合成完整块后再喂给
+  `ProgressFan`，严禁逐 token 触发进度推送刷爆微信 `context_token` 10 条额度；`session/load` 历史回放期间
+  (`replaying=true`)静默抑制 `session/update`，不重复外发；
+  ③ ACP 会话 JSONL 由控制面用 `O_NOFOLLOW` 直接写进不挂载给 worker 的 `contexts/<contextId>/transcripts/`，
+  并在 `assertSafeSessionId` 拦截任何含 `/`、`\`、`..` 的会话 ID；
+  ④ 切换 `CATMAN_HARNESS` 时，`RuntimeManager` 自动回收旧引擎容器并重建，`Agent` 调用 `ContextStore.rebindHarness`
+  将旧引擎 `sdkSessionId` 归入 `previousSessionIds`，既避免跨引擎错误 `resume`，又保证 `/切换会话` 与历史检索不断链。
 
 ## 会话与回合
 

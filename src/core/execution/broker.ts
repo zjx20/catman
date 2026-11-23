@@ -47,16 +47,44 @@ export class CapabilityBroker {
     const rest = path.slice("/api/runtime/".length).split("/");
     const kind = rest.shift();
     let target: URL; let credentialHeaders: Record<string, string> = {}; let sessionKey: string | undefined;
+    let modelProvider: "anthropic" | "gemini" | "openai" | undefined;
     if (kind === "model") {
-      const base = (process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com").replace(/\/$/, "");
+      if (rest[0] === "anthropic" || rest[0] === "gemini" || rest[0] === "openai") {
+        modelProvider = rest.shift() as "anthropic" | "gemini" | "openai";
+      } else if (rest[0] === "v1beta") {
+        modelProvider = "gemini";
+      } else {
+        modelProvider = "anthropic";
+      }
       const suffix = rest.join("/");
-      if (!/^v1\/(messages|models)(\/count_tokens)?$/.test(suffix)) throw new Error("模型接口未授权");
-      target = new URL(`${base}/${suffix}`);
-      if (process.env.ANTHROPIC_API_KEY) credentialHeaders["x-api-key"] = process.env.ANTHROPIC_API_KEY;
-      else {
-        const token = process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN;
-        if (!token) throw new Error("控制面未配置模型凭据");
-        credentialHeaders.authorization = `Bearer ${token}`;
+      if (modelProvider === "anthropic") {
+        const base = (process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com").replace(/\/$/, "");
+        if (!/^v1\/(messages|models)(\/count_tokens)?$/.test(suffix)) throw new Error("模型接口未授权");
+        target = new URL(`${base}/${suffix}`);
+        if (process.env.ANTHROPIC_API_KEY) credentialHeaders["x-api-key"] = process.env.ANTHROPIC_API_KEY;
+        else {
+          const token = process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN;
+          if (!token) throw new Error("控制面未配置模型凭据");
+          credentialHeaders.authorization = `Bearer ${token}`;
+        }
+      } else if (modelProvider === "gemini") {
+        const base = (process.env.GOOGLE_GEMINI_BASE_URL || "https://generativelanguage.googleapis.com").replace(/\/$/, "");
+        if (!/^v1(beta)?\/models(\/[A-Za-z0-9._-]+(:(generateContent|streamGenerateContent|countTokens|batchGenerateContent))?)?$/.test(suffix)) {
+          throw new Error("模型接口未授权");
+        }
+        target = new URL(`${base}/${suffix}`);
+        const key = process.env.GEMINI_API_KEY;
+        if (!key) throw new Error("控制面未配置 GEMINI_API_KEY 模型凭据");
+        credentialHeaders["x-goog-api-key"] = key;
+      } else {
+        const base = (process.env.OPENAI_BASE_URL || "https://api.openai.com").replace(/\/$/, "");
+        if (!/^v1\/(responses|chat\/completions|models(\/[A-Za-z0-9._-]+)?)$/.test(suffix)) {
+          throw new Error("模型接口未授权");
+        }
+        target = new URL(`${base}/${suffix}`);
+        const key = process.env.OPENAI_API_KEY;
+        if (!key) throw new Error("控制面未配置 OPENAI_API_KEY 模型凭据");
+        credentialHeaders.authorization = `Bearer ${key}`;
       }
     } else {
       const name = rest.shift() ?? "";
@@ -71,12 +99,16 @@ export class CapabilityBroker {
       if (kind === "mcp") sessionKey = `${r.container}:${name}`;
     }
     const incomingUrl = new URL(req.url!, "http://localhost");
-    for (const [key, value] of incomingUrl.searchParams) target.searchParams.append(key, value);
+    for (const [key, value] of incomingUrl.searchParams) {
+      // Gemini SDK 可能通过 ?key=<runtime.token> 传递客户端凭据；剥离它以免泄露运行时令牌或覆盖真实 x-goog-api-key。
+      if (kind === "model" && key.toLowerCase() === "key") continue;
+      target.searchParams.append(key, value);
+    }
     const headers: Record<string, string | string[]> = {};
-    const allowed = new Set(["content-type", "accept", "user-agent", "x-app", "anthropic-version", "anthropic-beta", "mcp-protocol-version", "last-event-id"]);
+    const allowed = new Set(["content-type", "accept", "user-agent", "x-app", "anthropic-version", "anthropic-beta", "x-goog-api-client", "mcp-protocol-version", "last-event-id"]);
     for (const [key, value] of Object.entries(req.headers)) if (allowed.has(key) && value) headers[key] = value;
     Object.assign(headers, credentialHeaders);
-    if (kind === "model" && process.env.CLAUDE_CODE_OAUTH_TOKEN && !String(headers["anthropic-beta"] ?? "").includes("oauth-2025-04-20")) {
+    if (modelProvider === "anthropic" && !process.env.ANTHROPIC_API_KEY && process.env.CLAUDE_CODE_OAUTH_TOKEN && !String(headers["anthropic-beta"] ?? "").includes("oauth-2025-04-20")) {
       headers["anthropic-beta"] = [headers["anthropic-beta"], "oauth-2025-04-20"].filter(Boolean).join(",");
     }
     if (sessionKey && this.sessions.has(sessionKey)) headers["mcp-session-id"] = this.sessions.get(sessionKey)!;

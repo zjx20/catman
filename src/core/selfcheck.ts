@@ -12,6 +12,7 @@ import { TurnTokens } from "./turn-tokens.js";
 import { writeSkills } from "./skills.js";
 import { readVersion, type VersionInfo } from "./version.js";
 import { checkInstructions } from "./execution/instruction-check.js";
+import { resolveHarness } from "./execution/harness.js";
 
 /**
  * 启动自检(smoke)。`CATMAN_SELFCHECK=1` 时 index.ts 走这条路,不起渠道、不起
@@ -67,9 +68,9 @@ export interface SelfCheckResult {
  */
 export function classifyFailure(text: string): Exclude<SelfCheckCategory, "ok"> {
   const t = text.toLowerCase();
-  if (/rate.?limit|429|529|overloaded|too many requests|quota exceeded/.test(t)) return "ratelimit";
+  if (/rate.?limit|429|529|overloaded|too many requests|quota exceeded|resource.?exhausted/.test(t)) return "ratelimit";
   if (
-    /credit balance|insufficient|401|403|unauthorized|authentication|invalid.{0,12}token|expired.{0,12}token|oauth|not logged in|please run \/login|logged out|no api key|missing api key/.test(
+    /credit balance|insufficient|401|403|unauthorized|unauthenticated|authentication|api_key_invalid|api key not valid|permission.?denied|invalid.{0,12}token|expired.{0,12}token|oauth|not logged in|please run \/login|logged out|no api key|missing api key/.test(
       t,
     )
   ) {
@@ -90,9 +91,6 @@ const PROBE_PROMPT = "只回复两个字:ok。不要使用任何工具,不要做
 
 /** 自检默认的总超时。跑在部署流水线里、没人盯着,必须有上限。 */
 const DEFAULT_TIMEOUT_MS = 180_000;
-
-/** 自检默认用的模型 —— 便宜的那档就够回答"大脑通不通"。 */
-const DEFAULT_PROBE_MODEL = "haiku";
 
 export interface SelfCheckOptions {
   /** Native CLI + local provider; injected only when testing selfcheck orchestration. */
@@ -157,7 +155,12 @@ export async function runSelfCheck(opts: SelfCheckOptions = {}): Promise<SelfChe
 
     // ── 第二段:实际指令加载。零模型费用；缺层/越界加载属于代码问题。
     try {
-      await (opts.checkInstructions ?? checkInstructions)(join(sandbox, "instructions"), config.persona, Math.max(1, Math.min(45_000, timeoutMs - (Date.now() - startedAt))));
+      const instrTimeout = Math.max(1, Math.min(45_000, timeoutMs - (Date.now() - startedAt)));
+      if (opts.checkInstructions) {
+        await opts.checkInstructions(join(sandbox, "instructions"), config.persona, instrTimeout);
+      } else {
+        await checkInstructions(join(sandbox, "instructions"), config.persona, instrTimeout, config);
+      }
     } catch (error) {
       return fail("code", `指令自检失败:${String(error)}`, version, startedAt);
     }
@@ -170,9 +173,8 @@ export async function runSelfCheck(opts: SelfCheckOptions = {}): Promise<SelfChe
     // finally 里会 clearTimeout,所以它最多把进程多留 timeoutMs,而那正是该活着的时候。
     const timer = setTimeout(() => abort.abort(), Math.max(1, timeoutMs - (Date.now() - startedAt)));
     // 探测模型优先用线上配置的那个:自检要回答的是"**这份部署**的大脑通不通",
-    // 写死 haiku 只在 Anthropic 官方 API 上成立。第三方 provider(或改过默认模型
-    // 的部署)上,那个模型名可能不存在 —— 于是凭据明明没问题,自检却报模型错误。
-    const model = process.env["CATMAN_SELFCHECK_MODEL"] || config.model || DEFAULT_PROBE_MODEL;
+    // 未指定时回落到当前 Harness 对应的轻量探测模型(如 claude -> haiku, agy -> flash)。
+    const model = process.env["CATMAN_SELFCHECK_MODEL"] || config.model || resolveHarness(config).defaultProbeModel || "";
     try {
       const probe = opts.runProbe ?? defaultProbe;
       const reply = await probe(agent, cwd, model, abort);
@@ -229,7 +231,7 @@ async function defaultProbe(
 ): Promise<{ text: string; isError: boolean }> {
   const reply = await agent.run(PROBE_PROMPT, {
     cwd,
-    model,
+    ...(model ? { model } : {}),
     maxTurns: 1,
     abortController: abort,
     logLabel: "selfcheck",

@@ -99,7 +99,7 @@ export const FEED_ACK_TEXT = "收到,一并交给正在处理的这一轮了。"
  * 用户会把「Credit balance is too low」读成助手在跟他说话,而不是"这轮根本没跑成"。
  * 原文照发不翻译:它是去查订阅/配置的唯一线索。
  */
-export const TURN_ERROR_PREFIX = "⚠️ 这一轮没能跑成,以下是 Claude 侧的报错原文:\n";
+export const TURN_ERROR_PREFIX = "⚠️ 这一轮没能跑成,以下是模型侧的报错原文:\n";
 
 /** 进度消息里思考/工具参数摘要的截断长度。 */
 const PROGRESS_MAX_CHARS = 200;

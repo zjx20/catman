@@ -9,11 +9,13 @@ import { ContextStore, hostPath, readTenantFile, readExecutionState, type Execut
 import { MAX_TASK_MS, type TaskRecord, type TaskRequest } from "./task-supervisor.js";
 import { readScopedFile } from "../scoped-files.js";
 import { ExecutionArtifacts } from "./artifacts.js";
-import { projectInstructions } from "./instructions.js";
+import { resolveHarness } from "./harness.js";
 import { codeBlock, inlineCode } from "../markdown.js";
 
 export interface RuntimeRecord {
   contextId: string; userKey: string; container: string; token: string; admin: boolean;
+  /** 创建该容器时绑定的引擎标识；引擎切换后旧容器会在下次访问或巡检时重建。 */
+  harness?: Config["harness"];
   createdAt: number; lastInteractionAt: number; extensionUntil: number; warnedDeadline?: number;
   tasks: TaskRecord[]; sdkTasks: Array<{ task_id: string; description: string; ambient?: boolean }>;
   /** Control-plane ownership; worker events cannot opt themselves out of notification. */
@@ -34,9 +36,6 @@ export async function dockerCommand(args: string[], env?: NodeJS.ProcessEnv): Pr
   });
 }
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
-// Releases install the SDK's native dependency on the deployment machine.
-// The stable runtime image uses Linux/glibc on that same architecture.
-const sdkNativePackage = `claude-agent-sdk-linux-${process.arch}`;
 export function networkEnvironment(apiBase: string): Record<string, string> {
   const env: Record<string, string> = {};
   for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) {
@@ -109,10 +108,24 @@ export class RuntimeManager {
     this.locks.set(id, next);
     try { return await next; } finally { if (this.locks.get(id) === next) this.locks.delete(id); }
   }
+  private resolveReleaseCandidate(): string {
+    if (process.env.CATMAN_RELEASE_LINK) return process.env.CATMAN_RELEASE_LINK;
+    const primary = `${this.config.releasesDir}/current`;
+    return existsSync(primary) ? primary : `${this.config.dataDir}/releases/current`;
+  }
+  private resolveReleaseDir(): string {
+    return realpathSync(this.resolveReleaseCandidate());
+  }
+  private tryResolveReleaseDir(): string {
+    const candidate = this.resolveReleaseCandidate();
+    return existsSync(candidate) ? realpathSync(candidate) : candidate;
+  }
   private async provision(context: ExecutionContext): Promise<RuntimeRecord> {
     if (!this.config.hostDataDir) throw new Error("多租户执行要求配置 CATMAN_HOST_DATA_DIR；拒绝退回控制进程执行");
+    const harness = resolveHarness(this.config);
     let old = this.records.find(r => r.contextId === context.id);
     if (old && old.admin !== this.opts.isAdmin(context.userKey)) { await this.remove(context.id, "用户权限已改变"); old = undefined; }
+    if (old && (old.harness ?? "claude") !== harness.id) { await this.remove(context.id, "执行引擎已切换"); old = undefined; }
     if (old) {
       // A daemon outage must not be confused with a missing container.
       let state: string;
@@ -124,9 +137,9 @@ export class RuntimeManager {
     }
     if (this.records.length >= this.config.maxActiveRuntimes) throw new Error("活跃执行环境已达上限，请先回收空闲环境");
     const p = this.contexts.ensure(context);
-    const release = realpathSync(process.env.CATMAN_RELEASE_LINK || `${this.config.dataDir}/releases/current`);
-    const binary = join(release, "node_modules/@anthropic-ai", sdkNativePackage, "claude");
-    if (!existsSync(binary) || !existsSync(join(release, "dist/src/core/execution/worker.js"))) throw new Error("release 缺少执行运行时，请先构建");
+    const release = this.resolveReleaseDir();
+    if (!existsSync(join(release, "dist/src/core/execution/worker.js"))) throw new Error("release 缺少执行运行时，请先构建");
+    harness.verifyRelease(release, this.config);
     const generation = randomBytes(8).toString("hex");
     // Snapshot history before starting the worker. Persist this baseline so adopting
     // the same container after controller downtime cannot swallow a new completion.
@@ -134,7 +147,8 @@ export class RuntimeManager {
     if (!Array.isArray(history)) throw new Error("后台任务状态损坏");
     const inheritedTaskIds = history.filter(t => t && /^t_[a-f0-9-]{36}$/.test(t.id) && t.status !== "running" && Number.isFinite(t.endedAt)).map(t => t.id);
     const r: RuntimeRecord = { contextId: context.id, userKey: context.userKey, container: `catman-ctx-${context.id}-${generation}`,
-      token: randomBytes(32).toString("hex"), admin: this.opts.isAdmin(context.userKey), createdAt: this.now(), lastInteractionAt: this.now(), extensionUntil: 0, tasks: [], sdkTasks: [], inheritedTaskIds };
+      token: randomBytes(32).toString("hex"), admin: this.opts.isAdmin(context.userKey), harness: harness.id,
+      createdAt: this.now(), lastInteractionAt: this.now(), extensionUntil: 0, tasks: [], sdkTasks: [], inheritedTaskIds };
     let launchAttempted = false;
     try {
       const projection = this.project(context, generation);
@@ -147,17 +161,19 @@ export class RuntimeManager {
       mount(p.work, p.work); mount(p.sdk, p.sdk); mount(p.tasks, p.tasks); mount(p.home, "/user");
       mount(join(release, "dist"), "/runtime/release/dist", true);
       mount(join(release, "package.json"), "/runtime/release/package.json", true);
-      mount(dirname(binary), `/runtime/release/node_modules/@anthropic-ai/${sdkNativePackage}`, true);
       mount(projection, "/runtime/bin", true);
-      mount(join(projection, "CLAUDE.md"), join(p.sdk, "CLAUDE.md"), true);
-      mount(join(p.home, "skills"), join(p.sdk, "skills"));
-      const shared = join(projection, "skills");
-      for (const name of readdirSync(shared)) mount(join(shared, name), join(p.sdk, "skills", name), true);
+      const sharedSkillNames = readdirSync(join(projection, "skills"));
+      for (const spec of harness.containerMounts({ config: this.config, paths: p, projectionDir: projection, releaseDir: release, sharedSkillNames })) {
+        // 先以控制面 uid 建好 HOME 下的子挂载父目录，避免 Docker daemon 以 root 创建只读父目录导致容器内 CLI 写状态报 EACCES。
+        if (spec.target.startsWith(`${p.sdk}/`)) mkdirSync(dirname(spec.target), { recursive: true, mode: 0o700 });
+        mount(spec.source, spec.target, Boolean(spec.readonly));
+      }
       if (r.admin && this.config.persona === "primary") {
         if (!existsSync(this.config.srcDir)) throw new Error("管理员源码目录不存在");
         mount(this.config.srcDir, "/catman-src");
       }
-      const env: NodeJS.ProcessEnv = { ...networkEnvironment(this.config.apiBase), PATH: "/runtime/bin:/usr/local/bin:/usr/bin:/bin", HOME: p.sdk, CLAUDE_CONFIG_DIR: p.sdk, CATMAN_CONTEXT_DIR: p.work, CATMAN_USER_PRIVATE_DIR: "/user", TINI_SUBREAPER: "1", CATMAN_TASKS_DIR: p.tasks,
+      const env: NodeJS.ProcessEnv = { ...networkEnvironment(this.config.apiBase), PATH: "/runtime/bin:/usr/local/bin:/usr/bin:/bin", HOME: p.sdk,
+        ...harness.containerEnv(p), CATMAN_CONTEXT_DIR: p.work, CATMAN_USER_PRIVATE_DIR: "/user", TINI_SUBREAPER: "1", CATMAN_TASKS_DIR: p.tasks,
         CATMAN_API_BASE: this.config.apiBase, CATMAN_RUNTIME_TOKEN: r.token, TZ: this.config.tz };
       for (const key of Object.keys(env)) args.push("-e", key);
       args.push("-w", p.work, this.config.sessionImage, "node", "/runtime/release/dist/src/core/execution/worker.js");
@@ -198,7 +214,12 @@ export class RuntimeManager {
       const canonical = /^---\r?\n[\s\S]*?^name:[ \t]*(\S+)/m.exec(body)?.[1] ?? entry.name;
       if (names.includes(canonical)) cpSync(source, join(target, "skills", entry.name), { recursive: true, dereference: false });
     }
-    projectInstructions(this.config.dataDir, p.home, join(target, "CLAUDE.md"), !!this.config.ops && this.opts.isAdmin(context.userKey));
+    resolveHarness(this.config).writeProjectionFiles({
+      config: this.config,
+      home: p.home,
+      projectionDir: target,
+      isAdmin: this.opts.isAdmin(context.userKey),
+    });
     const launcher = '#!/bin/sh\nexec node /runtime/release/dist/src/core/execution/task-cli.js "$@"\n';
     for (const name of ["catman-task", "catman-notify"]) writeFileSync(join(target, name), launcher, { mode: 0o755 });
     writeFileSync(join(target, "catman-ops"), '#!/bin/sh\nexec node /runtime/release/dist/src/core/execution/ops-cli.js "$@"\n', { mode: 0o755 });
@@ -228,10 +249,15 @@ export class RuntimeManager {
     const p = this.contexts.paths(context);
     const wrapper = join(this.config.dataDir, "execution", "wrappers", `${context.id}.sh`);
     mkdirSync(dirname(wrapper), { recursive: true, mode: 0o700 });
-    // Agent builds a fresh capability-only environment; also forward SDK-added protocol flags.
-    // Values never enter shell source or argv. Never overwrite SDK positional arguments.
+    // Agent builds a fresh capability-only environment; also forward SDK/ACP protocol flags.
+    // Values never enter shell source or argv. Never overwrite positional arguments.
+    const cmd = resolveHarness(this.config).containerCommand({
+      config: this.config,
+      releaseDir: this.tryResolveReleaseDir(),
+      isAdmin: r.admin,
+    });
     const before = ["exec", "-i", "-w", p.work];
-    const after = [r.container, "node", "/runtime/release/dist/src/core/execution/task-cli.js", "exec", "--", `/runtime/release/node_modules/@anthropic-ai/${sdkNativePackage}/claude`];
+    const after = [r.container, "node", "/runtime/release/dist/src/core/execution/task-cli.js", "exec", "--", ...cmd];
     writeFileSync(wrapper, `#!/bin/sh
 _e=
 for _k in $(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/\\1/p'); do
@@ -405,11 +431,13 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
   }
   async tick(): Promise<void> {
     if (this.ticking || this.closed) return; this.ticking = true;
+    const expectedHarness = resolveHarness(this.config).id;
     try {
       for (const r of [...this.records]) {
         try {
         if (!this.canMonitor(r)) continue;
         if (r.admin !== this.opts.isAdmin(r.userKey)) { await this.stop(r.contextId, "用户权限已改变"); continue; }
+        if ((r.harness ?? "claude") !== expectedHarness) { await this.stop(r.contextId, "执行引擎已切换"); continue; }
         let snapshot: { tasks: TaskRecord[]; processes: string[]; agents?: string[]; unmanaged?: string[] };
         try {
           await this.adopt(r);

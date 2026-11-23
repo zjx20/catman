@@ -1,8 +1,10 @@
 # catman
 
-跑在 OpenWrt / x86 软路由 Docker 里的个人 AI 助手:通过**微信**与之对话,后端是基于
-**Claude Agent SDK** 的长驻服务,使用 **Claude 订阅** 计费,能在容器内执行任意命令
-(Claude Code 的能力与行为),并带一个 HTTP **dashboard** 查看会话记录、管理接入账号。
+跑在 OpenWrt / x86 软路由 Docker 里的个人 AI 助手:通过**微信**与之对话,后端通过统一的
+**多 Harness 大脑抽象**驱动常驻智能体 —— 默认基于 **Claude Agent SDK**(使用 Claude 订阅或
+Anthropic API),也支持切换为 **Antigravity CLI (`agy acp` + `GEMINI_API_KEY`)** 或任意支持
+**ACP v1 (`stdio` JSON-RPC)** 的 CLI(如 `gemini --acp`、`codex-acp`),在按租户隔离的无凭据容器内
+执行命令,并带一个 HTTP **dashboard** 查看会话记录、管理接入账号。
 **支持多人各自扫码接入**,每人独立的会话上下文与工作目录。
 
 > 个人自用工具。微信侧走腾讯官方 **iLink 协议**(Tencent/openclaw-weixin 所用),合法、
@@ -53,7 +55,7 @@
 ```text
 用户消息 / cron → 控制服务 → owner + context → 常驻 worker
                                               ├─ 任务管理进程
-                                              ├─ Claude CLI（按需启动，SDK 有后台任务时保留）
+                                              ├─ Agent CLI（Claude CLI / agy acp / 通用 ACP，按需常驻）
                                               └─ 有明确超时的后台脚本
 ```
 
@@ -78,8 +80,9 @@
     home/                        # 本用户的持久文件、个人 skill 和配置
     contexts/<contextId>/
       work/                      # 当前 workspace
-      sdk/                       # 此上下文的 SDK 会话与记忆
+      sdk/                       # 此上下文的 CLI HOME / SDK 会话与记忆
       tasks/                     # 有限后台任务记录与日志
+      transcripts/               # 控制面自持的 ACP 会话 JSONL（不挂进 worker）
 ```
 
 tenantId 是 userKey 的 SHA-256 前 32 个十六进制字符。contextId 由服务端生成，SDK session ID 单独记录。控制面注册表是归属和清理的真相源。
@@ -88,7 +91,11 @@ tenantId 是 userKey 的 SHA-256 前 32 个十六进制字符。contextId 由服
 
 ## 前置:两项授权
 
-### 1. Claude 订阅 token(宿主机执行一次)
+### 1. 大脑引擎与模型凭据(按需三选一)
+
+真实模型密钥只保存在控制服务进程环境里；worker 容器只拿到单实例运行时令牌，模型流量全部由控制面 `CapabilityBroker` 反向代理并注入凭据。
+
+#### 方式 A（默认）：Claude 订阅或 Anthropic API（`CATMAN_HARNESS=claude`）
 
 ```bash
 npm install -g @anthropic-ai/claude-code   # 或用已装好的 claude CLI
@@ -96,10 +103,36 @@ claude setup-token                          # 浏览器授权,输出 1 年期 OA
 export CLAUDE_CODE_OAUTH_TOKEN="<上一步输出的 token>"
 ```
 
-把该 token 放进 `.env`(与 docker-compose.yml 同目录):
+把该 token（或 `ANTHROPIC_API_KEY`）放进 `.env`(与 docker-compose.yml 同目录):
 
-```
+```env
 CLAUDE_CODE_OAUTH_TOKEN=<token>
+```
+
+#### 方式 B：Antigravity CLI (`agy`) + `GEMINI_API_KEY`（`CATMAN_HARNESS=agy`）
+
+将匹配目标机架构（Linux glibc x64/arm64）的 `agy` 可执行文件放到数据卷 `/data/harness/agy`（或装进 `catman-env` 镜像 `PATH`），在 `.env` 配置：
+
+```env
+CATMAN_HARNESS=agy
+GEMINI_API_KEY=<你的 Gemini API Key>
+# 可选：若 agy 不在默认 /data/harness/agy 或镜像 PATH 中，显式指定路径
+# CATMAN_HARNESS_BIN=/data/harness/agy
+# 可选：自定义上游地址（默认 https://generativelanguage.googleapis.com）
+# GOOGLE_GEMINI_BASE_URL=https://generativelanguage.googleapis.com
+```
+
+控制面会自动为每个上下文生成只读 `~/.gemini/GEMINI.md`（不可变人格身份与执行边界）、`~/.gemini/AGENTS.md`（共享与个人指令）及 `settings.json`（`modelProvider: "gemini"`），并把 `/模型` 与 `/思考`（含 `xhigh` → `Extra`）通过 ACP `session/set_config_option` 同步给 `agy acp`。
+
+#### 方式 C：通用 ACP v1 智能体（`CATMAN_HARNESS=acp`）
+
+任意支持 Agent Client Protocol v1（`stdio` JSON-RPC 2.0）的 CLI（如 `gemini --acp`、`codex-acp`）均可接入：
+
+```env
+CATMAN_HARNESS=acp
+CATMAN_ACP_COMMAND='["codex-acp"]'
+CATMAN_ACP_UPSTREAM=openai
+OPENAI_API_KEY=<你的 OpenAI API Key>
 ```
 
 ### 2. dashboard 访问令牌
@@ -941,7 +974,7 @@ send #12 … #15                             → 全部失败
 详见「硬指令」一节。
 
 回合**出错**时用户不会被蒙在鼓里,两条路径都会说话:SDK 以错误结束(鉴权失败、额度打满、
-达到轮数上限)时,错误原文照发,但前面加一句「⚠️ 这一轮没能跑成,以下是 Claude 侧的报错原文」——
+达到轮数上限)时,错误原文照发,但前面加一句「⚠️ 这一轮没能跑成,以下是模型侧的报错原文」——
 不加的话「Credit balance is too low」在微信里和助手说的话长得一模一样;回合中途抛异常
 (含 `/取消`)则发一句「处理出错了:…」。**唯一发不出来的情况**是那条消息本身也发失败,
 最常见的是 `context_token` 的发送预算已被耗光(见上一节)——那时日志里的 `回合失败` /

@@ -21,6 +21,7 @@ test("限流类归 ratelimit", () => {
     "API Error: 429 too many requests",
     "Error 529: Overloaded",
     "quota exceeded for this org",
+    "RESOURCE_EXHAUSTED: Gemini API quota exceeded",
   ]) {
     assert.equal(classifyFailure(s), "ratelimit", s);
   }
@@ -37,6 +38,8 @@ test("凭据/额度类归 auth(重试无用,要人去换发)", () => {
     // "这份代码坏了",排查方向直接跑偏。
     "Not logged in · Please run /login",
     "No API key found",
+    "API_KEY_INVALID: API key not valid. Please pass a valid API key.",
+    "PERMISSION_DENIED: caller does not have permission",
   ]) {
     assert.equal(classifyFailure(s), "auth", s);
   }

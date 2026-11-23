@@ -1,15 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
-import { query, type SDKMessage, type SDKUserMessage, type McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
+import type { SDKUserMessage, McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { Config } from "../config.js";
 import type { EffortLevel } from "./settings.js";
 import type { Attachment } from "./attachments.js";
-import { AGENT_TRACE, describeSdkMessage } from "./agent-trace.js";
-import { instructionOptions } from "./execution/instructions.js";
 import { ContextStore, readTenantFile, type ExecutionContext } from "./execution/contexts.js";
 import { RuntimeManager, networkEnvironment } from "./execution/runtime.js";
 import { CapabilityBroker } from "./execution/broker.js";
-import { SdkSession } from "./execution/sdk-session.js";
+import { resolveHarness, type HarnessSession } from "./execution/harness.js";
 import { GENERATED_SKILLS, skillsOnDisk } from "./skills.js";
 /**
  * Agent SDK 封装。目标:尽量还原 Claude Code 的行为("脾气"),
@@ -296,9 +293,19 @@ function isBenignStderr(line: string): boolean {
   return /kernel does not support swap limit/i.test(line);
 }
 
-/** SDK transport for owner-scoped execution contexts. */
+interface LiveSessionSlot {
+  session: HarnessSession;
+  options: AgentRunOptions;
+  harnessId: Config["harness"];
+  model?: string;
+  effort?: string;
+  maxTurns?: number;
+  maxBudgetUsd?: number;
+}
+
+/** Multi-harness transport (`claude` SDK / `agy acp` / generic ACP) for owner-scoped execution contexts. */
 export class Agent {
-  private readonly live = new Map<string, { session: SdkSession; options: AgentRunOptions; model?: string; effort?: string; maxTurns?: number; maxBudgetUsd?: number }>();
+  private readonly live = new Map<string, LiveSessionSlot>();
   constructor(private readonly config: Config, private readonly execution?: {
     contexts: ContextStore; runtimes: RuntimeManager; broker: CapabilityBroker;
   }, private readonly probe = false) {}
@@ -309,28 +316,46 @@ export class Agent {
     if (this.probe) return this.runProbe(prompt, opts);
     const e = this.execution, context = opts.context;
     if (!e || !context) throw new Error("agent 必须在有归属的执行上下文中运行");
+    const harness = resolveHarness(this.config);
     e.runtimes.activity(context.id);
     const runtime = await e.runtimes.ensure(context);
     const paths = e.contexts.paths(context);
-    let entry = this.live.get(context.id);
-    if (entry && !entry.session.alive) { this.live.delete(context.id); entry = undefined; }
-    // A different SDK session (fresh cron) cannot attach to the previous CLI.
-    if (entry && (opts.resumeSessionId === undefined && context.sdkStarted === false)) {
-      entry.session.close(); this.live.delete(context.id); entry = undefined;
+    let activeContext = e.contexts.get(context.id, context.userKey) ?? context;
+    let entry = this.live.get(activeContext.id);
+    if (entry && !entry.session.alive) { this.live.delete(activeContext.id); entry = undefined; }
+    let harnessSwitchNote = "";
+    if (activeContext.sdkStarted && (activeContext.harness ?? "claude") !== harness.id) {
+      const previousHarness = activeContext.harness ?? "claude";
+      if (entry) { entry.session.close(); this.live.delete(activeContext.id); entry = undefined; }
+      activeContext = e.contexts.rebindHarness(activeContext.id, harness.id);
+      if (activeContext.kind === "chat") {
+        harnessSwitchNote = `系统执行引擎已由 ${previousHarness} 切换为 ${harness.id}；旧引擎的对话连接已归档，当前继续沿用同一工作目录（${paths.work}）与个人目录（/user）。`;
+      }
     }
-    if (entry && (entry.model !== opts.model || entry.effort !== opts.effort || entry.maxTurns !== opts.maxTurns || entry.maxBudgetUsd !== opts.maxBudgetUsd)) {
+    // A different session (fresh cron) cannot attach to the previous CLI.
+    if (entry && (opts.resumeSessionId === undefined && activeContext.sdkStarted === false)) {
+      entry.session.close(); this.live.delete(activeContext.id); entry = undefined;
+    }
+    if (
+      entry &&
+      (entry.harnessId !== harness.id ||
+        entry.model !== opts.model ||
+        entry.effort !== opts.effort ||
+        entry.maxTurns !== opts.maxTurns ||
+        entry.maxBudgetUsd !== opts.maxBudgetUsd)
+    ) {
       if (runtime.sdkTasks.length || entry.session.hasBackgroundTasks) throw new Error("此上下文仍有 SDK 后台任务；请先结束任务，再切换模型、思考设置或执行预算");
-      entry.session.close(); this.live.delete(context.id); entry = undefined;
+      entry.session.close(); this.live.delete(activeContext.id); entry = undefined;
     }
     if (!entry) {
       const agentId = randomUUID();
       const env: Record<string, string | undefined> = {
         ...networkEnvironment(this.config.apiBase),
         PATH: "/runtime/bin:/usr/local/bin:/usr/bin:/bin", HOME: paths.sdk, TZ: this.config.tz,
-        CLAUDE_CONFIG_DIR: paths.sdk, ANTHROPIC_BASE_URL: `${this.config.apiBase}/api/runtime/model`,
-        ANTHROPIC_AUTH_TOKEN: runtime.token, CATMAN_API_BASE: this.config.apiBase,
+        ...harness.sessionEnv(this.config.apiBase, runtime.token, paths),
+        CATMAN_API_BASE: this.config.apiBase,
         CATMAN_SESSION_TOKEN: runtime.token, CATMAN_RUNTIME_TOKEN: runtime.token, CATMAN_AGENT_ID: agentId,
-        CATMAN_CONTEXT_ID: context.id, CATMAN_CONTEXT_DIR: paths.work, CATMAN_USER_PRIVATE_DIR: "/user",
+        CATMAN_CONTEXT_ID: activeContext.id, CATMAN_CONTEXT_DIR: paths.work, CATMAN_USER_PRIVATE_DIR: "/user",
         ...(process.env.DOCKER_API_VERSION ? { DOCKER_API_VERSION: process.env.DOCKER_API_VERSION } : {}),
       };
       const personalMcp = readTenantFile(paths.home, "mcp.json");
@@ -343,41 +368,40 @@ export class Agent {
         ...Object.fromEntries(Object.entries(e.broker.mcpServers(runtime, this.config.apiBase)).map(([name, config]) => [`public_${name}`, config])),
       };
       const allSkills = [...new Set([...(opts.skills ?? []), ...skillsOnDisk(paths.home).filter(name => !(GENERATED_SKILLS as readonly string[]).includes(name))])];
-      const slot: { session: SdkSession; options: AgentRunOptions; model?: string; effort?: string; maxTurns?: number; maxBudgetUsd?: number } = {
-        session: undefined!, options: opts, model: opts.model, effort: opts.effort, maxTurns: opts.maxTurns, maxBudgetUsd: opts.maxBudgetUsd,
+      const slot: LiveSessionSlot = {
+        session: undefined!, options: opts, harnessId: harness.id, model: opts.model, effort: opts.effort, maxTurns: opts.maxTurns, maxBudgetUsd: opts.maxBudgetUsd,
       };
-      const session = new SdkSession(input => query({ prompt: input, options: {
-        pathToClaudeCodeExecutable: e.runtimes.wrapper(context, runtime),
-        cwd: paths.work, env, ...instructionOptions(this.config.persona, this.config.sessionMemoryLimit),
-        ...(context.sdkStarted ? { resume: context.sdkSessionId } : { sessionId: context.sdkSessionId }),
-        ...(opts.model ?? this.config.model ? { model: opts.model ?? this.config.model } : {}),
-        ...(opts.effort ? { effort: opts.effort } : {}), ...(opts.maxTurns ? { maxTurns: opts.maxTurns } : {}),
-        ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
-        thinking: { type: "adaptive", display: "summarized" }, skills: allSkills, mcpServers,
-        perTaskStopAffordance: true,
-        stderr: data => { if (data.trim() && !isBenignStderr(data.trim())) console.warn(`[agent ${context.id}] ${data.slice(0, 2000)}`); },
-      } }), {
+      const session = harness.openSession({
+        config: this.config,
+        context: activeContext,
+        paths,
+        wrapperPath: e.runtimes.wrapper(activeContext, runtime),
+        env,
+        model: opts.model,
+        effort: opts.effort,
+        maxTurns: opts.maxTurns,
+        maxBudgetUsd: opts.maxBudgetUsd,
+        skills: allSkills,
+        mcpServers,
+        isAdmin: runtime.admin,
+        onStderr: data => { if (data.trim() && !isBenignStderr(data.trim())) console.warn(`[agent ${activeContext.id}] ${data.slice(0, 2000)}`); },
         stopAgent: () => e.runtimes.rpc(runtime, `/agents/${agentId}`, "DELETE"),
         onClose: () => {
-          if (this.live.get(context.id)?.session === slot.session) { this.live.delete(context.id); e.runtimes.sdkTasks(context.id, []); }
+          if (this.live.get(activeContext.id)?.session === slot.session) { this.live.delete(activeContext.id); e.runtimes.sdkTasks(activeContext.id, []); }
         },
-        onBackground: message => {
-          if (message.type === "system" && message.subtype === "background_tasks_changed") e.runtimes.sdkTasks(context.id, message.tasks);
-          if (message.type === "system" && message.subtype === "task_notification") e.runtimes.report(context.id, `SDK 后台任务 ${message.task_id}：${message.status}\n${message.summary}`, message.uuid);
-          if (message.type === "result" && message.subtype === "success" && message.result) e.runtimes.report(context.id, message.result, message.uuid);
-        },
+        onBackgroundTasksChanged: tasks => e.runtimes.sdkTasks(activeContext.id, tasks),
+        onBackgroundNotice: (text, id) => e.runtimes.report(activeContext.id, text, id),
       });
-      slot.session = session; entry = slot; this.live.set(context.id, slot);
-      e.runtimes.onStop(context.id, () => session.close(new Error("执行环境已回收")));
+      slot.session = session; entry = slot; this.live.set(activeContext.id, slot);
+      e.runtimes.onStop(activeContext.id, () => session.close(new Error("执行环境已回收")));
     }
     entry.options = opts;
-    e.runtimes.activity(context.id);
-    const fan = new ProgressFan();
+    e.runtimes.activity(activeContext.id);
     opts.onFeedReady?.((text, attachments) => {
-      if (!entry!.session.feed(buildUserMessage(text, attachments))) return false;
-      e.runtimes.activity(context.id); return true;
+      if (!entry!.session.feed(text, attachments)) return false;
+      e.runtimes.activity(activeContext.id); return true;
     });
-    const available = opts.backgroundEventIds ? e.runtimes.selected(context.id, opts.backgroundEventIds) : e.runtimes.pending(context.id);
+    const available = opts.backgroundEventIds ? e.runtimes.selected(activeContext.id, opts.backgroundEventIds) : e.runtimes.pending(activeContext.id);
     const pendingEvents = [];
     let events = "";
     for (const event of available) {
@@ -385,18 +409,24 @@ export class Agent {
       if (pendingEvents.length && events.length + text.length + 2 > 12000) break;
       pendingEvents.push(event); events += (events ? "\n\n" : "") + text;
     }
-    const message = buildUserMessage(prompt, opts.attachments ?? [], [opts.ambient, events ? `后台任务记录：\n${events}` : ""].filter(Boolean).join("\n\n"));
-    const reply = await entry.session.run({ message, signal: opts.abortController?.signal, onMessage: message => {
-      if ("session_id" in message && message.session_id) { e.contexts.started(context.id, message.session_id); opts.onSessionId?.(message.session_id); }
-      const trace = describeSdkMessage(message);
-      if (trace && (trace.level === "always" || AGENT_TRACE)) console.info(`[agent ${context.id}] ${trace.text}`);
-      opts.onAlive?.();
-      if (message.type === "assistant") {
-        e.runtimes.activity(context.id);
-        for (const ev of fan.take(message.message.content)) opts.onProgress?.(ev);
-      }
-      if (message.type === "result") e.runtimes.activity(context.id);
-    } });
+    const ambient = [harnessSwitchNote, opts.ambient, events ? `后台任务记录：\n${events}` : ""].filter(Boolean).join("\n\n");
+    const reply = await entry.session.run({
+      prompt,
+      attachments: opts.attachments ?? [],
+      ...(ambient ? { ambient } : {}),
+      signal: opts.abortController?.signal,
+      onSessionId: id => {
+        e.contexts.started(activeContext.id, id, harness.id);
+        opts.onSessionId?.(id);
+      },
+      onAlive: () => opts.onAlive?.(),
+      onProgress: ev => {
+        e.runtimes.activity(activeContext.id);
+        opts.onProgress?.(ev);
+      },
+      onNotice: text => opts.onNotice?.(text),
+    });
+    e.runtimes.activity(activeContext.id);
     if (!reply.isError) e.runtimes.acknowledge(pendingEvents.map(event => event.id));
     return reply;
   }
@@ -404,13 +434,10 @@ export class Agent {
   close(): void { for (const { session } of this.live.values()) session.close(); this.live.clear(); }
 
   private async runProbe(prompt: string, opts: AgentRunOptions): Promise<AgentReply> {
-    const q = query({ prompt, options: {
-      cwd: opts.cwd, model: opts.model ?? this.config.model, maxTurns: 1,
-      abortController: opts.abortController, ...instructionOptions(this.config.persona),
-    } });
-    let text = "", sessionId = "", isError = false;
-    try { for await (const m of q) if (m.type === "result") { sessionId = m.session_id; isError = m.is_error; text = m.subtype === "success" ? m.result : m.errors.join("\n"); } }
-    finally { q.close(); }
-    return { text, sessionId, isError };
+    return resolveHarness(this.config).runProbe(
+      prompt,
+      { cwd: opts.cwd, model: opts.model, abortController: opts.abortController },
+      this.config,
+    );
   }
 }

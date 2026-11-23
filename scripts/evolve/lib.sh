@@ -84,7 +84,7 @@ die() { log "错误:$*"; exit 1; }
 # 用 `-e NAME`(不带值):docker 从本进程环境取值,令牌不进 argv,宿主 ps 看不到。
 brain_env_args() {
   local v
-  for v in $(env | sed -n 's/^\(ANTHROPIC_[A-Za-z0-9_]*\|CLAUDE_CODE_[A-Za-z0-9_]*\|CATMAN_MODEL\|CATMAN_MODEL_ALLOWLIST\)=.*/\1/p'); do
+  for v in $(env | sed -n 's/^\(ANTHROPIC_[A-Za-z0-9_]*\|CLAUDE_CODE_[A-Za-z0-9_]*\|GEMINI_API_KEY\|GOOGLE_GEMINI_[A-Za-z0-9_]*\|OPENAI_API_KEY\|OPENAI_BASE_URL\|CATMAN_HARNESS\|CATMAN_HARNESS_BIN\|CATMAN_AGY_BIN\|CATMAN_ACP_COMMAND\|CATMAN_ACP_UPSTREAM\|CATMAN_MODEL\|CATMAN_MODEL_ALLOWLIST\)=.*/\1/p'); do
     printf -- '-e %s ' "$v"
   done
 }

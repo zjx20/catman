@@ -13,6 +13,63 @@
 import { parseOpsMounts, type OpsConfig } from "./core/execution/ops-config.js";
 
 export type Persona = "primary" | "rescue";
+export type HarnessId = "claude" | "agy" | "acp";
+export type ModelUpstreamKind = "anthropic" | "gemini" | "openai" | "none";
+
+export const DEFAULT_MODELS_BY_HARNESS: Readonly<Record<HarnessId, readonly string[]>> = {
+  claude: ["opus", "sonnet", "haiku", "fable"],
+  agy: [
+    "gemini-4-carbon-high",
+    "gemini-4-hydrogen-high",
+    "gemini-3.8-flash-high",
+    "gemini-3.8-flash-medium",
+    "gemini-3.1-pro-high",
+  ],
+  acp: ["default"],
+};
+
+export function parseHarnessId(raw: string | undefined): HarnessId {
+  const v = raw?.trim().toLowerCase();
+  if (!v || v === "claude") return "claude";
+  if (v === "agy" || v === "antigravity") return "agy";
+  if (v === "acp") return "acp";
+  throw new Error(`不支持的 CATMAN_HARNESS=${JSON.stringify(raw)}，可选: claude / agy / acp`);
+}
+
+export function parseModelUpstream(raw: string | undefined, harness: HarnessId): ModelUpstreamKind {
+  const v = raw?.trim().toLowerCase();
+  if (v) {
+    if (v === "anthropic" || v === "gemini" || v === "openai" || v === "none") return v;
+    throw new Error(`不支持的 CATMAN_ACP_UPSTREAM=${JSON.stringify(raw)}，可选: anthropic / gemini / openai / none`);
+  }
+  if (harness === "claude") return "anthropic";
+  if (harness === "agy") return "gemini";
+  if (process.env.OPENAI_API_KEY) return "openai";
+  if (process.env.GEMINI_API_KEY) return "gemini";
+  if (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN) {
+    return "anthropic";
+  }
+  return "none";
+}
+
+export function parseCommandSpec(raw: string | undefined, envName: string): string[] | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.startsWith("[")) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (err) {
+      throw new Error(`环境变量 ${envName} 不是合法 JSON 数组: ${String(err)}`);
+    }
+    if (!Array.isArray(parsed) || !parsed.length || parsed.some((x) => typeof x !== "string" || !x.trim())) {
+      throw new Error(`环境变量 ${envName} 必须是非空字符串数组`);
+    }
+    return parsed as string[];
+  }
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  return parts.length ? parts : undefined;
+}
 
 function num(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -83,6 +140,14 @@ export interface Config {
   retentionMs: number;
   cleanupIntervalMs: number;
   dashboardPort: number;
+  /** Agent 大脑底层执行引擎：claude（默认）/ agy（Antigravity CLI ACP）/ acp（通用 ACP 子进程）。 */
+  harness: HarnessId;
+  /** 可选：显式指定引擎二进制路径（如 `/data/harness/agy`）。 */
+  harnessBin: string | undefined;
+  /** `CATMAN_HARNESS=acp` 时启动 ACP 子进程的命令与参数数组。 */
+  acpCommand: string[] | undefined;
+  /** `CATMAN_HARNESS=acp` 时由 CapabilityBroker 代理的模型上游协议族。 */
+  acpUpstream: ModelUpstreamKind;
   model: string | undefined;
   modelAllowlist: string[];
   ackEnabled: boolean;
@@ -121,6 +186,13 @@ export function loadConfig(): Config {
   const persona: Persona = process.env.CATMAN_PERSONA === "rescue" ? "rescue" : "primary";
   // 容器名默认按人格给 —— 与 compose 里的 container_name 一一对应。
   const containerName = str("CATMAN_CONTAINER_NAME", persona === "rescue" ? "catman-rescue" : "catman");
+  const harness = parseHarnessId(process.env.CATMAN_HARNESS);
+  const harnessBin = process.env.CATMAN_HARNESS_BIN?.trim() || process.env.CATMAN_AGY_BIN?.trim() || undefined;
+  const acpCommand = parseCommandSpec(process.env.CATMAN_ACP_COMMAND, "CATMAN_ACP_COMMAND");
+  if (harness === "acp" && !acpCommand?.length) {
+    throw new Error("CATMAN_HARNESS=acp 需要配置 CATMAN_ACP_COMMAND（例如 '[\"codex-acp\"]' 或 'gemini --acp'）");
+  }
+  const acpUpstream = parseModelUpstream(process.env.CATMAN_ACP_UPSTREAM, harness);
   return {
     dataDir,
     workspaceDir: `${dataDir}/tenants`,
@@ -137,8 +209,12 @@ export function loadConfig(): Config {
     retentionMs: num("CATMAN_RETENTION_MS", 30 * DAY),
     cleanupIntervalMs: num("CATMAN_CLEANUP_INTERVAL_MS", DAY),
     dashboardPort,
+    harness,
+    harnessBin,
+    acpCommand,
+    acpUpstream,
     model: process.env.CATMAN_MODEL || undefined,
-    modelAllowlist: list("CATMAN_MODEL_ALLOWLIST", ["opus", "sonnet", "haiku", "fable"]),
+    modelAllowlist: list("CATMAN_MODEL_ALLOWLIST", [...DEFAULT_MODELS_BY_HARNESS[harness]]),
     ackEnabled: bool("CATMAN_ACK", true),
     progressEnabled: bool("CATMAN_PROGRESS", true),
     // 默认按容器名寻址,不再用 127.0.0.1 —— 见 Config.apiBase 上面那段。

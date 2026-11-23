@@ -1,12 +1,20 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { Persona } from "../../config.js";
+import type { Config, Persona } from "../../config.js";
 import { personaBriefing } from "../persona.js";
+import { AcpSession, spawnAcpSubprocess } from "./acp-session.js";
 import { ContextStore, type ContextKind } from "./contexts.js";
-import { instructionOptions, projectInstructions } from "./instructions.js";
+import { startLocalGeminiProbeServer, writeAgyProjection } from "./harness.js";
+import {
+  executionRulesBlock,
+  instructionOptions,
+  projectInstructions,
+  readUserAndSharedInstructions,
+  systemInstructionSupplement,
+} from "./instructions.js";
 
 export const INSTRUCTION_PROBE_PROMPT = "Reply ok without using tools.";
 
@@ -37,10 +45,14 @@ export function instructionFixture(root: string, kind: ContextKind) {
   put(join(root, "shared/CLAUDE.md"), expected.shared);
   put(join(paths.home, "CLAUDE.md"), expected.personal);
   put(join(paths.work, "CLAUDE.md"), expected.workspace);
+  put(join(paths.work, "AGENTS.md"), expected.workspace);
   put(join(contexts.paths(other).home, "CLAUDE.md"), forbidden.otherPersonal);
   put(join(contexts.paths(other).work, "CLAUDE.md"), forbidden.otherWorkspace);
+  put(join(contexts.paths(other).work, "AGENTS.md"), forbidden.otherWorkspace);
   put(join(contexts.paths(sibling).work, "CLAUDE.md"), forbidden.siblingWorkspace);
+  put(join(contexts.paths(sibling).work, "AGENTS.md"), forbidden.siblingWorkspace);
   put(join(root, "control-only/CLAUDE.md"), forbidden.control);
+  put(join(root, "control-only/AGENTS.md"), forbidden.control);
   return { contexts, context, paths, expected, forbidden };
 }
 
@@ -65,7 +77,14 @@ export function verifyInstructionRequest(request: unknown, fixture: { expected: 
  * socket needed (the pre-deploy smoke container intentionally has none).
  * Mount namespace/isolation is additionally covered by test:docker.
  */
-export async function checkInstructions(root: string, persona: Persona, timeoutMs = 45_000): Promise<void> {
+export async function checkInstructions(
+  root: string,
+  persona: Persona,
+  timeoutMs = 45_000,
+  config?: Pick<Config, "harness" | "harnessBin" | "acpCommand">,
+): Promise<void> {
+  if (config?.harness === "agy") return checkAgyInstructions(root, persona, timeoutMs, config);
+  if (config?.harness === "acp") return checkGenericAcpInstructions(root, persona, timeoutMs, config);
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), timeoutMs);
   let firstRequest: unknown;
@@ -126,5 +145,145 @@ export async function checkInstructions(root: string, persona: Persona, timeoutM
     clearTimeout(timer);
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+}
+
+function verifyProjectedLayers(
+  projectedText: string,
+  workspaceText: string,
+  fixture: { expected: Record<string, string>; forbidden: Record<string, string> },
+  persona: Persona,
+): void {
+  const combined = `${projectedText}\n${workspaceText}`;
+  for (const [layer, marker] of Object.entries(fixture.expected)) {
+    if (!combined.includes(marker)) throw new Error(`指令未加载：${layer}`);
+  }
+  for (const [layer, marker] of Object.entries(fixture.forbidden)) {
+    if (combined.includes(marker)) throw new Error(`指令越界加载：${layer}`);
+  }
+  if (!projectedText.includes(personaBriefing(persona))) {
+    throw new Error(`人格身份未加载：${persona}`);
+  }
+}
+
+async function checkAgyInstructions(
+  root: string,
+  persona: Persona,
+  timeoutMs: number,
+  config: Pick<Config, "harnessBin" | "acpCommand">,
+): Promise<void> {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), timeoutMs);
+  let capturedRequest: unknown;
+  const server = startLocalGeminiProbeServer((_url, body) => {
+    const serialized = JSON.stringify(body);
+    if (serialized.includes(INSTRUCTION_PROBE_PROMPT)) capturedRequest ??= body;
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Gemini 指令自检端点未启动");
+    const bin = config.harnessBin || "agy";
+    const cmd = config.acpCommand ?? [bin, "acp", "--dangerously-skip-permissions", "--disable-telemetry"];
+    for (const kind of ["chat", "cron"] as const) {
+      const fixture = instructionFixture(join(root, kind), kind);
+      const { paths } = fixture;
+      const projectionDir = join(paths.root, "projection");
+      mkdirSync(projectionDir, { recursive: true, mode: 0o700 });
+      writeAgyProjection({
+        dataDir: fixture.contexts.root,
+        persona,
+        home: paths.home,
+        projectionDir,
+        ops: false,
+      });
+      mkdirSync(join(paths.sdk, ".gemini", "antigravity-cli"), { recursive: true, mode: 0o700 });
+      const geminiMd = readFileSync(join(projectionDir, "GEMINI.md"), "utf8");
+      const agentsMd = readFileSync(join(projectionDir, "AGENTS.md"), "utf8");
+      const settingsJson = readFileSync(join(projectionDir, "agy-settings.json"), "utf8");
+      writeFileSync(join(paths.sdk, ".gemini", "GEMINI.md"), geminiMd, { mode: 0o600 });
+      writeFileSync(join(paths.sdk, ".gemini", "AGENTS.md"), agentsMd, { mode: 0o600 });
+      writeFileSync(join(paths.sdk, ".gemini", "antigravity-cli", "settings.json"), settingsJson, { mode: 0o600 });
+      verifyProjectedLayers(
+        `${geminiMd}\n${agentsMd}`,
+        readFileSync(join(paths.work, "AGENTS.md"), "utf8"),
+        fixture,
+        persona,
+      );
+      capturedRequest = undefined;
+      const env: NodeJS.ProcessEnv = {
+        PATH: process.env.PATH,
+        HOME: paths.sdk,
+        GOOGLE_GEMINI_BASE_URL: `http://127.0.0.1:${address.port}`,
+        GEMINI_API_KEY: "instruction-selfcheck-local-only",
+        AGY_CLI_DISABLE_AUTO_UPDATE: "true",
+        NO_PROXY: "127.0.0.1,localhost",
+      };
+      const session = new AcpSession(
+        () => spawnAcpSubprocess(cmd, { cwd: paths.work, env }),
+        {
+          cwd: paths.work,
+          model: "gemini-3.8-flash-medium",
+          maxTurns: 1,
+          idleMs: 50,
+          onClose: () => {},
+          stopAgent: async () => {},
+        },
+      );
+      try {
+        const reply = await session.run({ prompt: INSTRUCTION_PROBE_PROMPT, attachments: [], signal: abort.signal });
+        if (reply.isError) throw new Error(`agy 指令自检失败：${reply.text}`);
+        if (capturedRequest !== undefined) {
+          const outbound = JSON.stringify(capturedRequest);
+          for (const [layer, marker] of Object.entries(fixture.expected)) {
+            if (!outbound.includes(marker)) throw new Error(`指令未加载：${layer}`);
+          }
+          for (const [layer, marker] of Object.entries(fixture.forbidden)) {
+            if (outbound.includes(marker)) throw new Error(`指令越界加载：${layer}`);
+          }
+          if (!outbound.includes(JSON.stringify(personaBriefing(persona)).slice(1, -1))) {
+            throw new Error(`人格身份未加载：${persona}`);
+          }
+        }
+      } finally {
+        session.close();
+      }
+    }
+  } catch (error) {
+    if (abort.signal.aborted) throw new Error(`指令自检超时(${timeoutMs}ms)`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+}
+
+async function checkGenericAcpInstructions(
+  root: string,
+  persona: Persona,
+  timeoutMs: number,
+  config: Pick<Config, "acpCommand">,
+): Promise<void> {
+  if (!config.acpCommand?.length) {
+    throw new Error("CATMAN_HARNESS=acp 需要配置 CATMAN_ACP_COMMAND");
+  }
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), timeoutMs);
+  try {
+    for (const kind of ["chat", "cron"] as const) {
+      const fixture = instructionFixture(join(root, kind), kind);
+      const { paths } = fixture;
+      const supplement = systemInstructionSupplement(persona);
+      const { shared, personal } = readUserAndSharedInstructions(fixture.contexts.root, paths.home);
+      const projected = `${supplement}\n\n${shared}\n\n${personal}\n\n${executionRulesBlock(false)}`;
+      verifyProjectedLayers(projected, readFileSync(join(paths.work, "AGENTS.md"), "utf8"), fixture, persona);
+      if (abort.signal.aborted) throw new Error(`指令自检超时(${timeoutMs}ms)`);
+    }
+  } finally {
+    clearTimeout(timer);
   }
 }
