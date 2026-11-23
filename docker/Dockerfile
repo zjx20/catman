@@ -75,7 +75,7 @@ RUN node -v > /etc/catman-node-version && cat /etc/catman-node-version
 #   procps psmisc lsof  —— 进程:ps/pgrep/pkill、pstree/killall/fuser、谁占着这个端口
 #   iproute2 iputils-ping bind9-dnsutils netcat-openbsd socat
 #                        —— 网络:ip/ss、ping、dig、连一下这个端口通不通
-#                           (这台机器上"是不是又是代理的事"是高频问题,见 CLAUDE.md)
+#                           (这台机器上"是不是又是代理的事"是高频问题,见 AGENTS.md)
 #   less file tree jq bc —— 看:分页、这是个什么文件、目录长什么样、切 JSON、算数
 #   unzip zip xz-utils rsync patch —— 搬运:解包、同步、打补丁
 #   sqlite3 strace vim-tiny        —— 偶尔要命:翻别的服务的库、查段错误、人 exec 进来编辑

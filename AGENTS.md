@@ -1,7 +1,7 @@
-# CLAUDE.md
+# AGENTS.md
 
-面向在本仓库开发 catman 的 Claude Code / 开发者。运行时的助手人设不在这里,而在
-`/data/shared/CLAUDE.md`(控制面为各执行上下文生成只读指令投影)。
+面向在本仓库开发 catman 的智能体（Claude Code / Antigravity / Codex 等）与开发者。运行时的助手人设不在这里,而在
+`/data/shared/AGENTS.md`(控制面为各执行上下文生成只读指令投影)。
 
 ## 这是什么
 
@@ -212,11 +212,11 @@ Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/conte
 
 - **还原 Claude Code 行为靠三个非默认选项**(`agent.ts`):`systemPrompt:{type:"preset",preset:"claude_code"}`
   + `settingSources:["user","project","local"]` + `bypassPermissions`。少任何一个"脾气"就变了。
-- **人格身份走 `systemPrompt.append`,不走 skill 也不走 CLAUDE.md**(`persona.ts`)。
+- **人格身份走 `systemPrompt.append`,不走 skill 也不走 AGENTS.md**(`persona.ts`)。
   真机踩过:管理员发 `/救援` 切过去,守护人格张口就说"我现在跟你对话的就是主人格本身"——
   它没说谎,三处身份来源当时全是人格无关的(preset 一模一样、skill 同一套、
-  而**人设 CLAUDE.md 在它的命名空间下压根不存在**)。三个候选载体各自的问题:
-  **skill 正文按需加载**,模型可能压根不去读;**CLAUDE.md** 住在数据卷里、用户能改能删,
+  而**人设 AGENTS.md 在它的命名空间下压根不存在**)。三个候选载体各自的问题:
+  **skill 正文按需加载**,模型可能压根不去读;**AGENTS.md** 住在数据卷里、用户能改能删,
   而"我是哪个人格"是装配事实,改不掉才对;**消息前缀**会污染对话记录且 resume 之后就没了。
   代价如实记:append 每回合都付钱,所以两段自述刻意短(单测钉着 <1200 字符)。
   **每条禁令都对应一个它做得到但不该做的动作** —— 泛泛一句"你是守护人格"挡不住一个
@@ -242,10 +242,12 @@ Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/conte
   (后者是排查时唯一的旋钮)。读不懂就当空、绝不抛:守护人格起不来比它少一个管理员糟得多。
 - **`Options.skills` 是上下文过滤不是沙箱**:未列出的 skill 文件仍能被 Read/Bash 读到
   (SDK 类型注释原文)。所以 **SKILL.md 里绝不能出现任何令牌**,只写环境变量引用。
-- **指令分层**：本文件是开发指南。运行时的共享指令在 `<数据根>/shared/CLAUDE.md`，
-  个人偏好在租户 `home/CLAUDE.md`。控制面创建 worker 时合并两者，并单文件只读挂到
-  当前 context 的 `$CLAUDE_CONFIG_DIR/CLAUDE.md`；workspace 的 Project memory 由 CLI
-  正常发现。不要恢复失效的 `@../CLAUDE.md`，也不要为指令继承整挂数据根。
+- **指令分层**：本文件是开发指南。运行时的共享指令在 `<数据根>/shared/AGENTS.md`，
+  个人偏好在租户 `home/AGENTS.md`（对未迁移的存量目录自动兼容读取历史 `CLAUDE.md` 并继承为 `AGENTS.md`）。
+  控制面创建 worker 时合并两者生成 `AGENTS.md` 只读投影，并按当前引擎挂入上下文配置目录
+  （其中 Claude CLI 在工作区原生加载 `AGENTS.md`，在 `$CLAUDE_CONFIG_DIR` 仍读取 `CLAUDE.md`，
+  故 `claudeHarness` 同时将该只读投影挂到 `AGENTS.md` 与 `CLAUDE.md`）；workspace 的 Project memory
+  （`AGENTS.md`）由各 CLI 原生发现。不要恢复失效的 `@../AGENTS.md`，也不要为指令继承整挂数据根。
   修改共享或个人指令后，需要重新建立 worker 以刷新只读投影。
 - **指令加载检查**：`execution/instructions.ts` 是正式会话与自检共用的 SDK 加载选项和
   User memory 投影实现。`instruction-check.ts` 用临时 owner/context、三层独立标记和
@@ -283,7 +285,7 @@ tenants/<tenantId>/
 |---|---|
 | 当前 context 的 work、sdk、tasks | 可读写；cwd 为 work |
 | owner 的 home，映射为 `/user` | 可读写；个人 skill、MCP 和个人凭据属于这里 |
-| 共享/个人指令合并后的 CLAUDE.md、公共 skill、运行时代码 | 只读 |
+| 共享/个人指令合并后的 AGENTS.md 投影、公共 skill、运行时代码 | 只读 |
 | `/catman-src` | 仅主人格管理员可读写源码 |
 
 即使某个挂载目标以 `/data/tenants/...` 开头，也只挂入了对应子目录；其他 context、

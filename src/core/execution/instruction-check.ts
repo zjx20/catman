@@ -42,16 +42,12 @@ export function instructionFixture(root: string, kind: ContextKind) {
   const put = (path: string, value: string) => writeFileSync(path, `# Instruction probe\n\n${value}\n`, { mode: 0o600 });
   mkdirSync(join(root, "shared"), { recursive: true });
   mkdirSync(join(root, "control-only"), { recursive: true });
-  put(join(root, "shared/CLAUDE.md"), expected.shared);
-  put(join(paths.home, "CLAUDE.md"), expected.personal);
-  put(join(paths.work, "CLAUDE.md"), expected.workspace);
+  put(join(root, "shared/AGENTS.md"), expected.shared);
+  put(join(paths.home, "AGENTS.md"), expected.personal);
   put(join(paths.work, "AGENTS.md"), expected.workspace);
-  put(join(contexts.paths(other).home, "CLAUDE.md"), forbidden.otherPersonal);
-  put(join(contexts.paths(other).work, "CLAUDE.md"), forbidden.otherWorkspace);
+  put(join(contexts.paths(other).home, "AGENTS.md"), forbidden.otherPersonal);
   put(join(contexts.paths(other).work, "AGENTS.md"), forbidden.otherWorkspace);
-  put(join(contexts.paths(sibling).work, "CLAUDE.md"), forbidden.siblingWorkspace);
   put(join(contexts.paths(sibling).work, "AGENTS.md"), forbidden.siblingWorkspace);
-  put(join(root, "control-only/CLAUDE.md"), forbidden.control);
   put(join(root, "control-only/AGENTS.md"), forbidden.control);
   return { contexts, context, paths, expected, forbidden };
 }
@@ -67,7 +63,7 @@ export function verifyInstructionRequest(request: unknown, fixture: { expected: 
   for (const [layer, marker] of Object.entries(fixture.forbidden)) {
     if (text.includes(marker)) throw new Error(`指令越界加载：${layer}`);
   }
-  // The identity is an assembly fact, separate from editable CLAUDE.md files.
+  // The identity is an assembly fact, separate from editable AGENTS.md files.
   if (!(JSON.stringify(body.system) ?? "").includes(JSON.stringify(personaBriefing(persona)).slice(1, -1))) throw new Error(`人格身份未加载：${persona}`);
 }
 
@@ -113,6 +109,7 @@ export async function checkInstructions(
     for (const kind of ["chat", "cron"] as const) {
       const fixture = instructionFixture(join(root, kind), kind);
       const { paths } = fixture;
+      projectInstructions(fixture.contexts.root, paths.home, join(paths.sdk, "AGENTS.md"));
       projectInstructions(fixture.contexts.root, paths.home, join(paths.sdk, "CLAUDE.md"));
       firstRequest = undefined;
       // Explicitly unset inherited secrets/proxy/provider switches, even if SDK merges env.

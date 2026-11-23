@@ -13,7 +13,7 @@ import { SessionManager } from "./core/session.js";
 import { FileStore, readJsonFile } from "./core/file-store.js";
 import { Gateway } from "./core/gateway.js";
 import { UserRegistry } from "./core/users.js";
-import { adminBaseline, initialSharedClaudeMd } from "./core/persona.js";
+import { adminBaseline, initialSharedAgentsMd } from "./core/persona.js";
 import { TokenAlerter } from "./core/token-alert.js";
 import { allowAll, type AdmissionPolicy } from "./core/admission.js";
 import { GlobalSettings } from "./core/settings.js";
@@ -136,7 +136,7 @@ async function main(): Promise<void> {
     workspaceRoot: config.workspaceDir,
   });
   // 只在共享指令缺席时初始化；RuntimeManager 在创建 worker 时合并共享与个人指令。
-  users.ensureSharedClaudeMd(initialSharedClaudeMd(config.persona));
+  users.ensureSharedAgentsMd(initialSharedAgentsMd(config.persona));
   const turns = new TurnTokens();
   turns.runtimeResolver = token => {
     const runtime = runtimes.resolve(token);

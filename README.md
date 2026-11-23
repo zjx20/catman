@@ -63,7 +63,7 @@ Anthropic API),也支持切换为 **Antigravity CLI (`agy acp` + `GEMINI_API_KEY
 临时执行内容、中间文件和任务私有状态写在 workspace，按需要组织子目录。workspace 在容器回收后仍保留，容器的 `/tmp` 随容器回收。同一用户的聊天和 cron 共用 `/user`；长期共用的提示词、配置、脚本和需保留的输出统一归入 `/user/projects/<项目>`。项目内部结构灵活，优先沿用已有布局，`prompts/`、`scripts/`、`outputs/` 只是建议；不再使用顶层 `/user/artifacts`。
 管理员可以通过受控接口修改全局设置、公共能力配置并触发自进化。worker 没有 Docker socket、整棵 `/data`、其他用户目录或原始管理员凭据。容器启动失败直接报错，不退回控制进程执行。控制服务重启后认领原容器与已登记任务；无法重连的旧 SDK stdio 连接会先停止，再恢复会话，防止两个 CLI 并发写同一会话。
 
-全局人格在 `/data/shared/CLAUDE.md`；公共 skill 保留在控制面的 `$CLAUDE_CONFIG_DIR/skills`，按角色只读投影。个人偏好在 `/user/CLAUDE.md`，个人 skill 在 `/user/skills/<名字>/SKILL.md`。
+全局人格在 `/data/shared/AGENTS.md`；公共 skill 保留在控制面的 `$CLAUDE_CONFIG_DIR/skills`，按角色只读投影。个人偏好在 `/user/AGENTS.md`，个人 skill 在 `/user/skills/<名字>/SKILL.md`。
 公共模型凭据和公共 MCP/HTTP 服务凭据由控制服务持有，worker 通过限定的运行身份使用。个人 MCP 可在 `/user/mcp.json` 配置；公共 MCP 使用 HTTP 部署端点，私人 MCP 可使用 stdio。
 
 ```text
@@ -75,7 +75,7 @@ Anthropic API),也支持切换为 **Antigravity CLI (`agy acp` + `GEMINI_API_KEY
     events.json                  # 完成、超时、回收和通知状态
     continuations.json           # 后台自动续接的次数、暂停状态和崩溃重试租约
     shared-tools.json            # 公共 MCP/服务端点及凭据，0600
-  shared/CLAUDE.md
+  shared/AGENTS.md
   tenants/<tenantId>/
     home/                        # 本用户的持久文件、个人 skill 和配置
     contexts/<contextId>/
@@ -213,7 +213,7 @@ curl http://catman-courier:8787/health → 503   容器名不在 NO_PROXY 里
 
 自家这三个进了默认名单。**别人的容器刻意不加** —— 那份名单枚举不完也维护不动。
 访问它们时显式绕开代理:`curl --noproxy '*'`,或别的工具的等效写法。这条约定写在
-共享人设 CLAUDE.md 里(`core/persona.ts` 的模板),新部署也带着走。
+共享人设 AGENTS.md 里(`core/persona.ts` 的模板),新部署也带着走。
 
 #### 定时任务的容器
 
@@ -468,7 +468,7 @@ docker logs catman-deployer            # 看这次到底发生了什么
 ### 每个人自己的存储
 
 个人 home 是 `/data/tenants/<tenantId>/home`，在本人的 worker 中挂成 `/user`。聊天 session 与 cron 各自有独立 workspace，不挂整个租户根目录。
-默认把临时执行内容写当前 cwd。跨上下文共用的配置、脚本和保留的输出放 /user/projects/<项目>，目录结构按项目需要组织；个人 skill 放 /user/skills/<目录>/SKILL.md，个人偏好放 /user/CLAUDE.md，个人 MCP 配置放 /user/mcp.json。
+默认把临时执行内容写当前 cwd。跨上下文共用的配置、脚本和保留的输出放 /user/projects/<项目>，目录结构按项目需要组织；个人 skill 放 /user/skills/<目录>/SKILL.md，个人偏好放 /user/AGENTS.md，个人 MCP 配置放 /user/mcp.json。
 worker 不能访问其他用户、控制配置或 Docker socket。普通用户管理自己的配置和任务，管理员通过受控接口管理全局能力与自进化。
 
 ### 重新扫码(凭据失效 / 换手机)
@@ -498,9 +498,9 @@ docker compose exec catman node dist/src/scripts/ilink-login.js --rebind <账号
 |---|---|
 | 会话上下文 | 各自独立,互不可见 |
 | 工作目录(cwd) | `/data/tenants/<tenantId>/contexts/<contextId>/work`，每个聊天/cron 独立 |
-| 个人偏好 | 本人 home 的 `CLAUDE.md`，worker 内为 `/user/CLAUDE.md` |
+| 个人偏好 | 本人 home 的 `AGENTS.md`，worker 内为 `/user/AGENTS.md` |
 | 运行配置 | `prefs.json` 里各自一份(模型、回执、进度、超时、分段长度) |
-| 共享人设 | `/data/shared/CLAUDE.md`，控制面合并个人指令后生成只读投影 |
+| 共享人设 | `/data/shared/AGENTS.md`，控制面合并个人指令后生成只读投影 |
 
 新人的**第一条消息**会先收到一份使用指引(硬指令清单 + 能自助改哪些配置),然后才是对
 他那条消息的回答。指引只推一次;推送失败会留到下次重试。
@@ -1296,7 +1296,7 @@ docker run --rm -u 0:0 \
 | 数据 | `/data` | `/data/rescue`,**看不到主人格的会话** |
 | 部署指令 | `/发布` `/回滚` | 没有 —— 它换版本走固化的 deployer |
 
-自述走 SDK 的 `systemPrompt.append`(`src/core/persona.ts`),**不是** CLAUDE.md ——
+自述走系统提示词补充块(`src/core/persona.ts`),**不是** AGENTS.md ——
 那份住在数据卷里、用户能改能删,而"我是哪个人格"是装配事实。管理员名单则从主
 `settings.json` 继承(守护人格的那份是空文件),否则切过去的人会被降级成普通用户,
 而诊断与恢复恰好全是管理员的活;要显式指定用 `CATMAN_ADMIN_USER_KEYS`。
@@ -1349,7 +1349,7 @@ worker 的挂载不能通过配置扩展到任意宿主路径。个人配置读�
 3. 每段聊天建立独立 context，每个 cron 建立固定 context。保存 owner、kind、jobId（cron）、sdkSessionId、sdkStarted、createdAt、lastActivityAt。contextId 为 `c_` 加 24 位随机十六进制字符；旧 SDK session ID 可以保留。
 4. 将每段 JSONL 及其同名 subagent 目录迁到对应 `sdk/projects/<encodeProjectDir(新 cwd)>/`，核对条目数量和内容。cwd 使用目标部署的容器路径（通常 `/data/...`），不能误用迁移机器的宿主路径。SDK 会话元数据中的 cwd 随目录位置更新，历史消息正文保留。
 5. 把会话状态更新为 `{current:{sessionId,lastActive},history:[],reminded:false}`，补齐已确认归属的历史引用。users.json 的 dirName 更新为 tenantId。每个 cron 的工作文件归到 owner 的 cron context，删除 task 中旧的 image/network/mounts/limits，按新 workspace 修改脚本及提示词路径。
-6. 共享人格转到 shared/CLAUDE.md，去掉个人 `@../CLAUDE.md` 导入。公共模型凭据仅放控制服务环境；公共 MCP/服务凭据整理到受控 shared-tools.json，不复制进各 SDK 配置目录。公共 stdio MCP 如需共享，应先部署为 HTTP MCP 服务。
+6. 共享人格转到 shared/AGENTS.md，去掉个人跨目录 `@../` 导入。公共模型凭据仅放控制服务环境；公共 MCP/服务凭据整理到受控 shared-tools.json，不复制进各 SDK 配置目录。公共 stdio MCP 如需共享，应先部署为 HTTP MCP 服务。
 7. 无法确认 owner 的文件与会话放控制面隔离归档，保留旧位置和校验值，不能分发给所有用户。核验账号、用户数、会话数、各自 resume/搜索，以及两个用户互不可见。目录属主必须匹配目标控制服务的 uid/gid；不要修改 release 与部署器的专用属主。
 8. 验证完成后最后写 `execution/schema.json` 为 `{"schema":2,"containerRoot":"/data"}`。本次还修改了 compose 的挂载和运行时配置，需要在维护窗口应用新版 compose、重建相应服务容器；仅切 release 链接或 restart 不会应用这些配置。启动新版本，分别验证聊天、cron、后台下载、超时、提前提醒、延长和重启认领。主人格、pinned 守护人格与固化部署执行器必须一起切到支持 v2 的版本，归档旧的回退候选，避免机械回退启动旧布局代码。回退到 v1 必须连同数据备份一起恢复，不能只换代码链接。备份保留到真实部署验收完成。
 

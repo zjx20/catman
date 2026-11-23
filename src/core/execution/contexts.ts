@@ -139,8 +139,15 @@ export class ContextStore {
     for (const dir of [p.work, p.sdk, p.tasks, p.transcripts, p.home, join(p.home, "skills")]) {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
-    const instructions = join(p.home, "CLAUDE.md");
-    if (!existsSync(instructions)) writeFileSync(instructions, "# 个人偏好\n\n在这里维护本用户的偏好。个人 skill 放在 skills/。\n", { mode: 0o600 });
+    const instructions = join(p.home, "AGENTS.md");
+    if (!existsSync(instructions)) {
+      const legacy = readTenantFile(p.home, "CLAUDE.md");
+      writeFileSync(
+        instructions,
+        legacy ?? "# 个人偏好\n\n在这里维护本用户的偏好。个人 skill 放在 skills/。\n",
+        { mode: 0o600 },
+      );
+    }
     return p;
   }
   started(id: string, sessionId: string, harness?: HarnessKind): void {

@@ -29,14 +29,14 @@ export function executionRulesBlock(ops = false): string {
   return `## 执行环境\n当前 workspace 是本会话或定时任务的独立工作区。临时执行内容、中间文件和任务私有状态放在这里，按任务需要组织子目录。workspace 在执行容器回收后仍保留；容器的 /tmp 随容器回收。同一用户的聊天和 cron 都可读写 /user。需要跨会话共用的长期配置、脚本和保留的输出统一归入 /user/projects/<项目>，不再使用顶层 /user/artifacts。项目内部结构是建议，优先沿用现有布局；例如可用 prompts/、scripts/、outputs/，简单项目可直接放文件，不要求建齐固定目录。读写以项目已有配置和实际路径为准，迁移时同步更新引用。个人 skill 放 /user/skills。不要把共享目录或控制面数据目录当作工作区。后台命令必须通过 catman-task run --timeout <秒> -- <命令> 登记；最长 86400 秒。长期服务需要部署。\n${operations}${background}`;
 }
 
-/** 读取共享指令与个人偏好（同时兼容既有 CLAUDE.md 与通用 AGENTS.md）。 */
+/** 读取共享指令与个人偏好（统一使用 AGENTS.md，对未迁移的旧盘回退读取历史 CLAUDE.md）。 */
 export function readUserAndSharedInstructions(dataDir: string, home: string): { shared: string; personal: string } {
   const sharedAgents = join(dataDir, "shared", "AGENTS.md");
-  const sharedClaude = join(dataDir, "shared", "CLAUDE.md");
+  const sharedLegacy = join(dataDir, "shared", "CLAUDE.md");
   const shared = existsSync(sharedAgents)
     ? readFileSync(sharedAgents, "utf8")
-    : existsSync(sharedClaude)
-      ? readFileSync(sharedClaude, "utf8")
+    : existsSync(sharedLegacy)
+      ? readFileSync(sharedLegacy, "utf8")
       : "";
   const personal = readTenantFile(home, "AGENTS.md") ?? readTenantFile(home, "CLAUDE.md") ?? "";
   return { shared, personal };

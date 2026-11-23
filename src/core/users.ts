@@ -1,5 +1,5 @@
-import { tenantId } from "./execution/contexts.js";
-import { mkdirSync, readdirSync, writeFileSync, existsSync } from "node:fs";
+import { readTenantFile, tenantId } from "./execution/contexts.js";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { readJsonFile, writeJsonFileAtomic } from "./file-store.js";
 import {
@@ -33,8 +33,8 @@ const DISPLAY_NAME_MAX = 64;
 
 export type UserMap = Record<string, UserRecord>;
 
-/** 新建用户 home 时写入的 CLAUDE.md 初始内容。 */
-function initialUserClaudeMd(userKey: string): string {
+/** 新建用户 home 时写入的 AGENTS.md 初始内容。 */
+function initialUserAgentsMd(userKey: string): string {
   return `# 个人偏好
 
 共享人设由运行环境只读装配，下面写只对本用户生效的偏好。
@@ -68,17 +68,22 @@ export class UserRegistry {
   /**
    * 共享人设文件不存在就写一份。**已存在的绝不覆盖。**
    *
-   * RuntimeManager 把共享指令与个人 home/CLAUDE.md 合并，再只读装配到 context 的 SDK 配置目录。
-   * 这里不使用跨目录 import，也不依赖宿主目录的向上继承。
+   * RuntimeManager 把共享指令与个人 home/AGENTS.md 合并，再只读装配到 context 的引擎配置目录。
+   * 若存量数据目录仅有历史遗留的 shared/CLAUDE.md，首次启动将其内容继承为 shared/AGENTS.md
+   * （同时保留旧文件不删，确保版本回滚安全）。
    *
    * 与 skill 那种「每次启动幂等覆盖」刻意相反:skill 的真相源是代码,这个是人。
    * 启动时覆盖等于每次重启抹掉一次人设。
    */
-  ensureSharedClaudeMd(body: string): void {
+  ensureSharedAgentsMd(body: string): void {
     mkdirSync(this.workspaceRoot, { recursive: true });
-    const path = join(this.workspaceRoot, "..", "shared", "CLAUDE.md");
-    mkdirSync(join(this.workspaceRoot, "..", "shared"), { recursive: true });
-    if (!existsSync(path)) writeFileSync(path, body, "utf8");
+    const sharedDir = join(this.workspaceRoot, "..", "shared");
+    mkdirSync(sharedDir, { recursive: true });
+    const path = join(sharedDir, "AGENTS.md");
+    if (!existsSync(path)) {
+      const legacy = join(sharedDir, "CLAUDE.md");
+      writeFileSync(path, existsSync(legacy) ? readFileSync(legacy, "utf8") : body, "utf8");
+    }
   }
 
   /** 某用户持久 home 的绝对路径，不是聊天/cron 的 cwd。不保证目录已存在。 */
@@ -88,16 +93,18 @@ export class UserRegistry {
 
   /**
    * 确保该用户的持久 home 存在并已注册，返回 home 路径。
-   * 幂等:已存在的目录与 CLAUDE.md 都不覆盖(用户可能已经改过个人偏好)。
+   * 幂等:已存在的目录与 AGENTS.md 都不覆盖(用户可能已经改过个人偏好)；
+   * 存量目录仅有历史 CLAUDE.md 时按受限读取继承其正文。
    */
   ensureWorkspace(userKey: string): string {
     const dir = this.workspaceDirOf(userKey);
     assertPathFitsSdkLimit(dir);
     mkdirSync(dir, { recursive: true });
 
-    const claudeMd = join(dir, "CLAUDE.md");
-    if (!existsSync(claudeMd)) {
-      writeFileSync(claudeMd, initialUserClaudeMd(userKey), "utf8");
+    const agentsMd = join(dir, "AGENTS.md");
+    if (!existsSync(agentsMd)) {
+      const legacy = readTenantFile(dir, "CLAUDE.md");
+      writeFileSync(agentsMd, legacy ?? initialUserAgentsMd(userKey), "utf8");
     }
 
     const t = this.now();

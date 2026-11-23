@@ -40,8 +40,8 @@ export type Attachment = ImageAttachment;
  *
  * 关于 maxImageBytes 的量级:模型侧限制的是 **base64 之后**的大小(约 5MB),
  * base64 把体积放大到 4/3,所以原始字节的等效上限约 3.75MB —— schema 的默认值
- * 3.5MB 是在此之下留的余量。超限**直接拒收而不缩图**:本项目运行时零依赖
- * (见 CLAUDE.md),没有图像库可用,与其写个半吊子缩放不如把失败明确告诉用户。
+ * 3.5MB 是在此之下留的余量。超限**直接拒收而不缩图**:本项目运行时零图像依赖
+ * (见 AGENTS.md),没有图像库可用,与其写个半吊子缩放不如把失败明确告诉用户。
  */
 export interface AttachmentLimits {
   /** 单张图片的原始字节上限。 */

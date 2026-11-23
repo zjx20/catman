@@ -149,7 +149,7 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
   const config = { ...loadConfig(), dataDir: root, mainDataDir: root, hostDataDir: join(hostRoot, relative(repo, root)),
     srcDir: join(root, "src"), apiBase: "", sessionImage: image, sessionMemoryLimit: "700m", runtimeIdleMs: 3600_000, maxActiveRuntimes: 8 };
   mkdirSync(config.srcDir, { recursive: true }); writeFileSync(join(config.srcDir, "source-only"), "admin source");
-  mkdirSync(join(root, "shared"), { recursive: true }); writeFileSync(join(root, "shared/CLAUDE.md"), "# Public persona\n");
+  mkdirSync(join(root, "shared"), { recursive: true }); writeFileSync(join(root, "shared/AGENTS.md"), "# Public persona\n");
   mkdirSync(join(root, "claude/skills/public-probe"), { recursive: true });
   writeFileSync(join(root, "claude/skills/public-probe/SKILL.md"), "---\nname: public-probe\ndescription: Integration probe\n---\nPublic skill.\n");
   mkdirSync(join(root, "control-only")); writeFileSync(join(root, "control-only/secret"), "control file");
@@ -268,7 +268,7 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
         const fixture = instructionFixture(memoryRoot, kind);
         // This ancestor would be Project memory on the controller, but must not exist
         // in the worker mount namespace. Catch an accidental whole-data-root mount.
-        writeFileSync(join(memoryRoot, "CLAUDE.md"), fixture.forbidden.control);
+        writeFileSync(join(memoryRoot, "AGENTS.md"), fixture.forbidden.control);
         const memoryConfig = { ...config, persona, dataDir: memoryRoot };
         const manager = new RuntimeManager(memoryConfig, fixture.contexts, options); managers.push(manager);
         const memoryBroker = new CapabilityBroker(join(memoryRoot, "execution/shared-tools.json"), manager, options.isAdmin);

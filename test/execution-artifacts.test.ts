@@ -15,7 +15,7 @@ test("回收只删除当前实例投影与 wrapper,重建不累积;用户持久�
     const projection = artifacts.projection(c.id, first.container.slice(-16));
     const wrapper = f.runtimes.wrapper(c, first);
     for (const dir of [p.work, p.home, p.sdk, p.tasks]) writeFileSync(join(dir, "keep"), "persist");
-    assert.ok(existsSync(join(projection, "CLAUDE.md")));
+    assert.ok(existsSync(join(projection, "AGENTS.md")));
     await f.runtimes.stop(c.id, "test", true);
     assert.equal(existsSync(projection), false); assert.equal(existsSync(wrapper), false);
     for (const dir of [p.work, p.home, p.sdk, p.tasks]) assert.equal(readFileSync(join(dir, "keep"), "utf8"), "persist");

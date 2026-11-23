@@ -19,27 +19,41 @@ function setup() {
   return { root, workspaceRoot, registry, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-test("ensureWorkspace 创建个人 home，共享人设由运行环境装配", () => {
+test("ensureWorkspace 创建个人 home 与 AGENTS.md，共享人设由运行环境装配", () => {
   const { workspaceRoot, registry, cleanup } = setup();
   try {
     const dir = registry.ensureWorkspace("wechat:acct:u1");
     assert.equal(dir, join(workspaceRoot, tenantId("wechat:acct:u1"), "home"));
-    const md = readFileSync(join(dir, "CLAUDE.md"), "utf8");
-    // 共享人设靠显式 import 引入,不依赖向上递归查找。
-    assert.doesNotMatch(md, /@\.\.\/CLAUDE\.md/);
+    const md = readFileSync(join(dir, "AGENTS.md"), "utf8");
+    assert.doesNotMatch(md, /@\.\.\/AGENTS\.md/);
     assert.match(md, /wechat:acct:u1/);
   } finally {
     cleanup();
   }
 });
 
-test("ensureWorkspace 幂等:不覆盖用户改过的 CLAUDE.md", () => {
-  const { registry, cleanup } = setup();
+test("ensureWorkspace 幂等:不覆盖用户改过的 AGENTS.md，且存量目录仅有历史 CLAUDE.md 时无损继承", () => {
+  const { root, workspaceRoot, registry, cleanup } = setup();
   try {
     const dir = registry.ensureWorkspace("wechat:acct:u1");
-    writeFileSync(join(dir, "CLAUDE.md"), "我自己写的偏好", "utf8");
+    writeFileSync(join(dir, "AGENTS.md"), "我自己写的偏好", "utf8");
     registry.ensureWorkspace("wechat:acct:u1");
-    assert.equal(readFileSync(join(dir, "CLAUDE.md"), "utf8"), "我自己写的偏好");
+    assert.equal(readFileSync(join(dir, "AGENTS.md"), "utf8"), "我自己写的偏好");
+
+    // 模拟存量用户目录只有旧版 CLAUDE.md：升级后首次 ensureWorkspace 应继承其正文且保留原文件供回滚
+    const legacyHome = join(workspaceRoot, tenantId("wechat:acct:legacy"), "home");
+    mkdirSync(legacyHome, { recursive: true });
+    writeFileSync(join(legacyHome, "CLAUDE.md"), "存量用户的自定义偏好", "utf8");
+    registry.ensureWorkspace("wechat:acct:legacy");
+    assert.equal(readFileSync(join(legacyHome, "AGENTS.md"), "utf8"), "存量用户的自定义偏好");
+    assert.equal(readFileSync(join(legacyHome, "CLAUDE.md"), "utf8"), "存量用户的自定义偏好");
+
+    // 模拟存量 shared/CLAUDE.md：ensureSharedAgentsMd 同样继承存量内容而不被默认模板覆盖
+    const sharedDir = join(root, "shared");
+    mkdirSync(sharedDir, { recursive: true });
+    writeFileSync(join(sharedDir, "CLAUDE.md"), "存量共享人设正文", "utf8");
+    registry.ensureSharedAgentsMd("默认模板");
+    assert.equal(readFileSync(join(sharedDir, "AGENTS.md"), "utf8"), "存量共享人设正文");
   } finally {
     cleanup();
   }
@@ -100,12 +114,12 @@ test("listWorkspaceDirs 列出各用户目录并算出对应 projectDir", () => 
   }
 });
 
-test("listWorkspaceDirs 忽略共享 CLAUDE.md 与非本程序生成的目录", () => {
+test("listWorkspaceDirs 忽略共享 AGENTS.md 与非本程序生成的目录", () => {
   const { workspaceRoot, registry, cleanup } = setup();
   try {
     registry.ensureWorkspace("wechat:acct:u1");
     // 共享人设文件,以及用户手动放进来的目录 —— 都不是某个人的 workspace。
-    writeFileSync(join(workspaceRoot, "CLAUDE.md"), "共享人设", "utf8");
+    writeFileSync(join(workspaceRoot, "AGENTS.md"), "共享人设", "utf8");
     mkdirSync(join(workspaceRoot, "我的笔记"), { recursive: true });
     mkdirSync(join(workspaceRoot, "notes"), { recursive: true });
 

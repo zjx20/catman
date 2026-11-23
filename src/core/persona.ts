@@ -8,7 +8,7 @@ import { canonicalOf } from "./commands.js";
  *
  * 真机上踩到的:管理员发 `${/救援}` 切到守护人格,它张口就说"我现在跟你对话的就是
  * 主人格本身"。它没说谎 —— 三处身份来源当时全是人格无关的:preset 系统提示词两边
- * 一模一样、skill 是同一套、而**人设 CLAUDE.md 在它的命名空间下压根不存在**
+ * 一模一样、skill 是同一套、而**人设 AGENTS.md 在它的命名空间下压根不存在**
  * (当时守护人格与主人格使用不同的 workspace，人设没有正确装配)。于是它对"我是谁"的全部线索,
  * 只剩 `catman-settings` skill 正文里那句"你跑在 catman 里"。
  *
@@ -16,7 +16,7 @@ import { canonicalOf } from "./commands.js";
  *
  * - **skill 正文**是**按需加载**的 —— 模型可能压根不去读。而身份不是"需要时再查"
  *   的参考资料,它必须无条件在场(与「图片走内联而不是给路径」同一条理由)。
- * - **CLAUDE.md** 住在数据卷里、用户能改能删。而"我是哪个人格"是**装配事实**,
+ * - **AGENTS.md** 住在数据卷里、用户能改能删。而"我是哪个人格"是**装配事实**,
  *   不是偏好 —— 用户改不掉它才对。何况守护人格那份要靠代码生成,又会与主人格
  *   那份人手维护的慢慢走样。
  * - **每回合的用户消息前缀**会污染对话记录,而且 resume 之后前几轮就没有了。
@@ -38,8 +38,8 @@ export function personaBriefing(persona: Persona, memoryLimit?: string): string 
 /**
  * 内存那一段。
  *
- * 为什么进系统提示词而不是 CLAUDE.md:与"我是哪个人格"同一条理由 —— 这是**装配
- * 事实**,而 CLAUDE.md 住在数据卷里、用户能改能删。真被删了的话,大脑会在完全
+ * 为什么进系统提示词而不是 AGENTS.md:与"我是哪个人格"同一条理由 —— 这是**装配
+ * 事实**,而 AGENTS.md 住在数据卷里、用户能改能删。真被删了的话,大脑会在完全
  * 不知道有上限的情况下撞上去。
  *
  * 里面每一句都对应一个真机上付过代价的事实:137 那句是因为大脑光看到工具失败
@@ -138,15 +138,15 @@ export function adminBaseline(
 }
 
 /**
- * 共享人设文件(`<workspaceRoot>/CLAUDE.md`)不存在时写入的初始内容。
+ * 共享人设文件(`<dataDir>/shared/AGENTS.md`)不存在时写入的初始内容。
  *
- * 控制面为缺少 shared/CLAUDE.md 的人格提供初始指令。
- * RuntimeManager 在创建 worker 时合并共享与个人指令，并只读挂到该 context 的 SDK 配置目录。
+ * 控制面为缺少 shared/AGENTS.md 的人格提供初始指令。
+ * RuntimeManager 在创建 worker 时合并共享与个人指令，并只读挂到该 context 的引擎配置目录。
  *
  * **不覆盖已有文件**:它是人手维护的东西,启动时覆盖等于每次重启抹掉一次人设。
  * 与 skill 那种"每次启动幂等覆盖"刻意相反 —— skill 的真相源是代码,这个不是。
  */
-export function initialSharedClaudeMd(persona: Persona): string {
+export function initialSharedAgentsMd(persona: Persona): string {
   if (persona === "rescue") {
     return `# 守护人格的共享人设
 
@@ -200,12 +200,12 @@ const EXECUTION_STORAGE_INSTRUCTIONS = `
 |---|---|
 | 当前 cwd / CATMAN_CONTEXT_DIR | 当前聊天或当前 cron 的 workspace，可读写；默认产物写这里 |
 | /user | 仅 owner 的持久 home，可读写；个人 skill、配置与个人凭据放这里 |
-| CLAUDE_CONFIG_DIR | 仅当前 context 的 SDK 状态，可读写；装配的 CLAUDE.md 和公共 skill 只读 |
+| 当前 context 的 sdk 目录 | 仅当前 context 的 CLI/SDK 状态，可读写；装配的指令投影和公共 skill 只读 |
 | 当前 context 的 tasks 目录 | 后台任务状态和日志，可读写；由任务管理器维护 |
 | /runtime/bin/skills 与运行时代码 | 公共 skill、共享指令投影和运行时代码，只读 |
 | /catman-src | 仅主人格管理员获得的源码挂载，可读写 |
 
 worker 不整挂 /data、/opt/services、/mnt/usb 或 docker.sock，也看不到其他用户、其他聊天或其他 cron 的目录。路径以 /data 开头只说明这个具体子目录被挂入，不表示整个 /data 可见。只有可信控制服务访问完整控制数据并操作 Docker。
 同一用户的聊天和 cron 都可读写 /user。跨上下文共用的长期配置、脚本和需保留的输出统一归入 /user/projects/<项目>，不再使用顶层 /user/artifacts。项目内部布局按任务灵活组织，优先沿用已有结构；prompts/、scripts/、outputs/ 只是建议，不要求建齐。临时执行内容和任务私有状态留在各自 workspace。个人 skill 放 /user/skills，个人 MCP 放 /user/mcp.json。共享模型和公共服务的原始凭据由控制面代理，个人凭据仍属于本用户的 /user。
-共享指令与 /user/CLAUDE.md 由控制面合并，新建 worker 时生成只读投影；不依赖 @../CLAUDE.md 导入。
+共享指令与 /user/AGENTS.md 由控制面合并，新建 worker 时生成只读投影；不依赖 @../AGENTS.md 导入。
 `;

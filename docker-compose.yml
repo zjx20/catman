@@ -105,7 +105,7 @@ services:
       # 三个自家容器按名字列出;**没有通配也没有前缀匹配**,`catman` 盖不住
       # `catman-courier`(实测),所以只能一个个写。
       # 别的服务(catwalk / phonicsfun / …)刻意不加 —— 那份名单枚举不完也维护不动,
-      # 访问它们时显式加 `--noproxy '*'`(见共享人设 CLAUDE.md 里那条约定)。
+      # 访问它们时显式加 `--noproxy '*'`(见共享人设 AGENTS.md 里那条约定)。
       NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,::1,host.docker.internal,catman,catman-courier,catman-rescue,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.qq.com}"
       no_proxy: "${NO_PROXY:-localhost,127.0.0.1,::1,host.docker.internal,catman,catman-courier,catman-rescue,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.qq.com}"
       # dashboard 访问令牌(整站生效)。留空则首次启动自动生成,写入 /data/dashboard-token

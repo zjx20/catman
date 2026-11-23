@@ -297,7 +297,7 @@ export const claudeHarness: AgentHarness = {
   },
 
   writeProjectionFiles({ config, home, projectionDir, isAdmin }) {
-    projectInstructions(config.dataDir, home, join(projectionDir, "CLAUDE.md"), Boolean(config.ops) && isAdmin);
+    projectInstructions(config.dataDir, home, join(projectionDir, "AGENTS.md"), Boolean(config.ops) && isAdmin);
   },
 
   containerMounts({ paths, projectionDir, releaseDir, sharedSkillNames }) {
@@ -308,7 +308,11 @@ export const claudeHarness: AgentHarness = {
         target: `/runtime/release/node_modules/@anthropic-ai/${sdkNativePackage}`,
         readonly: true,
       },
-      { source: join(projectionDir, "CLAUDE.md"), target: join(paths.sdk, "CLAUDE.md"), readonly: true },
+      // Claude CLI 在工作区(project 级)原生加载 AGENTS.md，但在 $CLAUDE_CONFIG_DIR(user 级)
+      // 仅读取固定文件名 CLAUDE.md（由 checkInstructions 实测验证）；控制面投影统一为 AGENTS.md，
+      // 挂进 SDK 目录时同时挂到 AGENTS.md 与 user 级入口 CLAUDE.md。
+      { source: join(projectionDir, "AGENTS.md"), target: join(paths.sdk, "AGENTS.md"), readonly: true },
+      { source: join(projectionDir, "AGENTS.md"), target: join(paths.sdk, "CLAUDE.md"), readonly: true },
       { source: join(paths.home, "skills"), target: join(paths.sdk, "skills") },
     ];
     for (const name of sharedSkillNames) {

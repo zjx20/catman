@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   adminBaseline,
-  initialSharedClaudeMd,
+  initialSharedAgentsMd,
   personaBriefing,
 } from "../src/core/persona.js";
 import { canonicalOf } from "../src/core/commands.js";
@@ -13,7 +13,7 @@ import { instructionOptions } from "../src/core/execution/instructions.js";
  *
  * 真机上它不知道:管理员发 `/救援` 切过去,它张口就说"我现在跟你对话的就是主人格
  * 本身"。三处身份来源当时全是人格无关的 —— preset 系统提示词一模一样、skill 是同一套、
- * 而人设 CLAUDE.md 在它的命名空间下压根不存在。这组用例钉住修复的每一半。
+ * 而人设 AGENTS.md 在它的命名空间下压根不存在。这组用例钉住修复的每一半。
  */
 
 test("两个人格的自述必须不同 —— 这是整条修复的根", () => {
@@ -77,10 +77,10 @@ test("自述真的接到了 SDK 的 systemPrompt 上", () => {
 
 test("共享人设占位分人格,且守护人格那份说清身份归系统提示词管", () => {
   // Shared instructions are editable; immutable identity belongs in systemPrompt.append.
-  const r = initialSharedClaudeMd("rescue");
+  const r = initialSharedAgentsMd("rescue");
   assert.match(r, /守护人格/);
   assert.match(r, /系统提示词/);
-  assert.notEqual(r, initialSharedClaudeMd("primary"));
+  assert.notEqual(r, initialSharedAgentsMd("primary"));
 });
 
 // --- 管理员名单的 env 基线 ---
@@ -118,8 +118,8 @@ test("主 settings.json 读不懂就当空,绝不抛", () => {
   ]);
 });
 
-test("共享 CLAUDE.md:主人格那份带省内存指引", () => {
-  const s = initialSharedClaudeMd("primary");
+test("共享 AGENTS.md:主人格那份带省内存指引", () => {
+  const s = initialSharedAgentsMd("primary");
   assert.match(s, /## 省内存地写命令/);
   // 具体上限不在这里写死 —— 它由系统提示词按实际装配给出。这份是人手可改的文件,
   // 在这里写"700m"会在改了 compose 之后变成一句假话,而没人会想起来同步它。
@@ -127,17 +127,17 @@ test("共享 CLAUDE.md:主人格那份带省内存指引", () => {
 });
 
 /**
- * 这条约定要**跟着代码走到新部署上**,而不是只留在这台机器的 CLAUDE.md 里。
+ * 这条约定要**跟着代码走到新部署上**,而不是只留在这台机器的 AGENTS.md 里。
  * 聊天客户端按 markdown 渲染,裸贴日志会糊成一坨 —— 本机 2026-08-28 踩过一次
  * (长任务通知),换台机器部署的人不该再踩一遍。
  */
-test("共享 CLAUDE.md:两个人格都交代「发出去的文字是 markdown」", () => {
-  assert.match(initialSharedClaudeMd("primary"), /markdown/);
-  assert.match(initialSharedClaudeMd("primary"), /围栏/);
+test("共享 AGENTS.md:两个人格都交代「发出去的文字是 markdown」", () => {
+  assert.match(initialSharedAgentsMd("primary"), /markdown/);
+  assert.match(initialSharedAgentsMd("primary"), /围栏/);
   // 守护人格的活儿就是贴日志报状态,更需要这条。
-  assert.match(initialSharedClaudeMd("rescue"), /代码围栏/);
+  assert.match(initialSharedAgentsMd("rescue"), /代码围栏/);
 });
 
-test("共享 CLAUDE.md:守护人格那份不带 —— 它不干重活,那份刻意只写风格", () => {
-  assert.doesNotMatch(initialSharedClaudeMd("rescue"), /省内存/);
+test("共享 AGENTS.md:守护人格那份不带 —— 它不干重活,那份刻意只写风格", () => {
+  assert.doesNotMatch(initialSharedAgentsMd("rescue"), /省内存/);
 });
