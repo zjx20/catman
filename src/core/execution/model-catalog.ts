@@ -2,6 +2,7 @@ import { accessSync, constants, existsSync, mkdtempSync, mkdirSync, realpathSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { EnvHttpProxyAgent, request } from "undici";
 import { DEFAULT_MODELS_BY_HARNESS, type Config, type HarnessId } from "../../config.js";
 import { InputChannel } from "../agent.js";
 import { readJsonFile, writeJsonFileAtomic } from "../file-store.js";
@@ -879,17 +880,42 @@ export class ModelCatalog {
     return [];
   }
 
+  private async requestJsonViaEnvProxy(url: string, headers: Record<string, string>): Promise<unknown | undefined> {
+    const env = this.env();
+    const dispatcher = new EnvHttpProxyAgent({
+      httpProxy: env["http_proxy"] ?? env["HTTP_PROXY"] ?? "",
+      httpsProxy: env["https_proxy"] ?? env["HTTPS_PROXY"] ?? "",
+      noProxy: ["localhost", "127.0.0.1", env["no_proxy"] ?? env["NO_PROXY"] ?? ""].filter(Boolean).join(","),
+      proxyTunnel: false,
+    });
+    try {
+      const res = await request(url, {
+        dispatcher,
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        await res.body.dump();
+        return undefined;
+      }
+      return await res.body.json();
+    } catch {
+      return undefined;
+    } finally {
+      await dispatcher.destroy().catch(() => {});
+    }
+  }
+
   private async fetchGeminiModels(): Promise<DiscoveredModel[]> {
     const env = this.env();
     const key = env["GEMINI_API_KEY"]?.trim();
     if (!key) return [];
     const base = (env["GOOGLE_GEMINI_BASE_URL"] || "https://generativelanguage.googleapis.com").replace(/\/$/, "");
-    const res = await fetch(`${base}/v1beta/models`, {
-      headers: { "x-goog-api-key": key },
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (!res.ok) return [];
-    const data = (await res.json()) as { models?: Array<{ name?: string; displayName?: string; supportedGenerationMethods?: string[] }> };
+    const data = (await this.requestJsonViaEnvProxy(`${base}/v1beta/models`, {
+      "x-goog-api-key": key,
+    })) as { models?: Array<{ name?: string; displayName?: string; supportedGenerationMethods?: string[] }> } | undefined;
+    if (!data) return [];
     const out: DiscoveredModel[] = [];
     for (const m of data.models ?? []) {
       if (Array.isArray(m.supportedGenerationMethods) && !m.supportedGenerationMethods.includes("generateContent")) continue;
@@ -900,16 +926,11 @@ export class ModelCatalog {
   }
 
   private async fetchOpenAiStyleModels(url: string, headers: Record<string, string>): Promise<DiscoveredModel[]> {
-    try {
-      const res = await fetch(url, { headers, signal: AbortSignal.timeout(5_000) });
-      if (!res.ok) return [];
-      const data = (await res.json()) as { data?: Array<{ id?: string }> };
-      return (data.data ?? [])
-        .map((m) => (typeof m.id === "string" ? m.id.trim() : ""))
-        .filter((id) => id.length > 0 && id.length <= 64)
-        .map((id) => ({ id }));
-    } catch {
-      return [];
-    }
+    const data = (await this.requestJsonViaEnvProxy(url, headers)) as { data?: Array<{ id?: string }> } | undefined;
+    if (!data) return [];
+    return (data.data ?? [])
+      .map((m) => (typeof m.id === "string" ? m.id.trim() : ""))
+      .filter((id) => id.length > 0 && id.length <= 64)
+      .map((id) => ({ id }));
   }
 }

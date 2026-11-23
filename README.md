@@ -172,11 +172,11 @@ compose 里已经预留好透传(大小写两份都传,程序之间认哪种并�
 
 | 流量 | |
 |---|---|
-| Claude API(模型请求) | ✅ 走代理 |
-| 助手用 WebFetch 抓网页 | ✅ 走代理(请求由容器本地发起) |
-| 助手在 Bash 里跑的命令(`curl` / `git` / `npm` …) | ✅ 走代理,子进程继承环境变量 |
-| 助手用 WebSearch 搜索 | ➖ **不经过你的代理**:搜索在 Anthropic 服务端执行,结果随 API 响应回来 |
-| Claude 的遥测上报 | ✅ 走代理。代理若是白名单模式记得放行,否则每回合多几次失败重试 |
+| 模型请求（Claude / `agy` Gemini / `acp` OpenAI 等，含动态模型探测） | ✅ 走代理（worker 内经 `NO_PROXY` 直连控制面 `CapabilityBroker`，由控制面 `EnvHttpProxyAgent` 走代理出网） |
+| 助手抓网页（Claude WebFetch / `agy` 网页工具等） | ✅ 走代理（请求由 worker 容器本地发起，自动继承 `HTTP_PROXY` / `HTTPS_PROXY`） |
+| 助手在 Bash 里跑的命令(`curl` / `git` / `npm` …)与 MCP 子进程 | ✅ 走代理,子进程继承环境变量 |
+| 助手用服务端搜索（如 Claude WebSearch / Gemini Grounding） | ➖ **不经过你的代理**:搜索在模型厂商服务端执行,结果随 API 响应回来 |
+| CLI 遥测上报（`agy` 默认已自动关遥测与自动更新） | ✅ 走代理。代理若是白名单模式记得放行,否则每回合多几次失败重试 |
 | 微信 iLink(收发消息、下载图片) | ➖ 不走,见下面的 `NO_PROXY` |
 
 覆盖不到的只有**不读这些环境变量的程序**。catman 自身代码里访问微信服务器用的就是这类

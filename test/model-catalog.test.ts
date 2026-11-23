@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, type Config, type HarnessId } from "../src/config.js";
@@ -433,6 +433,85 @@ test("回合事前拦截与事中故障逃生引导：不静默代切计费通�
       assert.match((badPatch.body as { error: string }).error, /未配置 GEMINI_API_KEY/);
     } finally {
       await gateway.stop();
+    }
+  });
+});
+
+test("ModelCatalog HTTP 回退探测自动继承 HTTP_PROXY（与 CapabilityBroker 一致）", async () => {
+  await withTempDir(async (dir) => {
+    const proxyRequests: Array<{ url: string; apiKey?: string }> = [];
+    const proxyServer = createServer((req, res) => {
+      proxyRequests.push({
+        url: req.url ?? "",
+        apiKey: typeof req.headers["x-goog-api-key"] === "string" ? req.headers["x-goog-api-key"] : undefined,
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          models: [
+            {
+              name: "models/gemini-2.5-pro",
+              displayName: "Gemini 2.5 Pro",
+              supportedGenerationMethods: ["generateContent"],
+            },
+          ],
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => proxyServer.listen(0, "127.0.0.1", resolve));
+    const proxyPort = (proxyServer.address() as { port: number }).port;
+
+    // 构造一个不返回 configOptions 的最小 ACP 服务端，迫使 ModelCatalog 走 HTTP /v1beta/models 回退探测
+    const emptyAcp = join(dir, "empty-acp.mjs");
+    writeFileSync(
+      emptyAcp,
+      `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+const rl = createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } }) + "\\n");
+  } else if (msg.method === "session/new") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s_1", configOptions: [] } }) + "\\n");
+  } else if (msg.method === "session/close") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }) + "\\n");
+  }
+});
+`,
+      { mode: 0o755 },
+    );
+    chmodSync(emptyAcp, 0o755);
+
+    try {
+      const cfg: Config = {
+        ...baseConfig(dir),
+        harness: "acp",
+        acpCommand: [process.execPath, emptyAcp],
+        acpUpstream: "gemini",
+      };
+      const catalog = new ModelCatalog({
+        config: cfg,
+        checkAvailability: (h) => ({ available: h === "acp" }),
+        env: () => ({
+          PATH: process.env.PATH,
+          GEMINI_API_KEY: "test-gemini-key",
+          GOOGLE_GEMINI_BASE_URL: "http://fake-gemini-upstream.example.com:8080",
+          HTTP_PROXY: `http://127.0.0.1:${proxyPort}`,
+          http_proxy: `http://127.0.0.1:${proxyPort}`,
+        }),
+      });
+      await catalog.refresh("acp");
+      assert.equal(proxyRequests.length, 1, "HTTP 回退模型列表探测应自动走 HTTP_PROXY");
+      assert.match(proxyRequests[0]!.url, /^http:\/\/fake-gemini-upstream\.example\.com:8080\/v1beta\/models$/);
+      assert.equal(proxyRequests[0]!.apiKey, "test-gemini-key");
+      assert.deepEqual(
+        catalog.entryOf("acp").models.map((m) => m.id),
+        ["gemini-2.5-pro"],
+      );
+    } finally {
+      proxyServer.closeAllConnections();
+      await new Promise<void>((resolve) => proxyServer.close(() => resolve()));
     }
   });
 });
