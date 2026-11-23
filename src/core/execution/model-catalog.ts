@@ -326,9 +326,15 @@ export class ModelCatalog {
   entryOf(harness: HarnessId): HarnessCatalogEntry {
     const status = this.checkAvailability(harness);
     const cached = this.discovered.get(harness);
-    const models = cached?.models.length
+    const baseModels = cached?.models.length
       ? cached.models
       : DEFAULT_MODELS_BY_HARNESS[harness].map((id) => ({ id }));
+    const configuredModel =
+      harness === this.opts.config.harness ? this.opts.config.model?.trim() : undefined;
+    const models =
+      configuredModel && configuredModel !== "default" && !baseModels.some((m) => m.id.toLowerCase() === configuredModel.toLowerCase())
+        ? [{ id: configuredModel }, ...baseModels]
+        : baseModels;
     return {
       harness,
       available: status.available,
