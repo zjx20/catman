@@ -9,3 +9,5 @@ data/
 .env
 
 /.migration-backups/
+# 测试在 /tmp 是 noexec 时会退到这里建临时目录（见 test/webgrab.test.ts）
+/.test-tmp/

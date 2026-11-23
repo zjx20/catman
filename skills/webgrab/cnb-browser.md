@@ -1,6 +1,6 @@
 > 这是 skill **webgrab** 的 `cnb` 通道的完整动作参考,不是独立 skill。
 > 什么时候该用它、怎么起手,看 [SKILL.md](SKILL.md);这里是动作表和坑。
-> 命令行封装:`webgrab cnb <start|status|text|html|shot|do|profiles|profile|proxy>`,
+> 命令行封装:`webgrab cnb <start|status|text|html|shot|do|profiles|profile|proxy|warp>`,
 > 它替你带 token、撞上冷启动自动重试、run_script 的两层 success 也替你判过了。
 
 
@@ -159,39 +159,55 @@ P '{"action":"get_text"}'
 - `hasArchive` 表示这个 profile 目录里有 manifest（即由上传的归档解出来的），**不是**「导出过」。
   导出只把 manifest 打进归档文件，目录本身不变。
 
-## 出口代理（本地增补，不是上游内容）
+## 出口：WARP 与代理开关（部署侧增补）
 
-部署侧新增的接口，**不是上游动作**，所以 `cnb do` 透传不到它，要用 `cnb proxy` 子命令。
-上游文档同步覆盖本文件时，这一节要手工保留（`sync-cnb-doc.mjs` 不生成它）：
+这两组是**网关路由**（`kind: raw`，只做白名单转发），不是浏览器动作，所以 `cnb do`
+透传不到它们，要用 `cnb warp` / `cnb proxy` 子命令。上游文档同步覆盖本文件时，这一节
+要手工保留（`sync-cnb-doc.mjs` 不生成它）。
 
 ```bash
-"$WG" cnb proxy                                    # 看内置默认浏览器
-"$WG" cnb proxy --profile work                     # 看某个 profile
+"$WG" cnb warp                                     # 空间级 WARP 状态
+"$WG" cnb warp --reconnect                         # 强制换一个 WARP 入口(最多 90s)
+"$WG" cnb proxy                                    # 内置默认浏览器的代理开关
+"$WG" cnb proxy --profile work                     # 指定 profile
 "$WG" cnb proxy --profile work --mode on           # auto|on|off
-"$WG" cnb proxy --profile work --enabled false     # 另一种写法,等价 mode=off
+"$WG" cnb proxy --profile work --enabled false     # true|false|null(等价 mode=off / 重置 auto)
 ```
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
-| GET | `/proxy`、`/profiles/{id}/proxy` | 返回 `{profile:{…,proxy:{mode,enabled,available}}}` |
+| GET | `/warp/status` | `managed`、`controlAvailable`、`status`（phase / 当前入口 / 上次换入口结果） |
+| POST | `/warp/reconnect` | 强制换入口，返回 `rotation.from/to` 与最新状态 |
+| GET | `/proxy`、`/profiles/{id}/proxy` | `{profile:{…,proxy:{mode,enabled,available}}}` |
 | PUT | 同上 | body `{"mode":"auto|on|off"}` 或 `{"enabled":true|false|null}`，返回 `{profile,restarted,changed}` |
 
-语义与坑：
+**先换出口，再动代理开关**，因为前者不重启浏览器：
 
-- **`on`** 走部署代理（实测出口是 Cloudflare WARP，`warp=on`，IPv4/IPv6 都有）；
-  **`off`** 直连空间自己的网络（实测 `warp=off`，拿到空间真实出口 IP，**IPv6 不通**）；
-  **`auto`** 由部署决定，当前部署下等同于启用。
-- **改配置会重启这台浏览器**：响应里 `restarted: true`，实测 12~30 秒；`changed:false`
-  时不会重启。刚 `PUT` 完不要立刻叠页面动作，给 `--timeout` 留够（默认 120 秒够）。
-- 是否按 profile 独立生效：是。`--profile` 的 PUT 只影响那个 profile 进程；不带
-  `--profile` 改的是内置默认浏览器。
-- **什么时候要动它**：站点在直连出口下连不上或过不了人机验证时。实测案例：
-  `challenges.cloudflare.com`（Turnstile 的挑战域）在 `off` 下 IPv6 不通、域名请求挂死，
-  切到 `on` 后立刻恢复；反过来也有站点只认直连出口。判断方法是先 `GET /proxy` 看
-  `mode/enabled/available`，再分别试一次目标和 `https://www.cloudflare.com/cdn-cgi/trace`
-  （后者能看出当前出口 IP 和 `warp=` 状态）。
-- `available:false` 表示这个空间/部署没有可用的代理，此时 `on` 不一定生效，看返回的
-  `proxy` 字段为准。
+- `/warp/reconnect` 只在空间托管 WARP 时可用（`/warp/status` 的 `managed=true`）。它把
+  当前入口冷却、清掉 `last_good`，再走候选轮换；**本地 `socks5://127.0.0.1:40000` 不变，
+  Firefox 不用重启，页面和标签页都保留**。一次最多等 90 秒，别高频调用。
+- 失败返回 `503` + `{"ok":false,…}`，原因看 `rotation.reason` / `status.reason`
+  （例如 `recovery budget exhausted; cooling down` 表示预算用完，得等冷却）。
+  显式配置 `PROXY_URL` 或 `WARP_ENABLED=false` 时返回 `409`。
+- 实测 `status.phase` 可能是 `degraded`（"proxy has no verified WARP egress"）而流量仍在走；
+  也有 `degraded` 时确实过不了人机验证的情况，这时 `--reconnect` 是第一个该试的。
+
+**代理开关的语义**：
+
+- `auto`（默认）跟随空间级代理；`off` 直连；`on` 强制走代理 —— 在没有代理的空间会
+  **返回 409**；`{"enabled":null}` 等于重置回 `auto`。
+- **改设置会重启该 profile 的浏览器进程**（响应 `restarted:true`，实测 12~30 秒），
+  页面和标签页会丢；要保留现场就先导出归档再改。`changed:false` 时不重启。
+- 设置在 profile 目录的 `cnb-browser-proxy.json` 里，**随归档导出/恢复**；旧归档按
+  `auto` 处理。网关不额外保存。
+- `off` 只改流量出口，**DNS 仍走空间本地 DoH 转发器**。
+- 响应不回传 `PROXY_URL`（可能带账号密码）；`available:false` 表示当前空间没有可用代理。
+- 按 profile 独立生效：`--profile` 的 PUT 只影响那个进程，不带 `--profile` 是内置默认浏览器。
+
+**判断当前出口**：`GET /warp/status` 的 `status.phase` 与 `active_endpoint`；再打一次
+`https://www.cloudflare.com/cdn-cgi/trace` 看 `ip=` 和 `warp=`（`on` 时 `warp=on`，
+`off` 时是空间真实 IP 且 IPv6 不通）。实测案例：`challenges.cloudflare.com`（Turnstile
+的挑战域）在 `off` 下域名请求挂死，切 `on` 后立刻恢复。
 
 ## 动作参考
 

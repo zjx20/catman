@@ -101,18 +101,25 @@ goto 的 abort 有时来自跳转链，必须看页面状态；504 也不保证�
 profile」的全局状态，多个 profile 可以并行——但空间只有 4 核 8GB，同时开 1-2 个就够。
 归档里是明文会话凭据，别提交、别贴日志。
 
-出口代理可以按浏览器单独开关（部署侧新增的接口，不是上游动作）：
+出口可以换，也可以按浏览器单独开关（部署侧新增的网关路由，不是上游动作）：
 
 ```bash
-"$WG" cnb proxy                                     # 看当前模式
+"$WG" cnb warp                                      # 空间级 WARP 状态
+"$WG" cnb warp --reconnect                          # 换一个 WARP 入口,最多 90 秒,不重启浏览器
+"$WG" cnb proxy                                     # 看当前代理模式
 "$WG" cnb proxy --profile work --mode on            # auto|on|off
-"$WG" cnb proxy --profile work --enabled false      # 等价写法
+"$WG" cnb proxy --profile work --enabled false      # true|false|null(null=重置 auto)
 ```
 
-`on` 走部署代理（WARP 出口），`off` 直连空间自己的网络，`auto` 由部署决定。
-改完服务端会**重启这台浏览器**（十几秒），所以别在同一条命令里紧接着做页面操作。
+**顺序是先 `warp --reconnect`，再动 `proxy`**：换入口只改空间里的 WARP 出口，Firefox
+不重启、页面和标签页都在；代理开关会**重启这台浏览器**（十几秒），现场会丢。
+
+`on` 走代理出口，`off` 直连空间自己的网络，`auto` 跟随空间级设置。空间没有可用代理时
+`on` 返回 409，不是"配上了但没生效"。`off` 只改流量出口，DNS 仍走空间本地 DoH。
 实测有些站点只有某一种出口能过（例如 `challenges.cloudflare.com` 在直连出口下 IPv6
 不通，turnstile 出不了令牌），遇到人机验证卡住先看这一层。
+`warp --reconnect` 失败返回 503 + `rotation.reason`（常见 `recovery budget exhausted`，
+要等冷却），显式配置过 `PROXY_URL`/`WARP_ENABLED=false` 时是 409；别高频调用。
 
 ## Cloudflare 后备通道
 

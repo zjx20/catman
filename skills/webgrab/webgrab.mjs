@@ -597,6 +597,34 @@ function cmdCnbProfile(c, pos, opt) {
 }
 
 /**
+ * 空间级 WARP 出口。带 --reconnect 就强制换一个入口 —— 本地 socks 端口不变,
+ * 浏览器不用重启,页面和标签页都保留。一次最多等 90 秒,别高频调用。
+ * 只对托管 WARP 的空间可用(managed=true),否则 409。
+ */
+function cmdCnbWarp(c, opt) {
+  if (cnbProfileId(opt)) die('warp 是空间级接口,不接受 --profile')
+  const path = opt.reconnect ? '/warp/reconnect' : '/warp/status'
+  const call = () => {
+    const r = cnbCurl(c, opt.reconnect ? { path, post: true, timeout: opt.timeout } : { path, timeout: opt.timeout })
+    return { r, j: tryParse(r.body) }
+  }
+  let { r, j } = call()
+  // 只有明确的「空间没起来」才拉起重试;reconnect 的 503 是换出口失败,不是冷启动,
+  // 拿它去 /gw/start 只会白等一轮(实测会把错误盖成「空间未就绪」)。
+  if (j && /WORKSPACE_(STARTING|UNREACHABLE)/.test(j.error || '')) {
+    process.stderr.write('[空间未就绪,先拉起]\n')
+    cnbStart(c)
+    ;({ r, j } = call())
+  }
+  if (j && j.ok === false) {
+    cnbEmit(JSON.stringify(j, null, 2), opt)
+    die(`换出口失败:${(j.rotation && j.rotation.reason) || (j.status && j.status.reason) || "unknown"}`, 3)
+  }
+  if (r.status >= 400 || !j) cnbFail(r, j)
+  return void cnbEmit(JSON.stringify(j, null, 2), opt)
+}
+
+/**
  * 出口代理开关。GET 看状态;带 --mode/--enabled 就 PUT 改。
  * 改完服务端会重启这台浏览器(响应里 restarted:true,实测 12~30 秒),所以别在
  * 一次 --timeout 很小的调用里改。
@@ -611,8 +639,9 @@ function cmdCnbProxy(c, opt) {
   }
   if (opt.proxyEnabled !== undefined) {
     const v = String(opt.proxyEnabled).toLowerCase()
-    if (v !== 'true' && v !== 'false') die('--enabled 只支持 true|false')
-    body.enabled = v === 'true'
+    if (v === 'null') body.enabled = null // 重置回 auto
+    else if (v === 'true' || v === 'false') body.enabled = v === 'true'
+    else die('--enabled 只支持 true|false|null')
   }
   const write = Object.keys(body).length > 0
   const { r, j } = cnbCall(
@@ -620,6 +649,9 @@ function cmdCnbProxy(c, opt) {
     write ? { path, method: 'PUT', body: JSON.stringify(body) } : { path },
     opt
   )
+  if (r.status === 409) {
+    die(`409 —— 这个空间没有可用代理,或显式配置了 PROXY_URL / WARP_ENABLED=false:\n  ${(j && (j.error || j.message)) || r.body}`.slice(0, 600), 2)
+  }
   if (r.status >= 400 || !j) cnbFail(r, j)
   return void cnbEmit(JSON.stringify(j, null, 2), opt)
 }
@@ -649,6 +681,7 @@ function cmdCnb(sub, pos, opt) {
   }
   if (sub === 'profile') return void cmdCnbProfile(c, pos, opt)
   if (sub === 'proxy') return void cmdCnbProxy(c, opt)
+  if (sub === 'warp') return void cmdCnbWarp(c, opt)
   if (sub === 'do') {
     // 原样透传一个动作 JSON。'-' 读 stdin,'@f' 读文件 —— 长脚本别塞进 argv。
     let raw = pos[0] || die('缺动作 JSON;例:webgrab cnb do \'{"action":"get_page_info"}\'')
@@ -733,7 +766,7 @@ function cmdCnb(sub, pos, opt) {
     if (r.status >= 400) die(`HTTP ${r.status}(错误正文在 ${opt.out} 里)`, 2)
     return void process.stderr.write(`→ ${opt.out}\n`)
   }
-  die(`未知 cnb 子命令 ${sub};可用: start status text html shot do profiles profile proxy`)
+  die(`未知 cnb 子命令 ${sub};可用: start status text html shot do profiles profile proxy warp`)
 }
 
 // ── args ─────────────────────────────────────────────────────────────────────
@@ -743,7 +776,7 @@ const HELP = `webgrab —— 抓直接 curl 抓不到的网页
   webgrab plain <url> [--ua S] [--noproxy] [--out F]
   webgrab jina  <url> [--plain] [--cache] [--out F]
   webgrab cf <action> <url> [选项]      (后备:无状态渲染,已不是首选)
-  webgrab cnb <start|text|html|shot|do|status|profiles|profile|proxy> [url] [选项]
+  webgrab cnb <start|text|html|shot|do|status|profiles|profile|proxy|warp> [url] [选项]
   webgrab actions                      列出 CF 的 action
 
 cf action: ${CF_ACTIONS.join(' ')}
@@ -769,8 +802,9 @@ cnb:  远程真实浏览器,有状态(cookie/登录态跨请求保留),串行,�
       --profile ID 落到 /profiles/{id}/…;不带就是内置默认 profile
       profiles 列出全部 profile  profile <create|start|stop|delete|export|import> <id>
       profile export <id> --out f.tar.gz(隐含 stop)  profile import <id> --in f [--sha256 S]
-      proxy [--mode auto|on|off] [--enabled true|false]   看/改出口代理;不带参数只看
-            改完浏览器会重启(十几秒);on 走部署代理(WARP),off 直连
+      proxy [--mode auto|on|off] [--enabled true|false|null]   看/改出口代理;不带参数只看
+            改完该 profile 的浏览器会重启(十几秒);on 走空间代理,off 直连,auto 跟随空间
+      warp [--reconnect]   空间级 WARP 出口:看状态 / 强制换一个入口(不重启浏览器,最多 90s)
       goto 报 abort 不一定是失败(跳转链):脚本靠文档记号判,晚到会自动重取正文
       完整动作表: /runtime/bin/skills/webgrab/cnb-browser.md
 `
@@ -794,7 +828,7 @@ function parse(argv) {
       '--kitesurf': 'kitesurfNoop', '--chromium': 'chromium', '--no-kitesurf': 'chromium',
       '--raw': 'raw', '--dry-run': 'dryRun', '--plain': 'plain', '--cache': 'cache',
       '--noproxy': 'noproxy', '--reject-css': 'rejectCss', '--desktop': 'desktop',
-      '--attached': 'attached',
+      '--attached': 'attached', '--reconnect': 'reconnect',
     }
     if (takes[a]) {
       if (!argv[i + 1] || argv[i + 1].startsWith('--')) die(`${a} 缺少参数`)

@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -8,8 +8,27 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const script = fileURLToPath(new URL("../skills/webgrab/webgrab.mjs", import.meta.url));
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+
+// 临时目录必须能执行放进去的假 curl：/tmp 常被挂成 noexec，那时 execvp 遇到 EACCES 会
+// 跳过假 curl 继续找系统 curl，测试就悄悄变成真的联网（表现为 120 秒超时）。
+function execTempDir(prefix: string) {
+  for (const base of [tmpdir(), join(repoRoot, ".test-tmp")]) {
+    try {
+      mkdirSync(base, { recursive: true });
+      const dir = mkdtempSync(join(base, prefix));
+      writeFileSync(join(dir, "probe"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const probe = spawnSync(join(dir, "probe"));
+      rmSync(join(dir, "probe"));
+      if (!probe.error && probe.status === 0) return dir;
+      rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  }
+  throw new Error("找不到能执行脚本的临时目录；把 TMPDIR 指到一个非 noexec 的位置");
+}
+
 async function fixture(t: TestContext) {
-  const cwd = mkdtempSync(join(tmpdir(), "catman-webgrab-"));
+  const cwd = execTempDir("catman-webgrab-");
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   const run = (args: string[], env: NodeJS.ProcessEnv = {}) => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn(process.execPath, [script, ...args], { cwd, env: { ...process.env,
@@ -132,9 +151,41 @@ test("webgrab：cnb proxy 读走 GET、改走 PUT，非法模式不发请求", a
   assert.equal(toggle.code, 0, toggle.stderr);
   assert.deepEqual(seen.at(-1), { method: "PUT", path: "/proxy", body: '{"enabled":false}' });
 
+  const reset = await f.run(["cnb", "proxy", "--enabled", "null"], env);
+  assert.equal(reset.code, 0, reset.stderr);
+  assert.deepEqual(seen.at(-1), { method: "PUT", path: "/proxy", body: '{"enabled":null}' });
+
   const before = seen.length;
   const bad = await f.run(["cnb", "proxy", "--mode", "sometimes"], env);
   assert.notEqual(bad.code, 0); assert.match(bad.stderr, /auto\|on\|off/); assert.equal(seen.length, before);
+});
+
+test("webgrab：cnb warp 是空间级接口，--reconnect 才会 POST", async t => {
+  const f = await fixture(t);
+  const seen: Array<{ method: string; path: string }> = [];
+  const server = createServer((req, res) => {
+    req.resume(); req.on("end", () => {
+      seen.push({ method: req.method!, path: req.url! });
+      res.setHeader("content-type", "application/json");
+      res.end('{"managed":true,"controlAvailable":true,"status":{"phase":"healthy"}}');
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const address = server.address(); assert.ok(address && typeof address !== "string");
+  const env = { CNB_BROWSER_URL: `http://127.0.0.1:${address.port}` };
+
+  const status = await f.run(["cnb", "warp"], env);
+  assert.equal(status.code, 0, status.stderr);
+  assert.deepEqual(seen.at(-1), { method: "GET", path: "/warp/status" });
+
+  const reconnect = await f.run(["cnb", "warp", "--reconnect"], env);
+  assert.equal(reconnect.code, 0, reconnect.stderr);
+  assert.deepEqual(seen.at(-1), { method: "POST", path: "/warp/reconnect" });
+
+  const before = seen.length;
+  const bad = await f.run(["cnb", "warp", "--profile", "work"], env);
+  assert.notEqual(bad.code, 0); assert.match(bad.stderr, /空间级/); assert.equal(seen.length, before);
 });
 
 test("webgrab：503 冷启动重试共享同一个总超时", { timeout: 5000 }, async t => {
