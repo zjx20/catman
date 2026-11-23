@@ -37,6 +37,7 @@ export type CommandName =
   | "status"
   | "jobs"
   | "nop"
+  | "harness"
   | "model"
   | "effort"
   | "newSession"
@@ -147,10 +148,19 @@ export const COMMAND_TABLE: readonly CommandDef[] = [
     immediate: true,
   },
   {
+    name: "harness",
+    canonical: "/引擎",
+    aliases: ["/harness", "/大脑"],
+    desc: "看或切底层引擎(claude / agy / acp):不带参数查看各引擎就绪状态与模型目录,带上引擎名就切换(下一轮生效),「默认」清掉你的设置",
+    immediate: true,
+    takesArg: true,
+    argHint: "引擎名",
+  },
+  {
     name: "model",
     canonical: "/模型",
     aliases: ["/model"],
-    desc: "看或切模型:不带参数列出可选项与当前值,带上模型名就切换(下一轮生效),「默认」清掉你的设置",
+    desc: "看或切模型:不带参数按引擎列出可用模型,带上模型名自动切换(支持 引擎:模型、「刷新」与「默认」,下一轮生效)",
     // immediate:只改自己的偏好、幂等,而且**正是"当前这个模型不行了"的时候最该使得上
     // 的东西** —— 走队列就会被卡死的回合堵住,那这条指令的意义就没了。它不碰会话状态、
     // 不与消息投递抢先后,所以不违背 immediate 的约束(见文件头)。

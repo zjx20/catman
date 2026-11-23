@@ -1,3 +1,4 @@
+import type { HarnessId } from "../config.js";
 import { readJsonFile, writeJsonFileAtomic } from "./file-store.js";
 import {
   SETTING_SCHEMA,
@@ -32,16 +33,24 @@ export interface PrefsStoreOptions {
    * 拿快照会让改动要等重启才生效。
    */
   defaults: () => Settings;
+  /**
+   * 可选：校验选出的 model 是否与当前生效的 harness 兼容。
+   * 例如用户只把 harness 切到 agy，而全局默认 model 是 claude 的 opus 时，
+   * 回退为 undefined 让新引擎使用自己的默认模型（不改盘）。
+   */
+  compatibleModel?: (harness: HarnessId, model: string | undefined) => string | undefined;
 }
 
 export class PrefsStore {
   private readonly prefs: PrefsMap;
   private readonly path: string;
   private readonly defaults: () => Settings;
+  private readonly compatibleModel: ((harness: HarnessId, model: string | undefined) => string | undefined) | undefined;
 
   constructor(opts: PrefsStoreOptions) {
     this.path = opts.path;
     this.defaults = opts.defaults;
+    this.compatibleModel = opts.compatibleModel;
     this.prefs = readJsonFile<PrefsMap>(this.path, {});
   }
 
@@ -63,8 +72,13 @@ export class PrefsStore {
     const pick = <K extends UserSettingKey>(key: K): Settings[K] =>
       resolveSetting(key, ctx, userKey, [raw[key], globals[key]]);
 
+    const harness = pick("harness");
+    const pickedModel = pick("model");
+    const model = this.compatibleModel ? this.compatibleModel(harness, pickedModel) : pickedModel;
+
     return {
-      model: pick("model"),
+      harness,
+      model,
       effort: pick("effort"),
       ackEnabled: pick("ackEnabled"),
       progressEnabled: pick("progressEnabled"),

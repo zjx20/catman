@@ -1,6 +1,7 @@
 import type { ContextStore } from "./execution/contexts.js";
 import type { RuntimeManager } from "./execution/runtime.js";
 import type { OpsManager } from "./execution/ops.js";
+import type { ModelCatalog } from "./execution/model-catalog.js";
 import { BackgroundContinuations, CONTINUATION_TIMEOUT_MS, CONTINUATION_MAX_TURNS, CONTINUATION_MAX_USD, CHAT_MAX_TURNS } from "./execution/continuations.js";
 import type { RuntimeEvent } from "./execution/runtime.js";
 import type { Accepted, Channel, IncomingMessage } from "../channels/types.js";
@@ -149,6 +150,8 @@ const NEWS_RETRY_MS = 60_000;
 
 export interface GatewayOptions {
   execution?: { contexts: ContextStore; runtimes: RuntimeManager; ops?: OpsManager };
+  /** 动态模型目录与各引擎就绪状态中心；用于 /引擎、/模型 跨引擎自动路由与故障切换引导。 */
+  modelCatalog?: ModelCatalog;
   channel: Channel;
   agent: Agent;
   sessions: SessionManager;
@@ -702,6 +705,7 @@ export class Gateway {
   private readonly binDir: string | undefined;
 
   private readonly execution: GatewayOptions["execution"];
+  private readonly modelCatalog: ModelCatalog | undefined;
   private readonly continuations?: BackgroundContinuations;
   private readonly continuationIntervalMs: number;
   private continuationTimer?: NodeJS.Timeout;
@@ -709,6 +713,7 @@ export class Gateway {
 
   constructor(opts: GatewayOptions) {
     this.execution = opts.execution;
+    this.modelCatalog = opts.modelCatalog;
     this.channel = opts.channel;
     this.agent = opts.agent;
     this.sessions = opts.sessions;
@@ -1177,7 +1182,14 @@ export class Gateway {
         return;
       }
 
+      case "harness":
+        await this.trySend(userKey, this.switchHarnessText(userKey, cmd, arg), cmd.desc);
+        return;
+
       case "model":
+        await this.trySend(userKey, await this.switchModelText(userKey, cmd, arg), cmd.desc);
+        return;
+
       case "effort":
         await this.trySend(userKey, this.switchPrefText(userKey, cmd, arg), cmd.desc);
         return;
@@ -1591,8 +1603,100 @@ export class Gateway {
     ];
   }
 
+  private explicitAllowlist(): readonly string[] | undefined {
+    return this.settings.hasExplicitModelAllowlist()
+      ? this.settings.effective().modelAllowlist
+      : undefined;
+  }
+
+  /** `/引擎`:查看各引擎实时就绪度，或切换当前用户的引擎（不可用时拒绝并给出可用引导）。 */
+  private switchHarnessText(userKey: string, cmd: CommandDef, arg: string): string {
+    if (!this.modelCatalog) return this.switchPrefText(userKey, cmd, arg);
+    const cur = this.prefs.effective(userKey);
+    const own = this.prefs.get(userKey).harness !== undefined;
+    const allowlist = this.explicitAllowlist();
+    if (!arg) {
+      return [
+        `引擎:${cur.harness}${own ? "(你设的)" : "(默认)"} · 当前模型:${cur.model ?? "由引擎默认决定"}`,
+        "各引擎就绪状态与可用模型：",
+        this.modelCatalog.formatCatalogSummary(cur.harness, allowlist),
+        "切换指令（替换参数值）：", codeBlock(`${cmd.canonical} <claude|agy|acp>`),
+        "回到默认设置：", codeBlock(`${cmd.canonical} 默认`),
+      ].join("\n\n");
+    }
+    if (arg === "默认" || arg.toLowerCase() === "default") {
+      const eff = this.prefs.set(userKey, { harness: null });
+      return `引擎已回到默认:${eff.harness}。下一轮生效。`;
+    }
+    const res = this.modelCatalog.resolveHarnessChoice(arg, allowlist);
+    if (!res.ok) return res.message;
+    const explicitUserModel = this.prefs.get(userKey).model;
+    const clearIncompatibleModel = explicitUserModel !== undefined && !this.modelCatalog.ownsModel(res.harness, explicitUserModel);
+    const eff = this.prefs.set(userKey, {
+      harness: res.harness,
+      ...(clearIncompatibleModel ? { model: null } : {}),
+    });
+    const modelNote = eff.model
+      ? `（当前模型:${eff.model}）`
+      : res.recommendedModel
+        ? `（默认模型将由引擎决定，也可发 \`/模型 ${res.recommendedModel}\` 指定）`
+        : "";
+    return `引擎已切到 ${eff.harness}${modelNote},下一轮生效。`;
+  }
+
+  /** `/模型`:支持按动态目录展示、手动刷新、跨引擎自动路由，以及模型/引擎不可用时给出替代建议。 */
+  private async switchModelText(userKey: string, cmd: CommandDef, arg: string): Promise<string> {
+    if (!this.modelCatalog) return this.switchPrefText(userKey, cmd, arg);
+    const cur = this.prefs.effective(userKey);
+    const own = this.prefs.get(userKey).model !== undefined;
+    const allowlist = this.explicitAllowlist();
+    const show = (v: string | undefined): string => v ?? "由 SDK 决定";
+
+    if (arg === "刷新" || arg.toLowerCase() === "refresh") {
+      await this.modelCatalog.refresh();
+      return [
+        "已刷新各引擎可用模型目录：",
+        this.modelCatalog.formatCatalogSummary(this.prefs.effective(userKey).harness, allowlist),
+      ].join("\n\n");
+    }
+
+    if (!arg) {
+      return [
+        `模型:${show(cur.model)}${own ? "(你设的)" : "(默认)"} · 当前引擎:${cur.harness}`,
+        "可选:",
+        this.modelCatalog.formatCatalogSummary(cur.harness, allowlist),
+        "切换指令（直接填模型名会自动匹配对应引擎）：", codeBlock(`${cmd.canonical} <${cmd.argHint ?? "模型名"}>`),
+        "重新探测最新模型列表：", codeBlock(`${cmd.canonical} 刷新`),
+        "回到默认设置：", codeBlock(`${cmd.canonical} 默认`),
+      ].join("\n\n");
+    }
+
+    if (arg === "默认" || arg.toLowerCase() === "default") {
+      const eff = this.prefs.set(userKey, { model: null });
+      return `模型已回到默认:${show(eff.model)}。下一轮生效。`;
+    }
+
+    const res = this.modelCatalog.resolveModelChoice(arg, cur.harness, allowlist);
+    if (!res.ok) return res.message;
+
+    if (res.harness === "acp" && !this.modelCatalog.entryOf("acp").models.some((m) => m.id === res.model)) {
+      this.modelCatalog.recordDiscoveredModels("acp", [...this.modelCatalog.entryOf("acp").models, { id: res.model }]);
+    }
+
+    try {
+      const eff = this.prefs.set(userKey, {
+        ...(res.switchedHarness ? { harness: res.harness } : {}),
+        model: res.model,
+      });
+      const switchNote = res.switchedHarness ? `（已同步切到 ${res.harness} 引擎）` : "";
+      return `模型已切到 ${show(eff.model)}${switchNote},下一轮生效。`;
+    } catch (err) {
+      return `模型没改:${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
   /**
-   * `/模型` 与 `/思考`:看或切一项自己的偏好。
+   * `/模型`(无 ModelCatalog 单测兜底)与 `/思考`:看或切一项自己的偏好。
    *
    * 走 immediate 路径,所以**不进 LLM、不花额度**,而且回合卡死时照样管用 ——
    * "换个模型"最需要的时刻恰恰是"当前这个不行了",那时一个要排队的回合根本轮不上。
@@ -1602,7 +1706,7 @@ export class Gateway {
    * 同一份文案,不另写一套。**下一轮生效**是实话:在飞的回合已经带着旧值进了 SDK。
    */
   private switchPrefText(userKey: string, cmd: CommandDef, arg: string): string {
-    const key = cmd.name === "model" ? "model" : "effort";
+    const key = cmd.name === "harness" ? "harness" : cmd.name === "model" ? "model" : "effort";
     const def = SETTING_SCHEMA[key];
     const ctx = { modelAllowlist: this.settings.effective().modelAllowlist };
     const show = (v: string | undefined): string => v ?? "由 SDK 决定";
@@ -1641,7 +1745,8 @@ export class Gateway {
       "📋 当前状态",
       this.inFlightText(userKey),
       ...this.backgroundLines(userKey),
-      `模型:${p.model ?? "由 SDK 决定"}${own("model")}  ` +
+      `引擎:${p.harness}${own("harness")}  ` +
+        `模型:${p.model ?? "由 SDK 决定"}${own("model")}  ` +
         `思考:${p.effort ?? "由 SDK 决定"}${own("effort")}`,
       current === undefined || idle === undefined
         ? "会话:还没有进行中的对话,下一条消息开新的"
@@ -1923,6 +2028,29 @@ export class Gateway {
         automaticTimeout = setTimeout(() => { automaticTimedOut = true; turn.ctx.abort.abort(new Error("后台自动续接超过 5 分钟，已停止")); }, CONTINUATION_TIMEOUT_MS);
         automaticTimeout.unref();
       }
+      if (this.modelCatalog) {
+        const readiness = this.modelCatalog.checkAvailability(prefs.harness);
+        if (!readiness.available) {
+          this.lastTurn = { at: this.now(), isError: true };
+          await progress;
+          const guidance = this.modelCatalog.failureGuidance({
+            harness: prefs.harness,
+            model: prefs.model,
+            errorText: `${readiness.reason ?? ""} unauthorized 可执行文件`,
+            explicitAllowlist: this.explicitAllowlist(),
+          });
+          const msg = [
+            `⚠️ 这一轮没能启动：当前选用的 \`${prefs.harness}\` 引擎不可用（${readiness.reason ?? "未就绪"}）。`,
+            ...(guidance ? [guidance] : []),
+          ].join("\n\n");
+          await this.sendChunked(
+            userKey,
+            this.labelIfDetached(turn.ctx, observedSessionId ?? (decision.isNew ? undefined : decision.resumeSessionId), msg),
+            prefs.maxReplyChars,
+          );
+          return false;
+        }
+      }
       // 上一回合被内存中止过的话,把前情缀在这条消息前面。**取走即清** ——
       // 它只对紧接着的那一条有意义,留着会在几轮之后冒出来把人搞糊涂。
       const prior = this.lastMemAbort.get(userKey);
@@ -1937,6 +2065,7 @@ export class Gateway {
         : CONTINUATION_MAX_TURNS;
       const reply = await this.agent.run(prior ? priorAbortPrefix(prior) + text : text, {
         cwd: pre.cwd,
+        harness: prefs.harness,
         ...(context ? { context } : {}),
         ...(ambient ? { ambient } : {}),
         resumeSessionId: decision.isNew ? undefined : decision.resumeSessionId,
@@ -2020,7 +2149,16 @@ export class Gateway {
       if (turn.ctx.detached) this.sessions.archiveTurn(userKey, reply.sessionId, hint);
       else this.sessions.record(userKey, reply.sessionId, hint);
       await progress;
-      const body = reply.isError ? TURN_ERROR_PREFIX + reply.text : reply.text;
+      let body = reply.isError ? TURN_ERROR_PREFIX + reply.text : reply.text;
+      if (reply.isError && this.modelCatalog) {
+        const guidance = this.modelCatalog.failureGuidance({
+          harness: prefs.harness,
+          model: prefs.model,
+          errorText: reply.text,
+          explicitAllowlist: this.explicitAllowlist(),
+        });
+        if (guidance) body = `${body}\n\n${guidance}`;
+      }
       await this.sendChunked(
         userKey,
         this.labelIfDetached(turn.ctx, reply.sessionId, body),
@@ -2071,7 +2209,19 @@ export class Gateway {
             ? (automaticTimedOut ? "后台自动续接超过 5 分钟，已停止。任务结果和会话记录保留，请发消息继续。" : memAbort && circuitTripped(this.memAbortStreak.get(userKey) ?? 0)
                 ? circuitTripText(this.memAbortStreak.get(userKey) ?? 0, memAbort.limit)
                 : abortNoticeText(memAbort))
-            : `处理出错了：\n\n${codeBlock((err as Error).message ?? String(err))}`,
+            : (() => {
+                const rawErr = (err as Error).message ?? String(err);
+                const guidance = this.modelCatalog?.failureGuidance({
+                  harness: prefs.harness,
+                  model: prefs.model,
+                  errorText: rawErr,
+                  explicitAllowlist: this.explicitAllowlist(),
+                });
+                return [
+                  `处理出错了：\n\n${codeBlock(rawErr)}`,
+                  ...(guidance ? [guidance] : []),
+                ].join("\n\n");
+              })(),
         ),
         "错误说明",
       );

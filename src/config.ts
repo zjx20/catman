@@ -150,6 +150,8 @@ export interface Config {
   acpUpstream: ModelUpstreamKind;
   model: string | undefined;
   modelAllowlist: string[];
+  /** 是否在环境变量中显式设置了 CATMAN_MODEL_ALLOWLIST（未显式设置时优先采用 ModelCatalog 动态发现结果）。 */
+  modelAllowlistExplicit?: boolean;
   ackEnabled: boolean;
   progressEnabled: boolean;
   /** worker 访问控制服务的地址，必须可从 mynet 网络访问。 */
@@ -215,6 +217,7 @@ export function loadConfig(): Config {
     acpUpstream,
     model: process.env.CATMAN_MODEL || undefined,
     modelAllowlist: list("CATMAN_MODEL_ALLOWLIST", [...DEFAULT_MODELS_BY_HARNESS[harness]]),
+    modelAllowlistExplicit: Boolean(process.env.CATMAN_MODEL_ALLOWLIST?.trim()),
     ackEnabled: bool("CATMAN_ACK", true),
     progressEnabled: bool("CATMAN_PROGRESS", true),
     // 默认按容器名寻址,不再用 127.0.0.1 —— 见 Config.apiBase 上面那段。

@@ -1,4 +1,4 @@
-import type { Config } from "../config.js";
+import type { Config, HarnessId } from "../config.js";
 import { BUILTIN_ADMIN_USER_KEY, parseUserKey } from "./identity.js";
 import { readJsonFile, writeJsonFileAtomic } from "./file-store.js";
 
@@ -63,7 +63,19 @@ export function parseEffort(raw: unknown): EffortLevel | undefined {
   return EFFORT_ALIASES[t];
 }
 
+export const HARNESS_LEVELS = ["claude", "agy", "acp"] as const;
+
+export function parseHarnessSetting(raw: unknown): HarnessId | undefined {
+  if (typeof raw !== "string") return undefined;
+  const t = raw.trim().toLowerCase();
+  if (t === "claude") return "claude";
+  if (t === "agy" || t === "antigravity") return "agy";
+  if (t === "acp") return "acp";
+  return undefined;
+}
+
 export interface Settings {
+  harness: HarnessId;
   model: string | undefined;
   /** 思考强度。undefined = 不传,由 SDK 按模型默认(目前是 high)。 */
   effort: EffortLevel | undefined;
@@ -89,6 +101,7 @@ export interface Settings {
 
 /** scope="user" 的那些项:全局可设默认值,每用户还能各自覆盖。 */
 export type UserSettingKey =
+  | "harness"
   | "model"
   | "effort"
   | "ackEnabled"
@@ -97,6 +110,7 @@ export type UserSettingKey =
   | "sessionTimeoutMs";
 
 export const USER_SETTING_KEYS: readonly UserSettingKey[] = [
+  "harness",
   "model",
   "effort",
   "ackEnabled",
@@ -256,6 +270,23 @@ function parseSkillNameList(raw: unknown): string[] | undefined {
 // --- schema ---
 
 export const SETTING_SCHEMA: Schema = {
+  harness: {
+    scope: "user",
+    label: "引擎",
+    desc: "驱动助手的底层引擎(claude / agy / acp)。改完下一轮生效。",
+    floor: "claude",
+    hint: () => "claude / agy / acp",
+    validate(raw) {
+      const v = parseHarnessSetting(raw);
+      if (!v) {
+        throw new Error(`不支持的引擎 ${JSON.stringify(raw)},可选:claude / agy / acp`);
+      }
+      return v;
+    },
+    parse(raw) {
+      return parseHarnessSetting(raw);
+    },
+  },
   model: {
     scope: "user",
     label: "模型",
@@ -469,23 +500,38 @@ export interface GlobalSettingsOptions {
   path: string;
   /** env 基线。settings.json 没覆盖的项回落到它。 */
   env: Config;
+  /**
+   * 可选：动态发现的模型目录提供器（ModelCatalog）。
+   * 当管理员未通过 settings.json 或 CATMAN_MODEL_ALLOWLIST 显式收窄白名单时，
+   * 自动使用各就绪 Harness 动态发现的模型集合，无需人工维护模型清单。
+   */
+  dynamicModels?: () => string[];
 }
 
 export class GlobalSettings {
   private overridesRaw: Record<string, unknown>;
   private readonly path: string;
   private readonly env: Config;
+  private readonly dynamicModels: (() => string[]) | undefined;
   private readonly listeners: Array<() => void> = [];
 
   constructor(opts: GlobalSettingsOptions) {
     this.path = opts.path;
     this.env = opts.env;
+    this.dynamicModels = opts.dynamicModels;
     this.overridesRaw = readJsonFile<Record<string, unknown>>(this.path, {});
+  }
+
+  /** 管理员是否显式指定了模型白名单（用于区分“自动全开放”与“人工限流过滤”）。 */
+  hasExplicitModelAllowlist(): boolean {
+    return this.overridesRaw["modelAllowlist"] !== undefined || Boolean(this.env.modelAllowlistExplicit);
   }
 
   /** env 基线里对应某项的值;没有对应 env 的项返回 undefined。 */
   private envBaseline(key: SettingKey): unknown {
     switch (key) {
+      case "harness":
+        return this.env.harness;
       case "model":
         return this.env.model;
       case "ackEnabled":
@@ -495,6 +541,10 @@ export class GlobalSettings {
       case "sessionTimeoutMs":
         return this.env.sessionTimeoutMs;
       case "modelAllowlist":
+        if (!this.env.modelAllowlistExplicit && this.dynamicModels) {
+          const discovered = this.dynamicModels();
+          if (discovered.length) return discovered;
+        }
         return this.env.modelAllowlist;
       case "maxConcurrentTurns":
         return this.env.maxConcurrentTurns;
@@ -531,6 +581,7 @@ export class GlobalSettings {
       resolveSetting(key, ctx, "global", [this.overridesRaw[key], this.envBaseline(key)]);
 
     return {
+      harness: pick("harness"),
       modelAllowlist,
       model: pick("model"),
       effort: pick("effort"),

@@ -1,4 +1,5 @@
 import type { ContextStore } from "../execution/contexts.js";
+import type { ModelCatalog } from "../execution/model-catalog.js";
 import type { Agent } from "../agent.js";
 import type { PrefsStore } from "../prefs.js";
 import type { GlobalSettings } from "../settings.js";
@@ -48,6 +49,7 @@ export interface AgentTaskRunner {
 
 export interface RealAgentTaskRunnerOptions {
   contexts?: ContextStore;
+  modelCatalog?: ModelCatalog;
   readonly agent: Agent;
   readonly users: UserRegistry;
   readonly prefs: PrefsStore;
@@ -88,14 +90,19 @@ export class RealAgentTaskRunner implements AgentTaskRunner {
     // detached 在这个代码库里的含义正是「还在跑,但没有人在等它」—— 与被
     // `/新会话` 切走的那些回合是同一种东西,所以复用它而不是新造一个概念。
     turn.ctx.detached = true;
-    // 模型:任务显式指定的优先,否则跟着这个用户当前的偏好走(他把自己换成
-    // sonnet 之后,定时任务也该跟着换,而不是永远钉在建任务那天的选择上)。
-    const model = task.model ?? o.prefs.effective(job.userKey).model;
-    // 挂载与环境变量共用同一个结果,理由同网关:变量在而挂载不在是最坏的情况。
+    // 模型与引擎:任务显式指定的优先,否则跟着这个用户当前的偏好走。若任务显式指定的模型
+    // 归属另一个已就绪引擎(如 gemini-* 归属 agy),自动路由到对应引擎。
+    const userPrefs = o.prefs.effective(job.userKey);
+    const model = task.model ?? userPrefs.model;
+    const harness =
+      task.model && o.modelCatalog
+        ? (o.modelCatalog.entries().find((e) => e.available && o.modelCatalog!.ownsModel(e.harness, task.model!))?.harness ?? userPrefs.harness)
+        : userPrefs.harness;
 
     try {
       const reply = await o.agent.run(task.prompt, {
         cwd,
+        harness,
         ...(context ? { context } : {}),
         ...(task.session === "chain" && (context?.sdkStarted || job.agentSessionId)
           ? { resumeSessionId: context?.sdkSessionId ?? job.agentSessionId }

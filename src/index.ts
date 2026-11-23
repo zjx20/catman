@@ -3,6 +3,7 @@ import { RuntimeManager } from "./core/execution/runtime.js";
 import { OpsManager } from "./core/execution/ops.js";
 import { CapabilityBroker } from "./core/execution/broker.js";
 import { resolveHarness } from "./core/execution/harness.js";
+import { ModelCatalog } from "./core/execution/model-catalog.js";
 import { ContextScriptRunner } from "./core/execution/cron-runner.js";
 import { ExecutionApi } from "./dashboard/api-execution.js";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
@@ -99,21 +100,30 @@ async function main(): Promise<void> {
   mkdirSync(configDir, { recursive: true });
 
 
+  const modelCatalog = new ModelCatalog({
+    config,
+    cachePath: `${config.dataDir}/execution/model-catalog.json`,
+    configDir,
+  });
+
   // 配置三层由外到内装配:全局层要先建,每用户层拿它当默认值,会话层拿它算超时。
   const settings = new GlobalSettings({
     path: config.settingsPath,
     env: { ...config, adminUserKeys: resolveAdminBaseline(config) },
+    dynamicModels: () => modelCatalog.dynamicAllowlist(),
   });
   const prefs = new PrefsStore({
     path: config.prefsPath,
     // 传函数不是快照:管理员改了全局默认要立刻跟随,不能等重启。
     defaults: () => settings.effective(),
+    compatibleModel: (harness, model) => modelCatalog.compatibleModelFor(harness, model),
   });
 
   let gatewayRef: Gateway | undefined;
   const contexts = new ContextStore(config.dataDir);
   const runtimes = new RuntimeManager(config, contexts, {
     isAdmin: userKey => settings.isAdmin(userKey),
+    harnessFor: userKey => prefs.effective(userKey).harness,
     notify: async (userKey, text) => {
       if (!gatewayRef) throw new Error("渠道尚未启动");
       await gatewayRef.push(userKey, text, "announce");
@@ -124,7 +134,7 @@ async function main(): Promise<void> {
     isAdmin: userKey => settings.isAdmin(userKey),
     notify: (userKey, contextId, text) => runtimes.notifyUser(userKey, contextId, text),
   });
-  const execution = { contexts, runtimes, broker, ops };
+  const execution = { contexts, runtimes, broker, ops, modelCatalog };
   const agent = new Agent(config, execution);
   const sessions = new SessionManager({
     store: new FileStore(config.statePath),
@@ -150,18 +160,21 @@ async function main(): Promise<void> {
 
   // 接口说明做成 skill(按需加载,常态不占 token)。每次启动覆盖写,保证跟代码同步。
   // 按人格生成不同的一套 —— 守护人格拿 catman-rescue 而不是 catman-evolve。
-  writeSkills(
-    configDir,
-    { modelAllowlist: settings.effective().modelAllowlist },
-    {
-      srcDir: config.srcDir,
-      deployBinDir: `${config.deployDir}/bin`,
-      releasesDir: config.releasesDir,
-      deployDir: config.deployDir,
-      courierDir: config.courierDir,
-    },
-    config.persona,
-  );
+  const refreshSkills = () =>
+    writeSkills(
+      configDir,
+      { modelAllowlist: settings.effective().modelAllowlist },
+      {
+        srcDir: config.srcDir,
+        deployBinDir: `${config.deployDir}/bin`,
+        releasesDir: config.releasesDir,
+        deployDir: config.deployDir,
+        courierDir: config.courierDir,
+      },
+      config.persona,
+    );
+  refreshSkills();
+  modelCatalog.onChange(refreshSkills);
 
   // 推送令牌与 `catman-notify`。
   //
@@ -228,6 +241,7 @@ async function main(): Promise<void> {
   );
   const gateway = new Gateway({
     execution,
+    modelCatalog,
     channel,
     agent,
     sessions,
@@ -277,7 +291,7 @@ async function main(): Promise<void> {
           notifyTokens,
           binDir,
           skillsDir: configDir,
-          contexts, runtimes,
+          contexts, runtimes, modelCatalog,
         })
       : undefined;
   cronRef = cron;
@@ -297,7 +311,7 @@ async function main(): Promise<void> {
     chat,
     contexts,
     executionApi: new ExecutionApi({ config, contexts, runtimes, broker, turns, ops, isAdmin: userKey => settings.isAdmin(userKey) }),
-    selfApi: { turns, prefs, users, sessions, settings, configDir, contexts },
+    selfApi: { turns, prefs, users, sessions, settings, configDir, contexts, modelCatalog },
     notifyApi: {
       tokens: notifyTokens,
       limiter: new NotifyRateLimiter(),
@@ -362,6 +376,7 @@ async function main(): Promise<void> {
     // 只停轮询,**不碰在跑的容器**:它们是 detached 的,本来就该活过这次重启,
     // 回来之后照常认领(见 cron/docker.ts 开头)。
     cron?.scheduler.stop();
+    modelCatalog.close();
     runtimes.close();
     ops.close();
     agent.close();
@@ -381,6 +396,7 @@ async function main(): Promise<void> {
   await gateway.start();
   // 调度器**排在渠道之后**起:它起来就会去收上一轮遗留的执行,而收完是要发通知的 ——
   // 渠道还没起来时那条结果只能石沉大海,而它恰恰是用户睡前定下、等着看的那一条。
+  modelCatalog.start();
   cron?.scheduler.start();
   runtimes.start();
   ops.start();
@@ -409,6 +425,7 @@ function createCron(
     skillsDir: string;
     contexts: ContextStore;
     runtimes: RuntimeManager;
+    modelCatalog: ModelCatalog;
   },
 ): { store: CronStore; scheduler: CronScheduler; api: CronApiDeps } {
   const store = new CronStore({
@@ -436,6 +453,7 @@ function createCron(
     agentRunner: new RealAgentTaskRunner({
       agent: deps.agent,
       contexts: deps.contexts,
+      modelCatalog: deps.modelCatalog,
       users: deps.users,
       prefs: deps.prefs,
       settings,

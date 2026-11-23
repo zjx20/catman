@@ -82,6 +82,7 @@ export interface OpenHarnessSessionInput {
   onStderr: (data: string) => void;
   stopAgent: () => Promise<unknown>;
   onClose: () => void;
+  onModelsDiscovered?: (models: Array<{ id: string; name?: string; description?: string; resolvedId?: string; hiddenInSummary?: boolean }>) => void;
   onBackgroundTasksChanged: (tasks: Array<{ task_id: string; description: string; ambient?: boolean }>) => void;
   onBackgroundNotice: (text: string, id?: string) => void;
 }
@@ -203,6 +204,35 @@ function mountableAgyBinary(config: Config, releaseDir: string): string | undefi
   return undefined;
 }
 
+export function extractSdkSupportedModels(
+  models: ReadonlyArray<{ value?: string; displayName?: string; description?: string; resolvedModel?: string }>,
+): Array<{ id: string; name?: string; description?: string; resolvedId?: string; hiddenInSummary?: boolean }> {
+  const out: Array<{ id: string; name?: string; description?: string; resolvedId?: string; hiddenInSummary?: boolean }> = [];
+  const seen = new Set<string>();
+  for (const m of models) {
+    const id = typeof m.value === "string" ? m.value.trim() : "";
+    if (!id || id === "default" || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      ...(m.displayName ? { name: m.displayName } : {}),
+      ...(m.description ? { description: m.description } : {}),
+      ...(m.resolvedModel ? { resolvedId: m.resolvedModel } : {}),
+    });
+  }
+  for (const m of models) {
+    const resolved = typeof m.resolvedModel === "string" ? m.resolvedModel.trim() : "";
+    if (!resolved || seen.has(resolved)) continue;
+    seen.add(resolved);
+    out.push({
+      id: resolved,
+      ...(m.displayName ? { name: m.displayName } : {}),
+      hiddenInSummary: true,
+    });
+  }
+  return out;
+}
+
 // ── 1. Claude Agent SDK Harness ──────────────────────────────────────────────
 
 class ClaudeSessionAdapter implements HarnessSession {
@@ -213,8 +243,8 @@ class ClaudeSessionAdapter implements HarnessSession {
     const { config, context, paths, wrapperPath, env, model, effort, maxTurns, maxBudgetUsd, skills, mcpServers } = input;
     this.contextId = context.id;
     this.inner = new SdkSession(
-      (stream) =>
-        query({
+      (stream) => {
+        const q = query({
           prompt: stream,
           options: {
             pathToClaudeCodeExecutable: wrapperPath,
@@ -232,7 +262,18 @@ class ClaudeSessionAdapter implements HarnessSession {
             perTaskStopAffordance: true,
             stderr: input.onStderr,
           },
-        }),
+        });
+        if (input.onModelsDiscovered) {
+          void q
+            .supportedModels()
+            .then((models) => {
+              const collected = extractSdkSupportedModels(models);
+              if (collected.length) input.onModelsDiscovered?.(collected);
+            })
+            .catch(() => {});
+        }
+        return q;
+      },
       {
         stopAgent: input.stopAgent,
         onClose: input.onClose,
@@ -506,6 +547,7 @@ export const agyHarness: AgentHarness = {
         transcript: new TranscriptRecorder(paths.transcripts),
         logLabel: context.id,
         onStderr: input.onStderr,
+        onModelsDiscovered: input.onModelsDiscovered,
         onBackgroundTasksChanged: input.onBackgroundTasksChanged,
         onBackgroundNotice: input.onBackgroundNotice,
         onClose: input.onClose,
@@ -642,6 +684,7 @@ export const genericAcpHarness: AgentHarness = {
         transcript: new TranscriptRecorder(paths.transcripts),
         logLabel: context.id,
         onStderr: input.onStderr,
+        onModelsDiscovered: input.onModelsDiscovered,
         onBackgroundTasksChanged: input.onBackgroundTasksChanged,
         onBackgroundNotice: input.onBackgroundNotice,
         onClose: input.onClose,

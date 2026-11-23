@@ -1,4 +1,5 @@
 import type { ContextStore } from "../core/execution/contexts.js";
+import type { ModelCatalog } from "../core/execution/model-catalog.js";
 import type { PrefsStore, UserPrefsPatch } from "../core/prefs.js";
 import type { SessionManager } from "../core/session.js";
 import type { GlobalSettings } from "../core/settings.js";
@@ -27,6 +28,7 @@ export const SESSION_HEADER = "x-catman-session";
 
 export interface SelfApiDeps {
   contexts?: ContextStore;
+  modelCatalog?: ModelCatalog;
   turns: TurnTokens;
   prefs: PrefsStore;
   users: UserRegistry;
@@ -114,6 +116,7 @@ function describeMe(userKey: string, deps: SelfApiDeps): unknown {
       history: state?.history ?? [],
     },
     prefs: { effective, overrides: deps.prefs.get(userKey) },
+    ...(deps.modelCatalog ? { harnesses: deps.modelCatalog.entries() } : {}),
     schema: describeSettings(USER_SETTING_KEYS, { modelAllowlist: globals.modelAllowlist }),
     commands: COMMAND_TABLE.map((c) => ({
       canonical: c.canonical,
@@ -140,9 +143,32 @@ function patchMe(userKey: string, body: unknown, deps: SelfApiDeps): ApiResult {
   }
 
   try {
+    const patchPayload: Record<string, unknown> = { ...rest };
+    if (deps.modelCatalog) {
+      const explicitAllowlist = deps.settings.hasExplicitModelAllowlist()
+        ? deps.settings.effective().modelAllowlist
+        : undefined;
+      if (typeof patchPayload["harness"] === "string") {
+        const hRes = deps.modelCatalog.resolveHarnessChoice(patchPayload["harness"], explicitAllowlist);
+        if (!hRes.ok) return err(400, hRes.message);
+        patchPayload["harness"] = hRes.harness;
+      }
+      if (typeof patchPayload["model"] === "string") {
+        const baseHarness =
+          typeof patchPayload["harness"] === "string"
+            ? (patchPayload["harness"] as ReturnType<typeof deps.prefs.effective>["harness"])
+            : deps.prefs.effective(userKey).harness;
+        const mRes = deps.modelCatalog.resolveModelChoice(patchPayload["model"], baseHarness, explicitAllowlist);
+        if (!mRes.ok) return err(400, mRes.message);
+        patchPayload["model"] = mRes.model;
+        if (mRes.switchedHarness && patchPayload["harness"] === undefined) {
+          patchPayload["harness"] = mRes.harness;
+        }
+      }
+    }
     // prefs 的校验在 set() 内部,失败会抛 —— 放在最前面,让它先于任何写入。
-    const effective = Object.keys(rest).length
-      ? deps.prefs.set(userKey, rest as UserPrefsPatch)
+    const effective = Object.keys(patchPayload).length
+      ? deps.prefs.set(userKey, patchPayload as UserPrefsPatch)
       : deps.prefs.effective(userKey);
     if (typeof displayName === "string") deps.users.setDisplayName(userKey, displayName);
     return ok({

@@ -151,8 +151,9 @@ Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/conte
 | `src/core/identity.ts` | userKey 编解码、内置管理员常量与旧目录名工具 |
 | `src/core/users.ts` | UserRegistry；用户资料与租户 home，不负责 session/cron 的 cwd |
 | `src/core/execution/contexts.ts` | owner、聊天/cron context、tenantId、独立路径、跨引擎重绑与会话注册表 |
-| `src/core/execution/runtime.ts` | 精确挂载、能力身份、按 Harness 创建/重建 worker、闲置预警与回收 |
+| `src/core/execution/runtime.ts` | 精确挂载、能力身份、按用户/上下文 Harness 并发创建或重建 worker、闲置预警与回收 |
 | `src/core/execution/harness.ts` | `AgentHarness` 统一契约及 `claude` / `agy` / 通用 `acp` 三套实现 |
+| `src/core/execution/model-catalog.ts` | 多 Harness 零 Token 动态模型发现、持久化缓存、就绪度诊断与故障逃生引导 |
 | `src/core/execution/acp-session.ts` | 零依赖 ACP v1(`stdio` JSON-RPC 2.0)常驻会话、流式分块聚合、中途补话与护栏 |
 | `src/core/execution/transcript-recorder.ts` | 控制面自持的 ACP 会话 JSONL 记录器(`O_NOFOLLOW`,不挂进 worker) |
 | `src/core/execution/artifacts.ts` | 实例投影与 wrapper 清理，不触碰用户持久数据；活动容器由 runtime 对账保护 |
@@ -342,8 +343,17 @@ Agent 按指定事件 ID 注入结果，未放入输入的事件不得确认消�
   (`replaying=true`)静默抑制 `session/update`，不重复外发；
   ③ ACP 会话 JSONL 由控制面用 `O_NOFOLLOW` 直接写进不挂载给 worker 的 `contexts/<contextId>/transcripts/`，
   并在 `assertSafeSessionId` 拦截任何含 `/`、`\`、`..` 的会话 ID；
-  ④ 切换 `CATMAN_HARNESS` 时，`RuntimeManager` 自动回收旧引擎容器并重建，`Agent` 调用 `ContextStore.rebindHarness`
-  将旧引擎 `sdkSessionId` 归入 `previousSessionIds`，既避免跨引擎错误 `resume`，又保证 `/切换会话` 与历史检索不断链。
+  ④ 切换引擎（管理员改全局默认或用户发 `/引擎` / `/模型` 跨引擎切换）时，`RuntimeManager` 自动在下一轮或容器空闲时
+  回收旧引擎容器并重建（绝不强杀正在运行的后台任务），`Agent` 调用 `ContextStore.rebindHarness` 将旧引擎
+  `sdkSessionId` 归入 `previousSessionIds`，既避免跨引擎错误 `resume`，又保证 `/切换会话` 与历史检索不断链。
+- **零 Token 动态模型目录与不可用逃生引导**(`execution/model-catalog.ts`)：
+  ① 不手工维护静态模型表：`claude` 通过 SDK `Query.supportedModels()` 握手（叠加自定义网关 `/v1/models`）获取实时模型，
+  `agy` 与通用 `acp` 通过 `initialize` -> `session/new` 的 `configOptions` 获取实时模型，全程不发对话请求、零 Token 消耗，
+  结果落盘缓存于 `execution/model-catalog.json` 并在每次真实会话握手时顺手刷新；`modelAllowlist` 仅在管理员显式设置时作为收窄过滤器生效；
+  ② `/引擎` 与 `/模型` 联动：用户直接 `/模型 gemini-4-carbon-high`（或通过 `/api/me` 自然语言修改）会自动识别目标引擎并连带切换 `harness`；
+  若用户仅切 `/引擎` 而原模型属于其他引擎，`PrefsStore` 通过 `compatibleModel` 自动回退为新引擎默认模型而不改盘；
+  ③ 当目标引擎/模型缺凭据、缺二进制、拼写错误，或回合运行期撞上限流/401/模型下线时，**绝不背着用户静默切换到另一计费通道重跑**，
+  而是明确说明不可用原因，并附上当前健康引擎/模型的可一键复制 `/模型 <可用模型>` 代码块。
 
 ## 会话与回合
 

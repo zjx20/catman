@@ -142,6 +142,8 @@ export interface AcpSessionOptions {
   logLabel?: string;
   idleMs?: number;
   onStderr?: (line: string) => void;
+  /** 握手或运行期收到服务端广播的可用模型选项时回调（零 Token 动态模型发现）。 */
+  onModelsDiscovered?: (models: Array<{ id: string; name?: string; description?: string }>) => void;
   onBackgroundTasksChanged?: (tasks: Array<{ task_id: string; description: string; ambient?: boolean }>) => void;
   onBackgroundNotice?: (text: string, id?: string) => void;
   onClose: () => void;
@@ -517,6 +519,7 @@ export class AcpSession {
 
         if (Array.isArray(setupRes?.configOptions)) {
           this.configOptions = setupRes.configOptions;
+          this.emitDiscoveredModels();
         }
         this.logAlways(
           `init acp=${initRes?.agentInfo?.name ?? "agent"}@${initRes?.agentInfo?.version ?? "?"} ` +
@@ -532,6 +535,21 @@ export class AcpSession {
     }
     onSessionId?.(this.sessionId);
     await this.applyConfigOptions();
+  }
+
+  private emitDiscoveredModels(): void {
+    if (!this.opts.onModelsDiscovered) return;
+    const modelOpt = this.configOptions.find((o) => o.category === "model" || o.id === "model");
+    if (!modelOpt) return;
+    const choices = flattenSelectOptions(modelOpt);
+    if (!choices.length) return;
+    this.opts.onModelsDiscovered(
+      choices.map((c) => ({
+        id: c.value,
+        ...(c.name ? { name: c.name } : {}),
+        ...(c.description ? { description: c.description } : {}),
+      })),
+    );
   }
 
   private async applyConfigOptions(): Promise<void> {
@@ -653,6 +671,7 @@ export class AcpSession {
 
     if (kind === "config_option_update" && Array.isArray(u["configOptions"]) && targetSession === this.sessionId) {
       this.configOptions = u["configOptions"] as AcpConfigOption[];
+      this.emitDiscoveredModels();
       return;
     }
 
@@ -1042,5 +1061,40 @@ export class AcpSession {
     if (!AGENT_TRACE) return;
     const label = this.opts.logLabel ?? this.sessionId.slice(0, 8) ?? "acp";
     console.info(`[agent ${label}] ${text}`);
+  }
+}
+
+/**
+ * 零 Token 探测 ACP 子进程声明的模型列表：仅执行 `initialize` -> `session/new` -> `session/close`，
+ * 不发送 `session/prompt`，不消耗任何模型推理额度。
+ */
+export async function discoverAcpModels(
+  spawner: AcpProcessSpawner,
+  opts: { cwd: string; timeoutMs?: number },
+): Promise<Array<{ id: string; name?: string; description?: string }>> {
+  const timeoutMs = opts.timeoutMs ?? 10_000;
+  let discovered: Array<{ id: string; name?: string; description?: string }> = [];
+  const session = new AcpSession(spawner, {
+    cwd: opts.cwd,
+    idleMs: 20,
+    logLabel: "model-probe",
+    onModelsDiscovered: (models) => {
+      discovered = models;
+    },
+    onClose: () => {},
+    stopAgent: async () => {},
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      (session as unknown as { ensureInitialized(): Promise<void> }).ensureInitialized(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`ACP 模型列表探测超时(${timeoutMs}ms)`)), timeoutMs);
+      }),
+    ]);
+    return discovered;
+  } finally {
+    if (timer) clearTimeout(timer);
+    session.close();
   }
 }

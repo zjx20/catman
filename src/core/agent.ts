@@ -7,6 +7,7 @@ import { ContextStore, readTenantFile, type ExecutionContext } from "./execution
 import { RuntimeManager, networkEnvironment } from "./execution/runtime.js";
 import { CapabilityBroker } from "./execution/broker.js";
 import { resolveHarness, type HarnessSession } from "./execution/harness.js";
+import type { ModelCatalog } from "./execution/model-catalog.js";
 import { GENERATED_SKILLS, skillsOnDisk } from "./skills.js";
 /**
  * Agent SDK 封装。目标:尽量还原 Claude Code 的行为("脾气"),
@@ -100,6 +101,8 @@ export type AgentFeed = (prompt: string, attachments: readonly Attachment[]) => 
 
 export interface AgentRunOptions {
   context?: ExecutionContext;
+  /** 本回合使用的底层引擎；缺省回落到 config.harness。 */
+  harness?: Config["harness"];
   /** 传入则 resume 该会话;不传则开启新会话。 */
   resumeSessionId?: string;
   /**
@@ -307,7 +310,7 @@ interface LiveSessionSlot {
 export class Agent {
   private readonly live = new Map<string, LiveSessionSlot>();
   constructor(private readonly config: Config, private readonly execution?: {
-    contexts: ContextStore; runtimes: RuntimeManager; broker: CapabilityBroker;
+    contexts: ContextStore; runtimes: RuntimeManager; broker: CapabilityBroker; modelCatalog?: ModelCatalog;
   }, private readonly probe = false) {}
 
   static forProbe(config: Config): Agent { return new Agent(config, undefined, true); }
@@ -316,9 +319,12 @@ export class Agent {
     if (this.probe) return this.runProbe(prompt, opts);
     const e = this.execution, context = opts.context;
     if (!e || !context) throw new Error("agent 必须在有归属的执行上下文中运行");
-    const harness = resolveHarness(this.config);
+    const effectiveConfig = opts.harness && opts.harness !== this.config.harness
+      ? { ...this.config, harness: opts.harness }
+      : this.config;
+    const harness = resolveHarness(effectiveConfig);
     e.runtimes.activity(context.id);
-    const runtime = await e.runtimes.ensure(context);
+    const runtime = await e.runtimes.ensure(context, harness.id);
     const paths = e.contexts.paths(context);
     let activeContext = e.contexts.get(context.id, context.userKey) ?? context;
     let entry = this.live.get(activeContext.id);
@@ -372,7 +378,7 @@ export class Agent {
         session: undefined!, options: opts, harnessId: harness.id, model: opts.model, effort: opts.effort, maxTurns: opts.maxTurns, maxBudgetUsd: opts.maxBudgetUsd,
       };
       const session = harness.openSession({
-        config: this.config,
+        config: effectiveConfig,
         context: activeContext,
         paths,
         wrapperPath: e.runtimes.wrapper(activeContext, runtime),
@@ -389,6 +395,7 @@ export class Agent {
         onClose: () => {
           if (this.live.get(activeContext.id)?.session === slot.session) { this.live.delete(activeContext.id); e.runtimes.sdkTasks(activeContext.id, []); }
         },
+        onModelsDiscovered: models => e.modelCatalog?.recordDiscoveredModels(harness.id, models),
         onBackgroundTasksChanged: tasks => e.runtimes.sdkTasks(activeContext.id, tasks),
         onBackgroundNotice: (text, id) => e.runtimes.report(activeContext.id, text, id),
       });
@@ -434,10 +441,13 @@ export class Agent {
   close(): void { for (const { session } of this.live.values()) session.close(); this.live.clear(); }
 
   private async runProbe(prompt: string, opts: AgentRunOptions): Promise<AgentReply> {
-    return resolveHarness(this.config).runProbe(
+    const effectiveConfig = opts.harness && opts.harness !== this.config.harness
+      ? { ...this.config, harness: opts.harness }
+      : this.config;
+    return resolveHarness(effectiveConfig).runProbe(
       prompt,
       { cwd: opts.cwd, model: opts.model, abortController: opts.abortController },
-      this.config,
+      effectiveConfig,
     );
   }
 }

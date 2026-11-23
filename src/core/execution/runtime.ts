@@ -9,7 +9,7 @@ import { ContextStore, hostPath, readTenantFile, readExecutionState, type Execut
 import { MAX_TASK_MS, type TaskRecord, type TaskRequest } from "./task-supervisor.js";
 import { readScopedFile } from "../scoped-files.js";
 import { ExecutionArtifacts } from "./artifacts.js";
-import { resolveHarness } from "./harness.js";
+import { resolveHarness, type AgentHarness } from "./harness.js";
 import { codeBlock, inlineCode } from "../markdown.js";
 
 export interface RuntimeRecord {
@@ -72,6 +72,7 @@ export class RuntimeManager {
   constructor(readonly config: Config, readonly contexts: ContextStore, private readonly opts: {
     isAdmin: (userKey: string) => boolean;
     notify: (userKey: string, text: string) => Promise<void>;
+    harnessFor?: (userKey: string) => Config["harness"];
     docker?: DockerCommand; now?: () => number;
   }) {
     this.path = join(config.dataDir, "execution", "runtimes.json");
@@ -99,8 +100,8 @@ export class RuntimeManager {
   retainWhile(predicate: (runtime: RuntimeRecord) => boolean): () => void {
     this.retainers.add(predicate); return () => { this.retainers.delete(predicate); };
   }
-  async ensure(context: ExecutionContext): Promise<RuntimeRecord> {
-    return this.withContext(context.id, () => this.provision(context));
+  async ensure(context: ExecutionContext, harnessOverride?: Config["harness"]): Promise<RuntimeRecord> {
+    return this.withContext(context.id, () => this.provision(context, harnessOverride));
   }
   private async withContext<T>(id: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.locks.get(id) ?? Promise.resolve();
@@ -120,9 +121,10 @@ export class RuntimeManager {
     const candidate = this.resolveReleaseCandidate();
     return existsSync(candidate) ? realpathSync(candidate) : candidate;
   }
-  private async provision(context: ExecutionContext): Promise<RuntimeRecord> {
+  private async provision(context: ExecutionContext, harnessOverride?: Config["harness"]): Promise<RuntimeRecord> {
     if (!this.config.hostDataDir) throw new Error("多租户执行要求配置 CATMAN_HOST_DATA_DIR；拒绝退回控制进程执行");
-    const harness = resolveHarness(this.config);
+    const targetHarnessId = harnessOverride ?? this.opts.harnessFor?.(context.userKey) ?? this.config.harness;
+    const harness = resolveHarness({ ...this.config, harness: targetHarnessId });
     let old = this.records.find(r => r.contextId === context.id);
     if (old && old.admin !== this.opts.isAdmin(context.userKey)) { await this.remove(context.id, "用户权限已改变"); old = undefined; }
     if (old && (old.harness ?? "claude") !== harness.id) { await this.remove(context.id, "执行引擎已切换"); old = undefined; }
@@ -151,7 +153,7 @@ export class RuntimeManager {
       createdAt: this.now(), lastInteractionAt: this.now(), extensionUntil: 0, tasks: [], sdkTasks: [], inheritedTaskIds };
     let launchAttempted = false;
     try {
-      const projection = this.project(context, generation);
+      const projection = this.project(context, generation, harness);
       const uid = process.getuid?.() ?? 10001, gid = process.getgid?.() ?? 10001;
       const args = ["run", "-d", "--name", r.container, "--init", "--label", "catman.context=1", "--label", `catman.context.id=${context.id}`,
         "--user", `${uid}:${gid}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only", "--network", "mynet", "--add-host", "host.docker.internal:host-gateway",
@@ -200,7 +202,7 @@ export class RuntimeManager {
       await this.forget(r, "执行环境启动失败", true); throw error;
     }
   }
-  private project(context: ExecutionContext, generation: string): string {
+  private project(context: ExecutionContext, generation: string, harness: AgentHarness): string {
     const p = this.contexts.ensure(context);
     const target = this.artifacts.projection(context.id, generation);
     mkdirSync(join(target, "skills"), { recursive: true, mode: 0o700 });
@@ -214,8 +216,8 @@ export class RuntimeManager {
       const canonical = /^---\r?\n[\s\S]*?^name:[ \t]*(\S+)/m.exec(body)?.[1] ?? entry.name;
       if (names.includes(canonical)) cpSync(source, join(target, "skills", entry.name), { recursive: true, dereference: false });
     }
-    resolveHarness(this.config).writeProjectionFiles({
-      config: this.config,
+    harness.writeProjectionFiles({
+      config: { ...this.config, harness: harness.id },
       home: p.home,
       projectionDir: target,
       isAdmin: this.opts.isAdmin(context.userKey),
@@ -251,8 +253,9 @@ export class RuntimeManager {
     mkdirSync(dirname(wrapper), { recursive: true, mode: 0o700 });
     // Agent builds a fresh capability-only environment; also forward SDK/ACP protocol flags.
     // Values never enter shell source or argv. Never overwrite positional arguments.
-    const cmd = resolveHarness(this.config).containerCommand({
-      config: this.config,
+    const targetHarnessId = r.harness ?? this.config.harness;
+    const cmd = resolveHarness({ ...this.config, harness: targetHarnessId }).containerCommand({
+      config: { ...this.config, harness: targetHarnessId },
       releaseDir: this.tryResolveReleaseDir(),
       isAdmin: r.admin,
     });
@@ -431,13 +434,12 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
   }
   async tick(): Promise<void> {
     if (this.ticking || this.closed) return; this.ticking = true;
-    const expectedHarness = resolveHarness(this.config).id;
     try {
       for (const r of [...this.records]) {
         try {
         if (!this.canMonitor(r)) continue;
         if (r.admin !== this.opts.isAdmin(r.userKey)) { await this.stop(r.contextId, "用户权限已改变"); continue; }
-        if ((r.harness ?? "claude") !== expectedHarness) { await this.stop(r.contextId, "执行引擎已切换"); continue; }
+        const expectedHarness = this.opts.harnessFor?.(r.userKey) ?? this.config.harness;
         let snapshot: { tasks: TaskRecord[]; processes: string[]; agents?: string[]; unmanaged?: string[] };
         try {
           await this.adopt(r);
@@ -476,7 +478,11 @@ exec docker ${before.map(quote).join(" ")} $_e ${after.map(quote).join(" ")} "$@
         const expired = r.tasks.find(t => !t.endedAt && this.now() >= t.deadlineAt + 5000);
         if (expired) { await this.stop(r.contextId, `后台任务「${expired.name}」超时且未退出`); continue; }
         const registeredUntil = Math.max(0, ...r.tasks.filter(t => t.status === "running").map(t => t.deadlineAt));
-        if (snapshot.agents?.length === 0 && snapshot.unmanaged?.length === 0 && !r.tasks.some(t => t.endedAt === undefined) && ![...this.retainers].some(retain => retain(r)) && this.now() - r.lastInteractionAt >= 30_000) {
+        const noActiveWork = snapshot.agents?.length === 0 && snapshot.unmanaged?.length === 0 && !r.tasks.some(t => t.endedAt === undefined) && ![...this.retainers].some(retain => retain(r));
+        if (noActiveWork && (r.harness ?? "claude") !== expectedHarness) {
+          await this.stop(r.contextId, "执行引擎已切换", true); continue;
+        }
+        if (noActiveWork && this.now() - r.lastInteractionAt >= 30_000) {
           await this.stop(r.contextId, "没有活动进程，释放空闲执行环境", true); continue;
         }
         const deadline = Math.max(r.lastInteractionAt + this.config.runtimeIdleMs, r.extensionUntil, registeredUntil);
