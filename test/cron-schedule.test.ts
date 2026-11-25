@@ -142,4 +142,57 @@ test("展示用文案", () => {
   assert.equal(describeSchedule({ kind: "every", ms: 2 * 3600_000 }, SH), "每 2 小时");
   assert.equal(describeSchedule({ kind: "every", ms: 24 * 3600_000 }, SH), "每 1 天");
   assert.match(describeSchedule({ kind: "cron", expr: "0 8 * * *", tz: SH }, SH), /0 8 \* \* \*/);
+  assert.equal(
+    describeSchedule({ kind: "cron", expr: "0 9 * * *", tz: SH, calendar: "cn-workday" }, SH),
+    "cron 0 9 * * *(Asia/Shanghai · 法定工作日)",
+  );
+  assert.equal(
+    describeSchedule({ kind: "cron", expr: "0 10 * * *", tz: SH, calendar: "cn-restday" }, SH),
+    "cron 0 10 * * *(Asia/Shanghai · 法定休息日)",
+  );
+});
+
+test("calendar:cn-workday 跳过法定节假日,并在周末调休补班日触发", () => {
+  const workday = { kind: "cron", expr: "0 9 * * *", tz: SH, calendar: "cn-workday" } as const;
+  // 2026-09-18 周五 10:00 之后:9月19日是普通周六(不跑),9月20日是周日调休补班(跑!)
+  assert.equal(
+    nextAt(workday, at("2026-09-18T10:00:00+08:00")),
+    at("2026-09-20T09:00:00+08:00"),
+  );
+  // 2026-09-30 周三 10:00 之后:10月1日~7日国庆连休 7 天 → 下一个工作日是 10月8日周四
+  assert.equal(
+    nextAt(workday, at("2026-09-30T10:00:00+08:00")),
+    at("2026-10-08T09:00:00+08:00"),
+  );
+  // 2026-10-09 周五 10:00 之后:10月10日周六调休补班 → 10月10日 09:00 触发
+  assert.equal(
+    nextAt(workday, at("2026-10-09T10:00:00+08:00")),
+    at("2026-10-10T09:00:00+08:00"),
+  );
+});
+
+test("calendar:cn-restday 与 cn-workday 严格互补,且与 cron 表达式取交集(AND)", () => {
+  const restday = { kind: "cron", expr: "0 10 * * *", tz: SH, calendar: "cn-restday" } as const;
+  // 2026-09-18 周五 → 9月19日周六休息(触发),9月20日周日补班(不触发!)
+  const first = nextAt(restday, at("2026-09-18T12:00:00+08:00"))!;
+  assert.equal(first, at("2026-09-19T10:00:00+08:00"));
+  // 9月19日之后跳过 9月20日补班和周一~周四,落在 9月25日周五(中秋节放假第一天)
+  assert.equal(nextAt(restday, first), at("2026-09-25T10:00:00+08:00"));
+
+  // AND 过滤:是法定工作日的周一(`0 9 * * 1` + `cn-workday`)
+  // 2026-04-06 是周一,但恰逢清明节放假 → 跳过 4/6,落到下一个周一 4/13
+  const workMonday = { kind: "cron", expr: "0 9 * * 1", tz: SH, calendar: "cn-workday" } as const;
+  assert.equal(
+    nextAt(workMonday, at("2026-04-01T00:00:00+08:00")),
+    at("2026-04-13T09:00:00+08:00"),
+  );
+});
+
+test("calendar:未知年份平滑回退到普通周一至周五", () => {
+  const workday = { kind: "cron", expr: "0 9 * * *", tz: SH, calendar: "cn-workday" } as const;
+  // 2035 年不在内置表里:2035-01-05 是周五,10:00 之后下一个是周一 2035-01-08
+  assert.equal(
+    nextAt(workday, at("2035-01-05T10:00:00+08:00")),
+    at("2035-01-08T09:00:00+08:00"),
+  );
 });

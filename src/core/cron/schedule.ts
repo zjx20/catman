@@ -19,11 +19,20 @@
  * 容器 TZ 也不会让已经排好的时刻集体漂移。
  */
 
-/** 5 字段 cron。tz 为 IANA 时区名。 */
+import {
+  CALENDAR_LABELS,
+  DEFAULT_CALENDAR_DATA,
+  matchesCalendar,
+  type CalendarData,
+  type CalendarId,
+} from "./calendar.js";
+
+/** 5 字段 cron。tz 为 IANA 时区名;可选 calendar 先筛日历再与 expr 取交集(AND)。 */
 export interface CronExprSchedule {
   readonly kind: "cron";
   readonly expr: string;
   readonly tz: string;
+  readonly calendar?: CalendarId;
 }
 
 /** 固定间隔。从上次触发起算,首次从创建时刻起算。 */
@@ -277,7 +286,11 @@ function startOfNextDay(tz: string, w: WallClock): number {
  * 一个不存在的日子(经典的 `0 0 30 2 *` —— 2 月 30 日)。创建任务时会拿这个
  * undefined 当拒收理由,免得存进去一个永远不动的任务、用户等到天荒地老。
  */
-export function nextAt(schedule: CronSchedule, from: number): number | undefined {
+export function nextAt(
+  schedule: CronSchedule,
+  from: number,
+  calendar: CalendarData = DEFAULT_CALENDAR_DATA,
+): number | undefined {
   if (schedule.kind === "once") return schedule.at > from ? schedule.at : undefined;
   if (schedule.kind === "every") return from + schedule.ms;
 
@@ -288,7 +301,7 @@ export function nextAt(schedule: CronSchedule, from: number): number | undefined
   let t = Math.floor(from / 60_000) * 60_000 + 60_000;
   for (let step = 0; step < MAX_STEPS; step++) {
     const w = wallClockIn(tz, t);
-    if (!matchesDate(p, w)) {
+    if (!matchesCalendar(schedule.calendar, w, calendar) || !matchesDate(p, w)) {
       t = startOfNextDay(tz, w);
       continue;
     }
@@ -315,12 +328,17 @@ export function nextAt(schedule: CronSchedule, from: number): number | undefined
  * 一分钟一次,两者形状一模一样。所以真去算几次,看相邻两次差多少。
  * 只有一次(或一次都没有)的返回 Infinity —— 那种任务谈不上频繁。
  */
-export function minGapMs(schedule: CronSchedule, from: number, samples = 6): number {
-  let prev = nextAt(schedule, from);
+export function minGapMs(
+  schedule: CronSchedule,
+  from: number,
+  samples = 6,
+  calendar: CalendarData = DEFAULT_CALENDAR_DATA,
+): number {
+  let prev = nextAt(schedule, from, calendar);
   if (prev === undefined) return Infinity;
   let min = Infinity;
   for (let i = 1; i < samples; i++) {
-    const next = nextAt(schedule, prev);
+    const next = nextAt(schedule, prev, calendar);
     if (next === undefined) break;
     min = Math.min(min, next - prev);
     prev = next;
@@ -345,5 +363,6 @@ export function describeSchedule(schedule: CronSchedule, tz: string): string {
     if (m % 60 === 0) return `每 ${m / 60} 小时`;
     return `每 ${Math.round(m)} 分钟`;
   }
-  return `cron ${schedule.expr}(${schedule.tz})`;
+  const cal = schedule.calendar ? ` · ${CALENDAR_LABELS[schedule.calendar]}` : "";
+  return `cron ${schedule.expr}(${schedule.tz}${cal})`;
 }

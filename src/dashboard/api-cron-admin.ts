@@ -1,3 +1,4 @@
+import type { CalendarStore } from "../core/cron/calendar.js";
 import type { CronStore } from "../core/cron/store.js";
 import type { CronRun } from "../core/cron/types.js";
 import type { ApiResult } from "./api-self.js";
@@ -23,8 +24,10 @@ const err = (status: number, message: string): ApiResult => ({ status, body: { e
 
 export interface CronAdminApiDeps {
   readonly store: CronStore;
+  readonly calendar?: CalendarStore;
   readonly scheduler?: {
     runNow(jobId: string): Promise<CronRun | { error: string }>;
+    reloadSchedules?(): { reloaded: number; changed: number };
   };
 }
 
@@ -48,6 +51,32 @@ export async function handleCronAdminApi(
       return ok({ jobs: deps.store.all() });
     }
     return err(405, `${CRON_ADMIN_PREFIX} 只支持 GET`);
+  }
+
+  // 法定节假日日历查询与更新(更新后自动重算排期)。
+  if (parts.length === 1 && parts[0] === "calendar") {
+    if (!deps.calendar) return err(503, "这台机器未装配节假日日历存储");
+    if (method === "GET") {
+      return ok(deps.calendar.describe());
+    }
+    if (method === "PUT") {
+      try {
+        deps.calendar.update(body);
+      } catch (e) {
+        return err(400, (e as Error).message);
+      }
+      const reload = deps.scheduler?.reloadSchedules?.() ?? { reloaded: 0, changed: 0 };
+      return ok({ ok: true, ...deps.calendar.describe(), ...reload });
+    }
+    return err(405, `${CRON_ADMIN_PREFIX}/calendar 只支持 GET 与 PUT`);
+  }
+
+  // 手动触发重读磁盘 calendar.json 并重算所有已启用任务的排期。
+  if (parts.length === 1 && parts[0] === "reload") {
+    if (method !== "POST") return err(405, `${CRON_ADMIN_PREFIX}/reload 只支持 POST`);
+    deps.calendar?.reload();
+    const reload = deps.scheduler?.reloadSchedules?.() ?? { reloaded: 0, changed: 0 };
+    return ok({ ok: true, ...reload });
   }
 
   const job = deps.store.get(parts[0]!);

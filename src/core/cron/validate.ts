@@ -1,3 +1,4 @@
+import { CALENDAR_IDS, DEFAULT_CALENDAR_DATA, type CalendarData, type CalendarId } from "./calendar.js";
 import { minGapMs, nextAt, parseCronExpr, type CronSchedule } from "./schedule.js";
 import type { CronJob, CronNotify, CronTask, OverlapPolicy } from "./types.js";
 
@@ -79,6 +80,8 @@ export interface ValidateContext {
   /** 允许 agent 任务指定的模型。与用户能给自己选的是同一份名单。 */
   readonly modelAllowlist: readonly string[];
   readonly now: number;
+  /** 当前节假日日历数据,用于计算首次触发与最小间隔。 */
+  readonly calendar?: CalendarData;
 }
 
 // ── 基础取值 ──────────────────────────────────────────────────────
@@ -171,12 +174,19 @@ function validateSchedule(raw: unknown, ctx: ValidateContext): CronSchedule {
   const kind = optEnum(o["kind"], "schedule.kind", ["cron", "every", "once"] as const, "cron");
 
   if (kind === "cron") {
-    noExtraKeys(o, ["kind", "expr", "tz"], "schedule");
+    noExtraKeys(o, ["kind", "expr", "tz", "calendar"], "schedule");
     const expr = reqString(o["expr"], "schedule.expr", 120);
     const tz = o["tz"] === undefined ? ctx.defaultTz : reqString(o["tz"], "schedule.tz", 64);
+    let calendar: CalendarId | undefined;
+    if (o["calendar"] !== undefined && o["calendar"] !== null) {
+      if (typeof o["calendar"] !== "string" || !(CALENDAR_IDS as readonly string[]).includes(o["calendar"])) {
+        fail(`schedule.calendar 只能是 ${CALENDAR_IDS.join(" / ")},给的是 ${JSON.stringify(o["calendar"])}`);
+      }
+      calendar = o["calendar"] as CalendarId;
+    }
     // 真解析一遍。语法错在这里就报出去,而不是等到第一次 tick。
     parseCronExpr(expr);
-    return { kind: "cron", expr, tz };
+    return { kind: "cron", expr, tz, ...(calendar ? { calendar } : {}) };
   }
 
   if (kind === "every") {
@@ -199,13 +209,14 @@ function validateSchedule(raw: unknown, ctx: ValidateContext): CronSchedule {
 
 /** 频率闸:算真实的相邻间隔,而不是看表达式长什么样。 */
 function checkFrequency(schedule: CronSchedule, ctx: ValidateContext, isAgent: boolean): number {
-  const first = nextAt(schedule, ctx.now);
+  const cal = ctx.calendar ?? DEFAULT_CALENDAR_DATA;
+  const first = nextAt(schedule, ctx.now, cal);
   if (first === undefined || first - ctx.now > NO_FIRE_HORIZON_MS) {
     fail(
       "按这个周期算不出一年内的下次触发 —— 多半是写了个不存在的日子(比如 2 月 30 日)。",
     );
   }
-  const gap = minGapMs(schedule, ctx.now);
+  const gap = minGapMs(schedule, ctx.now, 6, cal);
   const mins = (n: number) => Math.round(n / 60_000);
   // agent 任务在全局下限之上再压一道:它烧的是订阅额度,而且没有人盯着。
   if (isAgent && gap < AGENT_MIN_INTERVAL_MS) {
@@ -371,7 +382,7 @@ export function validateJobInput(raw: unknown, ctx: ValidateContext): ValidatedJ
   // 任务体要先验:频率下限对 agent 任务更严,而"是不是 agent"只有验完才知道。
   const task = validateTask(o["task"], ctx);
   const firstAt = checkFrequency(schedule, ctx, task.kind === "agent");
-  const gap = minGapMs(schedule, ctx.now);
+  const gap = minGapMs(schedule, ctx.now, 6, ctx.calendar ?? DEFAULT_CALENDAR_DATA);
   // 默认超时**跟着周期走**:10 分钟,但不超过一个触发间隔。密集的任务(每 5 分钟)
   // 于是不必每次都显式写超时,而"超时比周期还长"这条不变量照样成立。
   const defaultTimeout = Number.isFinite(gap)
@@ -433,7 +444,14 @@ export function mergeJobPatch(job: CronJob, patch: unknown): unknown {
 }
 
 function scheduleToInput(s: CronSchedule): Record<string, unknown> {
-  if (s.kind === "cron") return { kind: "cron", expr: s.expr, tz: s.tz };
+  if (s.kind === "cron") {
+    return {
+      kind: "cron",
+      expr: s.expr,
+      tz: s.tz,
+      ...(s.calendar ? { calendar: s.calendar } : {}),
+    };
+  }
   if (s.kind === "every") return { kind: "every", minutes: Math.round(s.ms / 60_000) };
   return { kind: "once", at: new Date(s.at).toISOString() };
 }

@@ -187,6 +187,13 @@ GET 列出；POST 创建；PATCH /<id> 修改；DELETE /<id> 删除；POST /<id>
 \`\`\`
 agent 任务的 task 为 {"kind":"agent","prompt":"检查本目录的状态","session":"chain","maxTurns":10}。
 
+法定工作日/休息日调度：\`schedule\` 为 \`{"kind":"cron","expr":"0 9 * * *","calendar":"cn-workday"}\`。
+- 默认不填 \`calendar\` 表示全年 365 天都按 \`expr\` 触发。
+- 设置 \`calendar\` 后，先按日历规则筛出符合条件的日子，再与 \`expr\` 取交集（AND）：
+  - \`"cn-workday"\`：中国大陆所有法定工作日（周一至周五剔除法定节假日 + 周末调休补班日）。
+  - \`"cn-restday"\`：中国大陆所有法定休息日（周末剔除调休补班日 + 法定节假日）。
+- 注意：若希望周末调休补班日也触发，\`expr\` 的星期位应保持 \`*\`，不要写成 \`1-5\`（否则会与 \`cn-workday\` 取 AND 把周末补班筛掉）；若确实只要「是法定工作日的周一」等进一步过滤条件，再收窄日期/星期位。
+
 每个任务有固定 workspace，多次执行共享其中的游标和台账。聊天、其他 cron 的 workspace 互相隔离。
 同一用户的聊天和 cron 共用可读写的 /user。需要跨会话查看或修改的长期提示词、配置、脚本和保留输出，统一放在 /user/projects/<项目>；不要把聊天需要读取的配置仅放在 cron workspace，也不再使用顶层 /user/artifacts。
 简单指令可直接写在 task.prompt；较长指引可让 task.prompt 引用项目内的文件。优先沿用项目现有布局；prompt.md、scripts/、outputs/ 只是建议，不强制目录名或层级。读取或修改前先检查实际配置路径，路径调整时同步更新任务和相关 skill 的引用，保持一份权威配置，不另建可能过期的缓存副本。
@@ -300,6 +307,22 @@ curl -s -X DELETE -H "X-Catman-Session: $CATMAN_SESSION_TOKEN" "$CATMAN_API_BASE
 「账号」页点**重新扫码**。重新扫码换掉凭据但保留账号与它服务的用户 —— 那个人的会话、
 工作目录、个人配置都接着用;千万**不要**改用"删掉再重新添加",那会让他变成一个新用户,
 过去的一切都接不上。
+
+## 法定节假日日历(供 cn-workday / cn-restday 定时任务使用)
+
+\`\`\`bash
+# 查看已加载的年份、天数与来源
+curl -s -H "X-Catman-Session: $CATMAN_SESSION_TOKEN" "$CATMAN_API_BASE/api/admin/cron/calendar"
+
+# 按年写入/更新节假日与调休补班表(写入后自动 reload 重算所有已启用任务的排期)
+curl -s -X PUT -H "X-Catman-Session: $CATMAN_SESSION_TOKEN" \\
+     -H 'content-type: application/json' \\
+     -d '{"years":{"2028":{"off":["01-01","01-02","01-03"],"work":["01-29"]}}}' \\
+     "$CATMAN_API_BASE/api/admin/cron/calendar"
+
+# 手动重读磁盘 calendar.json 并重算排期
+curl -s -X POST -H "X-Catman-Session: $CATMAN_SESSION_TOKEN" "$CATMAN_API_BASE/api/admin/cron/reload"
+\`\`\`
 `;
 }
 

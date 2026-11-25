@@ -46,8 +46,14 @@ export function renderStart(job: CronJob, run: CronRun): string {
   return `⏰ 「${job.name}」开始跑了${TRIGGER_CN[run.trigger]}`;
 }
 
-/** 结果通知。`nextText` 由调用方算好 —— 它要读全局配置,不属于纯函数这一侧。 */
-export function renderEnd(job: CronJob, run: CronRun, tail: string, nextText: string): string {
+/** 结果通知。`nextText` 与可选的 `warning` 由调用方算好 —— 它们要读全局配置与日历,不属于纯函数这一侧。 */
+export function renderEnd(
+  job: CronJob,
+  run: CronRun,
+  tail: string,
+  nextText: string,
+  warning?: string,
+): string {
   const dur = run.endedAt ? formatDuration(run.endedAt - run.startedAt) : "";
   const head = ((): string => {
     switch (run.status) {
@@ -78,6 +84,7 @@ export function renderEnd(job: CronJob, run: CronRun, tail: string, nextText: st
   } else if (run.status === "ok") lines.push("(没有输出)");
   if (run.note) lines.push(run.note.includes("\n") ? codeBlock(run.note) : run.note);
   lines.push(nextText);
+  if (warning) lines.push(warning);
   return lines.join("\n\n");
 }
 

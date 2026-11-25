@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { renderCronDetail, renderCronList, type CronJobRow } from "../src/dashboard/ui-cron.js";
 import { handleCronAdminApi, isCronAdminApiPath } from "../src/dashboard/api-cron-admin.js";
+import { CalendarStore } from "../src/core/cron/calendar.js";
 import { CronStore } from "../src/core/cron/store.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -182,25 +183,42 @@ test("详情页:通知策略说人话", () => {
 
 // ── 管理员接口 ────────────────────────────────────────────────────
 
-function adminSetup(): { store: CronStore; ran: string[]; call: (m: string, p: string, b?: unknown) => Promise<{ status: number; body: any }> } {
+function adminSetup(): {
+  store: CronStore;
+  calendar: CalendarStore;
+  ran: string[];
+  reloads: number;
+  call: (m: string, p: string, b?: unknown) => Promise<{ status: number; body: any }>;
+} {
   const dir = mkdtempSync(join(tmpdir(), "catman-cronadmin-"));
   dirs.push(dir);
   const store = new CronStore({ dir, now: () => T0 });
+  const calendar = new CalendarStore({ path: join(dir, "calendar.json"), now: () => T0 });
   store.put(job());
   store.put(job({ id: "j_2", userKey: "wechat:a:u2", name: "别人的" }));
   const ran: string[] = [];
+  let reloads = 0;
   const deps = {
     store,
+    calendar,
     scheduler: {
       async runNow(jobId: string): Promise<CronRun | { error: string }> {
         ran.push(jobId);
         return run({ jobId });
       },
+      reloadSchedules(): { reloaded: number; changed: number } {
+        reloads += 1;
+        return { reloaded: 2, changed: 1 };
+      },
     },
   };
   return {
     store,
+    calendar,
     ran,
+    get reloads() {
+      return reloads;
+    },
     call: (m, p, b) => handleCronAdminApi(m, p, b, deps) as Promise<{ status: number; body: any }>,
   };
 }
@@ -248,4 +266,44 @@ test("管理员接口:试跑与看输出", async () => {
 
   assert.equal((await s.call("GET", "/api/admin/cron/j_1/runs/20200101T000000Z-ffff")).status, 404);
   assert.equal((await s.call("PATCH", "/api/admin/cron/j_nope", { enabled: false })).status, 404);
+});
+
+test("管理员接口:节假日日历 GET / PUT 自动校验并触发 reload,以及手动 POST /reload", async () => {
+  const s = adminSetup();
+  const initial = await s.call("GET", "/api/admin/cron/calendar");
+  assert.equal(initial.status, 200);
+  assert.ok(initial.body.years.some((y: any) => y.year === "2026" && y.source === "builtin"));
+
+  // 非法公历日(2月30日)或 off/work 冲突一律 400
+  const badDate = await s.call("PUT", "/api/admin/cron/calendar", {
+    years: { "2028": { off: ["02-30"], work: [] } },
+  });
+  assert.equal(badDate.status, 400);
+  assert.match(badDate.body.error, /非法公历日期/);
+
+  const conflict = await s.call("PUT", "/api/admin/cron/calendar", {
+    years: { "2028": { off: ["01-01"], work: ["01-01"] } },
+  });
+  assert.equal(conflict.status, 400);
+  assert.match(conflict.body.error, /既在 off 又在 work/);
+  assert.equal(s.reloads, 0);
+
+  // 正常写入 2028 年并自动触发 reloadSchedules
+  const updated = await s.call("PUT", "/api/admin/cron/calendar", {
+    years: { "2028": { off: ["01-01", "01-02", "01-03"], work: ["01-29"] } },
+  });
+  assert.equal(updated.status, 200);
+  assert.equal(updated.body.ok, true);
+  assert.equal(updated.body.reloaded, 2);
+  assert.equal(updated.body.changed, 1);
+  assert.equal(s.reloads, 1);
+  const y2028 = updated.body.years.find((y: any) => y.year === "2028");
+  assert.equal(y2028.source, "file");
+  assert.equal(y2028.offDays, 3);
+  assert.equal(y2028.workDays, 1);
+
+  // 显式 POST /api/admin/cron/reload
+  const manualReload = await s.call("POST", "/api/admin/cron/reload");
+  assert.equal(manualReload.status, 200);
+  assert.equal(s.reloads, 2);
 });

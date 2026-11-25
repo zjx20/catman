@@ -203,3 +203,29 @@ test("PATCH:能原样吃回自己吐出来的任务(往返一致)", () => {
   assert.equal(v.timeoutMs, j.timeoutMs);
   assert.equal(v.keepRuns, j.keepRuns);
 });
+
+test("calendar:合法取值通过并参与首次触发计算,非法取值报 400 文案,PATCH 往返保留", () => {
+  // 2026-09-30 周三 10:00 创建早 9 点法定工作日任务 → 跳过国庆 7 天,首次触发在 10-08
+  const v = validateJobInput(
+    input({ schedule: { kind: "cron", expr: "0 9 * * *", calendar: "cn-workday" } }),
+    ctx({ now: Date.parse("2026-09-30T10:00:00+08:00") }),
+  );
+  assert.deepEqual(v.schedule, { kind: "cron", expr: "0 9 * * *", tz: "Asia/Shanghai", calendar: "cn-workday" });
+  assert.equal(v.nextAt, Date.parse("2026-10-08T09:00:00+08:00"));
+
+  // PATCH 往返保留 calendar
+  const j = job({ schedule: v.schedule, nextAt: v.nextAt });
+  const roundtrip = validateJobInput(mergeJobPatch(j, { name: "改名不丢日历" }), ctx());
+  assert.deepEqual(roundtrip.schedule, v.schedule);
+
+  // 非法 calendar 值拒收
+  rejects(
+    input({ schedule: { kind: "cron", expr: "0 9 * * *", calendar: "us-workday" } }),
+    /schedule\.calendar 只能是 cn-workday \/ cn-restday/,
+  );
+  // every / once 上不接受 calendar
+  rejects(
+    input({ schedule: { kind: "every", minutes: 60, calendar: "cn-workday" } }),
+    /不认识的字段 "calendar"/,
+  );
+});

@@ -1,6 +1,12 @@
 import { containerNameFor, type ScriptRunner } from "./runner.js";
+import {
+  DEFAULT_CALENDAR_DATA,
+  formatMissingCalendarWarning,
+  missingCalendarYears,
+  type CalendarData,
+} from "./calendar.js";
 import { renderAutoDisabled, renderEnd, renderNextLine, renderStart } from "./notify.js";
-import { formatAt, nextAt as computeNextAt } from "./schedule.js";
+import { formatAt, nextAt as computeNextAt, wallClockIn } from "./schedule.js";
 import { inQuietHours, mergeNotices, type NoticeSpool } from "./notices.js";
 import type { AgentTaskRunner } from "./agent-runner.js";
 import type { CronStore } from "./store.js";
@@ -50,6 +56,8 @@ export interface SchedulerOptions {
   readonly notices?: NoticeSpool;
   /** 现读配置。是函数不是快照 —— 与 prefs 那边同一个理由。 */
   readonly runtime: () => CronRuntime;
+  /** 现读节假日日历数据。管理员更新日历后不必重启。 */
+  readonly calendar?: () => CalendarData;
   /** 展示用时区。 */
   readonly tz: string;
   /** Required even when individual jobs disable notifications; missing wiring must fail at startup. */
@@ -88,11 +96,16 @@ export class CronScheduler {
     this.tickMs = opts.tickMs ?? 30_000;
   }
 
+  private calendarData(): CalendarData {
+    return this.opts.calendar?.() ?? DEFAULT_CALENDAR_DATA;
+  }
+
   start(): void {
     // 起来先补一次 nextAt:新任务、以及上个版本还没算过这一项的任务。
+    const cal = this.calendarData();
     for (const job of this.opts.store.all()) {
       if (job.enabled && job.nextAt === undefined) {
-        this.opts.store.patch(job.id, { nextAt: computeNextAt(job.schedule, this.now()) });
+        this.opts.store.patch(job.id, { nextAt: computeNextAt(job.schedule, this.now(), cal) });
       }
     }
     this.timer = setInterval(() => void this.tick(), this.tickMs);
@@ -100,6 +113,32 @@ export class CronScheduler {
     // 两者都不在这个进程里,所以它没资格拦着进程退出(与 gateway 的提醒定时器同一条界线)。
     this.timer.unref?.();
     void this.bootSweep();
+  }
+
+  /**
+   * 节假日日历更新后重算所有已启用任务的下次触发时刻。
+   * 不打断正在运行的任务;重算起点取 `max(now, lastRunAt)` 防止同一分钟内二次点火。
+   */
+  reloadSchedules(): { reloaded: number; changed: number } {
+    const now = this.now();
+    const cal = this.calendarData();
+    let reloaded = 0;
+    let changed = 0;
+    for (const job of this.opts.store.all()) {
+      if (!job.enabled) continue;
+      reloaded += 1;
+      const from = job.lastRunAt !== undefined && job.lastRunAt > now ? job.lastRunAt : now;
+      const next = computeNextAt(job.schedule, from, cal);
+      if (next !== job.nextAt) {
+        changed += 1;
+        if (next === undefined) {
+          this.opts.store.patch(job.id, { enabled: false, nextAt: undefined });
+        } else {
+          this.opts.store.patch(job.id, { nextAt: next });
+        }
+      }
+    }
+    return { reloaded, changed };
   }
 
   /**
@@ -255,13 +294,18 @@ export class CronScheduler {
 
   private async notifyEnd(job: CronJob, run: CronRun): Promise<void> {
     if (!job.notify.end) return;
-    if (job.notify.onlyFailure && run.status === "ok") return;
     // 跳过这一轮不值得单独推一条:用户没损失什么,而记录里查得到。
     if (run.status === "skipped") return;
+
+    const warning = this.calendarWarningFor(job, run);
+    // onlyFailure 且成功时原本闭嘴;但如果跨年缺少节假日数据,排期已退回普通双休,
+    // 必须把这条带 warning 的结果推给用户,否则没人发现管理员忘了更新日历。
+    if (job.notify.onlyFailure && run.status === "ok" && !warning) return;
+
     // Agent results are Markdown, not a stdout tail: keep their opening fences and conclusion.
     const tail = this.opts.store.readLog(job.id, run.id, job.task.kind === "script" ? TAIL_BYTES : undefined);
     const next = renderNextLine(job.nextAt, this.opts.tz, job.enabled, job.schedule.kind === "once");
-    const text = renderEnd(job, run, tail, next);
+    const text = renderEnd(job, run, tail, next, warning);
 
     // 静默时段:攒起来,出窗口时合并成一条。**不是丢掉** —— 半夜的结果照样是
     // 用户第二天要看的东西,只是不该在半夜一条条砸过去(而且那时多半也发不出去)。
@@ -344,12 +388,22 @@ export class CronScheduler {
 
   /** 把 nextAt 推到下一档。一次性任务跑完就停用 —— 留着记录,不留一个死排期。 */
   private advance(job: CronJob, from: number): void {
-    const next = computeNextAt(job.schedule, from);
+    const next = computeNextAt(job.schedule, from, this.calendarData());
     if (next === undefined) {
       this.opts.store.patch(job.id, { enabled: false, nextAt: undefined });
       return;
     }
     this.opts.store.patch(job.id, { nextAt: next });
+  }
+
+  /** 若任务启用了法定日历,检查本次执行年份或下次触发年份是否缺失节假日数据。 */
+  private calendarWarningFor(job: CronJob, run: CronRun): string | undefined {
+    if (job.schedule.kind !== "cron" || !job.schedule.calendar) return undefined;
+    const tz = job.schedule.tz;
+    const years = [wallClockIn(tz, run.startedAt).y];
+    if (job.nextAt !== undefined) years.push(wallClockIn(tz, job.nextAt).y);
+    const missing = missingCalendarYears(job.schedule.calendar, years, this.calendarData());
+    return formatMissingCalendarWarning(missing);
   }
 
   private activeCount(): number {

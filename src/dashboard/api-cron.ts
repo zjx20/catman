@@ -1,7 +1,13 @@
 import type { TurnTokens } from "../core/turn-tokens.js";
+import {
+  DEFAULT_CALENDAR_DATA,
+  formatMissingCalendarWarning,
+  missingCalendarYears,
+  type CalendarData,
+} from "../core/cron/calendar.js";
 import type { CronStore } from "../core/cron/store.js";
 import type { CronJob, CronRun } from "../core/cron/types.js";
-import { describeSchedule, formatAt } from "../core/cron/schedule.js";
+import { describeSchedule, formatAt, wallClockIn } from "../core/cron/schedule.js";
 import {
   CronInputError,
   MAX_JOBS_PER_USER,
@@ -167,12 +173,21 @@ function patchJob(job: CronJob, body: unknown, deps: CronApiDeps): ApiResult {
 
 function viewJob(job: CronJob, deps: CronApiDeps): Record<string, unknown> {
   const tz = job.schedule.kind === "cron" ? job.schedule.tz : deps.tz;
+  const calData: CalendarData = deps.validateContext().calendar ?? DEFAULT_CALENDAR_DATA;
+  const now = deps.now?.() ?? Date.now();
+  const checkYears = [wallClockIn(tz, now).y];
+  if (job.nextAt !== undefined) checkYears.push(wallClockIn(tz, job.nextAt).y);
+  const calendarWarning =
+    job.schedule.kind === "cron"
+      ? formatMissingCalendarWarning(missingCalendarYears(job.schedule.calendar, checkYears, calData))
+      : undefined;
   return {
     id: job.id,
     name: job.name,
     enabled: job.enabled,
     schedule: job.schedule,
     scheduleText: describeSchedule(job.schedule, tz),
+    ...(calendarWarning ? { calendarWarning } : {}),
     task: job.task,
     timeoutMinutes: Math.round(job.timeoutMs / 60_000),
     overlap: job.overlap,

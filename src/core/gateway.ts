@@ -13,13 +13,16 @@ import type { GlobalSettings } from "./settings.js";
 import type { MintedTurn, TurnContext, TurnTokens } from "./turn-tokens.js";
 import { allowAll, type AdmissionPolicy } from "./admission.js";
 import { buildTurnEnv } from "./turn-env.js";
-import { formatAt } from "./cron/schedule.js";
+import type { CalendarData } from "./cron/calendar.js";
+import { formatMissingCalendarWarning, missingCalendarYears } from "./cron/calendar.js";
+import { formatAt, wallClockIn } from "./cron/schedule.js";
 import type { CronJob, RunStatus } from "./cron/types.js";
 
 /** 网关眼里的定时任务:只有"这个人有哪些任务"这一个问题。 */
 export interface CronView {
   jobsOf(userKey: string): readonly CronJob[];
   readonly tz: string;
+  calendar?(): CalendarData | undefined;
 }
 
 const JOB_STATUS_CN: Partial<Record<RunStatus, string>> = {
@@ -1373,14 +1376,25 @@ export class Gateway {
       return "你还没有定时任务。跟我说一句「每天早上八点看一眼磁盘」就能建一个。";
     }
     const lines = [`⏰ 你有 ${jobs.length} 个定时任务`];
+    const now = this.now();
+    const calData = this.cron.calendar?.();
+    const missingSet = new Set<number>();
     for (const j of jobs) {
       const when = j.enabled && j.nextAt !== undefined ? formatAt(j.nextAt, this.cron.tz) : "已停用";
       const last = j.lastStatus ? `,上次${JOB_STATUS_CN[j.lastStatus] ?? j.lastStatus}` : "";
       const streak = j.failStreak >= 2 ? `(已连续失败 ${j.failStreak} 次)` : "";
       lines.push(`- ${inlineCode(j.name)} —— 下次 ${when}${last}${streak}`);
+      if (j.enabled && j.schedule.kind === "cron" && j.schedule.calendar && calData) {
+        const tz = j.schedule.tz;
+        const ys = [wallClockIn(tz, now).y];
+        if (j.nextAt !== undefined) ys.push(wallClockIn(tz, j.nextAt).y);
+        for (const y of missingCalendarYears(j.schedule.calendar, ys, calData)) missingSet.add(y);
+      }
     }
+    const calWarn = formatMissingCalendarWarning([...missingSet].sort((a, b) => a - b));
+    if (calWarn) lines.push(calWarn);
     lines.push("要看某个任务跑出了什么,直接问我。");
-    return [lines[0], lines.slice(1, -1).join("\n"), lines.at(-1)].join("\n\n");
+    return [lines[0], lines.slice(1, calWarn ? -2 : -1).join("\n"), ...(calWarn ? [calWarn] : []), lines.at(-1)].join("\n\n");
   }
 
   private upgradeStatusText(): string {

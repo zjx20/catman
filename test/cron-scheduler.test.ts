@@ -754,3 +754,71 @@ test("静默时段:窗口外照常当场推", async () => {
   assert.equal(h.notes.length, 1);
   assert.match(h.notes[0]!.text, /白天这次/);
 });
+
+// ── 法定节假日日历与跨年缺数据告警 ──────────────────────────────────
+
+test("calendar:跨年没有当年节假日数据时,执行完在通知里追加 warning(含 onlyFailure 破例提醒)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "catman-sched-cal-"));
+  dirs.push(dir);
+  // 设在 2028-01-03 周一 09:00,内置日历里只有 2025-2027,没有 2028
+  let clock = Date.parse("2028-01-03T09:00:00+08:00");
+  const store = new CronStore({ dir, hostDir: "/mnt/usb/catman_data/cron", now: () => clock });
+  const runner = new FakeRunner();
+  const notes: Array<{ text: string; kind: NotifyKind }> = [];
+  let calYears: Record<string, { off: string[]; work: string[] }> = {};
+  const sched = new CronScheduler({
+    store,
+    runner,
+    calendar: () => ({ years: calYears }),
+    runtime: () => ({ enabled: true, maxConcurrent: 1, catchUpMs: 900_000, runMaxAgeMs: 1e12 }),
+    tz: SH,
+    notify: async (_u, text, kind) => {
+      notes.push({ text, kind });
+    },
+    now: () => clock,
+  });
+
+  store.put({
+    id: "j_cal",
+    userKey: "wechat:a:u1",
+    name: "早报",
+    enabled: true,
+    schedule: { kind: "cron", expr: "0 9 * * *", tz: SH, calendar: "cn-workday" },
+    task: { kind: "script", cmd: ["echo", "ok"], env: {} },
+    timeoutMs: 600_000,
+    overlap: "skip",
+    // 即便设了 onlyFailure=true,缺节假日数据时成功也必须破例推一条带 warning 的通知
+    notify: { start: false, end: true, onlyFailure: true },
+    keepRuns: 20,
+    createdAt: clock,
+    updatedAt: clock,
+    nextAt: clock - 1000,
+    failStreak: 0,
+  });
+
+  await sched.tick();
+  runner.finish(0, "早报生成完毕");
+  clock += 5000;
+  await sched.tick();
+
+  assert.equal(notes.length, 1, "缺节假日数据时应当推送提醒");
+  assert.match(notes[0]!.text, /缺少 2028 年法定节假日数据/);
+  assert.match(notes[0]!.text, /联系管理员更新节假日配置/);
+  // 此时尚未更新日历,下次触发按普通周二 2028-01-04 09:00 算
+  assert.equal(store.get("j_cal")!.nextAt, Date.parse("2028-01-04T09:00:00+08:00"));
+
+  // 管理员补入 2028 日历(假设 01-04 放假)并 reloadSchedules → 排期立刻跳到 01-05,且后续不再告警
+  calYears = { "2028": { off: ["01-04"], work: [] } };
+  const reloaded = sched.reloadSchedules();
+  assert.equal(reloaded.reloaded, 1);
+  assert.equal(reloaded.changed, 1);
+  assert.equal(store.get("j_cal")!.nextAt, Date.parse("2028-01-05T09:00:00+08:00"));
+
+  notes.length = 0;
+  clock = Date.parse("2028-01-05T09:00:05+08:00");
+  await sched.tick();
+  runner.finish(0, "正常早报");
+  clock += 5000;
+  await sched.tick();
+  assert.equal(notes.length, 0, "日历齐备后 onlyFailure=true 恢复静默");
+});

@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { ContextStore, hostPath } from "../execution/contexts.js";
 import { readJsonFile, writeJsonFileAtomic } from "../file-store.js";
+import { isCalendarId } from "./calendar.js";
 import type { CronJob, CronRun, RunStatus } from "./types.js";
 
 /**
@@ -351,7 +352,10 @@ function parseJob(raw: unknown): CronJob | undefined {
   if (typeof o["id"] !== "string" || typeof o["userKey"] !== "string") return undefined;
   if (typeof o["name"] !== "string" || !s || !t) return undefined;
   const okSchedule =
-    (s["kind"] === "cron" && typeof s["expr"] === "string" && typeof s["tz"] === "string") ||
+    (s["kind"] === "cron" &&
+      typeof s["expr"] === "string" &&
+      typeof s["tz"] === "string" &&
+      (s["calendar"] === undefined || isCalendarId(s["calendar"]))) ||
     (s["kind"] === "every" && typeof s["ms"] === "number") ||
     (s["kind"] === "once" && typeof s["at"] === "number");
   if (!okSchedule) return undefined;

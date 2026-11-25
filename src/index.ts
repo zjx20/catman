@@ -38,6 +38,7 @@ import { readVersion, versionLine, type VersionInfo } from "./core/version.js";
 import { syncSrcRepoToRelease } from "./core/src-repo-sync.js";
 import { runSelfCheck } from "./core/selfcheck.js";
 import { ScriptDeployControl } from "./core/deploy.js";
+import { CalendarStore } from "./core/cron/calendar.js";
 import { CronStore, DEFAULT_RUN_MAX_AGE_MS } from "./core/cron/store.js";
 import { CronScheduler } from "./core/cron/scheduler.js";
 import { RealAgentTaskRunner } from "./core/cron/agent-runner.js";
@@ -229,7 +230,7 @@ async function main(): Promise<void> {
   // gateway 要在 createChannel 之后建,而 bridge 的 onDetach 要指向 gateway ——
   // 用一个后填的引用打破这个环。detach 帧在 gateway 装好之前不可能到达
   // (bridge 要等 start() 才开始拉取),所以这里的 undefined 窗口是安全的。
-  let cronRef: { store: CronStore } | undefined;
+  let cronRef: { store: CronStore; calendar: CalendarStore } | undefined;
   const { channel, admission, ipcClient: bridgeClient } = createChannel(
     config,
     chat,
@@ -273,6 +274,7 @@ async function main(): Promise<void> {
     cron: {
       jobsOf: (userKey) => cronRef?.store.ofUser(userKey) ?? [],
       tz: config.tz,
+      calendar: () => cronRef?.calendar.data(),
     },
   });
   gatewayRef = gateway;
@@ -323,6 +325,7 @@ async function main(): Promise<void> {
       ? {
           cronAdmin: {
             store: cron.store,
+            calendar: cron.calendar,
             scheduler: cron.scheduler,
             tz: config.tz,
             enabled: () => settings.effective().cronEnabled,
@@ -427,7 +430,10 @@ function createCron(
     runtimes: RuntimeManager;
     modelCatalog: ModelCatalog;
   },
-): { store: CronStore; scheduler: CronScheduler; api: CronApiDeps } {
+): { store: CronStore; calendar: CalendarStore; scheduler: CronScheduler; api: CronApiDeps } {
+  const calendar = new CalendarStore({
+    path: `${config.dataDir}/cron/calendar.json`,
+  });
   const store = new CronStore({
     dir: `${config.dataDir}/cron`,
     contexts: deps.contexts,
@@ -437,6 +443,7 @@ function createCron(
   });
   const scheduler = new CronScheduler({
     store,
+    calendar: () => calendar.data(),
     notify: (userKey, text, kind) => gateway.push(userKey, text, kind),
     runner: new ContextScriptRunner(deps.contexts, deps.runtimes, store),
     contextBusy: job => {
@@ -494,11 +501,12 @@ function createCron(
         modelAllowlist: s.modelAllowlist,
         hostDataDir: config.hostDataDir,
         now: Date.now(),
+        calendar: calendar.data(),
       };
     },
     tz: config.tz,
   };
-  return { store, scheduler, api };
+  return { store, calendar, scheduler, api };
 }
 
 /**
