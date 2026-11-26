@@ -14,7 +14,8 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync, accessSync, statSync, constants } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync, accessSync, statSync, openSync, readSync, closeSync, constants } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 
@@ -587,11 +588,92 @@ function cmdCnbProfile(c, pos, opt) {
     const input = opt.in
     if (!input) die('import 需要 --in <文件.tar.gz>')
     if (!existsSync(input)) die(`文件不存在:${input}`)
-    const headers = ['Content-Type: application/gzip']
-    if (opt.sha256) headers.push(`X-Archive-Sha256: ${opt.sha256}`)
-    const { r, j } = cnbCall(c, { path: `${base}/archive`, method: 'PUT', dataFile: input, headers }, opt)
-    if (r.status >= 400 || !j) cnbFail(r, j)
-    return void cnbEmit(JSON.stringify(j, null, 2), opt)
+    const fileSize = statSync(input).size
+    const CHUNK_THRESHOLD = 2 * 1024 * 1024
+    if (fileSize <= CHUNK_THRESHOLD) {
+      const headers = ['Content-Type: application/gzip']
+      if (opt.sha256) headers.push(`X-Archive-Sha256: ${opt.sha256}`)
+      const { r, j } = cnbCall(c, { path: `${base}/archive`, method: 'PUT', dataFile: input, headers }, opt)
+      if (r.status >= 400 || !j) cnbFail(r, j)
+      return void cnbEmit(JSON.stringify(j, null, 2), opt)
+    }
+
+    // 大于 2MB 优先走分片上传，绕开 Cloudflare 100s 请求限制；若网关不支持(404/405)则回退一次性 PUT
+    const sha256 = opt.sha256 || (() => {
+      const h = createHash('sha256')
+      const fd = openSync(input, 'r')
+      const buf = Buffer.allocUnsafe(1024 * 1024)
+      try {
+        let n
+        while ((n = readSync(fd, buf, 0, buf.length, null)) > 0) h.update(buf.subarray(0, n))
+      } finally {
+        closeSync(fd)
+      }
+      return h.digest('hex')
+    })()
+
+    const initRes = cnbCall(c, {
+      path: `${base}/uploads`,
+      post: true,
+      headers: [`X-Archive-Sha256: ${sha256}`],
+    }, opt)
+    if (initRes.r.status === 404 || initRes.r.status === 405) {
+      const headers = ['Content-Type: application/gzip', `X-Archive-Sha256: ${sha256}`]
+      const { r, j } = cnbCall(c, { path: `${base}/archive`, method: 'PUT', dataFile: input, headers }, opt)
+      if (r.status >= 400 || !j) cnbFail(r, j)
+      return void cnbEmit(JSON.stringify(j, null, 2), opt)
+    }
+    if (initRes.r.status >= 400 || !initRes.j?.uploadId) cnbFail(initRes.r, initRes.j)
+
+    const uploadId = initRes.j.uploadId
+    const chunkSize = Math.min(1024 * 1024, Number(initRes.j.maxChunkBytes) || 1024 * 1024)
+    const tmpDir = mkdtempSync(join(tmpdir(), 'cnb-chunk-'))
+    const chunkFile = join(tmpDir, 'chunk.bin')
+    const fd = openSync(input, 'r')
+    const buf = Buffer.allocUnsafe(chunkSize)
+    try {
+      let index = 0
+      let bytesRead
+      while ((bytesRead = readSync(fd, buf, 0, chunkSize, null)) > 0) {
+        writeFileSync(chunkFile, buf.subarray(0, bytesRead))
+        const chunkOpt = { ...opt, timeout: Math.min(opt.timeout || 60, 60) }
+        let cr = cnbCurl(c, {
+          path: `${base}/uploads/${uploadId}/chunks/${index}`,
+          method: 'PUT',
+          dataFile: chunkFile,
+          headers: ['Content-Type: application/octet-stream'],
+          timeout: chunkOpt.timeout,
+        })
+        let cj = null
+        try { cj = JSON.parse(cr.body) } catch {}
+        if (cr.status === 0 || cr.status >= 500) {
+          // 同一片超时/5xx 时按相同字节幂等重发一次
+          cr = cnbCurl(c, {
+            path: `${base}/uploads/${uploadId}/chunks/${index}`,
+            method: 'PUT',
+            dataFile: chunkFile,
+            headers: ['Content-Type: application/octet-stream'],
+            timeout: chunkOpt.timeout,
+          })
+          try { cj = JSON.parse(cr.body) } catch {}
+        }
+        if (cr.status >= 400 || !cj) cnbFail(cr, cj)
+        index++
+      }
+    } finally {
+      closeSync(fd)
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+
+    const commitRes = cnbCurl(c, {
+      path: `${base}/uploads/${uploadId}/commit`,
+      post: true,
+      timeout: opt.timeout,
+    })
+    let commitJson = null
+    try { commitJson = JSON.parse(commitRes.body) } catch {}
+    if (commitRes.status >= 400 || !commitJson) cnbFail(commitRes, commitJson)
+    return void cnbEmit(JSON.stringify(commitJson, null, 2), opt)
   }
   die(`未知 profile 动作 ${action};可用: create start stop delete export import`)
 }
