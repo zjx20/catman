@@ -6,7 +6,7 @@ import type { GlobalSettings } from "../settings.js";
 import type { UserRegistry } from "../users.js";
 import type { TurnTokens } from "../turn-tokens.js";
 import { buildTurnEnv } from "../turn-env.js";
-import { skillsFor, skillsOnDisk } from "../skills.js";
+import { discoverAvailableSkills, skillsFor, skillsOnDisk } from "../skills.js";
 import type { Persona } from "../../config.js";
 import type { AgentTask, CronJob } from "./types.js";
 
@@ -57,7 +57,8 @@ export interface RealAgentTaskRunnerOptions {
   readonly turns: TurnTokens;
   readonly apiBase: string;
   readonly persona: Persona;
-  /** CLAUDE_CONFIG_DIR。同网关:主人格按它下面 `skills/` 的现状决定给哪些 skill。 */
+  /** 分层 skill 数据源（控制面数据目录 + 当前 release 目录）。 */
+  readonly skillSources?: { dataDir: string; releaseDir?: string };
   readonly skillsDir?: string;
   /** 推送令牌的发放处。定时任务里的助手同样会起长任务,它也需要 `catman-notify`。 */
   readonly notifyTokens?: { for(userKey: string): string };
@@ -116,7 +117,11 @@ export class RealAgentTaskRunner implements AgentTaskRunner {
           ...(o.binDir ? { binDir: o.binDir } : {}),
         }),
         skills: skillsFor(o.persona, isAdmin, {
-          ...(o.skillsDir ? { onDisk: skillsOnDisk(o.skillsDir) } : {}),
+          ...(o.skillSources
+            ? { onDisk: discoverAvailableSkills({ ...o.skillSources, isAdmin }) }
+            : o.skillsDir
+              ? { onDisk: skillsOnDisk(o.skillsDir) }
+              : {}),
           disabled: o.settings.effective().disabledSkills,
         }),
         // 用调度器给的那个:超时与「任务被删了」都从它那边掐。

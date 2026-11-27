@@ -8,7 +8,7 @@ import { RuntimeManager, networkEnvironment } from "./execution/runtime.js";
 import { CapabilityBroker } from "./execution/broker.js";
 import { resolveHarness, type HarnessSession } from "./execution/harness.js";
 import type { ModelCatalog } from "./execution/model-catalog.js";
-import { GENERATED_SKILLS, skillsOnDisk } from "./skills.js";
+import { BUILTIN_SKILLS, skillsOnDisk } from "./skills.js";
 /**
  * Agent SDK 封装。目标:尽量还原 Claude Code 的行为("脾气"),
  * 关键是三项非默认配置 —— 系统提示词 preset、加载 setting sources、启用 skills。
@@ -373,7 +373,7 @@ export class Agent {
         ...Object.fromEntries(Object.entries(privateServers).map(([name, config]) => [`user_${name}`, config])),
         ...Object.fromEntries(Object.entries(e.broker.mcpServers(runtime, this.config.apiBase)).map(([name, config]) => [`public_${name}`, config])),
       };
-      const allSkills = [...new Set([...(opts.skills ?? []), ...skillsOnDisk(paths.home).filter(name => !(GENERATED_SKILLS as readonly string[]).includes(name))])];
+      const allSkills = [...new Set([...(opts.skills ?? []), ...skillsOnDisk(paths.home).filter(name => !(BUILTIN_SKILLS as readonly string[]).includes(name))])];
       const slot: LiveSessionSlot = {
         session: undefined!, options: opts, harnessId: harness.id, model: opts.model, effort: opts.effort, maxTurns: opts.maxTurns, maxBudgetUsd: opts.maxBudgetUsd,
       };

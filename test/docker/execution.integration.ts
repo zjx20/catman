@@ -150,8 +150,8 @@ test("Docker 执行上下文端到端", { timeout: 240_000 }, async t => {
     srcDir: join(root, "src"), apiBase: "", sessionImage: image, sessionMemoryLimit: "700m", runtimeIdleMs: 3600_000, maxActiveRuntimes: 8 };
   mkdirSync(config.srcDir, { recursive: true }); writeFileSync(join(config.srcDir, "source-only"), "admin source");
   mkdirSync(join(root, "shared"), { recursive: true }); writeFileSync(join(root, "shared/AGENTS.md"), "# Public persona\n");
-  mkdirSync(join(root, "claude/skills/public-probe"), { recursive: true });
-  writeFileSync(join(root, "claude/skills/public-probe/SKILL.md"), "---\nname: public-probe\ndescription: Integration probe\n---\nPublic skill.\n");
+  mkdirSync(join(root, "shared/skills/user/public-probe"), { recursive: true });
+  writeFileSync(join(root, "shared/skills/user/public-probe/SKILL.md"), "---\nname: public-probe\ndescription: Integration probe\n---\nPublic skill.\n");
   mkdirSync(join(root, "control-only")); writeFileSync(join(root, "control-only/secret"), "control file");
   const options = { isAdmin: (owner: string) => owner === "admin", notify: async (owner: string, text: string) => { notices.push({ owner, text }); }, now: () => now, docker };
   let runtimes = new RuntimeManager(config, contexts, options); managers.push(runtimes);

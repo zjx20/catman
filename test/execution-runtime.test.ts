@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
 import { RuntimeManager } from "../src/core/execution/runtime.js";
 import { ContextStore } from "../src/core/execution/contexts.js";
+import { generatedSkillsDir, sharedSkillsDir, writeSkills } from "../src/core/skills.js";
 import { join } from "node:path";
 import { executionFixture } from "./helpers/execution.js";
 
@@ -250,4 +251,71 @@ test("通知渠道阻塞也不延迟容器截止回收", async () => {
     f.advance(10 * 60_000); await manager.tick();
     assert.equal(manager.all().length, 0);
   } finally { manager.close(); release(); await new Promise(resolve => setImmediate(resolve)); f.cleanup(); }
+});
+
+test("分层整目录只读挂载 skill：零文件复制、非管理员物理隔离 admin 分组、个人 skill 优先于全局共享且不污染 /user/skills", async () => {
+  const f = executionFixture();
+  try {
+    const release = process.env.CATMAN_RELEASE_LINK!;
+    mkdirSync(join(release, "skills/user/webgrab"), { recursive: true });
+    writeFileSync(join(release, "skills/user/webgrab/SKILL.md"), "---\nname: webgrab\ndescription: release webgrab\n---\n");
+    mkdirSync(join(release, "skills/admin/catman-ops"), { recursive: true });
+    writeFileSync(join(release, "skills/admin/catman-ops/SKILL.md"), "---\nname: catman-ops\ndescription: release ops\n---\n");
+
+    writeSkills(generatedSkillsDir(f.config.dataDir), { modelAllowlist: ["opus"] }, {
+      srcDir: "/catman-src", deployBinDir: "/deploy/bin", releasesDir: "/releases", deployDir: "/deploy", courierDir: "/courier",
+    }, "primary");
+
+    mkdirSync(join(sharedSkillsDir(f.config.dataDir), "user/mediacenter"), { recursive: true });
+    writeFileSync(join(sharedSkillsDir(f.config.dataDir), "user/mediacenter/SKILL.md"), "---\nname: mediacenter\ndescription: shared\n---\n");
+    mkdirSync(join(sharedSkillsDir(f.config.dataDir), "admin/secret-ops"), { recursive: true });
+    writeFileSync(join(sharedSkillsDir(f.config.dataDir), "admin/secret-ops/SKILL.md"), "---\nname: secret-ops\ndescription: admin only\n---\n");
+
+    const manager = new RuntimeManager(f.config, f.contexts, {
+      ...f.options,
+      isAdmin: (u) => u === "admin",
+    });
+    try {
+      const alice = f.contexts.chat("alice");
+      const alicePaths = f.contexts.paths(alice);
+      // 个人同名 skill 应优先于 shared-user，但尝试冒充系统内置 webgrab 必须被拒绝覆盖
+      mkdirSync(join(alicePaths.home, "skills/mediacenter"), { recursive: true });
+      writeFileSync(join(alicePaths.home, "skills/mediacenter/SKILL.md"), "---\nname: mediacenter\ndescription: personal\n---\n");
+      mkdirSync(join(alicePaths.home, "skills/webgrab"), { recursive: true });
+      writeFileSync(join(alicePaths.home, "skills/webgrab/SKILL.md"), "---\nname: webgrab\ndescription: spoofed\n---\n");
+
+      const aliceRt = await manager.ensure(alice);
+      const aliceRun = f.calls.filter(c => c.args[0] === "run").at(-1)!;
+      const aliceMounts = aliceRun.args.flatMap((a, i) => a === "--mount" ? [aliceRun.args[i + 1]!] : []);
+
+      assert.ok(aliceMounts.some(m => m.includes("dst=/runtime/skills/gen-user,readonly")));
+      assert.ok(aliceMounts.some(m => m.includes("dst=/runtime/skills/release-user,readonly")));
+      assert.ok(aliceMounts.some(m => m.includes("dst=/runtime/skills/shared-user,readonly")));
+      assert.ok(aliceMounts.every(m => !m.includes("gen-admin") && !m.includes("release-admin") && !m.includes("shared-admin")), "普通用户绝不挂载任何 admin 分组目录");
+      assert.ok(aliceMounts.every(m => !m.includes(`src=/host/catman/tenants/`) || !m.includes("/skills")), "不再把 /user/skills 作为子挂载底层避免污染空桩");
+
+      const aliceProj = join(f.config.dataDir, "execution/projections", alice.id, aliceRt.container.slice(-16));
+      assert.ok(lstatSync(join(aliceProj, "skills/webgrab")).isSymbolicLink(), "投影使用软链而非 cpSync 复制文件");
+      assert.equal(readlinkSync(join(aliceProj, "cli-skills/webgrab")), "/runtime/skills/release-user/webgrab", "内置 skill 不可被个人同名目录劫持");
+      assert.equal(readlinkSync(join(aliceProj, "cli-skills/mediacenter")), "/user/skills/mediacenter", "个人 skill 优先于全局共享同名 skill");
+      assert.equal(readlinkSync(join(aliceProj, "skills/mediacenter")), "/runtime/skills/shared-user/mediacenter", "/runtime/bin/skills 保持指向公共脚本路径");
+      assert.equal(existsSync(join(aliceProj, "cli-skills/catman-ops")), false);
+      assert.equal(existsSync(join(aliceProj, "cli-skills/secret-ops")), false);
+
+      const adm = f.contexts.chat("admin");
+      const admRt = await manager.ensure(adm);
+      const admRun = f.calls.filter(c => c.args[0] === "run").at(-1)!;
+      const admMounts = admRun.args.flatMap((a, i) => a === "--mount" ? [admRun.args[i + 1]!] : []);
+      assert.ok(admMounts.some(m => m.includes("dst=/runtime/skills/gen-admin,readonly")));
+      assert.ok(admMounts.some(m => m.includes("dst=/runtime/skills/release-admin,readonly")));
+      assert.ok(admMounts.some(m => m.includes("dst=/runtime/skills/shared-admin,readonly")));
+      const admProj = join(f.config.dataDir, "execution/projections", adm.id, admRt.container.slice(-16));
+      assert.equal(readlinkSync(join(admProj, "cli-skills/catman-ops")), "/runtime/skills/release-admin/catman-ops");
+      assert.equal(readlinkSync(join(admProj, "cli-skills/secret-ops")), "/runtime/skills/shared-admin/secret-ops");
+    } finally {
+      manager.close();
+    }
+  } finally {
+    f.cleanup();
+  }
 });

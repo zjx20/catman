@@ -264,7 +264,7 @@ Dashboard、resume 与清理的范围来自 `ContextStore` 注册的 owner/conte
 
 执行实现见 `src/core/execution/`，行为和人工数据迁移步骤以 README 为准。
 控制面保存 owner/context/runtime 注册表，worker 只挂当前 work、sdk、tasks 和 owner home。禁止整挂 /data、/opt/services 或 docker.sock。容器无法启动就报错，没有本机执行降级。
-管理员宿主运维使用单独的临时 SSH 容器，不扩大 worker 挂载。部署用 `CATMAN_OPS_MOUNTS` 指定宿主目录数组（如 `/opt/services`、`/mnt/usb`），`CATMAN_OPS_DOCKER_SOCKET` 单独控制完整 Docker 权限；默认不开启。管理员专用 `catman-ops` skill 的维护入口为 `skills/catman-ops/SKILL.md`，由 `src/core/skills.ts` 从模块所属 release 安装，禁止从 cwd 或可写源码工作区读取，数据目录中的副本会在启动时覆盖。agent 用 `catman-ops request <用途>` 申请，用户硬指令 `/授权 <ID>` 才创建环境；HTTP 没有授权接口。系统回复完整资源清单并续接原会话，agent 用 `catman-ops connect` 查看清单与 SSH 登录方法，以 `catman-ops exec -- <程序> [参数...]` 或 `catman-ops run <本地脚本或-> [参数...]` 操作，避免手写嵌套 SSH；封装每次校验授权、处理转义、传送 stdin、保留退出码和清理临时私钥。无独立运维时限或续期，授权绑定原 worker 实例；回收/重建必须先回收附属运维容器，新实例不能继承。控制服务重启保留原父容器授权。待授权/已授权运维环境阻止空 worker 快速回收，原闲置预告和回收仍有效。实现和镜像构建见 README「临时运维容器」。
+管理员宿主运维使用单独的临时 SSH 容器，不扩大 worker 挂载。部署用 `CATMAN_OPS_MOUNTS` 指定宿主目录数组（如 `/opt/services`、`/mnt/usb`），`CATMAN_OPS_DOCKER_SOCKET` 单独控制完整 Docker 权限；默认不开启。管理员专用 `catman-ops` skill 的维护入口为 `skills/admin/catman-ops/SKILL.md`，worker 启动时直接从当前 release 的 `skills/admin/` 整目录只读挂载（普通用户不挂 `admin` 分组），禁止从 cwd 或可写源码工作区读取。agent 用 `catman-ops request <用途>` 申请，用户硬指令 `/授权 <ID>` 才创建环境；HTTP 没有授权接口。系统回复完整资源清单并续接原会话，agent 用 `catman-ops connect` 查看清单与 SSH 登录方法，以 `catman-ops exec -- <程序> [参数...]` 或 `catman-ops run <本地脚本或-> [参数...]` 操作，避免手写嵌套 SSH；封装每次校验授权、处理转义、传送 stdin、保留退出码和清理临时私钥。无独立运维时限或续期，授权绑定原 worker 实例；回收/重建必须先回收附属运维容器，新实例不能继承。控制服务重启保留原父容器授权。待授权/已授权运维环境阻止空 worker 快速回收，原闲置预告和回收仍有效。实现和镜像构建见 README「临时运维容器」。
 宿主存储统一位于 `<数据根>/tenants/<tenantId>/`：
 
 ```text
@@ -309,9 +309,11 @@ Agent 按指定事件 ID 注入结果，未放入输入的事件不得确认消�
 管理员源码在 /catman-src，通过固定制备 API 触发自进化；worker 不能直接运行宿主 Docker 或读部署凭据。
 本次允许不兼容升级，旧布局必须人工迁移并写 schema=2 标记，不能静默降级。原 session-container、user-private、cron-data 和 notify 独立容器实现已删除。
 
-`skills/webgrab/` 保存公共网页抓取 skill 的版本与回归用例；安装和更新由管理员显式复制到
-控制数据的 `claude/skills/webgrab/`，不加入 `writeSkills` 的启动覆盖名单。worker 只读快照
-在创建时生成，已有容器要在释放后重建才会读取新 skill。
+公共与内置 skill 按来源和权限分层管理，整目录只读挂载到 `/runtime/skills/<group>` 并在投影目录以软链暴露，零文件拷贝：
+- 代码生成的接口说明位于 `<数据根>/execution/generated-skills/{user,admin}/`；
+- 仓库内置工具位于 `<release>/skills/user/webgrab/` 与 `<release>/skills/admin/catman-ops/`，随 release 切换原子生效；
+- 全站共享自定义 skill 位于 `<数据根>/shared/skills/{user,admin}/`（启动时自动将历史 `claude/skills/` 中的自定义 skill 迁入 `shared/skills/`，`claude/` 仅保留 Claude OAuth 凭据）。
+已有容器保持创建时的挂载视图，释放后重建即读取最新 skill。
 
 ## 多 Harness 抽象与 ACP 接入纪律
 

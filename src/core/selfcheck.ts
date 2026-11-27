@@ -9,7 +9,7 @@ import { SessionManager } from "./session.js";
 import { FileStore } from "./file-store.js";
 import { UserRegistry } from "./users.js";
 import { TurnTokens } from "./turn-tokens.js";
-import { writeSkills } from "./skills.js";
+import { generatedSkillsDir, writeSkills } from "./skills.js";
 import { readVersion, type VersionInfo } from "./version.js";
 import { checkInstructions } from "./execution/instruction-check.js";
 import { resolveHarness } from "./execution/harness.js";
@@ -136,7 +136,7 @@ export async function runSelfCheck(opts: SelfCheckOptions = {}): Promise<SelfChe
     const turns = new TurnTokens();
     turns.counts();
     writeSkills(
-      configDir,
+      generatedSkillsDir(config.dataDir),
       { modelAllowlist: settings.effective().modelAllowlist },
       {
         srcDir: config.srcDir,

@@ -20,7 +20,7 @@ import { allowAll, type AdmissionPolicy } from "./core/admission.js";
 import { GlobalSettings } from "./core/settings.js";
 import { PrefsStore } from "./core/prefs.js";
 import { TurnTokens } from "./core/turn-tokens.js";
-import { writeSkills } from "./core/skills.js";
+import { generatedSkillsDir, migrateLegacySkills, writeSkills } from "./core/skills.js";
 import { NotifyTokens } from "./core/notify-tokens.js";
 import { writeNotifyBin } from "./core/notify-bin.js";
 import { NotifyRateLimiter } from "./dashboard/api-notify.js";
@@ -34,7 +34,7 @@ import type { Channel } from "./channels/types.js";
 import type { AttachmentLimits } from "./core/attachments.js";
 import { Dashboard } from "./dashboard/server.js";
 import { installLogStamps, redirectConsoleToStderr } from "./core/log-stamp.js";
-import { readVersion, versionLine, type VersionInfo } from "./core/version.js";
+import { findAppRoot, readVersion, versionLine, type VersionInfo } from "./core/version.js";
 import { syncSrcRepoToRelease } from "./core/src-repo-sync.js";
 import { runSelfCheck } from "./core/selfcheck.js";
 import { ScriptDeployControl } from "./core/deploy.js";
@@ -125,6 +125,7 @@ async function main(): Promise<void> {
   const runtimes = new RuntimeManager(config, contexts, {
     isAdmin: userKey => settings.isAdmin(userKey),
     harnessFor: userKey => prefs.effective(userKey).harness,
+    disabledSkills: () => settings.effective().disabledSkills,
     notify: async (userKey, text) => {
       if (!gatewayRef) throw new Error("渠道尚未启动");
       await gatewayRef.push(userKey, text, "announce");
@@ -159,11 +160,16 @@ async function main(): Promise<void> {
     };
   };
 
-  // 接口说明做成 skill(按需加载,常态不占 token)。每次启动覆盖写,保证跟代码同步。
-  // 按人格生成不同的一套 —— 守护人格拿 catman-rescue 而不是 catman-evolve。
+  // 接口说明做成 skill(按需加载,常态不占 token)。每次启动按权限分层写入 generated-skills,保证跟代码同步。
+  // 主人格同时平滑迁移存量 claude/skills 中的自定义共享 skill 到 shared/skills/{user,admin}。
+  const releaseRoot = findAppRoot();
+  if (config.persona === "primary") {
+    migrateLegacySkills(config.dataDir, releaseRoot);
+  }
+  const skillSources = { dataDir: config.dataDir, ...(releaseRoot ? { releaseDir: releaseRoot } : {}) };
   const refreshSkills = () =>
     writeSkills(
-      configDir,
+      generatedSkillsDir(config.dataDir),
       { modelAllowlist: settings.effective().modelAllowlist },
       {
         srcDir: config.srcDir,
@@ -256,7 +262,7 @@ async function main(): Promise<void> {
     admission,
     version,
     persona: config.persona,
-    skillsDir: configDir,
+    skillSources,
     // token 到期告警的微信出口。仅当前 Harness 支持本地 OAuth 过期时间戳时才启用告警,
     // API Key 模式或 env 长效 token 没有这份信息,安静跳过 —— 绝不编。
     tokenAlert: new TokenAlerter({
@@ -292,7 +298,7 @@ async function main(): Promise<void> {
           prefs,
           notifyTokens,
           binDir,
-          skillsDir: configDir,
+          skillSources,
           contexts, runtimes, modelCatalog,
         })
       : undefined;
@@ -425,7 +431,7 @@ function createCron(
     prefs: PrefsStore;
     notifyTokens: NotifyTokens;
     binDir: string;
-    skillsDir: string;
+    skillSources: { dataDir: string; releaseDir?: string };
     contexts: ContextStore;
     runtimes: RuntimeManager;
     modelCatalog: ModelCatalog;
@@ -467,7 +473,7 @@ function createCron(
       turns,
       apiBase: config.apiBase,
       persona: config.persona,
-      skillsDir: deps.skillsDir,
+      skillSources: deps.skillSources,
       // 定时 agent 任务里的助手同样会起长任务,`catman-notify` 对它一样有用。
       notifyTokens: deps.notifyTokens,
       binDir: deps.binDir,

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
-const script = fileURLToPath(new URL("../skills/webgrab/webgrab.mjs", import.meta.url));
+const script = fileURLToPath(new URL("../skills/user/webgrab/webgrab.mjs", import.meta.url));
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
 // 临时目录必须能执行放进去的假 curl：/tmp 常被挂成 noexec，那时 execvp 遇到 EACCES 会

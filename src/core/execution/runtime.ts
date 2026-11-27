@@ -1,13 +1,12 @@
 import { spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import type { Config } from "../../config.js";
 import { writeJsonFileAtomic } from "../file-store.js";
-import { skillsFor, skillsOnDisk } from "../skills.js";
+import { BUILTIN_SKILLS, resolveSkillGroups, scanSkillEntries, type SkillMountGroup } from "../skills.js";
 import { ContextStore, hostPath, readTenantFile, readExecutionState, type ExecutionContext } from "./contexts.js";
 import { MAX_TASK_MS, type TaskRecord, type TaskRequest } from "./task-supervisor.js";
-import { readScopedFile } from "../scoped-files.js";
 import { ExecutionArtifacts } from "./artifacts.js";
 import { resolveHarness, type AgentHarness } from "./harness.js";
 import { codeBlock, inlineCode } from "../markdown.js";
@@ -73,6 +72,7 @@ export class RuntimeManager {
     isAdmin: (userKey: string) => boolean;
     notify: (userKey: string, text: string) => Promise<void>;
     harnessFor?: (userKey: string) => Config["harness"];
+    disabledSkills?: () => readonly string[];
     docker?: DockerCommand; now?: () => number;
   }) {
     this.path = join(config.dataDir, "execution", "runtimes.json");
@@ -153,7 +153,7 @@ export class RuntimeManager {
       createdAt: this.now(), lastInteractionAt: this.now(), extensionUntil: 0, tasks: [], sdkTasks: [], inheritedTaskIds };
     let launchAttempted = false;
     try {
-      const projection = this.project(context, generation, harness);
+      const { projection, skillGroups } = this.project(context, generation, harness, release, r.admin);
       const uid = process.getuid?.() ?? 10001, gid = process.getgid?.() ?? 10001;
       const args = ["run", "-d", "--name", r.container, "--init", "--label", "catman.context=1", "--label", `catman.context.id=${context.id}`,
         "--user", `${uid}:${gid}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only", "--network", "mynet", "--add-host", "host.docker.internal:host-gateway",
@@ -164,10 +164,15 @@ export class RuntimeManager {
       mount(join(release, "dist"), "/runtime/release/dist", true);
       mount(join(release, "package.json"), "/runtime/release/package.json", true);
       mount(projection, "/runtime/bin", true);
-      const sharedSkillNames = readdirSync(join(projection, "skills"));
-      for (const spec of harness.containerMounts({ config: this.config, paths: p, projectionDir: projection, releaseDir: release, sharedSkillNames })) {
-        // 先以控制面 uid 建好 HOME 下的子挂载父目录，避免 Docker daemon 以 root 创建只读父目录导致容器内 CLI 写状态报 EACCES。
-        if (spec.target.startsWith(`${p.sdk}/`)) mkdirSync(dirname(spec.target), { recursive: true, mode: 0o700 });
+      for (const group of skillGroups) {
+        mount(group.sourceDir, group.containerDir, true);
+      }
+      for (const spec of harness.containerMounts({ config: this.config, paths: p, projectionDir: projection, releaseDir: release })) {
+        // 先以控制面 uid 建好 HOME 下的子挂载父目录（目录挂载点连自身一并建好），避免 Docker daemon 以 root 创建只读目录导致容器内报 EACCES 或残留 root 空桩。
+        if (spec.target.startsWith(`${p.sdk}/`)) {
+          const targetDir = existsSync(spec.source) && lstatSync(spec.source).isDirectory() ? spec.target : dirname(spec.target);
+          mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+        }
         mount(spec.source, spec.target, Boolean(spec.readonly));
       }
       if (r.admin && this.config.persona === "primary") {
@@ -202,30 +207,76 @@ export class RuntimeManager {
       await this.forget(r, "执行环境启动失败", true); throw error;
     }
   }
-  private project(context: ExecutionContext, generation: string, harness: AgentHarness): string {
+  private project(
+    context: ExecutionContext,
+    generation: string,
+    harness: AgentHarness,
+    releaseDir: string,
+    isAdmin: boolean,
+  ): { projection: string; skillGroups: SkillMountGroup[] } {
     const p = this.contexts.ensure(context);
     const target = this.artifacts.projection(context.id, generation);
-    mkdirSync(join(target, "skills"), { recursive: true, mode: 0o700 });
-    const globalDir = process.env.CLAUDE_CONFIG_DIR || join(this.config.dataDir, "claude");
-    const names = skillsFor(this.config.persona, this.opts.isAdmin(context.userKey), { onDisk: skillsOnDisk(globalDir) });
-    const skillRoot = join(globalDir, "skills");
-    for (const entry of existsSync(skillRoot) ? readdirSync(skillRoot, { withFileTypes: true }) : []) {
-      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
-      const source = join(skillRoot, entry.name);
-      let body: string; try { body = readScopedFile(skillRoot, join(source, "SKILL.md")); } catch { continue; }
-      const canonical = /^---\r?\n[\s\S]*?^name:[ \t]*(\S+)/m.exec(body)?.[1] ?? entry.name;
-      if (names.includes(canonical)) cpSync(source, join(target, "skills", entry.name), { recursive: true, dereference: false });
+    const binSkillsDir = join(target, "skills");
+    const cliSkillsDir = join(target, "cli-skills");
+    mkdirSync(binSkillsDir, { recursive: true, mode: 0o700 });
+    mkdirSync(cliSkillsDir, { recursive: true, mode: 0o700 });
+
+    const skillGroups = resolveSkillGroups({
+      dataDir: this.config.dataDir,
+      releaseDir,
+      persona: this.config.persona,
+      isAdmin,
+    });
+    const disabledList = this.config.persona === "rescue" ? [] : [...(this.opts.disabledSkills?.() ?? [])];
+    const disabled = new Set(disabledList);
+
+    // 1. /runtime/bin/skills/<dirName> 软链指向整目录只读挂载的 /runtime/skills/<group>/<dirName>，零文件拷贝。
+    const seenBinDirs = new Set<string>();
+    for (const group of skillGroups) {
+      for (const entry of group.entries) {
+        if (disabled.has(entry.canonicalName) || seenBinDirs.has(entry.dirName)) continue;
+        seenBinDirs.add(entry.dirName);
+        symlinkSync(`${group.containerDir}/${entry.dirName}`, join(binSkillsDir, entry.dirName));
+      }
     }
+
+    // 2. CLI skills 单层目录软链视图：系统内置(gen + release) > 个人(/user/skills) > 全局共享(shared)，不污染 /user/skills。
+    const claimedDirs = new Set<string>();
+    const claimedNames = new Set<string>();
+    const linkCliSkill = (dirName: string, canonicalName: string, containerTarget: string) => {
+      if (disabled.has(canonicalName) || claimedDirs.has(dirName) || claimedNames.has(canonicalName)) return;
+      claimedDirs.add(dirName);
+      claimedNames.add(canonicalName);
+      symlinkSync(containerTarget, join(cliSkillsDir, dirName));
+    };
+    for (const group of skillGroups.filter(g => g.kind === "builtin")) {
+      for (const entry of group.entries) {
+        linkCliSkill(entry.dirName, entry.canonicalName, `${group.containerDir}/${entry.dirName}`);
+      }
+    }
+    if (this.config.persona === "primary") {
+      for (const entry of scanSkillEntries(join(p.home, "skills"))) {
+        if ((BUILTIN_SKILLS as readonly string[]).includes(entry.canonicalName)) continue;
+        linkCliSkill(entry.dirName, entry.canonicalName, `/user/skills/${entry.dirName}`);
+      }
+      for (const group of skillGroups.filter(g => g.kind === "shared")) {
+        for (const entry of group.entries) {
+          linkCliSkill(entry.dirName, entry.canonicalName, `${group.containerDir}/${entry.dirName}`);
+        }
+      }
+    }
+
     harness.writeProjectionFiles({
       config: { ...this.config, harness: harness.id },
       home: p.home,
       projectionDir: target,
-      isAdmin: this.opts.isAdmin(context.userKey),
+      isAdmin,
+      disabledSkills: disabledList,
     });
     const launcher = '#!/bin/sh\nexec node /runtime/release/dist/src/core/execution/task-cli.js "$@"\n';
     for (const name of ["catman-task", "catman-notify"]) writeFileSync(join(target, name), launcher, { mode: 0o755 });
     writeFileSync(join(target, "catman-ops"), '#!/bin/sh\nexec node /runtime/release/dist/src/core/execution/ops-cli.js "$@"\n', { mode: 0o755 });
-    return target;
+    return { projection: target, skillGroups };
   }
   private async adopt(r: RuntimeRecord): Promise<void> {
     if (this.owned.has(r.container)) return;

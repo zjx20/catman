@@ -416,10 +416,11 @@ deploy key** —— 而后者更强:属主挡不住一个挂了 docker.sock 的�
 
 ### 日常升级
 
-公共网页抓取 skill 的维护版本在 `skills/webgrab/`。管理员更新前备份数据目录中的
-`claude/skills/webgrab/`，再复制这些非凭据文件；启动过程不会覆盖管理员安装的 skill。
-凭据只保存在 owner 的 `/user`，不要随 skill 分发。新建 worker 会装配最新副本；
-运行中的 worker 保持创建时的只读快照。
+公共网页抓取 skill 的维护版本在 `skills/user/webgrab/`，宿主运维 skill 在 `skills/admin/catman-ops/`。
+仓库内置 skill 直接从当前 release 按权限分层整目录只读挂载，随制备与部署原子切换，不再手工复制到数据目录。
+管理员安装的全站共享自定义 skill 放在数据目录的 `shared/skills/user/`（或仅管理员可见的 `shared/skills/admin/`）；
+启动时会自动将历史遗留 `claude/skills/` 中的自定义 skill 平滑迁入 `shared/skills/`。凭据只保存在 owner 的 `/user`，
+不要随 skill 分发。新建 worker 会装配最新挂载；运行中的 worker 保持创建时的只读视图。
 
 ```bash
 git -C data/src/catman pull            # 或让 agent 自己在 evolve/* 分支上改
@@ -752,7 +753,7 @@ CATMAN_OPS_MAX_ACTIVE=1
 
 默认关闭，Docker socket 默认不挂载。`CATMAN_OPS_MOUNTS` 是 JSON 数组；字符串按宿主原路径可写挂载，也支持 `{"source":"/host/config","target":"/config","readOnly":true}`。源路径属于 Docker daemon 宿主，不要求控制服务能访问；不存在则授权启动失败，不自动创建空目录。目标不能覆盖系统目录、与其他目标嵌套或覆盖当前 workspace。软链接目标只有在额外挂载覆盖它时才可访问；`/opt/services` 与 `/mnt/usb` 同时挂载可覆盖常见的外置存储链接。
 
-内置 [`catman-ops` skill](skills/catman-ops/SKILL.md) 的正文在仓库中维护，SSH 封装实现在 [`ops-cli.ts`](src/core/execution/ops-cli.ts)。它们随 Git 版本和 release 一起发布；启动时从当前 release 安装手册到运行时 skill 目录，不要直接维护数据目录中的副本。Skill 只提供给主人格管理员，说明申请时机、等待用户硬指令、资源使用、连接方式与回收。授权成功后，系统直接回复容器镜像、实际目录映射及读写模式、Docker socket、共享 workspace、SSH 使用方式与回收规则，并把同一份清单送入原 agent 会话继续任务。运行 `catman-ops connect` 会将本次授权专属的 SSH 私钥、固定主机公钥与配置写入该 worker 的 `/tmp`，输出清单、封装工具用法、`ssh -F ... catman-ops` 登录命令和 `scp` 示例。私钥不进入工具输出、共享 credential、skill 或 workspace。
+内置 [`catman-ops` skill](skills/admin/catman-ops/SKILL.md) 的正文在仓库中维护，SSH 封装实现在 [`ops-cli.ts`](src/core/execution/ops-cli.ts)。它们随 Git 版本和 release 一起发布；worker 启动时直接从当前 release 的 `skills/admin/` 整目录只读挂载（仅提供给主人格管理员），不再复制到持久化数据目录。Skill 说明申请时机、等待用户硬指令、资源使用、连接方式与回收。授权成功后，系统直接回复容器镜像、实际目录映射及读写模式、Docker socket、共享 workspace、SSH 使用方式与回收规则，并把同一份清单送入原 agent 会话继续任务。运行 `catman-ops connect` 会将本次授权专属的 SSH 私钥、固定主机公钥与配置写入该 worker 的 `/tmp`，输出清单、封装工具用法、`ssh -F ... catman-ops` 登录命令和 `scp` 示例。私钥不进入工具输出、共享 credential、skill 或 workspace。
 
 自动操作用封装工具，不需要手写嵌套 SSH 命令：
 

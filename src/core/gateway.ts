@@ -44,7 +44,7 @@ import {
   type ParsedCommand,
 } from "./commands.js";
 import { SETTING_SCHEMA, USER_SETTING_KEYS } from "./settings.js";
-import { skillsFor, skillsOnDisk } from "./skills.js";
+import { discoverAvailableSkills, skillsFor, skillsOnDisk } from "./skills.js";
 import { readVersion, releaseNote, shortSha, versionLine, type VersionInfo } from "./version.js";
 import type { DeployControl } from "./deploy.js";
 import {
@@ -195,9 +195,10 @@ export interface GatewayOptions {
    */
   persona?: Persona;
   /**
-   * CLAUDE_CONFIG_DIR。主人格靠扫它下面的 `skills/` 决定这一回合给哪些 skill ——
-   * 装进去就生效,不用改代码发版。不传则退回 skills.ts 里的硬编码兜底名单。
+   * 分层 skill 数据源（控制面数据目录 + 当前 release 目录）。
+   * 主人格按身份汇总 `generated-skills`、`release/skills` 与 `shared/skills`；不传则退回 `skillsDir` 或硬编码兜底名单。
    */
+  skillSources?: { dataDir: string; releaseDir?: string };
   skillsDir?: string;
   /**
    * OAuth token 到期告警(core/token-alert.ts)。只发给管理员 —— 换发要人在宿主
@@ -687,6 +688,7 @@ export class Gateway {
    */
   private readonly version: VersionInfo | undefined;
   private readonly persona: Persona;
+  private readonly skillSources: { dataDir: string; releaseDir?: string } | undefined;
   private readonly skillsDir: string | undefined;
   private readonly tokenAlert: GatewayOptions["tokenAlert"];
   /**
@@ -732,6 +734,7 @@ export class Gateway {
     this.deployNewsIntervalMs = opts.deployNewsIntervalMs ?? DEPLOY_NEWS_INTERVAL_MS;
     this.version = opts.version ?? readVersion();
     this.persona = opts.persona ?? "primary";
+    this.skillSources = opts.skillSources;
     this.skillsDir = opts.skillsDir;
     this.tokenAlert = opts.tokenAlert;
     this.deploy = opts.deploy;
@@ -2303,8 +2306,13 @@ export class Gateway {
   /** 子进程环境。实现在 core/turn-env.ts —— 定时 agent 任务用的是同一份。 */
   /** 这一回合给哪些 skill。磁盘现状 + 管理员禁用清单,规则在 skills.ts。 */
   private skillsFor(isAdmin: boolean): string[] {
+    const onDisk = this.skillSources
+      ? discoverAvailableSkills({ ...this.skillSources, isAdmin })
+      : this.skillsDir
+        ? skillsOnDisk(this.skillsDir)
+        : undefined;
     return skillsFor(this.persona, isAdmin, {
-      ...(this.skillsDir ? { onDisk: skillsOnDisk(this.skillsDir) } : {}),
+      ...(onDisk ? { onDisk } : {}),
       disabled: this.settings.effective().disabledSkills,
     });
   }

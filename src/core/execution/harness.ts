@@ -19,6 +19,7 @@ import {
 import { SdkSession } from "./sdk-session.js";
 import { AcpSession, spawnAcpSubprocess, type AcpMcpServerSpec } from "./acp-session.js";
 import { TranscriptRecorder } from "./transcript-recorder.js";
+import { BUILTIN_SKILLS } from "../skills.js";
 
 /**
  * Agent Harness 统一契约与内置实现（Claude SDK / Antigravity `agy acp` / 通用 ACP）。
@@ -101,6 +102,7 @@ export interface AgentHarness {
     home: string;
     projectionDir: string;
     isAdmin: boolean;
+    disabledSkills?: readonly string[];
   }): void;
 
   /** 返回除基础 work/sdk/tasks/home 之外，容器需要追加的引擎专属挂载。 */
@@ -109,7 +111,6 @@ export interface AgentHarness {
     paths: ContextPaths;
     projectionDir: string;
     releaseDir: string;
-    sharedSkillNames: readonly string[];
   }): BindMountSpec[];
 
   /** 容器启动时的引擎专属环境变量（不含真实密钥）。 */
@@ -341,9 +342,9 @@ export const claudeHarness: AgentHarness = {
     projectInstructions(config.dataDir, home, join(projectionDir, "AGENTS.md"), Boolean(config.ops) && isAdmin);
   },
 
-  containerMounts({ paths, projectionDir, releaseDir, sharedSkillNames }) {
+  containerMounts({ paths, projectionDir, releaseDir }) {
     const binary = join(releaseDir, "node_modules/@anthropic-ai", sdkNativePackage, "claude");
-    const mounts: BindMountSpec[] = [
+    return [
       {
         source: dirname(binary),
         target: `/runtime/release/node_modules/@anthropic-ai/${sdkNativePackage}`,
@@ -354,16 +355,8 @@ export const claudeHarness: AgentHarness = {
       // 挂进 SDK 目录时同时挂到 AGENTS.md 与 user 级入口 CLAUDE.md。
       { source: join(projectionDir, "AGENTS.md"), target: join(paths.sdk, "AGENTS.md"), readonly: true },
       { source: join(projectionDir, "AGENTS.md"), target: join(paths.sdk, "CLAUDE.md"), readonly: true },
-      { source: join(paths.home, "skills"), target: join(paths.sdk, "skills") },
+      { source: join(projectionDir, "cli-skills"), target: join(paths.sdk, "skills"), readonly: true },
     ];
-    for (const name of sharedSkillNames) {
-      mounts.push({
-        source: join(projectionDir, "skills", name),
-        target: join(paths.sdk, "skills", name),
-        readonly: true,
-      });
-    }
-    return mounts;
   },
 
   containerEnv(paths) {
@@ -426,6 +419,7 @@ export function writeAgyProjection(input: {
   home: string;
   projectionDir: string;
   ops: boolean;
+  disabledSkills?: readonly string[];
 }): void {
   // 不可变装配事实（人格身份、内存上限、回复格式、执行纪律）单独放进 ~/.gemini/GEMINI.md；
   // 共享与个人偏好放进 ~/.gemini/AGENTS.md。即使个人文件超长触发单文件 24KB 截断，
@@ -451,6 +445,14 @@ export function writeAgyProjection(input: {
     ),
     { mode: 0o600 },
   );
+  const skillsManifest =
+    input.persona === "rescue"
+      ? { entries: [] }
+      : {
+          entries: [{ path: "/user/skills" }],
+          exclude: [...new Set([...BUILTIN_SKILLS, ...(input.disabledSkills ?? [])])],
+        };
+  writeFileSync(join(input.projectionDir, "agy-skills.json"), JSON.stringify(skillsManifest, null, 2), { mode: 0o600 });
 }
 
 export const agyHarness: AgentHarness = {
@@ -466,7 +468,7 @@ export const agyHarness: AgentHarness = {
     }
   },
 
-  writeProjectionFiles({ config, home, projectionDir, isAdmin }) {
+  writeProjectionFiles({ config, home, projectionDir, isAdmin, disabledSkills }) {
     writeAgyProjection({
       dataDir: config.dataDir,
       persona: config.persona,
@@ -474,10 +476,11 @@ export const agyHarness: AgentHarness = {
       home,
       projectionDir,
       ops: Boolean(config.ops) && isAdmin,
+      disabledSkills,
     });
   },
 
-  containerMounts({ config, paths, projectionDir, releaseDir, sharedSkillNames }) {
+  containerMounts({ config, paths, projectionDir, releaseDir }) {
     const mounts: BindMountSpec[] = [
       { source: join(projectionDir, "GEMINI.md"), target: join(paths.sdk, ".gemini", "GEMINI.md"), readonly: true },
       { source: join(projectionDir, "AGENTS.md"), target: join(paths.sdk, ".gemini", "AGENTS.md"), readonly: true },
@@ -486,15 +489,9 @@ export const agyHarness: AgentHarness = {
         target: join(paths.sdk, ".gemini", "antigravity-cli", "settings.json"),
         readonly: true,
       },
-      { source: join(paths.home, "skills"), target: join(paths.sdk, ".gemini", "config", "skills") },
+      { source: join(projectionDir, "cli-skills"), target: join(paths.sdk, ".gemini", "config", "skills"), readonly: true },
+      { source: join(projectionDir, "agy-skills.json"), target: join(paths.sdk, ".gemini", "config", "skills.json"), readonly: true },
     ];
-    for (const name of sharedSkillNames) {
-      mounts.push({
-        source: join(projectionDir, "skills", name),
-        target: join(paths.sdk, ".gemini", "config", "skills", name),
-        readonly: true,
-      });
-    }
     const localBin = mountableAgyBinary(config, releaseDir);
     if (localBin) {
       mounts.push({ source: localBin, target: "/runtime/harness/agy", readonly: true });
@@ -631,21 +628,13 @@ export const genericAcpHarness: AgentHarness = {
     writeFileSync(join(projectionDir, "AGENTS.md"), body, { mode: 0o600 });
   },
 
-  containerMounts({ paths, projectionDir, sharedSkillNames }) {
-    const mounts: BindMountSpec[] = [
+  containerMounts({ paths, projectionDir }) {
+    return [
       { source: join(projectionDir, "AGENTS.md"), target: join(paths.sdk, "AGENTS.md"), readonly: true },
       { source: join(projectionDir, "AGENTS.md"), target: join(paths.sdk, ".agents", "AGENTS.md"), readonly: true },
       { source: join(projectionDir, "AGENTS.md"), target: join(paths.sdk, ".gemini", "AGENTS.md"), readonly: true },
-      { source: join(paths.home, "skills"), target: join(paths.sdk, ".agents", "skills") },
+      { source: join(projectionDir, "cli-skills"), target: join(paths.sdk, ".agents", "skills"), readonly: true },
     ];
-    for (const name of sharedSkillNames) {
-      mounts.push({
-        source: join(projectionDir, "skills", name),
-        target: join(paths.sdk, ".agents", "skills", name),
-        readonly: true,
-      });
-    }
-    return mounts;
   },
 
   containerEnv() {

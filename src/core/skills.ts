@@ -1,13 +1,11 @@
-import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
 import type { Dirent } from "node:fs";
 import { join } from "node:path";
 import { canonicalOf } from "./commands.js";
 import { BUILTIN_ADMIN_USER_KEY } from "./identity.js";
-import { MIN_SHA_PREFIX } from "./releases.js";
 import type { Persona } from "../config.js";
 import { SETTING_SCHEMA, USER_SETTING_KEYS, type SettingContext, type SettingKey } from "./settings.js";
 import { readScopedFile } from "./scoped-files.js";
-import { findAppRoot } from "./version.js";
 
 /**
  * 把「怎么调自己的配置接口」做成 skill 而不是塞进系统提示词。
@@ -15,17 +13,18 @@ import { findAppRoot } from "./version.js";
  * skill 的 description 常驻上下文、正文按需加载,常态下几乎不占 token ——
  * 而系统提示词是每回合每次都要付钱的。
  *
- * ## 两个刻意的约束
+ * ## 分层与挂载纪律
  *
- * 1. **每次启动幂等覆盖。** 文件落在数据卷里(CLAUDE_CONFIG_DIR/skills/),用户能改能删。
- *    接口说明从 SETTING_SCHEMA 等代码生成；运维手册从当前 release 的
- *    skills/catman-ops/SKILL.md 安装。数据目录中的副本不是维护入口。
+ * 1. **按来源与权限分层存放，整目录只读挂载，不逐个复制文件：**
+ *    - 代码动态生成的接口说明写到 `<dataDir>/execution/generated-skills/{user,admin}/`；
+ *    - 仓库维护的内置工具 skill 直接位于 `<releaseDir>/skills/{user,admin}/`（随 release 原子切换）；
+ *    - 管理员安装的全站共享自定义 skill 位于 `<dataDir>/shared/skills/{user,admin}/`（不再混入 `claude/skills`）。
+ *    worker 创建时按角色身份整目录只读 bind-mount 允许的分组，并在投影目录以软链暴露为一平层 `skills/`。
  *
  * 2. **正文里绝不能出现任何令牌。** Options.skills 是**上下文过滤而不是沙箱**
  *    (SDK 类型注释原文:"files remain on disk and are reachable via Read/Bash.
- *    Do not store secrets in skill files")。普通用户的 agent 看不到 catman-admin
- *    的列表项,但照样能 Read 到这个文件。所以只写 $CATMAN_ADMIN_TOKEN 这样的
- *    环境变量引用 —— 变量本身只注入 admin 回合的子进程。
+ *    Do not store secrets in skill files")。除了在挂载层拒绝把 `admin` 分组挂入普通用户容器外,
+ *    所有 skill 正文也只写 `$CATMAN_*` 环境变量引用。
  */
 
 export const USER_SKILL = "catman-settings";
@@ -34,59 +33,61 @@ export const ADMIN_SKILL = "catman-admin";
 export const EVOLVE_SKILL = "catman-evolve";
 export const OPS_SKILL = "catman-ops";
 export const RESCUE_SKILL = "catman-rescue";
+export const WEBGRAB_SKILL = "webgrab";
+
+export type SkillTier = "user" | "admin";
 
 /**
- * 由 `writeSkills` 生成的那几个。
- *
- * 这份名单划的是**「归 writeSkills 管」的边界**:它按人格生成其中一部分,也只清理
- * 其中一部分 —— 手写丢进 `skills/` 的那些一个都不碰。主人格走黑名单(见 `skillsFor`),
- * 手写 skill 装进去就生效,这条边界是那个模型能成立的前提。
+ * 由 `writeSkills` 动态生成并写入 `<dataDir>/execution/generated-skills/{user,admin}/` 的内置说明。
  */
 export const GENERATED_SKILLS: readonly string[] = [
   USER_SKILL,
   CRON_SKILL,
   ADMIN_SKILL,
   EVOLVE_SKILL,
-  OPS_SKILL,
   RESCUE_SKILL,
 ];
 
 /**
- * 主人格里**只给管理员**的。
+ * 系统内置 skill 全集（代码生成 + 仓库 `skills/{user,admin}/` 随版发布）。
+ * 个人 `/user/skills/` 与全局 `shared/skills/` 均不可遮蔽这些名字。
+ */
+export const BUILTIN_SKILLS: readonly string[] = [
+  ...GENERATED_SKILLS,
+  OPS_SKILL,
+  WEBGRAB_SKILL,
+];
+
+/**
+ * 主人格里**只给管理员**的内置 skill。
  *
- * `catman-evolve`:改自己的代码并推上线是全局影响的事(一次部署把所有用户都换了
- * 版本),与 `/发布` `/回滚` 的 adminOnly 是同一个决定。普通用户的回合里连这份说明
- * 都不该出现 —— description 常驻上下文,列出来等于告诉每个人有这条路。
+ * 除了挂载层物理隔离 `admin/` 分组目录外，保留名单做双重兜底（防止误放入 `user/` 分组）。
  */
 export const ADMIN_ONLY_SKILLS: readonly string[] = [ADMIN_SKILL, EVOLVE_SKILL, OPS_SKILL];
 
 /**
  * 主人格里**谁都不给**的:守护人格那份诊断手册。
- *
- * 它教的是「怎么把版本退回去」,而主人格正是被退的那一方 —— 何况退版本要先停容器,
- * 它就跑在那个容器里。正常情况下这个文件也不在主人格的 `skills/` 下(`writeSkills`
- * 只给守护人格生成它),这里挡的是有人手工拷了一份过来。
  */
 const PRIMARY_EXCLUDED: readonly string[] = [RESCUE_SKILL];
 
-/**
- * 磁盘读不到时,普通回合的兜底名单。
- *
- * `catman-cron` 在这里而不是 admin 那边:定时任务是**每人自己的**,接口按回合
- * 令牌定身份,一个用户既看不见也动不了别人的任务 —— 与改自己的设置同一个模型。
- */
+/** 磁盘读不到时,普通回合的兜底名单。 */
 export const USER_SKILLS: readonly string[] = [USER_SKILL, CRON_SKILL];
 /** 磁盘读不到时,admin 回合的兜底名单。 */
 export const ADMIN_SKILLS: readonly string[] = [USER_SKILL, CRON_SKILL, ADMIN_SKILL, EVOLVE_SKILL, OPS_SKILL];
 /**
  * 守护人格的 admin 回合可见的 skill。**这一支是白名单,不是兜底** —— 见 `skillsFor`。
- *
- * 与主人格的区别有两处:`catman-evolve` 换成 `catman-rescue`(它跑的是钉住的稳定
- * 版本,改了代码也上不了线,而人正在等它诊断);以及**没有 `catman-cron`** ——
- * 调度器只在主人格里跑,守护人格那边连接口都不存在,摆一份说明只会让它去调
- * 一个必然 404 的东西。
  */
 export const RESCUE_SKILLS: readonly string[] = [USER_SKILL, ADMIN_SKILL, RESCUE_SKILL];
+
+const SAFE_SKILL_DIR = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
+
+export function generatedSkillsDir(dataDir: string): string {
+  return join(dataDir, "execution", "generated-skills");
+}
+
+export function sharedSkillsDir(dataDir: string): string {
+  return join(dataDir, "shared", "skills");
+}
 
 function settingRows(keys: readonly SettingKey[], ctx: SettingContext): string {
   const rows = keys.map((key) => {
@@ -245,11 +246,13 @@ scope 为 user 的那几项(见 ${USER_SKILL})在这里设的是**全局默认�
 读取时会自动退到全局默认,再不行退到不指定模型。他的选择留在盘上,
 你把那个模型加回来时会自动恢复。所以不要为了"安全"先去查谁在用什么。
 
-## skill 的启用与禁用
+## skill 的分层安装与禁用
 
-装进 \`$CLAUDE_CONFIG_DIR/skills/<名字>/SKILL.md\` 就生效,**不用改代码、不用发版**,
-下一回合就能用。能往那个目录写文件的只有管理员和 catman 自己 —— 装进去这个动作
-本身就是认可,所以没有第二道登记。
+全站共享自定义 skill 按权限分层装进控制面数据目录的 \`shared/skills/user/<名字>/SKILL.md\`
+（所有用户可见）或 \`shared/skills/admin/<名字>/SKILL.md\`（仅管理员可见），**不用改代码、不用发版**，
+新建或 \`/回收\` 重建后的 worker 即按角色整目录只读挂载生效。仓库维护的内置 skill 位于
+\`skills/user/<名字>/\` 与 \`skills/admin/<名字>/\`，随 release 发布自动切换；单用户自己的私人
+skill 装在 \`/user/skills/<名字>/SKILL.md\`。
 
 要临时关掉一个,用上面的 PATCH 改 \`disabledSkills\`:
 
@@ -264,7 +267,7 @@ curl -s -X PATCH -H "X-Catman-Session: $CATMAN_SESSION_TOKEN" \\
 
 两点它管不着:
 
-- 普通用户的回合本来就看不到 ${ADMIN_ONLY_SKILLS.map(name => `\`${name}\``).join("、")}。那是权限门,
+- 普通用户的回合本来就看不到 ${ADMIN_ONLY_SKILLS.map(name => `\`${name}\``).join("、")} 及 \`shared/skills/admin/\` 下的目录。那是权限门,
   与"这个能力现在开不开"是两回事。
 - **守护人格走固定白名单,\`disabledSkills\` 对它无效。** 一个手滑的禁用不该让救援
   手册在最需要它的时候消失 —— 而解除禁用要走这个接口,那时主人格多半正不好使。
@@ -372,13 +375,6 @@ curl --fail-with-body -s -X POST -H "X-Catman-Session: $CATMAN_SESSION_TOKEN" -H
 `;
 }
 
-export function opsSkillBody(): string {
-  // 从模块所属 release 读取，不能依赖控制服务启动时的 cwd 或可写源码工作区。
-  const root = findAppRoot();
-  if (!root) throw new Error("无法定位内置运维 skill 所属的 release");
-  return readFileSync(join(root, "skills", OPS_SKILL, "SKILL.md"), "utf8");
-}
-
 export function rescueSkillBody(_paths: SkillPaths): string {
   return `${frontmatter(RESCUE_SKILL, "查看主人格与信使诊断，必要时请求固化恢复流程。")}
 # 守护人格诊断
@@ -393,94 +389,257 @@ GET $CATMAN_API_BASE/api/execution/diagnostics，请求头 X-Catman-Session: $CA
 }
 
 /**
- * 把 skill 写到 CLAUDE_CONFIG_DIR/skills/ 下,并清掉这个人格不该有的旧生成物。
- * 启动时调用一次。
- * 内容由 SETTING_SCHEMA、COMMAND_TABLE 与配置里的路径生成,所以那几处一改这里自动跟上。
+ * 把动态生成的接口 skill 按权限分层写到 `<generatedRoot>/{user,admin}/<name>/SKILL.md`，
+ * 并清理当前人格不该保留的旧生成物。
  *
- * **按人格生成不同的一套。** 守护人格拿到的是 `catman-rescue` 而不是 `catman-evolve`:
- * 它跑钉住的稳定版本,改了代码也上不了线;而 skill 的 description 常驻上下文,
- * 摆一份"怎么改自己的代码"在那儿,就是在邀请它去做一件注定白费的事 ——
- * 而人正在等它诊断。
+ * 仓库内置的 `skills/user/webgrab` 与 `skills/admin/catman-ops` 直接从当前 release
+ * 整目录只读挂载，不再复制到持久化数据目录。
  */
 export function writeSkills(
-  configDir: string,
+  generatedRoot: string,
   ctx: SettingContext,
   paths: SkillPaths,
   persona: Persona = "primary",
 ): void {
-  const bodies: Array<[string, string]> =
+  const specs: Array<{ tier: SkillTier; name: string; body: string }> =
     persona === "rescue"
       ? [
-          [USER_SKILL, userSkillBody(ctx)],
-          [ADMIN_SKILL, adminSkillBody(ctx)],
-          [RESCUE_SKILL, rescueSkillBody(paths)],
+          { tier: "user", name: USER_SKILL, body: userSkillBody(ctx) },
+          { tier: "admin", name: ADMIN_SKILL, body: adminSkillBody(ctx) },
+          { tier: "admin", name: RESCUE_SKILL, body: rescueSkillBody(paths) },
         ]
       : [
-          [USER_SKILL, userSkillBody(ctx)],
-          [CRON_SKILL, cronSkillBody()],
-          [ADMIN_SKILL, adminSkillBody(ctx)],
-          [EVOLVE_SKILL, evolveSkillBody(paths)],
-          [OPS_SKILL, opsSkillBody()],
+          { tier: "user", name: USER_SKILL, body: userSkillBody(ctx) },
+          { tier: "user", name: CRON_SKILL, body: cronSkillBody() },
+          { tier: "admin", name: ADMIN_SKILL, body: adminSkillBody(ctx) },
+          { tier: "admin", name: EVOLVE_SKILL, body: evolveSkillBody(paths) },
         ];
-  const wanted = new Set(bodies.map(([name]) => name));
-  for (const [name, body] of bodies) {
-    const dir = join(configDir, "skills", name);
+
+  mkdirSync(join(generatedRoot, "user"), { recursive: true });
+  mkdirSync(join(generatedRoot, "admin"), { recursive: true });
+
+  const wanted = new Map<string, SkillTier>();
+  for (const spec of specs) {
+    wanted.set(spec.name, spec.tier);
+    const dir = join(generatedRoot, spec.tier, spec.name);
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "SKILL.md"), body, "utf8");
+    writeFileSync(join(dir, "SKILL.md"), spec.body, "utf8");
   }
 
-  // 清掉**这个人格不要、而且确实是我自己生成过**的那些目录。
-  //
-  // 以前只写不删,于是换人格分支时旧文件会留在盘上:守护人格那边就躺着一份
-  // Aug 10 的 catman-evolve —— 名单里没有它,所以一直是哑的,但内容早就跟不上了
-  // (连 /发布 要几位 sha 都写错)。主人格改走黑名单之后,这种残留会**自己复活**,
-  // 那时它不只是多占几个 token,而是在主动教错。
-  //
-  // 只认 GENERATED_SKILLS 里的名字:手写丢进来的一个都不碰,那正是黑名单模型的前提。
-  for (const name of GENERATED_SKILLS) {
-    if (wanted.has(name)) continue;
-    rmSync(join(configDir, "skills", name), { recursive: true, force: true });
+  for (const tier of ["user", "admin"] as const) {
+    for (const name of [...GENERATED_SKILLS, OPS_SKILL]) {
+      if (wanted.get(name) === tier) continue;
+      rmSync(join(generatedRoot, tier, name), { recursive: true, force: true });
+    }
   }
 }
 
+export interface SkillDirEntry {
+  readonly dirName: string;
+  readonly canonicalName: string;
+}
+
 /**
- * 扫 `configDir/skills/`,返回每个 skill 的**声明名字**。
- *
- * 名字取 frontmatter 里的 `name:`,取不到才退回目录名 —— SDK 按 canonical name 匹配
- * (类型注释原文:"matching the exact canonical name ... Display names and aliases do
- * not match"),目录名与 `name` 不一致时列目录名等于没列,而且是**安静地**没列。
- *
- * 读不到目录就返回空数组,由 `skillsFor` 退回硬编码名单。
+ * 扫描单层 skill 目录 `<dir>/<entry>/SKILL.md`，返回目录名与声明的 canonical name。
+ * 读不到目录或无合法条目时返回空数组，绝不抛错。
  */
-export function skillsOnDisk(configDir: string): string[] {
-  const root = join(configDir, "skills");
-  const names = new Set<string>();
+export function scanSkillEntries(dir: string): SkillDirEntry[] {
   let entries: Dirent[];
   try {
-    entries = readdirSync(root, { withFileTypes: true });
+    entries = readdirSync(dir, { withFileTypes: true });
   } catch {
     return [];
   }
+  const out: SkillDirEntry[] = [];
   for (const e of entries) {
-    // 点开头的是 `.trash` 这类内部目录,不是 skill。`synced/` 装的是一批 skill
-    // 而不是一个,它没有顶层 SKILL.md,下面那道 try 会把它挡掉。
-    if (!e.isDirectory() || e.name.startsWith(".")) continue;
+    if (!e.isDirectory() || e.name.startsWith(".") || !SAFE_SKILL_DIR.test(e.name)) continue;
     let text: string;
     try {
-      text = readScopedFile(root, join(root, e.name, "SKILL.md"));
+      text = readScopedFile(dir, join(dir, e.name, "SKILL.md"));
     } catch {
       continue;
     }
     const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
     const declared = fm ? /^name:[ \t]*(\S+)/m.exec(fm[1] ?? "")?.[1] : undefined;
-    names.add(declared ?? e.name);
+    out.push({ dirName: e.name, canonicalName: declared ?? e.name });
+  }
+  return out.sort((a, b) => a.dirName.localeCompare(b.dirName));
+}
+
+/**
+ * 扫 `<parentDir>/skills/`（如 owner home `/user/skills/`），返回每个 skill 的声明名字。
+ */
+export function skillsOnDisk(parentDir: string): string[] {
+  const names = new Set(scanSkillEntries(join(parentDir, "skills")).map((e) => e.canonicalName));
+  return [...names].sort();
+}
+
+export interface SkillMountGroup {
+  readonly id: string;
+  readonly kind: "builtin" | "shared";
+  readonly tier: SkillTier;
+  readonly sourceDir: string;
+  readonly containerDir: string;
+  readonly entries: readonly SkillDirEntry[];
+}
+
+/**
+ * 按当前人格与管理员身份解析需要整目录只读挂载的 skill 分组。
+ *
+ * - 非管理员绝不挂载任何 `admin` 分组目录（物理级隔离）；
+ * - 守护人格只挂载固定白名单所在的 `gen-*` 分组，不继承 `release` 或 `shared` 磁盘现状；
+ * - 顺序即同名优先级：`gen-*` > `release-*` > `shared-*`。
+ */
+export function resolveSkillGroups(input: {
+  dataDir: string;
+  releaseDir?: string;
+  persona: Persona;
+  isAdmin: boolean;
+}): SkillMountGroup[] {
+  const { dataDir, releaseDir, persona, isAdmin } = input;
+  const genRoot = generatedSkillsDir(dataDir);
+  if (persona === "rescue") {
+    const allowed = new Set<string>(isAdmin ? RESCUE_SKILLS : [USER_SKILL]);
+    const candidates: Array<Omit<SkillMountGroup, "entries">> = [
+      { id: "gen-user", kind: "builtin", tier: "user", sourceDir: join(genRoot, "user"), containerDir: "/runtime/skills/gen-user" },
+      ...(isAdmin
+        ? [{ id: "gen-admin", kind: "builtin" as const, tier: "admin" as const, sourceDir: join(genRoot, "admin"), containerDir: "/runtime/skills/gen-admin" }]
+        : []),
+    ];
+    return candidates
+      .filter((c) => existsSync(c.sourceDir))
+      .map((c) => ({ ...c, entries: scanSkillEntries(c.sourceDir).filter((e) => allowed.has(e.canonicalName)) }));
+  }
+
+  const sharedRoot = sharedSkillsDir(dataDir);
+  const excluded = new Set<string>([
+    ...PRIMARY_EXCLUDED,
+    ...(isAdmin ? [] : ADMIN_ONLY_SKILLS),
+  ]);
+  const candidates: Array<Omit<SkillMountGroup, "entries">> = [
+    { id: "gen-user", kind: "builtin", tier: "user", sourceDir: join(genRoot, "user"), containerDir: "/runtime/skills/gen-user" },
+    ...(isAdmin
+      ? [{ id: "gen-admin", kind: "builtin" as const, tier: "admin" as const, sourceDir: join(genRoot, "admin"), containerDir: "/runtime/skills/gen-admin" }]
+      : []),
+    ...(releaseDir
+      ? [{ id: "release-user", kind: "builtin" as const, tier: "user" as const, sourceDir: join(releaseDir, "skills", "user"), containerDir: "/runtime/skills/release-user" }]
+      : []),
+    ...(isAdmin && releaseDir
+      ? [{ id: "release-admin", kind: "builtin" as const, tier: "admin" as const, sourceDir: join(releaseDir, "skills", "admin"), containerDir: "/runtime/skills/release-admin" }]
+      : []),
+    { id: "shared-user", kind: "shared", tier: "user", sourceDir: join(sharedRoot, "user"), containerDir: "/runtime/skills/shared-user" },
+    ...(isAdmin
+      ? [{ id: "shared-admin", kind: "shared" as const, tier: "admin" as const, sourceDir: join(sharedRoot, "admin"), containerDir: "/runtime/skills/shared-admin" }]
+      : []),
+  ];
+
+  return candidates
+    .filter((c) => existsSync(c.sourceDir))
+    .map((c) => ({
+      ...c,
+      entries: scanSkillEntries(c.sourceDir).filter((e) => !excluded.has(e.canonicalName)),
+    }));
+}
+
+/**
+ * 汇总当前数据目录与 release 下对该身份可见的全部公共/内置 skill 名单（供 `skillsFor` 过滤 `disabled`）。
+ */
+export function discoverAvailableSkills(input: {
+  dataDir: string;
+  releaseDir?: string;
+  isAdmin: boolean;
+}): string[] {
+  const names = new Set<string>();
+  for (const group of resolveSkillGroups({ ...input, persona: "primary" })) {
+    for (const entry of group.entries) names.add(entry.canonicalName);
   }
   return [...names].sort();
 }
 
-/** `skillsFor` 的两个可选输入。都不给就退回硬编码名单(即改这版之前的行为)。 */
+function moveDirSync(source: string, target: string): void {
+  mkdirSync(join(target, ".."), { recursive: true });
+  try {
+    renameSync(source, target);
+  } catch {
+    cpSync(source, target, { recursive: true, dereference: false });
+    rmSync(source, { recursive: true, force: true });
+  }
+}
+
+/**
+ * 启动期一次性平滑整理历史 skill 目录：
+ * 1. 确保 `<dataDir>/shared/skills/{user,admin}` 存在；
+ * 2. 若有人按旧习惯直接放在 `shared/skills/<name>/SKILL.md`，自动归入 `user/`（或 `admin/`）；
+ * 3. 若存量 `<dataDir>/claude/skills/` 仍在：
+ *    - 清掉旧 `writeSkills` 生成的内置项；
+ *    - 将仓库已自带的同名旧副本（如 `webgrab`）移入 `claude/.migrated-repo-skills/` 归档备查，避免遮蔽 release；
+ *    - 将管理员安装的自定义公共 skill 迁入 `shared/skills/{user,admin}/`；
+ *    - 迁空后移除空的 `claude/skills` 目录，让 `claude/` 仅服务于 Claude OAuth 凭据。
+ */
+export function migrateLegacySkills(dataDir: string, releaseDir?: string): void {
+  const sharedRoot = sharedSkillsDir(dataDir);
+  mkdirSync(join(sharedRoot, "user"), { recursive: true });
+  mkdirSync(join(sharedRoot, "admin"), { recursive: true });
+
+  // 归一顶层直接放置的 shared/skills/<name>
+  for (const entry of readdirSync(sharedRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith(".") || entry.name === "user" || entry.name === "admin") continue;
+    const src = join(sharedRoot, entry.name);
+    if (!existsSync(join(src, "SKILL.md"))) continue;
+    const tier: SkillTier = (ADMIN_ONLY_SKILLS as readonly string[]).includes(entry.name) ? "admin" : "user";
+    const dst = join(sharedRoot, tier, entry.name);
+    if (!existsSync(dst)) moveDirSync(src, dst);
+  }
+
+  const legacyRoot = join(dataDir, "claude", "skills");
+  if (!existsSync(legacyRoot)) return;
+
+  const repoNames = new Set<string>([OPS_SKILL, WEBGRAB_SKILL]);
+  if (releaseDir) {
+    for (const tier of ["user", "admin"] as const) {
+      for (const e of scanSkillEntries(join(releaseDir, "skills", tier))) {
+        repoNames.add(e.dirName);
+        repoNames.add(e.canonicalName);
+      }
+    }
+  }
+  const generatedNames = new Set<string>([...GENERATED_SKILLS, OPS_SKILL]);
+
+  for (const entry of readdirSync(legacyRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    const src = join(legacyRoot, entry.name);
+    if (generatedNames.has(entry.name)) {
+      rmSync(src, { recursive: true, force: true });
+      continue;
+    }
+    if (repoNames.has(entry.name)) {
+      const archiveDst = join(dataDir, "claude", ".migrated-repo-skills", entry.name);
+      rmSync(archiveDst, { recursive: true, force: true });
+      moveDirSync(src, archiveDst);
+      continue;
+    }
+    if (!existsSync(join(src, "SKILL.md"))) continue;
+    const tier: SkillTier = (ADMIN_ONLY_SKILLS as readonly string[]).includes(entry.name) ? "admin" : "user";
+    const dst = join(sharedRoot, tier, entry.name);
+    if (!existsSync(dst)) {
+      moveDirSync(src, dst);
+    } else {
+      const archiveDst = join(dataDir, "claude", ".migrated-repo-skills", entry.name);
+      rmSync(archiveDst, { recursive: true, force: true });
+      moveDirSync(src, archiveDst);
+    }
+  }
+
+  try {
+    if (readdirSync(legacyRoot).length === 0) rmdirSync(legacyRoot);
+  } catch {
+    // 非空或已移除时保持原状即可
+  }
+}
+
+/** `skillsFor` 的两个可选输入。都不给就退回硬编码名单。 */
 export interface SkillFilter {
-  /** 磁盘上装了哪些(见 `skillsOnDisk`)。空 = 读不到,走兜底。 */
+  /** 磁盘上装了哪些。空 = 读不到,走兜底。 */
   readonly onDisk?: readonly string[];
   /** 管理员在 `disabledSkills` 里显式关掉的。 */
   readonly disabled?: readonly string[];
@@ -489,31 +648,10 @@ export interface SkillFilter {
 /**
  * 这一回合该让哪些 skill 进上下文。
  *
- * ## 主人格:黑名单
- *
- * 默认**磁盘上装了什么就给什么**,只减三类:不属于这个人格的、非管理员回合里
- * 该挡的、以及管理员显式禁用的。
- *
- * 之所以不再要一份代码里的白名单:能往 `skills/` 里写文件的只有管理员和 catman
- * 自己,**装进去这个动作本身就是认可**。再要一次登记就只是摩擦 —— 登记表在代码里,
- * 改它得发一次版,而漏登记的表现是那份说明*安静地不存在*。真实的代价:三个手写
- * skill 就这么哑了十几天,期间共享人设的正文还在点名让人去用它们。
- *
- * `onDisk` 为空(目录读不到、或一个 SKILL.md 都没有)时退回硬编码名单。这条兜底
- * 是必须的,与 settings.ts 开头那条「任何配置状态下 agent 都必须能起来」同一个考虑:
- * 否则一次 readdir 失败就能让它连「怎么改自己的配置」都不知道。
- *
- * ## 守护人格:仍然是白名单
- *
- * 不跟着改,因为它的价值就是**没有惊喜**:跑钉住的稳定版本,被叫来时人正在等它诊断。
- * 白名单让它显式声明自己要什么,而不是继承磁盘现状 —— 那个目录里躺着什么它不该关心。
- *
- * `disabled` 同样不作用于这一支:一个手滑的禁用不该让救援手册在最需要它的时候消失,
- * 而解除禁用要走主人格那边的配置接口 —— 那时人找守护人格,多半正是因为主人格不好使。
+ * - **主人格（黑名单）**：磁盘可见池减去 `PRIMARY_EXCLUDED`、非管理员禁项与 `disabledSkills`；`onDisk` 为空退回兜底名单。
+ * - **守护人格（白名单）**：固定返回 `RESCUE_SKILLS`（普通用户只给 `USER_SKILL`），不受磁盘与 `disabledSkills` 影响。
  */
 export function skillsFor(persona: Persona, isAdmin: boolean, filter: SkillFilter = {}): string[] {
-  // 守护人格那边没有调度器,所以两条分支都要把 catman-cron 摘掉 ——
-  // 普通用户这一支同样要摘,否则它会去调一个必然 404 的接口。
   if (persona === "rescue") return isAdmin ? [...RESCUE_SKILLS] : [USER_SKILL];
 
   const pool = filter.onDisk?.length ? filter.onDisk : isAdmin ? ADMIN_SKILLS : USER_SKILLS;
