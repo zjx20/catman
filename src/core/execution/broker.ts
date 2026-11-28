@@ -6,6 +6,39 @@ import { readExecutionState } from "./contexts.js";
 
 export interface SharedEndpoint { url: string; headers?: Record<string, string>; adminOnly?: boolean; methods?: string[] }
 export interface SharedTools { mcp: Record<string, SharedEndpoint>; services: Record<string, SharedEndpoint> }
+export interface CapabilityBrokerOptions {
+  headersTimeoutMs?: number;
+  bodyTimeoutMs?: number;
+}
+
+export const DEFAULT_BROKER_HEADERS_TIMEOUT_MS = 45_000;
+export const DEFAULT_BROKER_BODY_TIMEOUT_MS = 120_000;
+
+export class BrokerUpstreamError extends Error {
+  constructor(
+    readonly status: 502 | 504,
+    message: string,
+    override readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = "BrokerUpstreamError";
+  }
+}
+
+function classifyUpstreamError(error: unknown): BrokerUpstreamError {
+  const err = error as { code?: unknown; name?: unknown; message?: unknown } | undefined;
+  const code = typeof err?.code === "string" ? err.code : "";
+  const name = typeof err?.name === "string" ? err.name : "";
+  const detail = error instanceof Error ? `${name || "Error"}: ${error.message}` : String(error);
+  const isTimeout =
+    code === "UND_ERR_HEADERS_TIMEOUT" ||
+    code === "UND_ERR_BODY_TIMEOUT" ||
+    code === "UND_ERR_CONNECT_TIMEOUT" ||
+    code === "ETIMEDOUT" ||
+    /TimeoutError$/i.test(name);
+  return new BrokerUpstreamError(isTimeout ? 504 : 502, detail, error);
+}
+
 const NAME = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
 
 /** Secrets stay in the control plane. A worker gets permission to invoke a named service. */
@@ -13,9 +46,18 @@ export class CapabilityBroker {
   private tools: SharedTools;
   private readonly sessions = new Map<string, string>();
   private readonly dispatcher = new EnvHttpProxyAgent({ noProxy: ["localhost", "127.0.0.1", process.env.NO_PROXY ?? process.env.no_proxy ?? ""].join(",") });
-  constructor(private readonly path: string, private readonly runtimes: RuntimeManager, private readonly isAdmin: (userKey: string) => boolean) {
+  private readonly headersTimeoutMs: number;
+  private readonly bodyTimeoutMs: number;
+  constructor(
+    private readonly path: string,
+    private readonly runtimes: RuntimeManager,
+    private readonly isAdmin: (userKey: string) => boolean,
+    opts?: CapabilityBrokerOptions,
+  ) {
     this.tools = readExecutionState<SharedTools>(path, { mcp: {}, services: {} });
     this.validate(this.tools);
+    this.headersTimeoutMs = opts?.headersTimeoutMs ?? DEFAULT_BROKER_HEADERS_TIMEOUT_MS;
+    this.bodyTimeoutMs = opts?.bodyTimeoutMs ?? DEFAULT_BROKER_BODY_TIMEOUT_MS;
   }
   configure(value: SharedTools): void { this.validate(value); writeJsonFileAtomic(this.path, value, 0o600); this.tools = structuredClone(value); }
   async close(): Promise<void> { await this.dispatcher.close(); }
@@ -112,11 +154,40 @@ export class CapabilityBroker {
       headers["anthropic-beta"] = [headers["anthropic-beta"], "oauth-2025-04-20"].filter(Boolean).join(",");
     }
     if (sessionKey && this.sessions.has(sessionKey)) headers["mcp-session-id"] = this.sessions.get(sessionKey)!;
+    let clientDisconnected = false;
     const abort = new AbortController();
-    req.once("aborted", () => abort.abort()); res.once("close", () => { if (!res.writableEnded) abort.abort(); });
-    const response = await request(target, { dispatcher: this.dispatcher, method: req.method as "GET", headers,
-      body: ["GET", "HEAD"].includes(req.method ?? "GET") ? undefined : req, signal: abort.signal,
-      headersTimeout: 120_000, bodyTimeout: 120_000 });
+    req.once("aborted", () => { clientDisconnected = true; abort.abort(); });
+    res.once("close", () => { if (!res.writableEnded) { clientDisconnected = true; abort.abort(); } });
+    // 先把请求体读取完（上限 16MiB，覆盖带多张 base64 图片的对话请求）再发往上游。
+    // 直接把 IncomingMessage 流作为 body 传给 undici 时，一旦上游 ECONNREFUSED 在流读取前就抛错，
+    // 未被消费完的 req 会让 Node HTTP Keep-Alive 连接卡在等待排空请求体上，导致客户端收不到 502 响应。
+    let requestBody: Buffer | undefined;
+    if (!["GET", "HEAD"].includes(req.method ?? "GET")) {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      for await (const chunk of req) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        total += buf.length;
+        if (total > 16 * 1024 * 1024) throw new Error("代理请求体过大");
+        chunks.push(buf);
+      }
+      requestBody = Buffer.concat(chunks);
+    }
+    let response: Awaited<ReturnType<typeof request>>;
+    try {
+      response = await request(target, {
+        dispatcher: this.dispatcher,
+        method: req.method as "GET",
+        headers,
+        body: requestBody,
+        signal: abort.signal,
+        headersTimeout: this.headersTimeoutMs,
+        bodyTimeout: this.bodyTimeoutMs,
+      });
+    } catch (error) {
+      if (clientDisconnected) return;
+      throw classifyUpstreamError(error);
+    }
     if (sessionKey && response.statusCode === 404) this.sessions.delete(sessionKey);
     if (sessionKey && typeof response.headers["mcp-session-id"] === "string") this.sessions.set(sessionKey, response.headers["mcp-session-id"]);
     const responseHeaders = Object.fromEntries(Object.entries(response.headers).filter(([k]) => !["set-cookie", "connection", "transfer-encoding", "mcp-session-id"].includes(k)));

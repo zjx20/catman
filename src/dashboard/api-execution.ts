@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { Config } from "../config.js";
 import type { ContextStore } from "../core/execution/contexts.js";
 import type { RuntimeManager } from "../core/execution/runtime.js";
-import type { CapabilityBroker, SharedTools } from "../core/execution/broker.js";
+import { BrokerUpstreamError, type CapabilityBroker, type SharedTools } from "../core/execution/broker.js";
 import type { TurnTokens } from "../core/turn-tokens.js";
 import type { OpsManager } from "../core/execution/ops.js";
 import { BUILTIN_ADMIN_USER_KEY } from "../core/identity.js";
@@ -167,7 +167,21 @@ export class ExecutionApi {
       }
       json(res, 404, { error: "没有这个执行接口" });
     } catch (error) {
-      if (!res.headersSent) json(res, 400, { error: String(error) }); else res.destroy(error instanceof Error ? error : new Error(String(error)));
+      if (!res.headersSent) {
+        if (error instanceof BrokerUpstreamError) {
+          json(res, error.status, {
+            error: {
+              code: error.status,
+              message: error.message,
+              status: error.status === 504 ? "DEADLINE_EXCEEDED" : "UNAVAILABLE",
+            },
+          });
+        } else {
+          json(res, 400, { error: String(error) });
+        }
+      } else {
+        res.destroy(error instanceof Error ? error : new Error(String(error)));
+      }
     }
     return true;
   }

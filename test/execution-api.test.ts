@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { CapabilityBroker } from "../src/core/execution/broker.js";
+import { CapabilityBroker, DEFAULT_BROKER_HEADERS_TIMEOUT_MS } from "../src/core/execution/broker.js";
 import { ExecutionApi } from "../src/dashboard/api-execution.js";
 import { TurnTokens } from "../src/core/turn-tokens.js";
 import { executionFixture } from "./helpers/execution.js";
@@ -101,5 +101,112 @@ test("制备 API 异步发送可复制的成功摘要，失败与启动异常各
   } finally {
     server.closeAllConnections(); await new Promise<void>(r => server.close(() => r()));
     await broker.close(); f.cleanup();
+  }
+});
+
+test("CapabilityBroker 上游响应头超时返回 504、上游断连/不可达返回 502（便于 SDK 自动重试），客户端校验错误保持 400", async () => {
+  assert.equal(DEFAULT_BROKER_HEADERS_TIMEOUT_MS, 45_000);
+  const f = executionFixture();
+  const savedGeminiKey = process.env.GEMINI_API_KEY;
+  const savedGeminiBase = process.env.GOOGLE_GEMINI_BASE_URL;
+
+  let hangSocket: import("node:net").Socket | undefined;
+  let mode: "hang" | "reset" = "hang";
+  const flakyUpstream = createServer(async (req, _res) => {
+    for await (const _chunk of req) {}
+    if (mode === "reset") {
+      req.socket.destroy();
+      return;
+    }
+    hangSocket = req.socket;
+  });
+  await new Promise<void>(resolve => flakyUpstream.listen(0, "127.0.0.1", resolve));
+  const upAddr = flakyUpstream.address();
+  assert.ok(upAddr && typeof upAddr !== "string");
+
+  const broker = new CapabilityBroker(
+    `${f.config.dataDir}/execution/shared-tools.json`,
+    f.runtimes,
+    () => false,
+    { headersTimeoutMs: 60, bodyTimeoutMs: 120 },
+  );
+  const api = new ExecutionApi({
+    config: f.config,
+    contexts: f.contexts,
+    runtimes: f.runtimes,
+    broker,
+    turns: new TurnTokens(),
+    isAdmin: () => false,
+  });
+  const server = createServer((req, res) => {
+    void api.handle(req, res, new URL(req.url!, "http://localhost"), false);
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const local = server.address();
+  assert.ok(local && typeof local !== "string");
+
+  try {
+    process.env.GEMINI_API_KEY = "test-gemini-secret";
+    process.env.GOOGLE_GEMINI_BASE_URL = `http://127.0.0.1:${upAddr.port}`;
+    const runtime = await f.runtimes.ensure(f.contexts.chat("alice"));
+    const endpoint = `http://127.0.0.1:${local.port}/api/runtime/model/gemini/v1beta/models/gemini-4-carbon:streamGenerateContent?alt=sse&key=${runtime.token}`;
+
+    // 1. 上游迟迟不回响应头 -> 504 DEADLINE_EXCEEDED
+    mode = "hang";
+    const timeoutRes = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"contents":[]}',
+    });
+    assert.equal(timeoutRes.status, 504);
+    const timeoutBody = await timeoutRes.json() as { error: { code: number; status: string; message: string } };
+    assert.equal(timeoutBody.error.code, 504);
+    assert.equal(timeoutBody.error.status, "DEADLINE_EXCEEDED");
+    assert.match(timeoutBody.error.message, /HeadersTimeoutError/i);
+    hangSocket?.destroy();
+
+    // 2. 上游未发响应头即断开连接 -> 502 UNAVAILABLE
+    mode = "reset";
+    const resetRes = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"contents":[]}',
+    });
+    assert.equal(resetRes.status, 502);
+    const resetBody = await resetRes.json() as { error: { code: number; status: string; message: string } };
+    assert.equal(resetBody.error.code, 502);
+    assert.equal(resetBody.error.status, "UNAVAILABLE");
+
+    // 3. 上游端口关闭（ECONNREFUSED） -> 502 UNAVAILABLE
+    flakyUpstream.closeAllConnections();
+    await new Promise<void>(r => flakyUpstream.close(() => r()));
+    const refusedRes = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"contents":[]}',
+    });
+    assert.equal(refusedRes.status, 502);
+    await refusedRes.text();
+
+    // 4. 非法路径仍返回 400（客户端不该重试）
+    const badPathRes = await fetch(
+      `http://127.0.0.1:${local.port}/api/runtime/model/gemini/v1beta/unauthorized?key=${runtime.token}`,
+    );
+    assert.equal(badPathRes.status, 400);
+    await badPathRes.text();
+  } finally {
+    if (savedGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = savedGeminiKey;
+    if (savedGeminiBase === undefined) delete process.env.GOOGLE_GEMINI_BASE_URL;
+    else process.env.GOOGLE_GEMINI_BASE_URL = savedGeminiBase;
+    hangSocket?.destroy();
+    server.closeAllConnections();
+    if (flakyUpstream.listening) {
+      flakyUpstream.closeAllConnections();
+      await new Promise<void>(r => flakyUpstream.close(() => r()));
+    }
+    await new Promise<void>(r => server.close(() => r()));
+    await broker.close();
+    f.cleanup();
   }
 });
